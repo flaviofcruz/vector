@@ -21,6 +21,7 @@ pub struct K8sPathsProvider {
     exclude_paths: Vec<glob::Pattern>,
     insert_namespace_fields: bool,
     extract_databricks_logs: bool,
+    use_hostpath_logging_annotation_override: bool,
 }
 
 impl K8sPathsProvider {
@@ -33,6 +34,7 @@ impl K8sPathsProvider {
         exclude_paths: Vec<glob::Pattern>,
         insert_namespace_fields: bool,
         extract_databricks_logs: bool,
+        use_hostpath_logging_annotation_override: bool,
     ) -> Self {
         Self {
             pod_state,
@@ -42,6 +44,7 @@ impl K8sPathsProvider {
             exclude_paths,
             insert_namespace_fields,
             extract_databricks_logs,
+            use_hostpath_logging_annotation_override,
         }
     }
 }
@@ -78,6 +81,7 @@ impl PathsProvider for K8sPathsProvider {
                     self.pod_logs_glob_patterns.as_slice(),
                     pod.as_ref(),
                     self.extract_databricks_logs,
+                    self.use_hostpath_logging_annotation_override,
                 );
                 filter_paths(
                     filter_paths(paths_iter, &self.include_paths, true),
@@ -159,7 +163,7 @@ const DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX: &str = "/databricks/host-root";
 // 2. The kubelet log directory is used.
 //    For pods that log to a kubelet-managed volume, the emptyDir volume under the pod's UID is
 //    used. This is the default behavior for pods.
-fn extract_databricks_pod_logs_directory(pod: &Pod) -> Option<PathBuf> {
+fn extract_databricks_pod_logs_directory(pod: &Pod, use_hostpath_logging_annotation_override: bool) -> Option<PathBuf> {
     // Allow the hostPath logging annotation override to be used in place of the kubelet log directory.
     let metadata = &pod.metadata;
     let uid = if let Some(static_pod_config_hashsum) = extract_static_pod_config_hashsum(metadata) {
@@ -170,21 +174,27 @@ fn extract_databricks_pod_logs_directory(pod: &Pod) -> Option<PathBuf> {
         metadata.uid.as_ref()?
     };
 
-    let hostpath_logging_annotation: Option<&str> =
-        metadata.annotations.as_ref().and_then(|annotations| {
-            annotations
-                .get(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY)
-                .map(|value| value.as_str())
-        });
-    hostpath_logging_annotation
-        .map(|value| {
-            PathBuf::from(format!(
-                "{}/{}",
-                DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX,
-                value.trim_start_matches('/')
-            ))
-        })
-        .or_else(|| Some(build_databricks_k8s_pod_logs_directory(uid)))
+    if use_hostpath_logging_annotation_override {
+        // Use the hostPath logging annotation override to determine the Databricks logs directory.
+        // If the annotation is not present, return None.
+        let hostpath_logging_annotation: Option<&str> =
+            metadata.annotations.as_ref().and_then(|annotations| {
+                annotations
+                    .get(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY)
+                    .map(|value| value.as_str())
+            });
+        hostpath_logging_annotation
+            .map(|value| {
+                PathBuf::from(format!(
+                    "{}/{}",
+                    DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX,
+                    value.trim_start_matches('/')
+                ))
+            })
+    } else {
+        // Use the kubelet log directory to determine the Databricks logs directory.
+        Some(build_databricks_k8s_pod_logs_directory(uid))
+    }
 }
 
 const CONTAINER_EXCLUSION_ANNOTATION_KEY: &str = "vector.dev/exclude-containers";
@@ -220,13 +230,14 @@ fn list_pod_log_paths<'a, G, GI>(
     pod_logs_glob_patterns: &'a [String],
     pod: &'a Pod,
     extract_databricks_logs: bool,
+    use_hostpath_logging_annotation_override: bool,
 ) -> impl Iterator<Item = PathBuf> + 'a
 where
     G: FnMut(&str) -> GI + 'a,
     GI: Iterator<Item = PathBuf> + 'a,
 {
     if extract_databricks_logs {
-        extract_databricks_pod_logs_directory(pod)
+        extract_databricks_pod_logs_directory(pod, use_hostpath_logging_annotation_override)
     } else {
         extract_pod_logs_directory(pod)
     }
@@ -388,7 +399,7 @@ mod tests {
     fn test_extract_databricks_pod_logs_directory() {
         let cases = vec![
             // Empty pod.
-            (Pod::default(), None),
+            (Pod::default(), false, None),
             // Happy path.
             (
                 Pod {
@@ -400,6 +411,7 @@ mod tests {
                     },
                     ..Pod::default()
                 },
+                false,
                 Some("/var/lib/kubelet/pods/sandbox0-uid/volumes/kubernetes.io~empty-dir/logs"),
             ),
             // No uid.
@@ -412,6 +424,22 @@ mod tests {
                     },
                     ..Pod::default()
                 },
+                false,
+                None,
+            ),
+            // Attempt to use the hostPath logging annotation override, but the annotation is not
+            // present.
+            (
+                Pod {
+                    metadata: ObjectMeta {
+                        namespace: Some("sandbox0-ns".to_owned()),
+                        name: Some("sandbox0-name".to_owned()),
+                        uid: Some("sandbox0-uid".to_owned()),
+                        ..ObjectMeta::default()
+                    },
+                    ..Pod::default()
+                },
+                true,
                 None,
             ),
             // Pod annotation overrides uid-based emptyDir path..
@@ -433,13 +461,14 @@ mod tests {
                     },
                     ..Pod::default()
                 },
+                true,
                 Some("/databricks/host-root/local_disk0/sandbox0-custom-logs-path"),
             ),
         ];
 
-        for (pod, expected) in cases {
+        for (pod, use_hostpath_logging_annotation, expected) in cases {
             assert_eq!(
-                extract_databricks_pod_logs_directory(&pod),
+                extract_databricks_pod_logs_directory(&pod, use_hostpath_logging_annotation),
                 expected.map(PathBuf::from)
             );
         }
@@ -630,7 +659,7 @@ mod tests {
                 "*/*.pb.base64*".to_string(),
             ];
             let actual_paths: Vec<_> =
-                list_pod_log_paths(mock_glob, pod_logs_glob_patterns.as_slice(), &pod, false)
+                list_pod_log_paths(mock_glob, pod_logs_glob_patterns.as_slice(), &pod, false, false)
                     .collect();
             let expected_paths: Vec<_> = expected_paths.into_iter().map(PathBuf::from).collect();
             assert_eq!(actual_paths, expected_paths)
@@ -724,7 +753,7 @@ mod tests {
                 "*/*.pb.base64*".to_string(),
             ];
             let actual_paths: Vec<_> =
-                list_pod_log_paths(mock_glob, pod_logs_glob_patterns.as_slice(), &pod, true)
+                list_pod_log_paths(mock_glob, pod_logs_glob_patterns.as_slice(), &pod, true, true)
                     .collect();
             let expected_paths: Vec<_> = expected_paths.into_iter().map(PathBuf::from).collect();
             assert_eq!(actual_paths, expected_paths)

@@ -58,3 +58,4 @@ This lists custom changes merged in Databricks fork of Vector.
 57. Emit file event from new spot (after multiline) https://github.com/databricks-eng/vector/pull/340
 58. Adds a mapping to the kubernetes_logs source which will allow it to annotate logs that don't match the standard kubernetes file pattern. https://github.com/databricks-eng/vector/pull/339
 59. Adds an option to the kuberenetes_logs source which allows it to specify a FileTTLRemovalConfig, similar to the file source. https://github.com/databricks-eng/vector/pull/346
+60. Adds an option to the kuberenetes_logs source which splits the pod log discovery behavior explicitly by whether or not we expect to rely on the logging hostpath annotation to discovery the log directory. https://github.com/databricks-eng/vector/pull/346
