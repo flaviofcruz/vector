@@ -412,7 +412,7 @@ mod tests {
                     ..Pod::default()
                 },
                 false,
-                Some("/var/lib/kubelet/pods/sandbox0-uid/volumes/kubernetes.io~empty-dir/logs"),
+                Some("/var/lib/kubelet/pods/sandbox0-uid/volumes/kubernetes.io~empty-dir"),
             ),
             // No uid.
             (
