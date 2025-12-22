@@ -163,7 +163,10 @@ const DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX: &str = "/databricks/host-root";
 // 2. The kubelet log directory is used.
 //    For pods that log to a kubelet-managed volume, the emptyDir volume under the pod's UID is
 //    used. This is the default behavior for pods.
-fn extract_databricks_pod_logs_directory(pod: &Pod, use_hostpath_logging_annotation_override: bool) -> Option<PathBuf> {
+fn extract_databricks_pod_logs_directory(
+    pod: &Pod,
+    use_hostpath_logging_annotation_override: bool,
+) -> Option<PathBuf> {
     // Allow the hostPath logging annotation override to be used in place of the kubelet log directory.
     let metadata = &pod.metadata;
     let uid = if let Some(static_pod_config_hashsum) = extract_static_pod_config_hashsum(metadata) {
@@ -183,14 +186,13 @@ fn extract_databricks_pod_logs_directory(pod: &Pod, use_hostpath_logging_annotat
                     .get(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY)
                     .map(|value| value.as_str())
             });
-        hostpath_logging_annotation
-            .map(|value| {
-                PathBuf::from(format!(
-                    "{}/{}",
-                    DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX,
-                    value.trim_start_matches('/')
-                ))
-            })
+        hostpath_logging_annotation.map(|value| {
+            PathBuf::from(format!(
+                "{}/{}",
+                DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX,
+                value.trim_start_matches('/')
+            ))
+        })
     } else {
         // Use the kubelet log directory to determine the Databricks logs directory.
         Some(build_databricks_k8s_pod_logs_directory(uid))
@@ -658,9 +660,14 @@ mod tests {
                 "*/*.json*".to_string(),
                 "*/*.pb.base64*".to_string(),
             ];
-            let actual_paths: Vec<_> =
-                list_pod_log_paths(mock_glob, pod_logs_glob_patterns.as_slice(), &pod, false, false)
-                    .collect();
+            let actual_paths: Vec<_> = list_pod_log_paths(
+                mock_glob,
+                pod_logs_glob_patterns.as_slice(),
+                &pod,
+                false,
+                false,
+            )
+            .collect();
             let expected_paths: Vec<_> = expected_paths.into_iter().map(PathBuf::from).collect();
             assert_eq!(actual_paths, expected_paths)
         }
@@ -752,9 +759,14 @@ mod tests {
                 "*/*.json*".to_string(),
                 "*/*.pb.base64*".to_string(),
             ];
-            let actual_paths: Vec<_> =
-                list_pod_log_paths(mock_glob, pod_logs_glob_patterns.as_slice(), &pod, true, true)
-                    .collect();
+            let actual_paths: Vec<_> = list_pod_log_paths(
+                mock_glob,
+                pod_logs_glob_patterns.as_slice(),
+                &pod,
+                true,
+                true,
+            )
+            .collect();
             let expected_paths: Vec<_> = expected_paths.into_iter().map(PathBuf::from).collect();
             assert_eq!(actual_paths, expected_paths)
         }

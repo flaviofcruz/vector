@@ -709,7 +709,8 @@ impl Source {
             namespace_label_selector,
             insert_namespace_fields: config.insert_namespace_fields,
             extract_databricks_logs: config.extract_databricks_logs,
-            use_hostpath_logging_annotation_override: config.use_hostpath_logging_annotation_override,
+            use_hostpath_logging_annotation_override: config
+                .use_hostpath_logging_annotation_override,
             ttl_removal_config: config.ttl_removal_config.clone(),
             node_selector,
             self_node_name,
