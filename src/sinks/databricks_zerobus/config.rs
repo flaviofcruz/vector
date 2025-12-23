@@ -1,6 +1,7 @@
 //! Configuration for the Zerobus sink.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 use serde_with::serde_as;
 use vector_lib::configurable::configurable_component;
@@ -11,6 +12,7 @@ use crate::sinks::{
     prelude::*,
     util::{BatchConfig, RealtimeSizeBasedDefaultBatchSettings, http::RequestConfig},
 };
+use databricks_zerobus_ingest_sdk::databricks::zerobus::RecordType;
 
 use super::{error::ZerobusSinkError, service::ZerobusService, sink::ZerobusSink};
 
@@ -73,9 +75,9 @@ pub enum SchemaSource {
 #[serde(deny_unknown_fields)]
 pub struct ZerobusStreamOptions {
     /// Maximum number of in-flight records before applying backpressure.
-    #[serde(default = "default_max_inflight_records")]
-    #[configurable(metadata(docs::examples = 1000))]
-    pub max_inflight_records: usize,
+    #[serde(default = "default_max_inflight_requests")]
+    #[configurable(metadata(docs::examples = 10))]
+    pub max_inflight_requests: NonZeroUsize,
 
     /// Number of retry attempts for stream recovery.
     #[serde(default = "default_recovery_retries")]
@@ -111,7 +113,7 @@ pub struct ZerobusStreamOptions {
 impl Default for ZerobusStreamOptions {
     fn default() -> Self {
         Self {
-            max_inflight_records: default_max_inflight_records(),
+            max_inflight_requests: default_max_inflight_requests(),
             recovery_retries: default_recovery_retries(),
             recovery_backoff_ms: default_recovery_backoff_ms(),
             flush_timeout_ms: default_flush_timeout_ms(),
@@ -127,13 +129,14 @@ impl From<ZerobusStreamOptions> for databricks_zerobus_ingest_sdk::StreamConfigu
         // Thin wrapper conversion - all fields map 1:1 to the SDK type.
         // This wrapper exists only to add Vector's configuration system support.
         Self {
-            max_inflight_records: options.max_inflight_records,
+            max_inflight_requests: options.max_inflight_requests.into(),
             recovery: options.recovery,
             recovery_timeout_ms: options.recovery_timeout_ms,
             recovery_backoff_ms: options.recovery_backoff_ms,
             recovery_retries: options.recovery_retries,
             server_lack_of_ack_timeout_ms: options.server_lack_of_ack_timeout_ms,
             flush_timeout_ms: options.flush_timeout_ms,
+            record_type: RecordType::Proto,
         }
     }
 }
@@ -316,13 +319,26 @@ impl ZerobusSinkConfig {
             }
         }
 
+        if let Some(max_bytes) = self.batch.max_bytes {
+            // Zerobus SDK limits max bytes to 10MB.
+            // NOTE: The size of the batch in Vector is not exactly the same as the size of the
+            // batch in the SDK since they are encoded differently. Though it is expected that
+            // Vector encoded data will be larger than the SDK encoded data since SDK encodes the
+            // data in protobuf format.
+            if max_bytes > 10_000_000 {
+                return Err(ZerobusSinkError::ConfigError {
+                    message: "max_bytes must be less than or equal to 10MB".to_string(),
+                });
+            }
+        }
+
         Ok(())
     }
 }
 
 // Default value functions
-fn default_max_inflight_records() -> usize {
-    1000
+fn default_max_inflight_requests() -> NonZeroUsize {
+    default_request_builder_concurrency_limit()
 }
 
 // 4 retries, 1 initial attempt for a total of 5 attempts
@@ -489,7 +505,7 @@ mod tests {
     #[test]
     fn test_stream_options_conversion() {
         let options = ZerobusStreamOptions {
-            max_inflight_records: 2000,
+            max_inflight_requests: NonZeroUsize::new(20).expect("static"),
             recovery_retries: 10,
             recovery_backoff_ms: 2000,
             flush_timeout_ms: 45000,
@@ -499,7 +515,7 @@ mod tests {
         };
 
         let sdk_options: databricks_zerobus_ingest_sdk::StreamConfigurationOptions = options.into();
-        assert_eq!(sdk_options.max_inflight_records, 2000);
+        assert_eq!(sdk_options.max_inflight_requests, 20);
         assert_eq!(sdk_options.recovery_retries, 10);
         assert_eq!(sdk_options.recovery_backoff_ms, 2000);
         assert_eq!(sdk_options.flush_timeout_ms, 45000);

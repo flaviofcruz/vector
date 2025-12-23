@@ -46,7 +46,8 @@ impl ZerobusSink {
         input
             .batched(self.batch_settings.as_byte_size_config())
             .request_builder(
-                default_request_builder_concurrency_limit(),
+                // Limit concurrency to what the SDK allows.
+                self.service.config.stream_options.max_inflight_requests,
                 ZerobusRequestBuilder::new(Compression::None, encoder),
             )
             .filter_map(|request| async move {
