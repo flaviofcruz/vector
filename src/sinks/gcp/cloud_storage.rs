@@ -10,11 +10,9 @@ use indoc::indoc;
 use snafu::{ResultExt, Snafu};
 use tower::ServiceBuilder;
 use uuid::Uuid;
+use vector_lib::event::event_log::generate_count_map;
 use vector_lib::{
-    TimeZone,
-    codecs::encoding::Framer,
-    configurable::configurable_component,
-    event::{EventFinalizers, Finalizable},
+    TimeZone, codecs::encoding::Framer, configurable::configurable_component, event::Finalizable,
     request_metadata::RequestMetadata,
 };
 
@@ -24,6 +22,7 @@ use crate::{
     event::Event,
     gcp::{GcpAuthConfig, GcpAuthenticator, Scope},
     http::{HttpClient, get_http_scheme_from_uri},
+    internal_events::vector_event::VectorEventLogSendMetadata,
     serde::json::to_string,
     sinks::{
         Healthcheck, VectorSink,
@@ -32,7 +31,7 @@ use crate::{
                 GcsPredefinedAcl, GcsRetryLogic, GcsStorageClass, build_healthcheck,
                 default_endpoint,
             },
-            service::{GcsRequest, GcsRequestSettings, GcsService},
+            service::{GcsMetadata, GcsRequest, GcsRequestSettings, GcsResponse, GcsService},
             sink::GcsSink,
         },
         util::{
@@ -151,6 +150,14 @@ pub struct GcsSinkConfig {
     #[serde(flatten)]
     encoding: EncodingConfigWithFraming,
 
+    /// Overrides what content encoding has been applied to the object.
+    ///
+    /// Directly comparable to the `Content-Encoding` HTTP header.
+    ///
+    /// If not specified, the compression scheme used dictates this value.
+    #[configurable(metadata(docs::examples = "gzip"))]
+    content_encoding: Option<String>,
+
     /// Compression configuration.
     ///
     /// All compression algorithms use the default compression level unless otherwise specified.
@@ -210,6 +217,7 @@ fn default_config(encoding: EncodingConfigWithFraming) -> GcsSinkConfig {
         filename_append_uuid: true,
         filename_extension: Default::default(),
         encoding,
+        content_encoding: None,
         compression: Compression::gzip_default(),
         batch: Default::default(),
         endpoint: Default::default(),
@@ -280,6 +288,14 @@ impl GcsSinkConfig {
 
         let svc = ServiceBuilder::new()
             .settings(request, GcsRetryLogic::default())
+            // Add another layer after retries for emitting our event log message
+            // Returns back the same result so it continues to work downstream
+            .map_result(|result: Result<GcsResponse, _>| {
+                if let Ok(ref response) = result {
+                    response.event_log_metadata.emit_upload_event();
+                }
+                result
+            })
             .service(GcsService::new(client, base_url, auth));
 
         let request_settings = RequestSettings::new(self, cx)?;
@@ -314,10 +330,12 @@ struct RequestSettings {
     encoder: (Transformer, Encoder<Framer>),
     compression: Compression,
     tz_offset: Option<FixedOffset>,
+    bucket: String,
 }
 
 impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
-    type Metadata = (String, EventFinalizers);
+    // type Metadata = (String, EventFinalizers);
+    type Metadata = GcsMetadata;
     type Events = Vec<Event>;
     type Encoder = (Transformer, Encoder<Framer>);
     type Payload = Bytes;
@@ -340,16 +358,36 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
         let finalizers = events.take_finalizers();
         let builder = RequestMetadataBuilder::from_events(&events);
 
-        ((partition_key, finalizers), builder, events)
+        // Create event metadata here as this is where the list of events are available pre-encoding
+        // And we want to access this list to process the raw events to see specific field values
+        let event_log_metadata = VectorEventLogSendMetadata {
+            // Events are not encoded here yet, so byte size is not yet known
+            // Setting as 0 here and updating when it is set in build_request()
+            bytes: 0,
+            events_len: events.len(),
+            // Similarly the exact blob isn't determined here yet
+            blob: "".to_string(),
+            container: self.bucket.clone(),
+            count_map: generate_count_map(&events, false),
+        };
+
+        let gcp_metadata = GcsMetadata {
+            partition_key,
+            finalizers,
+            event_log_metadata,
+        };
+
+        (gcp_metadata, builder, events)
     }
 
     fn build_request(
         &self,
-        gcp_metadata: Self::Metadata,
+        mut gcs_metadata: Self::Metadata,
         metadata: RequestMetadata,
         payload: EncodeResult<Self::Payload>,
     ) -> Self::Request {
-        let (key, finalizers) = gcp_metadata;
+        let key = gcs_metadata.partition_key;
+        let finalizers = gcs_metadata.finalizers;
         // TODO: pull the seconds from the last event
         let filename = {
             let seconds = match self.tz_offset {
@@ -370,6 +408,10 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
         let key = format!("{}{}.{}", key, filename, self.extension);
         let body = payload.into_payload();
 
+        gcs_metadata.event_log_metadata.bytes = body.len();
+        gcs_metadata.event_log_metadata.blob = key.clone();
+        gcs_metadata.event_log_metadata.emit_sending_event();
+
         GcsRequest {
             key,
             body,
@@ -382,6 +424,7 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
                 headers: self.headers.clone(),
             },
             metadata,
+            event_log_metadata: gcs_metadata.event_log_metadata,
         }
     }
 }
@@ -396,9 +439,11 @@ impl RequestSettings {
             .map(|acl| HeaderValue::from_str(&to_string(acl)).unwrap());
         let content_type = HeaderValue::from_str(encoder.content_type()).unwrap();
         let content_encoding = config
-            .compression
-            .content_encoding()
-            .map(|ce| HeaderValue::from_str(&to_string(ce)).unwrap());
+            .content_encoding
+            .as_deref()
+            .or(config.compression.content_encoding());
+        let content_encoding =
+            content_encoding.map(|ce| HeaderValue::from_str(&to_string(ce)).unwrap());
         let storage_class = config.storage_class.unwrap_or_default();
         let storage_class = HeaderValue::from_str(&to_string(storage_class)).unwrap();
         let metadata = config
@@ -434,6 +479,7 @@ impl RequestSettings {
             compression: config.compression,
             encoder: (transformer, encoder),
             tz_offset: offset,
+            bucket: config.bucket.clone(),
         })
     }
 }
@@ -523,13 +569,19 @@ mod tests {
         RequestSettings::new(sink_config, context).expect("Could not create request settings")
     }
 
-    fn build_request(extension: Option<&str>, uuid: bool, compression: Compression) -> GcsRequest {
+    fn build_request(
+        extension: Option<&str>,
+        uuid: bool,
+        compression: Compression,
+        content_encoding: Option<String>,
+    ) -> GcsRequest {
         let context = SinkContext::default();
         let sink_config = GcsSinkConfig {
             key_prefix: Some("key/".into()),
             filename_time_format: "date".into(),
             filename_extension: extension.map(Into::into),
             filename_append_uuid: uuid,
+            content_encoding,
             compression,
             ..default_config(
                 (
@@ -560,16 +612,38 @@ mod tests {
 
     #[test]
     fn gcs_build_request() {
-        let req = build_request(Some("ext"), false, Compression::None);
+        let req = build_request(Some("ext"), false, Compression::None, None);
         assert_eq!(req.key, "key/date.ext".to_string());
 
-        let req = build_request(None, false, Compression::None);
+        let req = build_request(None, false, Compression::None, None);
         assert_eq!(req.key, "key/date.log".to_string());
 
-        let req = build_request(None, false, Compression::gzip_default());
+        let req = build_request(None, false, Compression::gzip_default(), None);
         assert_eq!(req.key, "key/date.log.gz".to_string());
 
-        let req = build_request(None, true, Compression::gzip_default());
+        let req = build_request(None, true, Compression::gzip_default(), None);
         assert_ne!(req.key, "key/date.log.gz".to_string());
+    }
+
+    #[test]
+    fn gcs_build_request_respect_content_encoding_option() {
+        let compression_scheme = Compression::gzip_default();
+        let request = build_request(None, false, compression_scheme, None);
+        assert_eq!(
+            request.settings.content_encoding,
+            HeaderValue::from_str(compression_scheme.content_encoding().unwrap()).ok()
+        );
+
+        let custom_encoding = "test_encoding";
+        let request = build_request(
+            None,
+            false,
+            compression_scheme,
+            Some(custom_encoding.to_string()),
+        );
+        assert_eq!(
+            request.settings.content_encoding,
+            HeaderValue::from_str(custom_encoding).ok()
+        );
     }
 }

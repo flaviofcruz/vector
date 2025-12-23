@@ -4,6 +4,7 @@ use async_stream::stream;
 use futures::{Stream, StreamExt};
 use governor::{Quota, clock};
 use snafu::Snafu;
+use vector_common::finalization::EventStatus;
 
 use super::{
     config::{ThrottleConfig, ThrottleInternalMetricsConfig},
@@ -26,6 +27,7 @@ pub struct Throttle<C: clock::Clock<Instant = I>, I: clock::Reference> {
     exclude: Option<Condition>,
     pub clock: C,
     internal_metrics: ThrottleInternalMetricsConfig,
+    throttled_event_status: EventStatus,
 }
 
 impl<C, I> Throttle<C, I>
@@ -57,6 +59,15 @@ where
             .map(|condition| condition.build(&context.enrichment_tables))
             .transpose()?;
 
+        let throttled_event_status = match config.throttled_event_status.as_str() {
+            "dropped" => EventStatus::Dropped,
+            "errored" => EventStatus::Errored,
+            "rejected" => EventStatus::Rejected,
+            _ => {
+                return Err(Box::new(ConfigError::NonZero));
+            }
+        };
+
         Ok(Self {
             quota,
             clock,
@@ -64,6 +75,7 @@ where
             key_field: config.key_field.clone(),
             exclude,
             internal_metrics: config.internal_metrics.clone(),
+            throttled_event_status,
         })
     }
 
@@ -123,6 +135,7 @@ where
                         Some(event)
                     } else {
                         self.emit_event_discarded(key.unwrap_or_else(|| "None".to_string()));
+                        event.metadata().update_status(self.throttled_event_status);
                         None
                     }
                 } else {
@@ -147,15 +160,16 @@ mod tests {
     use std::task::Poll;
 
     use futures::SinkExt;
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
+    use crate::transforms::Transform;
     use crate::{
-        event::LogEvent,
-        test_util::components::assert_transform_compliance,
-        transforms::{Transform, test::create_topology},
+        event::LogEvent, test_util::components::assert_transform_compliance,
+        transforms::test::create_topology,
+        transforms::throttle::config::default_throttled_event_status,
     };
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
 
     #[tokio::test]
     async fn throttle_events() {
@@ -370,6 +384,7 @@ key_field = "{{ bucket }}"
                 key_field: None,
                 exclude: None,
                 internal_metrics: Default::default(),
+                throttled_event_status: default_throttled_event_status(),
             };
             let (tx, rx) = mpsc::channel(1);
             let (topology, mut out) = create_topology(ReceiverStream::new(rx), config).await;

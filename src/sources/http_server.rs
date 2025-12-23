@@ -175,6 +175,11 @@ pub struct SimpleHttpConfig {
     #[configurable(derived)]
     #[serde(default)]
     keepalive: KeepaliveConfig,
+
+    /// The maximum number of request source will handle concurrently.
+    #[configurable(derived)]
+    #[serde(default)]
+    max_concurrent_requests: Option<usize>,
 }
 
 impl SimpleHttpConfig {
@@ -286,6 +291,7 @@ impl Default for SimpleHttpConfig {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             log_namespace: None,
             keepalive: KeepaliveConfig::default(),
+            max_concurrent_requests: None,
         }
     }
 }
@@ -374,7 +380,7 @@ impl SourceConfig for SimpleHttpConfig {
             decoder,
             log_namespace,
         };
-        source.run(
+        source.run_with_concurrency_limit(
             self.address,
             self.path.as_str(),
             self.method,
@@ -385,6 +391,7 @@ impl SourceConfig for SimpleHttpConfig {
             cx,
             self.acknowledgements,
             self.keepalive.clone(),
+            self.max_concurrent_requests,
         )
     }
 
@@ -616,6 +623,7 @@ mod tests {
                 acknowledgements: acknowledgements.into(),
                 log_namespace: None,
                 keepalive: Default::default(),
+                max_concurrent_requests: None,
             }
             .build(context)
             .await

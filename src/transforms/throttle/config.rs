@@ -63,9 +63,17 @@ pub struct ThrottleConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub internal_metrics: ThrottleInternalMetricsConfig,
+
+    /// The event status to set when dropping event due to throttling. One of (dropped, errored, rejected)
+    #[serde(default = "default_throttled_event_status")]
+    pub throttled_event_status: String,
 }
 
 impl_generate_config_from_default!(ThrottleConfig);
+
+pub fn default_throttled_event_status() -> String {
+    "dropped".to_string()
+}
 
 #[async_trait::async_trait]
 #[typetag::serde(name = "throttle")]

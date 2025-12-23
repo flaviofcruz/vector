@@ -142,7 +142,13 @@ impl SourceShutdownCoordinator {
         // `force_shutdown_tripwire` resolves even if canceled when we should *not* be shutting down.
         // `tripwire_handler` handles cancel by never resolving.
         let force_shutdown_tripwire = force_shutdown_tripwire.then(tripwire_handler);
-        (shutdown_signal, force_shutdown_tripwire)
+        if internal {
+            // For internal sources tripwire will never resolve, i.e. internal sources will never be shutdown.
+            // This will keep logs and metrics based pipeline working till forced shutdown.
+            (ShutdownSignal::noop(), force_shutdown_tripwire)
+        } else {
+            (shutdown_signal, force_shutdown_tripwire)
+        }
     }
 
     /// Takes ownership of all internal state for the given source from another `ShutdownCoordinator`.

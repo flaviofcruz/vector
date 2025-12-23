@@ -6,6 +6,8 @@ on:
     types:
       - opened
       - reopened
+    branches-ignore:
+      - 'v*-custom'
 
 jobs:
   add-contributor-to-project:

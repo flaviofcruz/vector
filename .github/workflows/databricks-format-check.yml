@@ -1,0 +1,62 @@
+name: "BLOCKING: Formatting Check"
+
+on:
+  pull_request:
+    branches: 
+      - v*-custom
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  check-rust:
+    runs-on:
+      group: databricks-eng-protected-runner-group
+      labels: linux-ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          path: vector
+
+      - name: Generate access token for VRL repository
+        id: generate-token-gh-app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.VECTOR_VRL_GH_APP_ID }}
+          private-key: ${{ secrets.VECTOR_VRL_GH_PRIVATE_KEY }}
+          owner: databricks-eng
+          repositories: vrl
+
+      - name: Checkout VRL repository
+        uses: actions/checkout@v5
+        with:
+          repository: databricks-eng/vrl
+          ref: v0.27.0-custom          
+          token: ${{ steps.generate-token-gh-app.outputs.token }}
+          persist-credentials: false
+          path: vrl
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Configure Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Include Cargo.lock in cache key for more precise invalidation
+          key: ${{ hashFiles('**/Cargo.lock') }}
+          # Cache target directory and registry
+          cache-targets: true
+          cache-all-crates: true
+          workspaces: vector
+          cache-on-failure: true
+
+      - name: Run rust fmt check
+        run: cargo fmt --check
+        working-directory: vector

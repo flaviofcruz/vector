@@ -2,9 +2,16 @@
 use std::time::Duration;
 
 use aws_config::{
-    default_provider::credentials::DefaultCredentialsChain, identity::IdentityCache, imds,
-    profile::ProfileFileCredentialsProvider, provider_config::ProviderConfig,
+    default_provider::credentials::DefaultCredentialsChain,
+    identity::IdentityCache,
+    imds,
+    profile::ProfileFileCredentialsProvider,
+    provider_config::ProviderConfig,
     sts::AssumeRoleProviderBuilder,
+    web_identity_token::{
+        StaticConfiguration as WebIdentityTokenStaticConfiguration,
+        WebIdentityTokenCredentialsProvider,
+    },
 };
 use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
 use aws_runtime::env_config::file::{EnvConfigFileKind, EnvConfigFiles};
@@ -107,6 +114,42 @@ pub enum AwsAuthentication {
         /// [role_session_name]: https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html
         #[configurable(metadata(docs::examples = "vector-indexer-role"))]
         session_name: Option<String>,
+    },
+
+    /// Workload Identity Federation (WIF) authentication uses a third-party identity provider
+    /// (IdP) such as Google, Microsoft, or any OpenID Connect (OIDC)-compliant IdP to authenticate
+    /// and authorize access to AWS resources without using long-term AWS credentials.
+    ///
+    /// Vector uses the AWS SDK's default WIF provider chain, which checks for environment variables
+    /// and configuration files to locate the necessary configuration for WIF. In case, you need to
+    /// modify the default behaviour for a source / sink, you can use this enum to provide a custom
+    /// configuration.
+    WorkloadIdentityFederation {
+        /// The ARN of an [IAM role][iam_role] to assume.
+        ///     
+        /// [iam_role]: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html
+        #[configurable(metadata(docs::examples = "arn:aws:iam::123456789098:role/my_role"))]
+        role_arn: String,
+
+        /// Path to the file containing the OIDC token.
+        ///
+        /// This file is typically provided by the identity provider (IdP) and contains the OIDC token.
+        /// The token is used to authenticate with AWS STS to assume the specified role.
+        #[configurable(metadata(docs::examples = "/path/to/token"))]
+        web_identity_token_file: String,
+
+        /// Session name to use when assuming the role.
+        ///  
+        /// This can be any string that helps you identify the session, and is not required to be unique
+        /// or be configured in any specific format.
+        #[configurable(metadata(docs::examples = "vector-test-session"))]
+        session_name: String,
+
+        /// The [AWS region][aws_region] to send STS requests to.
+        ///
+        /// [aws_region]: https://docs.aws.amazon.com/general/latest/gr/rande.html#regional-endpoints
+        #[configurable(metadata(docs::examples = "us-west-2"))]
+        region: String,
     },
 
     /// Authenticate using credentials stored in a file.
@@ -330,6 +373,30 @@ impl AwsAuthentication {
                     .configure(&provider_config)
                     .build();
                 Ok(SharedCredentialsProvider::new(profile_provider))
+            }
+            AwsAuthentication::WorkloadIdentityFederation {
+                role_arn,
+                web_identity_token_file,
+                session_name,
+                region,
+            } => {
+                let connector = super::connector(proxy, tls_options)?;
+                let auth_region = Region::new(region.clone());
+
+                let provider_config = ProviderConfig::empty()
+                    .with_http_client(connector)
+                    .with_region(Some(auth_region));
+
+                let provider = WebIdentityTokenCredentialsProvider::builder()
+                    .static_configuration(WebIdentityTokenStaticConfiguration {
+                        web_identity_token_file: web_identity_token_file.into(),
+                        role_arn: role_arn.into(),
+                        session_name: session_name.into(),
+                    })
+                    .configure(&provider_config)
+                    .build();
+
+                Ok(SharedCredentialsProvider::new(provider))
             }
             AwsAuthentication::Role {
                 assume_role,
@@ -744,5 +811,104 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn parsing_workload_identity_federation() {
+        let config = toml::from_str::<ComponentConfig>(
+            r#"
+            auth.role_arn = "arn:aws:iam::123456789098:role/my_role"
+            auth.web_identity_token_file = "/path/to/token"
+            auth.session_name = "vector-test-session"
+            auth.region = "us-west-2"
+        "#,
+        )
+        .unwrap();
+
+        match config.auth {
+            AwsAuthentication::WorkloadIdentityFederation {
+                role_arn,
+                web_identity_token_file,
+                session_name,
+                region,
+            } => {
+                assert_eq!(&role_arn, "arn:aws:iam::123456789098:role/my_role");
+                assert_eq!(&web_identity_token_file, "/path/to/token");
+                assert_eq!(&session_name, "vector-test-session");
+                assert_eq!(&region, "us-west-2");
+            }
+            _ => panic!("Expected WorkloadIdentityFederation variant"),
+        }
+    }
+
+    #[test]
+    fn parsing_workload_identity_federation_with_different_region() {
+        let config = toml::from_str::<ComponentConfig>(
+            r#"
+            auth.role_arn = "arn:aws:iam::123456789098:role/my_role"
+            auth.web_identity_token_file = "/path/to/token"
+            auth.session_name = "vector-test-session"
+            auth.region = "eu-central-1"
+        "#,
+        )
+        .unwrap();
+
+        match config.auth {
+            AwsAuthentication::WorkloadIdentityFederation {
+                role_arn,
+                web_identity_token_file,
+                session_name,
+                region,
+            } => {
+                assert_eq!(&role_arn, "arn:aws:iam::123456789098:role/my_role");
+                assert_eq!(&web_identity_token_file, "/path/to/token");
+                assert_eq!(&session_name, "vector-test-session");
+                assert_eq!(&region, "eu-central-1");
+            }
+            _ => panic!("Expected WorkloadIdentityFederation variant"),
+        }
+    }
+
+    #[test]
+    fn parsing_workload_identity_federation_missing_required_fields() {
+        // Missing role_arn
+        let result = toml::from_str::<ComponentConfig>(
+            r#"
+            auth.web_identity_token_file = "/path/to/token"
+            auth.session_name = "vector-test-session"
+            auth.region = "us-west-2"
+        "#,
+        );
+        assert!(result.is_err());
+
+        // Missing web_identity_token_file
+        let result = toml::from_str::<ComponentConfig>(
+            r#"
+            auth.role_arn = "arn:aws:iam::123456789098:role/my_role"
+            auth.session_name = "vector-test-session"
+            auth.region = "us-west-2"
+        "#,
+        );
+        assert!(result.is_err());
+
+        // Missing session_name
+        let result = toml::from_str::<ComponentConfig>(
+            r#"
+            auth.role_arn = "arn:aws:iam::123456789098:role/my_role"
+            auth.web_identity_token_file = "/path/to/token"
+            auth.region = "us-west-2"
+        "#,
+        );
+        assert!(result.is_err());
+
+        // Missing region
+        let result = toml::from_str::<ComponentConfig>(
+            r#"
+            auth.role_arn = "arn:aws:iam::123456789098:role/my_role"
+            auth.web_identity_token_file = "/path/to/token"
+            auth.session_name = "vector-test-session"
+        "#,
+        );
+        assert!(result.is_err());
     }
 }

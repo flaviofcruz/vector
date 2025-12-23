@@ -1,5 +1,6 @@
 use enum_dispatch::enum_dispatch;
 use serde::Serialize;
+use std::path::PathBuf;
 use vector_lib::{
     config::GlobalOptions,
     configurable::{Configurable, NamedComponent, ToValue, configurable_component},
@@ -27,6 +28,11 @@ where
         skip_serializing_if = "Inputs::is_empty"
     )]
     pub inputs: Inputs<T>,
+
+    /// List of files to watch to trigger a reload of this enrichment table
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub files_to_watch: Vec<PathBuf>,
 }
 
 impl<T> EnrichmentTableOuter<T>
@@ -42,6 +48,7 @@ where
             inner: inner.into(),
             graph: Default::default(),
             inputs: Inputs::from_iter(inputs),
+            files_to_watch: vec![],
         }
     }
 
@@ -68,6 +75,7 @@ where
                     healthcheck: Default::default(),
                     buffer: Default::default(),
                     proxy: Default::default(),
+                    files_to_watch: vec![],
                     inner: sink,
                 },
             )
@@ -105,6 +113,7 @@ where
             inputs: Inputs::from_iter(inputs),
             inner: self.inner,
             graph: self.graph,
+            files_to_watch: self.files_to_watch,
         }
     }
 }

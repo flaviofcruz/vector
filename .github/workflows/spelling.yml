@@ -58,10 +58,8 @@ name: Check Spelling
 
 on:
   pull_request_target:
-    branches:
-    - "**"
-    tags-ignore:
-    - "**"
+    branches-ignore:
+      - 'v*-custom'
     types:
     - 'opened'
     - 'reopened'

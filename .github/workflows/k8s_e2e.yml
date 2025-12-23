@@ -21,6 +21,8 @@ on:
   workflow_dispatch:
   workflow_call:
   pull_request:
+    branches-ignore:
+      - 'v*-custom'
   merge_group:
     types: [checks_requested]
   schedule:

@@ -197,6 +197,7 @@ mod source {
             warn!(
                 message = "Currently ignoring file too small to fingerprint.",
                 file = %self.file.display(),
+                internal_log_rate_limit = false,
             );
             if self.include_file_metric_tag {
                 counter!(
@@ -297,6 +298,9 @@ mod source {
             info!(
                 message = "File deleted.",
                 file = %self.file.display(),
+                internal_log_rate_limit = false,
+                // VECTOR_OTHER_EVENT
+                vector_event_type = 1,
             );
             if self.include_file_metric_tag {
                 counter!(
@@ -323,7 +327,8 @@ mod source {
             info!(
                 message = "Stopped watching file.",
                 file = %self.file.display(),
-                reached_eof
+                reached_eof,
+                internal_log_rate_limit = false,
             );
             if self.include_file_metric_tag {
                 counter!(
@@ -390,7 +395,8 @@ mod source {
             info!(
                 message = "Resuming to watch file.",
                 file = %self.file.display(),
-                file_position = %self.file_position
+                file_position = %self.file_position,
+                internal_log_rate_limit = false,
             );
             if self.include_file_metric_tag {
                 counter!(
@@ -415,6 +421,9 @@ mod source {
             info!(
                 message = "Found new file to watch.",
                 file = %self.file.display(),
+                internal_log_rate_limit = false,
+                // VECTOR_OTHER_EVENT
+                vector_event_type = 1,
             );
             if self.include_file_metric_tag {
                 counter!(

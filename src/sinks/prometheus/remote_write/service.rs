@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use std::task::{Context, Poll};
 
 #[cfg(feature = "aws-core")]
@@ -5,7 +6,7 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 #[cfg(feature = "aws-core")]
 use aws_types::region::Region;
 use bytes::Bytes;
-use http::Uri;
+use http::{HeaderName, HeaderValue, Uri};
 
 use super::request_builder::RemoteWriteRequest;
 use crate::{
@@ -28,12 +29,20 @@ mod headers {
     pub(super) const APPLICATION_X_PROTOBUF: &str = "application/x-protobuf";
 }
 
+pub const RESERVED_HEADERS: [&str; 4] = [
+    headers::X_PROMETHEUS_REMOTE_WRITE_VERSION,
+    headers::CONTENT_ENCODING,
+    headers::CONTENT_TYPE,
+    headers::X_SCOPE_ORGID,
+];
+
 #[derive(Clone)]
 pub(super) struct RemoteWriteService {
     pub(super) endpoint: Uri,
     pub(super) auth: Option<Auth>,
     pub(super) client: HttpClient,
     pub(super) compression: super::Compression,
+    pub(super) custom_headers: IndexMap<HeaderName, HeaderValue>,
 }
 
 impl Service<RemoteWriteRequest> for RemoteWriteService {
@@ -51,6 +60,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
         let endpoint = self.endpoint.clone();
         let auth = self.auth.clone();
         let compression = self.compression;
+        let custom_headers = self.custom_headers.clone();
 
         Box::pin(async move {
             let metadata = std::mem::take(request.metadata_mut());
@@ -63,6 +73,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
                 compression,
                 request.request,
                 request.tenant_id.as_ref(),
+                custom_headers,
                 auth,
             )
             .await?;
@@ -105,6 +116,7 @@ pub(super) async fn build_request(
     compression: Compression,
     body: Bytes,
     tenant_id: Option<&String>,
+    custom_headers: IndexMap<HeaderName, HeaderValue>,
     auth: Option<Auth>,
 ) -> crate::Result<http::Request<hyper::Body>> {
     let mut builder = http::Request::builder()
@@ -119,6 +131,10 @@ pub(super) async fn build_request(
 
     if let Some(tenant_id) = tenant_id {
         builder = builder.header(headers::X_SCOPE_ORGID, tenant_id);
+    }
+
+    for (header, value) in custom_headers.iter() {
+        builder = builder.header(header, value.clone());
     }
 
     let mut request = builder.body(body)?;

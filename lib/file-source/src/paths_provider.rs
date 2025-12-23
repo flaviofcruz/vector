@@ -25,7 +25,7 @@ use glob::Pattern;
 /// We use an `IntoIter` here as a workaround.
 pub trait PathsProvider {
     /// Provides the iterator that returns paths.
-    type IntoIter: IntoIterator<Item = PathBuf>;
+    type IntoIter: IntoIterator<Item = (Option<LogFileInfo>, PathBuf)>;
 
     /// Provides a set of paths.
     fn paths(&self) -> Self::IntoIter;
@@ -40,6 +40,15 @@ pub struct Glob<E: FileSourceInternalEvents> {
     exclude_patterns: Vec<Pattern>,
     glob_match_options: MatchOptions,
     emitter: E,
+}
+
+// An identifier for a Kubernetes container associated with one or more files.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LogFileInfo {
+    pub pod_namespace: String,
+    pub pod_name: String,
+    pub pod_uid: String,
+    pub container_name: String,
 }
 
 impl<E: FileSourceInternalEvents> Glob<E> {
@@ -72,7 +81,7 @@ impl<E: FileSourceInternalEvents> Glob<E> {
 }
 
 impl<E: FileSourceInternalEvents> PathsProvider for Glob<E> {
-    type IntoIter = Vec<PathBuf>;
+    type IntoIter = Vec<(Option<LogFileInfo>, PathBuf)>;
 
     fn paths(&self) -> Self::IntoIter {
         self.include_patterns
@@ -94,6 +103,8 @@ impl<E: FileSourceInternalEvents> PathsProvider for Glob<E> {
                     exclude_pattern.matches(candidate_path_str)
                 })
             })
+            // By default, we don't have any pod metadata associated with the path.
+            .map(|path| (None, path))
             .collect()
     }
 }

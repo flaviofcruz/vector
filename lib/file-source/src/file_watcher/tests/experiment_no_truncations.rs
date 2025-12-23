@@ -20,6 +20,7 @@ async fn experiment_no_truncations(actions: Vec<FileWatcherAction>) {
         path.clone(),
         ReadFrom::Beginning,
         None,
+        None,
         100_000,
         Bytes::from("\n"),
     )

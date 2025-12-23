@@ -93,6 +93,7 @@ mod mongodb_metrics;
 mod mqtt;
 #[cfg(feature = "sources-nginx_metrics")]
 mod nginx_metrics;
+mod object_storage_metrics;
 mod open;
 #[cfg(any(
     feature = "sources-kubernetes_logs",
@@ -111,12 +112,16 @@ mod process;
 mod prometheus;
 #[cfg(any(feature = "sinks-pulsar", feature = "sources-pulsar"))]
 mod pulsar;
+#[cfg(feature = "transforms-redact")]
+mod redact;
 #[cfg(feature = "sources-redis")]
 mod redis;
 #[cfg(feature = "transforms-impl-reduce")]
 mod reduce;
 #[cfg(feature = "transforms-remap")]
 mod remap;
+#[cfg(all(feature = "aws-core", feature = "sinks-azure_blob"))]
+mod retries;
 #[cfg(feature = "transforms-impl-sample")]
 mod sample;
 #[cfg(feature = "sinks-sematext")]
@@ -132,6 +137,8 @@ mod tcp;
 mod template;
 #[cfg(feature = "transforms-throttle")]
 mod throttle;
+#[cfg(feature = "transforms-trace_to_log")]
+mod trace_to_log;
 mod udp;
 #[cfg(unix)]
 mod unix;
@@ -148,6 +155,7 @@ mod window;
     feature = "sinks-file",
 ))]
 mod file;
+pub(crate) mod vector_event;
 
 #[cfg(windows)]
 mod windows;
@@ -263,12 +271,16 @@ pub(crate) use self::postgresql_metrics::*;
 pub(crate) use self::prometheus::*;
 #[cfg(any(feature = "sinks-pulsar", feature = "sources-pulsar"))]
 pub(crate) use self::pulsar::*;
+#[cfg(feature = "transforms-redact")]
+pub use self::redact::*;
 #[cfg(feature = "sources-redis")]
 pub(crate) use self::redis::*;
 #[cfg(feature = "transforms-impl-reduce")]
 pub(crate) use self::reduce::*;
 #[cfg(feature = "transforms-remap")]
 pub(crate) use self::remap::*;
+#[cfg(all(feature = "aws-core", feature = "sinks-azure_blob"))]
+pub(crate) use self::retries::*;
 #[cfg(feature = "transforms-impl-sample")]
 pub(crate) use self::sample::*;
 #[cfg(feature = "sinks-sematext")]
@@ -293,5 +305,6 @@ pub(crate) use self::window::*;
 pub(crate) use self::windows::*;
 pub use self::{
     adaptive_concurrency::*, batch::*, common::*, conditions::*, encoding_transcode::*,
-    heartbeat::*, http::*, open::*, process::*, socket::*, tcp::*, template::*, udp::*,
+    heartbeat::*, http::*, object_storage_metrics::*, open::*, process::*, socket::*, tcp::*,
+    template::*, udp::*,
 };

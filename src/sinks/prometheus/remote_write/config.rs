@@ -1,10 +1,12 @@
-use http::Uri;
+use http::header::AUTHORIZATION;
+use http::{HeaderName, HeaderValue, Uri};
+use indexmap::IndexMap;
 use snafu::prelude::*;
 
 #[cfg(feature = "aws-core")]
 use super::Errors;
 use super::{
-    service::{RemoteWriteService, build_request},
+    service::{RESERVED_HEADERS, RemoteWriteService, build_request},
     sink::{PrometheusRemoteWriteDefaultBatchSettings, RemoteWriteSink},
 };
 use crate::{
@@ -91,6 +93,15 @@ pub struct RemoteWriteConfig {
     #[configurable(metadata(docs::advanced))]
     pub tenant_id: Option<Template>,
 
+    /// Additional custom HTTP headers to add to the request.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "example_custom_headers()"))]
+    #[configurable(metadata(docs::advanced))]
+    #[configurable(metadata(
+        docs::additional_props_description = "An HTTP request header and its value."
+    ))]
+    pub custom_headers: Option<IndexMap<String, String>>,
+
     /// The amount of time, in seconds, that incremental metrics will persist in the internal metrics cache
     /// after having not been updated before they expire and are removed.
     ///
@@ -129,6 +140,44 @@ const fn default_compression() -> Compression {
     Compression::Snappy
 }
 
+fn example_custom_headers() -> IndexMap<String, String> {
+    IndexMap::<_, _>::from_iter([
+        ("x-cloud-provider-region".to_owned(), "us-east-1".to_owned()),
+        ("x-backoff-retry-policy".to_owned(), "never".to_owned()),
+    ])
+}
+
+pub(super) fn validate_headers(
+    headers: &IndexMap<String, String>,
+    configures_auth: bool,
+) -> crate::Result<IndexMap<HeaderName, HeaderValue>> {
+    // Convert IndexMap to BTreeMap for util function
+    let btree_headers: std::collections::BTreeMap<String, String> = headers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let validated_btree = crate::sinks::util::http::validate_headers(&btree_headers)?;
+
+    // Convert back to IndexMap with proper HeaderName (extract from OrderedHeaderName)
+    let mut headers = IndexMap::new();
+    for (ordered_name, value) in validated_btree {
+        headers.insert(ordered_name.inner().clone(), value);
+    }
+
+    for name in headers.keys() {
+        if configures_auth && name == AUTHORIZATION {
+            return Err("Authorization header can not be used with defined auth options".into());
+        }
+        for &header in RESERVED_HEADERS.iter() {
+            if name == header {
+                return Err(format!("{} header is reserved", header).into());
+            }
+        }
+    }
+
+    Ok(headers)
+}
+
 impl_generate_config_from_default!(RemoteWriteConfig);
 
 #[async_trait::async_trait]
@@ -147,6 +196,12 @@ impl SinkConfig for RemoteWriteConfig {
         let default_namespace = self.default_namespace.clone();
 
         let client = HttpClient::new(tls_settings, cx.proxy())?;
+
+        let mut custom_headers = IndexMap::new();
+        if let Some(headers) = self.custom_headers.clone() {
+            let headers = validate_headers(&headers, self.auth.is_some())?;
+            custom_headers.extend(headers);
+        }
 
         let auth = match &self.auth {
             Some(PrometheusRemoteWriteAuth::Basic { user, password }) => {
@@ -191,6 +246,7 @@ impl SinkConfig for RemoteWriteConfig {
             client,
             auth,
             compression: self.compression,
+            custom_headers,
         };
         let service = ServiceBuilder::new()
             .settings(request_settings, http_response_retry_logic())
@@ -227,8 +283,16 @@ async fn healthcheck(
     auth: Option<Auth>,
 ) -> crate::Result<()> {
     let body = bytes::Bytes::new();
-    let request =
-        build_request(http::Method::GET, &endpoint, compression, body, None, auth).await?;
+    let request = build_request(
+        http::Method::GET,
+        &endpoint,
+        compression,
+        body,
+        None,
+        IndexMap::new(),
+        auth,
+    )
+    .await?;
     let response = client.send(request).await?;
 
     match response.status() {

@@ -77,3 +77,43 @@ where
         assert_eq!(expected, actual, "expected left, actual right");
     }
 }
+
+pub fn compare_log_events_without_timestamp(
+    log_namespace: LogNamespace,
+    expected_log_events: Vec<Event>,
+    output_log_events: Vec<Event>,
+) {
+    assert_eq!(
+        expected_log_events.len(),
+        output_log_events.len(),
+        "expected and output log events have different lengths: {} != {}",
+        expected_log_events.len(),
+        output_log_events.len()
+    );
+    for (expected_log_event, output_log_event) in
+        expected_log_events.iter().zip(output_log_events.iter())
+    {
+        let mut expected_log_event_owned = expected_log_event.clone();
+        let expected_log_event_mut_log = expected_log_event_owned.as_mut_log();
+        if log_namespace == LogNamespace::Vector {
+            expected_log_event_mut_log.remove(metadata_path!(Config::NAME, "timestamp"));
+            expected_log_event_mut_log.remove(metadata_path!(Config::NAME, "source_event_id"));
+        } else {
+            expected_log_event_mut_log.remove(event_path!("timestamp"));
+            expected_log_event_mut_log.remove(metadata_path!(Config::NAME, "source_event_id"));
+        };
+        let mut output_log_owned = output_log_event.clone();
+        let output_log_mut_log = output_log_owned.as_mut_log();
+        if log_namespace == LogNamespace::Vector {
+            output_log_mut_log.remove(metadata_path!(Config::NAME, "timestamp"));
+            output_log_mut_log.remove(metadata_path!(Config::NAME, "source_event_id"));
+        } else {
+            output_log_mut_log.remove(event_path!("timestamp"));
+            output_log_mut_log.remove(metadata_path!(Config::NAME, "source_event_id"));
+        };
+        assert_eq!(
+            expected_log_event_owned, output_log_owned,
+            "expected left, actual right"
+        );
+    }
+}

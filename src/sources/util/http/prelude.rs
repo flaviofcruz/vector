@@ -5,6 +5,7 @@ use futures::{FutureExt, TryFutureExt};
 use hyper::{Server, service::make_service_fn};
 use tokio::net::TcpStream;
 use tower::ServiceBuilder;
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tracing::Span;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf,
@@ -59,7 +60,6 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
     fn decode(&self, encoding_header: Option<&str>, body: Bytes) -> Result<Bytes, ErrorMessage> {
         decompress_body(encoding_header, body)
     }
-
     #[allow(clippy::too_many_arguments)]
     fn run(
         self,
@@ -73,6 +73,35 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
         cx: SourceContext,
         acknowledgements: SourceAcknowledgementsConfig,
         keepalive_settings: KeepaliveConfig,
+    ) -> crate::Result<crate::sources::Source> {
+        self.run_with_concurrency_limit(
+            address,
+            path,
+            method,
+            response_code,
+            strict_path,
+            tls,
+            auth,
+            cx,
+            acknowledgements,
+            keepalive_settings,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_concurrency_limit(
+        self,
+        address: SocketAddr,
+        path: &str,
+        method: HttpMethod,
+        response_code: StatusCode,
+        strict_path: bool,
+        tls: Option<&TlsEnableableConfig>,
+        auth: Option<&HttpServerAuthConfig>,
+        cx: SourceContext,
+        acknowledgements: SourceAcknowledgementsConfig,
+        keepalive_settings: KeepaliveConfig,
+        max_concurrent_request: Option<usize>,
     ) -> crate::Result<crate::sources::Source> {
         let tls = MaybeTlsSettings::from_config(tls, true)?;
         let protocol = tls.http_protocol_name();
@@ -186,9 +215,16 @@ pub trait HttpSource: Clone + Send + Sync + 'static {
             });
 
             let span = Span::current();
+            // using GlobalConcurrencyLimitLayer because using ConcurrencyLimitLayer will limited to per service and make_service_fn
+            // crates service for each connection.
+            let max_concurrent_request_layer =
+                max_concurrent_request.map(|max_concurrent_request| {
+                    GlobalConcurrencyLimitLayer::new(max_concurrent_request)
+                });
             let make_svc = make_service_fn(move |conn: &MaybeTlsIncomingStream<TcpStream>| {
                 let remote_addr = conn.peer_addr();
                 let svc = ServiceBuilder::new()
+                    .option_layer(max_concurrent_request_layer.clone())
                     .layer(build_http_trace_layer(span.clone()))
                     .option_layer(keepalive_settings.max_connection_age_secs.map(|secs| {
                         MaxConnectionAgeLayer::new(

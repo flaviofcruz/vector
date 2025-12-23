@@ -38,6 +38,8 @@ pub mod clickhouse;
 pub mod console;
 #[cfg(feature = "sinks-databend")]
 pub mod databend;
+#[cfg(feature = "sinks-databricks-zerobus")]
+pub mod databricks_zerobus;
 #[cfg(any(
     feature = "sinks-datadog_events",
     feature = "sinks-datadog_logs",
@@ -45,6 +47,8 @@ pub mod databend;
     feature = "sinks-datadog_traces"
 ))]
 pub mod datadog;
+#[cfg(feature = "sinks-azure-delta-table")]
+pub mod delta_table;
 #[cfg(feature = "sinks-elasticsearch")]
 pub mod elasticsearch;
 #[cfg(feature = "sinks-file")]
@@ -70,6 +74,8 @@ pub mod humio;
 pub mod influxdb;
 #[cfg(feature = "sinks-kafka")]
 pub mod kafka;
+#[cfg(feature = "sinks-kafka_producer_proxy")]
+pub mod kafka_producer_proxy;
 #[cfg(feature = "sinks-keep")]
 pub mod keep;
 #[cfg(feature = "sinks-loki")]

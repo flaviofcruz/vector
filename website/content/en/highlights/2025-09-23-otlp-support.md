@@ -1,5 +1,5 @@
 ---
-date: '2025-09-23'
+date: '2025-10-23'
 title: 'OTLP Support'
 description: 'Introducing Opentelemetry Protocol support!'
 authors: ['pront']
@@ -44,10 +44,20 @@ sinks:
       uri: http://otel-collector-sink:5318/v1/logs
       method: post
       encoding:
-        codec: otlp
+        codec: json
+      framing:
+        method: newline_delimited
+      batch:
+        max_events: 1
+      request:
+        headers:
+          content-type: application/json
 ```
 
 The above configuration will only work with Vector versions >= `0.51`.
+=======
+**Note:** This setup is affected by a [known issue](https://github.com/vectordotdev/vector/issues/22054).
+We plan to improve batching for this sink in future Vector versions.
 
 ## Example Configuration 2
 
@@ -67,7 +77,6 @@ otel_sink:
       protobuf:
         desc_file: path/to/opentelemetry-proto.desc
         message_type: opentelemetry.proto.collector.logs.v1.ExportLogsServiceRequest
-        use_json_names: true
     framing:
       method: 'bytes'
     request:
@@ -84,3 +93,5 @@ The `desc` file was generated with the following command:
     --descriptor_set_out=opentelemetry-proto.desc \\
           $(find /path/to/vector/lib/opentelemetry-proto/src/proto/opentelemetry-proto -name '*.proto')
 ```
+
+**Note:** In the future, we can simplify the `opentelemetry` sink UX further, eliminating the need to compile proto files.

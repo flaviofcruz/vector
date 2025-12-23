@@ -1,0 +1,30 @@
+name: "BLOCKING: Databricks Changelog Check"
+
+on:
+  pull_request:
+    branches: 
+      - v*-custom
+    types:
+      - opened
+      - edited
+      - synchronize
+    
+jobs:
+  check-db-changelog:
+    runs-on: 
+      group: databricks-eng-protected-runner-group
+      labels: linux-ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Fetch base branch
+        run: git fetch origin ${{ github.event.pull_request.base.ref }}:${{ github.event.pull_request.base.ref }}
+
+      - name: Check Changed files
+        run: |
+          CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.ref }} HEAD -- | grep 'README.databricks.md' || true)
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "Code changes have been made, but no README.databricks.md changes have been made. Please add a changelog entry to README.databricks.md."
+            exit 1
+          fi

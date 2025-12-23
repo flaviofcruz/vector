@@ -108,7 +108,7 @@ where
             partition_key: processed_event.metadata.partition_key,
         };
         let event = Event::from(processed_event.event);
-        let builder = RequestMetadataBuilder::from_event(&event);
+        let builder = RequestMetadataBuilder::from_event_with_event_log(&event);
 
         (kinesis_metadata, builder, event)
     }

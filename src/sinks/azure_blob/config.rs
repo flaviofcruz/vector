@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use azure_storage_blobs::prelude::*;
+use std::result::Result as StdResult;
 use tower::ServiceBuilder;
 use vector_lib::{
     codecs::{JsonSerializerConfig, NewlineDelimitedEncoderConfig, encoding::Framer},
@@ -16,7 +17,10 @@ use crate::{
     sinks::{
         Healthcheck, VectorSink,
         azure_common::{
-            self, config::AzureBlobRetryLogic, service::AzureBlobService, sink::AzureBlobSink,
+            self,
+            config::{AzureBlobResponse, AzureBlobRetryLogic},
+            service::AzureBlobService,
+            sink::AzureBlobSink,
         },
         util::{
             BatchConfig, BulkSizeBasedDefaultBatchSettings, Compression, ServiceBuilderExt,
@@ -197,6 +201,14 @@ impl AzureBlobSinkConfig {
         let request_limits = self.request.into_settings();
         let service = ServiceBuilder::new()
             .settings(request_limits, AzureBlobRetryLogic)
+            // Add another layer after retries for emitting our event log message
+            // Returns back the same result so it continues to work downstream
+            .map_result(|result: StdResult<AzureBlobResponse, _>| {
+                if let Ok(ref response) = result {
+                    response.event_log_metadata.emit_upload_event();
+                }
+                result
+            })
             .service(AzureBlobService::new(client));
 
         // Configure our partitioning/batching.

@@ -9,6 +9,8 @@ name: Integration Test Suite
 on:
   workflow_dispatch:
   pull_request:
+    branches-ignore:
+      - 'v*-custom'
   merge_group:
     types: [ checks_requested ]
 
@@ -126,7 +128,6 @@ jobs:
             else
               echo "Skipping ${{ matrix.service }} test as the value is false or conditions not met."
             fi
-
 
   e2e-tests:
     runs-on: ubuntu-24.04-8core

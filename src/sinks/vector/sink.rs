@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use prost::Message;
 use tower::Service;
+use vector_common::internal_event::delivery_event::VectorSinkDeliveryEvent;
+use vector_lib::event::event_log::generate_count_map_event_wrapper;
 use vector_lib::{
     ByteSizeOf, EstimatedJsonEncodedSizeOf,
     config::telemetry,
@@ -81,10 +83,16 @@ where
                 }),
             ))
             .map(|event_collection| {
-                let builder = RequestMetadataBuilder::new(
+                // This sink is exceptional in that it doesn't use other util classes / functions to build request
+                // So we need to generate the delivery event log needed for the request
+                let delivery_event_log = VectorSinkDeliveryEvent::with_count_map(
+                    generate_count_map_event_wrapper(&event_collection.events, true),
+                );
+                let builder = RequestMetadataBuilder::new_with_event_log(
                     event_collection.events.len(),
                     event_collection.events_byte_size,
                     event_collection.events_json_byte_size,
+                    Some(delivery_event_log),
                 );
 
                 let encoded_events = proto_vector::PushEventsRequest {

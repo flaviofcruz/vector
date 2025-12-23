@@ -9,7 +9,10 @@ use super::*;
 use crate::{
     config::SinkContext,
     event::{MetricKind, MetricValue},
-    sinks::{prometheus::remote_write::config::RemoteWriteConfig, util::test::build_test_server},
+    sinks::{
+        prometheus::remote_write::config::RemoteWriteConfig,
+        prometheus::remote_write::config::validate_headers, util::test::build_test_server,
+    },
     test_util::{
         self,
         components::{HTTP_SINK_TAGS, assert_sink_compliance},
@@ -116,6 +119,58 @@ async fn sends_x_scope_orgid_header() {
     assert_eq!(outputs.len(), 1);
     let (headers, _) = &outputs[0];
     assert_eq!(headers["x-scope-orgid"], "tenant");
+}
+
+#[tokio::test]
+async fn sends_custom_headers() {
+    let outputs = send_request(
+        indoc! {r#"
+                [custom_headers]
+                x-region = "us-east-1"
+                x-dicer-slice-key = "slice-1"
+            "#},
+        vec![create_event("gauge-3".into(), 12.0)],
+    )
+    .await;
+
+    assert_eq!(outputs.len(), 1);
+    let (headers, _) = &outputs[0];
+    assert_eq!(headers["x-region"], "us-east-1");
+    assert_eq!(headers["x-dicer-slice-key"], "slice-1");
+}
+
+#[tokio::test]
+async fn bans_reserved_headers() {
+    let config = r#"
+        endpoint = "http://something"
+        [custom_headers]
+        x-region = "us-east-1"
+        X-Prometheus-Remote-Write-Version = "something"
+        "#;
+    let config: RemoteWriteConfig = toml::from_str(config).unwrap();
+    let result = validate_headers(&config.custom_headers.unwrap(), false).unwrap_err();
+    assert!(
+        result
+            .to_string()
+            .contains("X-Prometheus-Remote-Write-Version header is reserved")
+    );
+}
+
+#[tokio::test]
+async fn bans_reserved_headers_case_insensitive() {
+    let config = r#"
+        endpoint = "http://something"
+        [custom_headers]
+        x-region = "us-east-1"
+        x-prometheus-remote-write-version = "something"
+        "#;
+    let config: RemoteWriteConfig = toml::from_str(config).unwrap();
+    let result = validate_headers(&config.custom_headers.unwrap(), false).unwrap_err();
+    assert!(
+        result
+            .to_string()
+            .contains("X-Prometheus-Remote-Write-Version header is reserved")
+    );
 }
 
 #[tokio::test]

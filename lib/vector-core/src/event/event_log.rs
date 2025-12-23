@@ -1,0 +1,151 @@
+// Extra functions for event log reporting functionality
+
+use serde_json;
+use std::collections::HashMap;
+use std::env;
+use std::sync::OnceLock;
+
+use crate::event::proto::EventWrapper;
+use crate::event::{Event, LogEvent};
+
+use vector_common::internal_event::delivery_event::{
+    EventWithEventLog, MetadataValuesCount, VectorSinkDeliveryEvent,
+};
+
+use vector_common::byte_size_of::ByteSizeOf;
+
+pub static EVENT_LOG_METADATA_FIELD: OnceLock<String> = OnceLock::new();
+// Using the granularity tracking method, we want to support two different events with potentially different granularity
+// One for send/upload events (EVENT_LOG_GRANULARITY_FIELDS) and one for delivery events (DELIVERY_EVENT_LOG_GRANULARITY_FIELDS)
+pub static EVENT_LOG_GRANULARITY_FIELDS: OnceLock<Vec<String>> = OnceLock::new();
+pub static DELIVERY_EVENT_LOG_GRANULARITY_FIELDS: OnceLock<Vec<String>> = OnceLock::new();
+pub static ENABLE_FILE_SEND_EVENTS: OnceLock<bool> = OnceLock::new();
+
+// File send events aren't default enabled until the send/uploading events messages are deprecated
+// Otherwise, we'll be double-sending events in VA which will be a lot of extra volume
+pub fn enable_file_send_events() -> bool {
+    *ENABLE_FILE_SEND_EVENTS.get_or_init(|| {
+        env::var("ENABLE_FILE_SEND_EVENTS")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    })
+}
+
+// Where we can find the log metadata object
+pub fn get_event_log_metadata_field() -> &'static String {
+    // Initialize the static variable once, or return the value if it's already initialized/computed
+    EVENT_LOG_METADATA_FIELD
+        .get_or_init(|| env::var("EVENT_LOG_METADATA_FIELD").unwrap_or_else(|_| "".to_string()))
+}
+
+// Within the log metadata object itself, these are fields we care to parse for
+pub fn get_event_log_granularity_fields(for_delivery_events: bool) -> &'static Vec<String> {
+    let (env_var, once_lock) = if for_delivery_events {
+        (
+            "DELIVERY_EVENT_LOG_GRANULARITY_FIELDS",
+            &DELIVERY_EVENT_LOG_GRANULARITY_FIELDS,
+        )
+    } else {
+        (
+            "EVENT_LOG_GRANULARITY_FIELDS",
+            &EVENT_LOG_GRANULARITY_FIELDS,
+        )
+    };
+    once_lock.get_or_init(|| {
+        let vec_string = env::var(env_var).unwrap_or_default();
+        serde_json::from_str(&vec_string).unwrap_or_default()
+    })
+}
+
+// Function to get the events of a desired field and encode them in a key so we more easily keep
+// a map tracking size / count per unique combination of field values
+fn build_key(
+    event: &LogEvent,
+    log_metadata_field: &str,
+    granularity_fields: &Vec<String>,
+) -> String {
+    let mut key_vals: Vec<String> = Vec::new();
+    // Get the field that holds the metadata struct itself
+    for key_part in granularity_fields {
+        if let Ok(Some(val)) =
+            event.parse_path_and_get_value(format!("{}.{}", log_metadata_field, key_part))
+        {
+            key_vals.push(format!("{}={}", key_part, val));
+        }
+    }
+    key_vals.join("/")
+}
+
+// Creates a map with the values of the desired fields (i.e. {plane: PLANE_CONTROL})
+fn build_map(
+    event: &LogEvent,
+    log_metadata_field: &str,
+    granularity_fields: &Vec<String>,
+) -> HashMap<String, String> {
+    let mut val_map = HashMap::new();
+    for key_part in granularity_fields {
+        if let Ok(Some(val)) =
+            event.parse_path_and_get_value(format!("{}.{}", log_metadata_field, key_part))
+        {
+            // Remove extra quotes from string
+            val_map.insert(key_part.to_string(), val.to_string().replace("\"", ""));
+        }
+    }
+    val_map
+}
+
+/*
+* On a list of events, iterate through them and track the counts per unique combination of
+* specified fields
+*
+* The map here is String -> MetadataValuesCount
+* where the String is an encoded key of the combination and values
+* and MetadataValuesCount is a struct that holds the count, size, and a map of the values
+*/
+pub fn generate_count_map(
+    events: &Vec<Event>,
+    for_delivery_events: bool,
+) -> HashMap<String, MetadataValuesCount> {
+    let log_metadata_field = get_event_log_metadata_field();
+    let granularity_fields = get_event_log_granularity_fields(for_delivery_events);
+    let mut count_map = HashMap::new();
+    for event in events {
+        // Check if it's a log event (see enum defined in lib/vector-core/src/event/mod.rs)
+        if let Event::Log(log_event) = event {
+            count_map
+                .entry(build_key(log_event, log_metadata_field, granularity_fields))
+                .and_modify(|x: &mut MetadataValuesCount| {
+                    x.count += 1;
+                    // For now, using pre-defined allocated bytes measure for size of event
+                    // This may not be fully consistent with the real size of logs
+                    // But having this a placeholder as consistent size measurement is tricky
+                    x.size += log_event.size_of();
+                })
+                .or_insert(MetadataValuesCount {
+                    value_map: build_map(log_event, log_metadata_field, granularity_fields),
+                    count: 1,
+                    size: 0,
+                });
+        }
+    }
+    count_map
+}
+
+// Some sinks pass events with an extra EventWrapper around them, use this function to first unwrap
+pub fn generate_count_map_event_wrapper(
+    events: &Vec<EventWrapper>,
+    for_delivery_events: bool,
+) -> HashMap<String, MetadataValuesCount> {
+    let event_map: Vec<Event> = events
+        .iter()
+        .map(|event: &EventWrapper| Event::from(event.clone()))
+        .collect();
+    generate_count_map(&event_map, for_delivery_events)
+}
+
+// Impl EventWithEventLog for the used log events
+impl EventWithEventLog for Event {
+    fn compute_event_log(&self) -> VectorSinkDeliveryEvent {
+        VectorSinkDeliveryEvent::with_count_map(generate_count_map(&vec![self.clone()], true))
+    }
+}

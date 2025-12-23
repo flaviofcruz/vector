@@ -540,6 +540,15 @@ generated: components: sinks: prometheus_remote_write: configuration: {
 			syntax: "template"
 		}
 	}
+	custom_headers: {
+		description:        "A list of custom headers to add to each request."
+		required:           false
+		type: object: options: "*": {
+			description: "An HTTP request header and it's value."
+			required:    true
+			type: string: {}
+		}
+	}
 	tls: {
 		description: "TLS configuration."
 		required:    false

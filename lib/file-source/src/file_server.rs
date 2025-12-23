@@ -1,8 +1,8 @@
 use std::{
     cmp,
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{self, Duration},
 };
 
@@ -24,11 +24,13 @@ use tokio::{
     time::sleep,
 };
 
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
+use vector_common::internal_event::{DeliveryReadEvent, emit};
 
 use crate::{
+    FileTTLAction, FileTTLRemovalConfig,
     file_watcher::{FileWatcher, RawLineResult},
-    paths_provider::PathsProvider,
+    paths_provider::{LogFileInfo, PathsProvider},
 };
 
 /// `FileServer` is a Source which cooperatively schedules reads over files,
@@ -49,6 +51,7 @@ where
     pub ignore_checkpoints: bool,
     pub read_from: ReadFrom,
     pub ignore_before: Option<DateTime<Utc>>,
+    pub start_reading_at: Option<DateTime<Utc>>,
     pub max_line_bytes: usize,
     pub line_delimiter: Bytes,
     pub data_dir: PathBuf,
@@ -58,6 +61,13 @@ where
     pub remove_after: Option<Duration>,
     pub emitter: E,
     pub rotate_wait: Duration,
+    pub ttl_removal_config: Option<FileTTLRemovalConfig>,
+    // Source context is plumbed into the delivery event logs for extra metadata
+    // This actually has to get converted to JSON string deeper in the stack for each emitted event
+    // But since the performance hit of doing this shouldn't be too high, we keep it as a normal
+    // map that can be normally used until we have to emit the event
+    pub source_context: Option<HashMap<String, String>>,
+    pub file_to_pod_map: Option<Arc<Mutex<HashMap<PathBuf, LogFileInfo>>>>,
 }
 
 /// `FileServer` as Source
@@ -78,6 +88,19 @@ where
     PP: PathsProvider,
     E: FileSourceInternalEvents,
 {
+    // Update the file-to-pod map with the given path and log file info.
+    fn update_file_to_pod_map(&mut self, path: PathBuf, log_file_info_opt: Option<LogFileInfo>) {
+        if self.file_to_pod_map.is_some() {
+            if let Some(log_file_info) = log_file_info_opt {
+                self.file_to_pod_map
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .insert(path.clone(), log_file_info.clone());
+            }
+        }
+    }
     // The first `shutdown_data` signal here is to stop this file
     // server from outputting new data; the second
     // `shutdown_checkpointer` is for finishing the background
@@ -103,15 +126,16 @@ where
 
         checkpointer.read_checkpoints(self.ignore_before).await;
 
-        let mut known_small_files = HashMap::new();
+        let mut known_small_files: HashMap<PathBuf, time::Instant> = HashMap::new();
 
         let mut existing_files = Vec::new();
-        for path in self.paths_provider.paths().into_iter() {
+        for (log_file_info_opt, path) in self.paths_provider.paths().into_iter() {
             if let Some(file_id) = self
                 .fingerprinter
                 .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
                 .await
             {
+                self.update_file_to_pod_map(path.clone(), log_file_info_opt);
                 existing_files.push((path, file_id));
             }
         }
@@ -185,7 +209,7 @@ where
                 for (_file_id, watcher) in &mut fp_map {
                     watcher.set_file_findable(false); // assume not findable until found
                 }
-                for path in self.paths_provider.paths().into_iter() {
+                for (log_file_info_opt, path) in self.paths_provider.paths().into_iter() {
                     if let Some(file_id) = self
                         .fingerprinter
                         .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
@@ -230,6 +254,7 @@ where
                             }
                         } else {
                             // untracked file fingerprint
+                            self.update_file_to_pod_map(path.clone(), log_file_info_opt);
                             self.watch_new_file(path, file_id, &mut fp_map, &checkpoints, false)
                                 .await;
                             self.emitter.emit_files_open(fp_map.len());
@@ -289,6 +314,7 @@ where
 
                 let start = time::Instant::now();
                 let mut bytes_read: usize = 0;
+                let mut lines_read: usize = 0;
                 while let Ok(RawLineResult {
                     raw_line: Some(line),
                     discarded_for_size_and_truncated,
@@ -311,6 +337,7 @@ where
                     stats.record_bytes(sz);
 
                     bytes_read += sz;
+                    lines_read += 1;
 
                     lines.push(Line {
                         text: line.bytes,
@@ -326,6 +353,15 @@ where
                     }
                 }
                 stats.record("reading", start.elapsed());
+                if lines_read > 0 {
+                    emit(DeliveryReadEvent {
+                        path: watcher.path.to_str().expect("not a valid path").to_owned(),
+                        bytes_read,
+                        lines_read,
+                        source_context: self.source_context.clone(),
+                        emitted_after_multiline_agg: false,
+                    });
+                }
 
                 if bytes_read > 0 {
                     global_bytes_read = global_bytes_read.saturating_add(bytes_read);
@@ -334,15 +370,19 @@ where
                     if let Some(grace_period) = self.remove_after
                         && watcher.last_read_success().elapsed() >= grace_period
                     {
-                        // Try to remove
-                        match remove_file(&watcher.path).await {
-                            Ok(()) => {
-                                self.emitter.emit_file_deleted(&watcher.path);
-                                watcher.set_dead();
-                            }
-                            Err(error) => {
-                                // We will try again after some time.
-                                self.emitter.emit_file_delete_error(&watcher.path, error);
+                        // Only remove the file if it meets the TTL removal config
+                        // If there is no TTL removal config, we always remove
+                        if self.should_ttl_delete(&watcher.path) {
+                            // Try to remove
+                            match remove_file(&watcher.path).await {
+                                Ok(()) => {
+                                    self.emitter.emit_file_deleted(&watcher.path);
+                                    watcher.set_dead();
+                                }
+                                Err(error) => {
+                                    // We will try again after some time.
+                                    self.emitter.emit_file_delete_error(&watcher.path, error);
+                                }
                             }
                         }
                     }
@@ -468,12 +508,17 @@ where
             path.clone(),
             read_from,
             self.ignore_before,
+            self.start_reading_at,
             self.max_line_bytes,
             self.line_delimiter.clone(),
         )
         .await
         {
             Ok(mut watcher) => {
+                if !watcher.is_active {
+                    // If the file is not active, we do not watch it but we should make sure that the file is still eligible for rediscovery if it gets modified again after the start_reading_at timestamp.
+                    return;
+                }
                 if let ReadFrom::Checkpoint(file_position) = read_from {
                     self.emitter.emit_file_resumed(&path, file_position);
                 } else {
@@ -484,6 +529,28 @@ where
             }
             Err(error) => self.emitter.emit_file_watch_error(&path, error),
         };
+    }
+
+    // Determines per the TTL removal config whether the file should be deleted
+    fn should_ttl_delete(&self, path: &Path) -> bool {
+        match &self.ttl_removal_config {
+            None => true, // No TTL config means we don't have any other TTL rules, so deletion is ok
+            Some(ttl_removal_config) => {
+                let path_str = path.to_string_lossy();
+                let matches_pattern = ttl_removal_config
+                    .patterns
+                    .iter()
+                    .any(|pattern| pattern.matches(&path_str));
+                match ttl_removal_config.action {
+                    // If Remove, we remove the file if it matches the pattern
+                    // So if matches_patterns => it should participate in TTL removal
+                    FileTTLAction::Remove => matches_pattern,
+                    // If Keep, we keep the file if it matches the pattern
+                    // So it only participates in TTL removal if it doesn't match the pattern
+                    FileTTLAction::Keep => !matches_pattern,
+                }
+            }
+        }
     }
 }
 
@@ -514,6 +581,37 @@ async fn checkpoint_writer(
 
 pub fn calculate_ignore_before(ignore_older_secs: Option<u64>) -> Option<DateTime<Utc>> {
     ignore_older_secs.map(|secs| Utc::now() - chrono::Duration::seconds(secs as i64))
+}
+
+/// Parse an ISO 8601 timestamp string into a DateTime<Utc>.
+///
+/// # Arguments
+///
+/// * `start_reading_at` - A string representing the timestamp to start reading at in ISO 8601 format.
+///   Supports timezone-aware format (e.g., "2022-01-01T12:00:00Z")
+///
+/// # Returns
+///
+/// A `DateTime<Utc>` if the timestamp is valid, otherwise `None`.
+pub fn parse_start_reading_at(start_reading_at: Option<String>) -> Option<DateTime<Utc>> {
+    match start_reading_at {
+        Some(s) => {
+            // Try ISO 8601 format with timezone (RFC 3339)
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
+                return Some(dt.with_timezone(&Utc));
+            }
+
+            // No valid ISO 8601 format found
+            warn!(
+                message = "Invalid timestamp provided for start_reading_at, expected ISO 8601 format, disabling timestamp filtering",
+                error = "Failed to parse as ISO 8601",
+                provided = %s,
+                examples = "2022-01-01T12:00:00Z"
+            );
+            None
+        }
+        None => None,
+    }
 }
 
 /// A sentinel type to signal that file server was gracefully shut down.

@@ -6,7 +6,7 @@ use std::{
 use crate::{
     internal_event::{
         CountByteSize, InternalEventHandle, RegisterTaggedInternalEvent, RegisteredEventCache,
-        TaggedEventsSent,
+        TaggedEventsSent, delivery_event::VectorSinkDeliveryEvent,
     },
     json_size::JsonSize,
 };
@@ -263,6 +263,8 @@ pub struct RequestMetadata {
     ///
     /// This is akin to the bytes sent/received over the network, regardless of whether or not compression was used.
     request_wire_size: usize,
+    /// Event log metadata for the batch request.
+    event_log_metadata: VectorSinkDeliveryEvent,
 }
 
 impl RequestMetadata {
@@ -280,7 +282,30 @@ impl RequestMetadata {
             events_estimated_json_encoded_byte_size,
             request_encoded_size,
             request_wire_size,
+            event_log_metadata: VectorSinkDeliveryEvent::new(),
         }
+    }
+
+    pub fn new_with_event_log(
+        event_count: usize,
+        events_byte_size: usize,
+        request_encoded_size: usize,
+        request_wire_size: usize,
+        events_estimated_json_encoded_byte_size: GroupedCountByteSize,
+        event_log_metadata: VectorSinkDeliveryEvent,
+    ) -> Self {
+        Self {
+            event_count,
+            events_byte_size,
+            events_estimated_json_encoded_byte_size,
+            request_encoded_size,
+            request_wire_size,
+            event_log_metadata: event_log_metadata,
+        }
+    }
+
+    pub fn event_log_metadata(&self) -> &VectorSinkDeliveryEvent {
+        &self.event_log_metadata
     }
 
     #[must_use]
@@ -339,6 +364,7 @@ impl<'a> Add<&'a RequestMetadata> for RequestMetadata {
                 + &other.events_estimated_json_encoded_byte_size,
             request_encoded_size: self.request_encoded_size + other.request_encoded_size,
             request_wire_size: self.request_wire_size + other.request_wire_size,
+            event_log_metadata: self.event_log_metadata + other.event_log_metadata.clone(),
         }
     }
 }

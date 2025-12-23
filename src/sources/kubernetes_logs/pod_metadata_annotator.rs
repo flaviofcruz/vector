@@ -17,11 +17,9 @@ use vector_lib::{
     },
 };
 
-use super::{
-    Config,
-    path_helpers::{LogFileInfo, parse_log_file_path},
-};
+use super::{Config, path_helpers::parse_log_file_path};
 use crate::event::{Event, LogEvent};
+use vector_lib::file_source::paths_provider::LogFileInfo;
 
 /// Configuration for how the events are enriched with Pod metadata.
 #[configurable_component]
@@ -197,10 +195,16 @@ impl PodMetadataAnnotator {
 
 impl PodMetadataAnnotator {
     /// Annotates an event with the information from the [`Pod::metadata`].
-    pub fn annotate<'a>(&self, event: &mut Event, file: &'a str) -> Option<LogFileInfo<'a>> {
+    pub fn annotate<'a>(
+        &self,
+        event: &mut Event,
+        file: &'a str,
+        cached_file_info: Option<LogFileInfo>,
+    ) -> Option<LogFileInfo> {
         let log = event.as_mut_log();
-        let file_info = parse_log_file_path(file)?;
-        let obj = ObjectRef::<Pod>::new(file_info.pod_name).within(file_info.pod_namespace);
+        let file_info: LogFileInfo =
+            cached_file_info.unwrap_or_else(|| parse_log_file_path(file).unwrap());
+        let obj = ObjectRef::<Pod>::new(&(file_info.pod_name)).within(&(file_info.pod_namespace));
         let resource = self.pods_state_reader.get(&obj)?;
         let pod: &Pod = resource.as_ref();
 
@@ -243,7 +247,7 @@ impl PodMetadataAnnotator {
 fn annotate_from_file_info(
     log: &mut LogEvent,
     fields_spec: &FieldsSpec,
-    file_info: &LogFileInfo<'_>,
+    file_info: &LogFileInfo,
     log_namespace: LogNamespace,
 ) {
     let legacy_key = fields_spec
@@ -258,7 +262,7 @@ fn annotate_from_file_info(
         log,
         legacy_key,
         path!("container_name"),
-        file_info.container_name.to_owned(),
+        file_info.container_name.clone(),
     );
 }
 

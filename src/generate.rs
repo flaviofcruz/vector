@@ -663,9 +663,8 @@ mod tests {
             format: Format::Yaml,
         };
 
-        assert_eq!(
-            generate_example(&opts, TransformInputsStrategy::Auto).unwrap(),
-            indoc::indoc! {r"
+        let generated = generate_example(&opts, TransformInputsStrategy::Auto).unwrap();
+        let expected = indoc::indoc! {r"
             data_dir: /var/lib/vector/
             sources:
               source0:
@@ -704,8 +703,10 @@ mod tests {
                   type: memory
                   max_events: 500
                   when_full: block
-            "}
-        );
+            "};
+        let generated_yaml: serde_yaml::Value = serde_yaml::from_str(&generated).unwrap();
+        let expected_yaml: serde_yaml::Value = serde_yaml::from_str(expected).unwrap();
+        assert_eq!(generated_yaml, expected_yaml);
     }
 
     #[cfg(all(

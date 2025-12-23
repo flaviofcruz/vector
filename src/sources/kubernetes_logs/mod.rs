@@ -4,7 +4,7 @@
 //! running inside the cluster as a DaemonSet.
 
 #![deny(missing_docs)]
-use std::{cmp::min, path::PathBuf, time::Duration};
+use std::{cmp::min, collections::HashMap, path::PathBuf, time::Duration};
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -57,7 +57,11 @@ use crate::{
     sources::kubernetes_logs::partial_events_merger::merge_partial_events,
     transforms::{FunctionTransform, OutputBuffer},
 };
+use std::sync::{Arc, Mutex};
 
+use vector_lib::file_source::{
+    TTLRemovalConfig, convert_to_file_ttl_removal_config, paths_provider::LogFileInfo,
+};
 mod k8s_paths_provider;
 mod lifecycle;
 mod namespace_metadata_annotator;
@@ -117,6 +121,22 @@ pub struct Config {
     #[serde(default = "default_insert_namespace_fields")]
     insert_namespace_fields: bool,
 
+    /// Specifies whether or not to extract Databricks-specific logs from the pod logs directory
+    /// in lieu of the actual Kubernetes logs.
+    ///
+    /// Setting to `true` will cause this source to extract the Databricks-specific logs from the
+    /// Databricks pod logs directory, whether that is the hostPath logging-annotation-override
+    /// directory or the kubelet log directory.
+    ///
+    #[serde(default = "default_extract_databricks_logs")]
+    extract_databricks_logs: bool,
+
+    /// Specifies the [file TTL removal config][file_ttl_removal_config] to use for the file source.
+    /// TTL removal configuration for file management
+    /// This allows us to specify the behavior of TTL file removal by file patterns
+    #[serde(default)]
+    pub ttl_removal_config: Option<TTLRemovalConfig>,
+
     /// The name of the Kubernetes [Node][node] that is running.
     ///
     /// Configured to use an environment variable by default, to be evaluated to a value provided by
@@ -165,6 +185,17 @@ pub struct Config {
 
     #[configurable(derived)]
     node_annotation_fields: node_metadata_annotator::FieldsSpec,
+
+    /// Specifies the glob patterns to scan for to extract logs using this source. This glob pattern
+    /// is relative to the pod logs directory.
+    ///
+    /// [pod_logs_directory]: https://kubernetes.io/docs/concepts/cluster-administration/kubelet/#pod-logs-directory
+    #[configurable(metadata(
+        docs::examples = "**/*.log*",
+        docs::examples = "**/*.json*",
+        docs::examples = "**/*.pb.base64*"
+    ))]
+    pod_logs_glob_patterns: Vec<String>,
 
     /// A list of glob patterns to include while reading the files.
     #[configurable(metadata(docs::examples = "**/include/**"))]
@@ -301,6 +332,8 @@ impl Default for Config {
             extra_label_selector: "".to_string(),
             extra_namespace_label_selector: "".to_string(),
             insert_namespace_fields: true,
+            extract_databricks_logs: false,
+            ttl_removal_config: None,
             self_node_name: default_self_node_name_env_template(),
             extra_field_selector: "".to_string(),
             auto_partial_merge: true,
@@ -308,6 +341,7 @@ impl Default for Config {
             pod_annotation_fields: pod_metadata_annotator::FieldsSpec::default(),
             namespace_annotation_fields: namespace_metadata_annotator::FieldsSpec::default(),
             node_annotation_fields: node_metadata_annotator::FieldsSpec::default(),
+            pod_logs_glob_patterns: default_pod_logs_glob_patterns(),
             include_paths_glob_patterns: default_path_inclusion(),
             exclude_paths_glob_patterns: default_path_exclusion(),
             read_from: default_read_from(),
@@ -567,8 +601,11 @@ struct Source {
     label_selector: String,
     namespace_label_selector: String,
     insert_namespace_fields: bool,
+    extract_databricks_logs: bool,
+    ttl_removal_config: Option<TTLRemovalConfig>,
     node_selector: String,
     self_node_name: String,
+    pod_logs_glob_patterns: Vec<String>,
     include_paths: Vec<glob::Pattern>,
     exclude_paths: Vec<glob::Pattern>,
     read_from: ReadFrom,
@@ -584,6 +621,7 @@ struct Source {
     delay_deletion: Duration,
     include_file_metric_tag: bool,
     rotate_wait: Duration,
+    file_to_pod_map: Arc<Mutex<HashMap<PathBuf, LogFileInfo>>>,
 }
 
 impl Source {
@@ -632,6 +670,8 @@ impl Source {
 
         let data_dir = globals.resolve_and_make_data_subdir(config.data_dir.as_ref(), key.id())?;
 
+        let pod_logs_glob_patterns = config.pod_logs_glob_patterns.clone();
+
         let include_paths = prepare_include_paths(config)?;
 
         let exclude_paths = prepare_exclude_paths(config)?;
@@ -656,8 +696,11 @@ impl Source {
             label_selector,
             namespace_label_selector,
             insert_namespace_fields: config.insert_namespace_fields,
+            extract_databricks_logs: config.extract_databricks_logs,
+            ttl_removal_config: config.ttl_removal_config.clone(),
             node_selector,
             self_node_name,
+            pod_logs_glob_patterns,
             include_paths,
             exclude_paths,
             read_from: ReadFrom::from(config.read_from),
@@ -673,6 +716,7 @@ impl Source {
             delay_deletion,
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
+            file_to_pod_map: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -693,8 +737,11 @@ impl Source {
             label_selector,
             namespace_label_selector,
             insert_namespace_fields,
+            extract_databricks_logs,
+            ttl_removal_config,
             node_selector,
             self_node_name,
+            pod_logs_glob_patterns,
             include_paths,
             exclude_paths,
             read_from,
@@ -710,6 +757,7 @@ impl Source {
             delay_deletion,
             include_file_metric_tag,
             rotate_wait,
+            file_to_pod_map,
         } = self;
 
         let mut reflectors = Vec::new();
@@ -797,9 +845,11 @@ impl Source {
         let paths_provider = K8sPathsProvider::new(
             pod_state.clone(),
             ns_state.clone(),
+            pod_logs_glob_patterns,
             include_paths,
             exclude_paths,
             insert_namespace_fields,
+            extract_databricks_logs,
         );
         let annotator = PodMetadataAnnotator::new(pod_state, pod_fields_spec, log_namespace);
         let ns_annotator =
@@ -815,10 +865,19 @@ impl Source {
                 max_merged_line_bytes.unwrap_or(max_line_bytes),
             );
         }
+        // Convert the TTL removal config to FileTTLRemovalConfig used by file_server
+        // Primarily involves converting Pathbufs -> glob patterns
+        let file_ttl_removal_config = match ttl_removal_config {
+            Some(ttl_removal_config_value) => Some(convert_to_file_ttl_removal_config(
+                &ttl_removal_config_value,
+            )),
+            None => None,
+        };
 
         // TODO: maybe more of the parameters have to be configurable.
 
         let checkpointer = Checkpointer::new(&data_dir);
+        let file_to_pod_map_ref = Arc::clone(&file_to_pod_map);
         let file_server = FileServer {
             // Use our special paths provider.
             paths_provider,
@@ -838,6 +897,8 @@ impl Source {
             // be other, more sound ways for users considering the use of this
             // option to solve their use case, so take consideration.
             ignore_before,
+            // For kubernetes logs, we don't support start_reading_at filtering
+            start_reading_at: None,
             // The maximum number of bytes a line can contain before being discarded. This
             // protects against malformed lines or tailing incorrect files.
             max_line_bytes: resolved_max_line_bytes,
@@ -870,6 +931,9 @@ impl Source {
             },
             // A handle to the current tokio runtime
             rotate_wait,
+            ttl_removal_config: file_ttl_removal_config,
+            source_context: None,
+            file_to_pod_map: Some(file_to_pod_map_ref),
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
@@ -888,7 +952,12 @@ impl Source {
                 log_namespace,
             );
 
-            let file_info = annotator.annotate(&mut event, &line.filename);
+            let cached_file_info = file_to_pod_map
+                .lock()
+                .unwrap()
+                .get(&PathBuf::from(&line.filename))
+                .cloned();
+            let file_info = annotator.annotate(&mut event, &line.filename, cached_file_info);
 
             emit!(KubernetesLogsEventsReceived {
                 file: &line.filename,
@@ -902,11 +971,11 @@ impl Source {
             if file_info.is_none() {
                 emit!(KubernetesLogsEventAnnotationError { event: &event });
             } else {
-                let namespace = file_info.as_ref().map(|info| info.pod_namespace);
+                let namespace = file_info.as_ref().map(|info| info.pod_namespace.to_owned());
 
                 if insert_namespace_fields
                     && let Some(name) = namespace
-                    && ns_annotator.annotate(&mut event, name).is_none()
+                    && ns_annotator.annotate(&mut event, &name).is_none()
                 {
                     emit!(KubernetesLogsEventNamespaceAnnotationError { event: &event });
                 }
@@ -922,7 +991,7 @@ impl Source {
             event
         });
 
-        let mut parser = Parser::new(log_namespace);
+        let mut parser = Parser::new(log_namespace, extract_databricks_logs);
         let events = events.flat_map(move |event| {
             let mut buf = OutputBuffer::with_capacity(1);
             parser.transform(&mut buf, event);
@@ -1042,6 +1111,12 @@ fn default_self_node_name_env_template() -> String {
     format!("${{{}}}", SELF_NODE_NAME_ENV_KEY.to_owned())
 }
 
+// By default, we only scan for *.log files, the default Kubernetes logs format.
+// This can be overridden by the user to scan for other file types, such as *.json or *.pb.base64.
+fn default_pod_logs_glob_patterns() -> Vec<String> {
+    vec!["*/*.log*".to_string()]
+}
+
 fn default_path_inclusion() -> Vec<PathBuf> {
     vec![PathBuf::from("**/*")]
 }
@@ -1063,6 +1138,10 @@ const fn default_oldest_first() -> bool {
 // It might make sense to disable this for clusters with a very large number of namespaces.
 const fn default_insert_namespace_fields() -> bool {
     true
+}
+
+const fn default_extract_databricks_logs() -> bool {
+    false
 }
 
 const fn default_max_line_bytes() -> usize {
