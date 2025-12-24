@@ -202,45 +202,49 @@ impl PodMetadataAnnotator {
         cached_file_info: Option<LogFileInfo>,
     ) -> Option<LogFileInfo> {
         let log = event.as_mut_log();
-        let file_info: LogFileInfo =
-            cached_file_info.unwrap_or_else(|| parse_log_file_path(file).unwrap());
-        let obj = ObjectRef::<Pod>::new(&(file_info.pod_name)).within(&(file_info.pod_namespace));
-        let resource = self.pods_state_reader.get(&obj)?;
-        let pod: &Pod = resource.as_ref();
+        let file_info_opt: Option<LogFileInfo> =
+            cached_file_info.or_else(|| parse_log_file_path(file));
+        if let Some(file_info) = file_info_opt {
+            let obj = ObjectRef::<Pod>::new(&(file_info.pod_name)).within(&(file_info.pod_namespace));
+            let resource = self.pods_state_reader.get(&obj)?;
+            let pod: &Pod = resource.as_ref();
 
-        annotate_from_file_info(log, &self.fields_spec, &file_info, self.log_namespace);
-        annotate_from_metadata(log, &self.fields_spec, &pod.metadata, self.log_namespace);
+            annotate_from_file_info(log, &self.fields_spec, &file_info, self.log_namespace);
+            annotate_from_metadata(log, &self.fields_spec, &pod.metadata, self.log_namespace);
 
-        let container;
-        if let Some(ref pod_spec) = pod.spec {
-            annotate_from_pod_spec(log, &self.fields_spec, pod_spec, self.log_namespace);
+            let container;
+            if let Some(ref pod_spec) = pod.spec {
+                annotate_from_pod_spec(log, &self.fields_spec, pod_spec, self.log_namespace);
 
-            container = pod_spec
-                .containers
-                .iter()
-                .find(|c| c.name == file_info.container_name);
-            if let Some(container) = container {
-                annotate_from_container(log, &self.fields_spec, container, self.log_namespace);
-            }
-        }
-
-        if let Some(ref pod_status) = pod.status {
-            annotate_from_pod_status(log, &self.fields_spec, pod_status, self.log_namespace);
-            if let Some(ref container_statuses) = pod_status.container_statuses {
-                let container_status = container_statuses
+                container = pod_spec
+                    .containers
                     .iter()
                     .find(|c| c.name == file_info.container_name);
-                if let Some(container_status) = container_status {
-                    annotate_from_container_status(
-                        log,
-                        &self.fields_spec,
-                        container_status,
-                        self.log_namespace,
-                    )
+                if let Some(container) = container {
+                    annotate_from_container(log, &self.fields_spec, container, self.log_namespace);
                 }
             }
+
+            if let Some(ref pod_status) = pod.status {
+                annotate_from_pod_status(log, &self.fields_spec, pod_status, self.log_namespace);
+                if let Some(ref container_statuses) = pod_status.container_statuses {
+                    let container_status = container_statuses
+                        .iter()
+                        .find(|c| c.name == file_info.container_name);
+                    if let Some(container_status) = container_status {
+                        annotate_from_container_status(
+                            log,
+                            &self.fields_spec,
+                            container_status,
+                            self.log_namespace,
+                        )
+                    }
+                }
+                Some(file_info)
+            }
+        } else {
+            None
         }
-        Some(file_info)
     }
 }
 
