@@ -240,8 +240,8 @@ impl PodMetadataAnnotator {
                         )
                     }
                 }
-                Some(file_info)
             }
+            Some(file_info)
         } else {
             None
         }
