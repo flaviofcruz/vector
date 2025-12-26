@@ -205,7 +205,8 @@ impl PodMetadataAnnotator {
         let file_info_opt: Option<LogFileInfo> =
             cached_file_info.or_else(|| parse_log_file_path(file));
         if let Some(file_info) = file_info_opt {
-            let obj = ObjectRef::<Pod>::new(&(file_info.pod_name)).within(&(file_info.pod_namespace));
+            let obj =
+                ObjectRef::<Pod>::new(&(file_info.pod_name)).within(&(file_info.pod_namespace));
             let resource = self.pods_state_reader.get(&obj)?;
             let pod: &Pod = resource.as_ref();
 
