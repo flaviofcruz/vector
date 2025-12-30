@@ -131,6 +131,16 @@ pub struct Config {
     #[serde(default = "default_extract_databricks_logs")]
     extract_databricks_logs: bool,
 
+    /// Specifies whether or not to rely on the HostPath logging-annotation-override directory to
+    /// extract Databricks logs.
+    ///
+    /// If set to `true`, we will assume the Databricks logs are located in the
+    /// HostPath logging-annotation-override directory.
+    /// If set to `false`, we will assume the Databricks logs are located in the
+    /// kubelet log directory.
+    #[serde(default = "default_use_hostpath_logging_annotation_override")]
+    use_hostpath_logging_annotation_override: bool,
+
     /// Specifies the [file TTL removal config][file_ttl_removal_config] to use for the file source.
     /// TTL removal configuration for file management
     /// This allows us to specify the behavior of TTL file removal by file patterns
@@ -333,6 +343,7 @@ impl Default for Config {
             extra_namespace_label_selector: "".to_string(),
             insert_namespace_fields: true,
             extract_databricks_logs: false,
+            use_hostpath_logging_annotation_override: false,
             ttl_removal_config: None,
             self_node_name: default_self_node_name_env_template(),
             extra_field_selector: "".to_string(),
@@ -602,6 +613,7 @@ struct Source {
     namespace_label_selector: String,
     insert_namespace_fields: bool,
     extract_databricks_logs: bool,
+    use_hostpath_logging_annotation_override: bool,
     ttl_removal_config: Option<TTLRemovalConfig>,
     node_selector: String,
     self_node_name: String,
@@ -697,6 +709,8 @@ impl Source {
             namespace_label_selector,
             insert_namespace_fields: config.insert_namespace_fields,
             extract_databricks_logs: config.extract_databricks_logs,
+            use_hostpath_logging_annotation_override: config
+                .use_hostpath_logging_annotation_override,
             ttl_removal_config: config.ttl_removal_config.clone(),
             node_selector,
             self_node_name,
@@ -738,6 +752,7 @@ impl Source {
             namespace_label_selector,
             insert_namespace_fields,
             extract_databricks_logs,
+            use_hostpath_logging_annotation_override,
             ttl_removal_config,
             node_selector,
             self_node_name,
@@ -850,6 +865,7 @@ impl Source {
             exclude_paths,
             insert_namespace_fields,
             extract_databricks_logs,
+            use_hostpath_logging_annotation_override,
         );
         let annotator = PodMetadataAnnotator::new(pod_state, pod_fields_spec, log_namespace);
         let ns_annotator =
@@ -1141,6 +1157,10 @@ const fn default_insert_namespace_fields() -> bool {
 }
 
 const fn default_extract_databricks_logs() -> bool {
+    false
+}
+
+const fn default_use_hostpath_logging_annotation_override() -> bool {
     false
 }
 
