@@ -315,19 +315,16 @@ impl ZerobusService {
 
         let num_events = events.len();
 
-        let mut batch: Vec<Vec<u8>>= Vec::with_capacity(num_events);
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(num_events);
 
         // Process each event and collect the last acknowledgment future
         for event in events.into_iter() {
             let encoded_data = if let Event::Log(log_event) = event {
-                let dynamic_message = encode_message(
-                    descriptor,
-                    log_event.into_parts().0,
-                    &self.encode_options,
-                )
-                .map_err(|e| ZerobusSinkError::EncodingError {
-                    message: format!("Failed to encode event to protobuf: {}", e),
-                })?;
+                let dynamic_message =
+                    encode_message(descriptor, log_event.into_parts().0, &self.encode_options)
+                        .map_err(|e| ZerobusSinkError::EncodingError {
+                            message: format!("Failed to encode event to protobuf: {}", e),
+                        })?;
                 dynamic_message.encode_to_vec()
             } else {
                 return Err(ZerobusSinkError::EncodingError {
@@ -337,11 +334,13 @@ impl ZerobusService {
             batch.push(encoded_data);
         }
 
-        let ack_future = stream.ingest_records(batch).await.map_err(|e| {
-            ZerobusSinkError::IngestionError {
-                message: format!("Failed to ingest batch: {}", e),
-            }
-        })?;
+        let ack_future =
+            stream
+                .ingest_records(batch)
+                .await
+                .map_err(|e| ZerobusSinkError::IngestionError {
+                    message: format!("Failed to ingest batch: {}", e),
+                })?;
 
         // Wait for it.
         if let Err(e) = ack_future.await {
@@ -350,9 +349,7 @@ impl ZerobusService {
             });
         }
 
-        Ok(ZerobusResponse {
-            count: num_events,
-        })
+        Ok(ZerobusResponse { count: num_events })
     }
 }
 

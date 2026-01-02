@@ -6,7 +6,7 @@ use std::env;
 use std::sync::OnceLock;
 
 use crate::event::proto::EventWrapper;
-use crate::event::{Event, LogEvent};
+use crate::event::{Event, EventArray, LogEvent};
 
 use vector_common::internal_event::delivery_event::{
     EventWithEventLog, MetadataValuesCount, VectorSinkDeliveryEvent,
@@ -141,6 +141,21 @@ pub fn generate_count_map_event_wrapper(
         .map(|event: &EventWrapper| Event::from(event.clone()))
         .collect();
     generate_count_map(&event_map, for_delivery_events)
+}
+
+pub fn generate_count_map_from_event_array(
+    events: &EventArray,
+    for_delivery_events: bool,
+) -> HashMap<String, MetadataValuesCount> {
+    if let EventArray::Logs(logs) = events {
+        let log_map: Vec<Event> = logs
+            .iter()
+            .map(|log: &LogEvent| Event::from(log.clone()))
+            .collect();
+        generate_count_map(&log_map, for_delivery_events)
+    } else {
+        HashMap::new()
+    }
 }
 
 // Impl EventWithEventLog for the used log events

@@ -13,6 +13,8 @@ use tokio::{
     sync::watch,
     time::{interval, sleep_until},
 };
+use vector_common::internal_event::delivery_event::VectorSinkDeliveryEvent;
+use vector_lib::event::event_log::generate_count_map_from_event_array;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf,
     internal_event::{
@@ -100,6 +102,11 @@ impl StreamSink<EventArray> for BlackholeSink {
 
             let finalizers = events.take_finalizers();
             finalizers.update_status(EventStatus::Delivered);
+
+            // Blackhole sink doesn't really stage / prepare anything, we just emit on delivery
+            let count_map = generate_count_map_from_event_array(&events, false);
+            let delivery_event_log = VectorSinkDeliveryEvent::with_count_map(count_map);
+            delivery_event_log.emit_delivered_event();
 
             events_sent.emit(CountByteSize(events.len(), message_len));
             bytes_sent.emit(ByteSize(message_len.get()));
