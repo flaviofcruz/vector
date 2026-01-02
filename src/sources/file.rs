@@ -784,7 +784,7 @@ fn reconcile_position_options(
     }
 }
 
-fn wrap_with_line_agg(
+pub fn wrap_with_line_agg(
     rx: impl Stream<Item = Line> + Send + std::marker::Unpin + 'static,
     config: line_agg::Config,
 ) -> Box<dyn Stream<Item = Line> + Send + std::marker::Unpin + 'static> {
