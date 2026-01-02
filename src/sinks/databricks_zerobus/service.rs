@@ -73,6 +73,7 @@ pub struct ZerobusService {
     pub config: ZerobusSinkConfig,
     stream: Arc<Mutex<Option<ZerobusStream>>>,
     descriptor: Arc<Mutex<Option<prost_reflect::MessageDescriptor>>>,
+    encode_options: vrl::protobuf::encode::Options,
 }
 
 impl ZerobusService {
@@ -99,12 +100,16 @@ impl ZerobusService {
         } else {
             None
         };
+        let encode_options = vrl::protobuf::encode::Options {
+            use_json_names: false,
+        };
 
         Ok(Self {
             sdk,
             config,
             stream: Arc::new(Mutex::new(None)),
             descriptor: Arc::new(Mutex::new(descriptor_opt)),
+            encode_options,
         })
     }
 
@@ -253,7 +258,7 @@ impl ZerobusService {
             let descriptor = Self::get_descriptor_or_infer(sample_event, &self.descriptor).await?;
             let table_properties = TableProperties {
                 table_name: self.config.table_name.clone(),
-                descriptor_proto: descriptor.descriptor_proto().clone(),
+                descriptor_proto: Some(descriptor.descriptor_proto().clone()),
             };
 
             let stream_options = Some(self.config.stream_options.clone().into());
@@ -308,19 +313,17 @@ impl ZerobusService {
                     message: "Descriptor not initialized".to_string(),
                 })?;
 
-        let mut ack_futures = Vec::new();
-        let encode_options = vrl::protobuf::encode::Options {
-            use_json_names: false,
-        };
+        let num_events = events.len();
 
-        // Process each event
-        for event in events.iter() {
-            // Encode event to protobuf bytes
+        let mut batch: Vec<Vec<u8>>= Vec::with_capacity(num_events);
+
+        // Process each event and collect the last acknowledgment future
+        for event in events.into_iter() {
             let encoded_data = if let Event::Log(log_event) = event {
                 let dynamic_message = encode_message(
                     descriptor,
-                    log_event.clone().into_parts().0,
-                    &encode_options,
+                    log_event.into_parts().0,
+                    &self.encode_options,
                 )
                 .map_err(|e| ZerobusSinkError::EncodingError {
                     message: format!("Failed to encode event to protobuf: {}", e),
@@ -331,34 +334,24 @@ impl ZerobusService {
                     message: "Unsupported event type".to_string(),
                 });
             };
-
-            // Ingest the record and collect the acknowledgment future
-            let ack_future = stream.ingest_record(encoded_data).await.map_err(|e| {
-                ZerobusSinkError::IngestionError {
-                    message: format!("Failed to ingest record: {}", e),
-                }
-            })?;
-
-            ack_futures.push(ack_future);
+            batch.push(encoded_data);
         }
 
-        // Wait for all acknowledgments
-        let mut success_count = 0;
-        for ack_future in ack_futures {
-            match ack_future.await {
-                Ok(_offset) => {
-                    success_count += 1;
-                }
-                Err(e) => {
-                    return Err(ZerobusSinkError::IngestionError {
-                        message: format!("Record acknowledgment failed: {}", e),
-                    });
-                }
+        let ack_future = stream.ingest_records(batch).await.map_err(|e| {
+            ZerobusSinkError::IngestionError {
+                message: format!("Failed to ingest batch: {}", e),
             }
+        })?;
+
+        // Wait for it.
+        if let Err(e) = ack_future.await {
+            return Err(ZerobusSinkError::IngestionError {
+                message: format!("Batch acknowledgment failed: {}", e),
+            });
         }
 
         Ok(ZerobusResponse {
-            count: success_count,
+            count: num_events,
         })
     }
 }
@@ -398,6 +391,7 @@ impl Clone for ZerobusService {
             config: self.config.clone(),
             stream: Arc::clone(&self.stream),
             descriptor: Arc::clone(&self.descriptor),
+            encode_options: self.encode_options.clone(),
         }
     }
 }
