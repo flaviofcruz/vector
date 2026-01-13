@@ -59,7 +59,7 @@ enum BuildError {
 }
 
 /// Custom deserializer for ISO-8601 timestamp validation
-fn deserialize_iso8601_timestamp<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+pub fn deserialize_iso8601_timestamp<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -784,7 +784,7 @@ fn reconcile_position_options(
     }
 }
 
-fn wrap_with_line_agg(
+pub fn wrap_with_line_agg(
     rx: impl Stream<Item = Line> + Send + std::marker::Unpin + 'static,
     config: line_agg::Config,
 ) -> Box<dyn Stream<Item = Line> + Send + std::marker::Unpin + 'static> {

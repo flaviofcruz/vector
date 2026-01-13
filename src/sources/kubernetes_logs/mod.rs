@@ -6,8 +6,9 @@
 #![deny(missing_docs)]
 use std::{cmp::min, collections::HashMap, path::PathBuf, time::Duration};
 
+use crate::sources::file::{deserialize_iso8601_timestamp, wrap_with_line_agg};
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{future::FutureExt, stream::StreamExt};
 use futures_util::Stream;
 use http_1::{HeaderName, HeaderValue};
@@ -28,6 +29,7 @@ use vector_lib::{
     configurable::configurable_component,
     file_source::file_server::{
         FileServer, Line, Shutdown as FileServerShutdown, calculate_ignore_before,
+        parse_start_reading_at,
     },
     file_source_common::{
         Checkpointer, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
@@ -37,6 +39,7 @@ use vector_lib::{
 };
 use vrl::value::{Kind, kind::Collection};
 
+use crate::sources::util::MultilineConfig;
 use crate::{
     SourceSender,
     built_info::{PKG_NAME, PKG_VERSION},
@@ -52,16 +55,17 @@ use crate::{
         KubernetesLogsPodInfo, StreamClosedError,
     },
     kubernetes::{custom_reflector, meta_cache::MetaCache},
+    line_agg,
     shutdown::ShutdownSignal,
     sources,
     sources::kubernetes_logs::partial_events_merger::merge_partial_events,
     transforms::{FunctionTransform, OutputBuffer},
 };
 use std::sync::{Arc, Mutex};
-
 use vector_lib::file_source::{
     TTLRemovalConfig, convert_to_file_ttl_removal_config, paths_provider::LogFileInfo,
 };
+
 mod k8s_paths_provider;
 mod lifecycle;
 mod namespace_metadata_annotator;
@@ -319,6 +323,33 @@ pub struct Config {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     rotate_wait: Duration,
+
+    /// Only read files if their last modification timestamp is later than the specified absolute unix timestamp.
+    /// If not set, all files matching the include patterns will be read.
+    #[serde(default, deserialize_with = "deserialize_iso8601_timestamp")]
+    #[configurable(metadata(docs::examples = "2022-01-01T12:00:00Z"))]
+    #[configurable(metadata(
+        docs::human_name = "Read Only Files Modified After This Absolute Timestamp"
+    ))]
+    pub start_reading_at: Option<String>,
+
+    /// Extra context (i.e. metadata tags) that are added to each log line
+    #[serde(default)]
+    #[configurable(description = "Additional context applied to each log line")]
+    #[configurable(metadata(
+        docs::examples = "{\"topic\": \"topic_name\", \"tags\": \"tag_value\"}"
+    ))]
+    #[configurable(metadata(
+        docs::human_name = "an optional object of key value pairs to added in each line."
+    ))]
+    pub source_context: Option<HashMap<String, String>>,
+
+    /// Multiline aggregation configuration.
+    ///
+    /// If not specified, multiline aggregation is disabled.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub multiline: Option<MultilineConfig>,
 }
 
 const fn default_read_from() -> ReadFromConfig {
@@ -371,6 +402,9 @@ impl Default for Config {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            start_reading_at: None,
+            source_context: None,
+            multiline: None,
         }
     }
 }
@@ -381,6 +415,14 @@ impl SourceConfig for Config {
     async fn build(&self, cx: SourceContext) -> crate::Result<sources::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let source = Source::new(self, &cx.globals, &cx.key).await?;
+
+        // Clippy rule, because async_trait?
+        #[allow(clippy::suspicious_else_formatting)]
+        {
+            if let Some(ref config) = self.multiline {
+                let _: line_agg::Config = config.try_into()?;
+            }
+        }
 
         Ok(Box::pin(
             source
@@ -634,6 +676,9 @@ struct Source {
     include_file_metric_tag: bool,
     rotate_wait: Duration,
     file_to_pod_map: Arc<Mutex<HashMap<PathBuf, LogFileInfo>>>,
+    start_reading_at: Option<DateTime<Utc>>,
+    source_context: Option<HashMap<String, String>>,
+    multiline: Option<MultilineConfig>,
 }
 
 impl Source {
@@ -731,6 +776,9 @@ impl Source {
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
             file_to_pod_map: Arc::new(Mutex::new(HashMap::new())),
+            start_reading_at: parse_start_reading_at(config.start_reading_at.clone()),
+            source_context: config.source_context.clone(),
+            multiline: config.multiline.clone(),
         })
     }
 
@@ -773,6 +821,9 @@ impl Source {
             include_file_metric_tag,
             rotate_wait,
             file_to_pod_map,
+            start_reading_at,
+            ref source_context,
+            multiline,
         } = self;
 
         let mut reflectors = Vec::new();
@@ -914,7 +965,7 @@ impl Source {
             // option to solve their use case, so take consideration.
             ignore_before,
             // For kubernetes logs, we don't support start_reading_at filtering
-            start_reading_at: None,
+            start_reading_at,
             // The maximum number of bytes a line can contain before being discarded. This
             // protects against malformed lines or tailing incorrect files.
             max_line_bytes: resolved_max_line_bytes,
@@ -948,7 +999,7 @@ impl Source {
             // A handle to the current tokio runtime
             rotate_wait,
             ttl_removal_config: file_ttl_removal_config,
-            source_context: None,
+            source_context: source_context.clone(),
             file_to_pod_map: Some(file_to_pod_map_ref),
         };
 
@@ -956,8 +1007,18 @@ impl Source {
 
         let checkpoints = checkpointer.view();
         let events = file_source_rx.flat_map(futures::stream::iter);
+        let multiline_config = multiline.clone();
+        let messages: Box<dyn Stream<Item = Line> + Send + std::marker::Unpin> =
+            if let Some(ref multiline_config) = multiline_config {
+                wrap_with_line_agg(
+                    events,
+                    multiline_config.try_into().unwrap(), // validated in build
+                )
+            } else {
+                Box::new(events)
+            };
         let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
-        let events = events.map(move |line| {
+        let events = messages.map(move |line| {
             let byte_size = line.text.len();
             bytes_received.emit(ByteSize(byte_size));
 
@@ -967,6 +1028,16 @@ impl Source {
                 ingestion_timestamp_field.as_ref(),
                 log_namespace,
             );
+
+            // Apply additional fields as specified by the source context if needed
+            if let Some(source_context) = &self.source_context {
+                for (key, value) in source_context {
+                    let path = format!("source_context.{}", key);
+                    // We don't want things like namespace consideration here since we want this value to be in a consistent spot
+                    // So we don't use the insert_source_metadata function and just directly insert
+                    event.as_mut_log().insert(path.as_str(), value.clone());
+                }
+            }
 
             let cached_file_info = file_to_pod_map
                 .lock()

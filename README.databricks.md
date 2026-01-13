@@ -63,3 +63,4 @@ This lists custom changes merged in Databricks fork of Vector.
 62. Instrument blackhole sink with delivery events https://github.com/databricks-eng/vector/pull/352
 63. Parse file paths for container name for deployment logs https://github.com/databricks-eng/vector/pull/360 https://github.com/databricks-eng/vector/pull/362
 64. Add $POD_NAME substitution in hostpath logging annotation for kubernetes_logs source https://github.com/databricks-eng/vector/pull/361
+65. Add source_context, start_reading_at and multiline config in k8s log https://github.com/databricks-eng/vector/pull/363
