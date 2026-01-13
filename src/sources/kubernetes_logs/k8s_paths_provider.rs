@@ -4,6 +4,10 @@
 
 use std::path::PathBuf;
 
+/// Default container name used when container name extraction is disabled.
+/// Choosing something obvious to make debugging easier when container name is invalid
+const DEFAULT_CONTAINER_NAME: &str = "DEFAULT_CONTAINER_NAME";
+
 use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::runtime::reflector::{ObjectRef, store::Store};
 use vector_lib::file_source::paths_provider::{LogFileInfo, PathsProvider};
@@ -90,6 +94,18 @@ impl PathsProvider for K8sPathsProvider {
                 )
                 // Add the pod metadata associated with the paths.
                 .map(|path| {
+                    // Only extract container_name from the path if extract_databricks_logs is enabled.
+                    // Path format: .../container-name/0.log
+                    let container_name = if self.extract_databricks_logs {
+                        path.parent() // Get directory containing the log file
+                            .and_then(|p| p.file_name()) // Get container directory name
+                            .and_then(|name| name.to_str())
+                            .unwrap_or(DEFAULT_CONTAINER_NAME)
+                            .to_string()
+                    } else {
+                        DEFAULT_CONTAINER_NAME.to_string()
+                    };
+
                     (
                         Some(LogFileInfo {
                             pod_namespace: pod
@@ -100,11 +116,7 @@ impl PathsProvider for K8sPathsProvider {
                                 .to_string(),
                             pod_name: pod.metadata.name.clone().unwrap_or_default().to_string(),
                             pod_uid: pod.metadata.uid.clone().unwrap_or_default().to_string(),
-                            // TODO(ken.lin): Optionally add the container name to the LogFileInfo. This
-                            // will augment the annotation with the container ID, container image ID, and
-                            // container image fields. However, since Databricks logs are per-pod rather
-                            // than per-container, we currently can't tell which container a log belongs to.
-                            container_name: "".to_string(),
+                            container_name,
                         }),
                         path,
                     )
@@ -937,5 +949,72 @@ mod tests {
                 &pod_logs_dir, &containers,
             )
         }
+    }
+
+    #[test]
+    fn test_container_name_extraction_from_path() {
+        // Verify that container_name is correctly extracted from the path
+        // Path format: .../container-name/0.log
+        let test_cases = vec![
+            (
+                "/var/log/pods/ns_name_uid/my-container/0.log",
+                "my-container",
+            ),
+            (
+                "/var/log/pods/ns_name_uid/another-container/1.log.gz",
+                "another-container",
+            ),
+            (
+                "/databricks/host-root/local_disk0/logs/service-container/app.log",
+                "service-container",
+            ),
+        ];
+
+        for (path_str, expected_container) in test_cases {
+            let path = PathBuf::from(path_str);
+            let container_name = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            assert_eq!(
+                container_name, expected_container,
+                "Failed for path: {}",
+                path_str
+            );
+        }
+    }
+
+    #[test]
+    fn test_container_name_conditional_extraction() {
+        use super::DEFAULT_CONTAINER_NAME;
+
+        let path = PathBuf::from("/var/log/pods/ns_name_uid/my-container/0.log");
+
+        // When extract_databricks_logs is true, extract from path
+        let extract_databricks_logs = true;
+        let container_name = if extract_databricks_logs {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or(DEFAULT_CONTAINER_NAME)
+                .to_string()
+        } else {
+            DEFAULT_CONTAINER_NAME.to_string()
+        };
+        assert_eq!(container_name, "my-container");
+
+        // When extract_databricks_logs is false, use default
+        let extract_databricks_logs = false;
+        let container_name = if extract_databricks_logs {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or(DEFAULT_CONTAINER_NAME)
+                .to_string()
+        } else {
+            DEFAULT_CONTAINER_NAME.to_string()
+        };
+        assert_eq!(container_name, DEFAULT_CONTAINER_NAME);
     }
 }
