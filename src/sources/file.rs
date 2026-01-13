@@ -59,7 +59,7 @@ enum BuildError {
 }
 
 /// Custom deserializer for ISO-8601 timestamp validation
-fn deserialize_iso8601_timestamp<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+pub fn deserialize_iso8601_timestamp<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {

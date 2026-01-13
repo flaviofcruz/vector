@@ -6,6 +6,7 @@
 #![deny(missing_docs)]
 use std::{cmp::min, collections::HashMap, path::PathBuf, time::Duration};
 
+use crate::sources::file::{deserialize_iso8601_timestamp, wrap_with_line_agg};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{future::FutureExt, stream::StreamExt};
@@ -27,7 +28,8 @@ use vector_lib::{
     config::{LegacyKey, LogNamespace},
     configurable::configurable_component,
     file_source::file_server::{
-        FileServer, Line, Shutdown as FileServerShutdown, calculate_ignore_before, parse_start_reading_at
+        FileServer, Line, Shutdown as FileServerShutdown, calculate_ignore_before,
+        parse_start_reading_at,
     },
     file_source_common::{
         Checkpointer, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
@@ -37,22 +39,32 @@ use vector_lib::{
 };
 use vrl::value::{Kind, kind::Collection};
 
-use crate::{SourceSender, built_info::{PKG_NAME, PKG_VERSION}, config::{
-    ComponentKey, DataType, GenerateConfig, GlobalOptions, SourceConfig, SourceContext,
-    SourceOutput, log_schema,
-}, event::Event, internal_events::{
-    FileInternalMetricsConfig, FileSourceInternalEventsEmitter, KubernetesLifecycleError,
-    KubernetesLogsEventAnnotationError, KubernetesLogsEventNamespaceAnnotationError,
-    KubernetesLogsEventNodeAnnotationError, KubernetesLogsEventsReceived,
-    KubernetesLogsPodInfo, StreamClosedError,
-}, kubernetes::{custom_reflector, meta_cache::MetaCache}, shutdown::ShutdownSignal, sources, sources::kubernetes_logs::partial_events_merger::merge_partial_events, transforms::{FunctionTransform, OutputBuffer}, line_agg};
+use crate::sources::util::MultilineConfig;
+use crate::{
+    SourceSender,
+    built_info::{PKG_NAME, PKG_VERSION},
+    config::{
+        ComponentKey, DataType, GenerateConfig, GlobalOptions, SourceConfig, SourceContext,
+        SourceOutput, log_schema,
+    },
+    event::Event,
+    internal_events::{
+        FileInternalMetricsConfig, FileSourceInternalEventsEmitter, KubernetesLifecycleError,
+        KubernetesLogsEventAnnotationError, KubernetesLogsEventNamespaceAnnotationError,
+        KubernetesLogsEventNodeAnnotationError, KubernetesLogsEventsReceived,
+        KubernetesLogsPodInfo, StreamClosedError,
+    },
+    kubernetes::{custom_reflector, meta_cache::MetaCache},
+    line_agg,
+    shutdown::ShutdownSignal,
+    sources,
+    sources::kubernetes_logs::partial_events_merger::merge_partial_events,
+    transforms::{FunctionTransform, OutputBuffer},
+};
 use std::sync::{Arc, Mutex};
-use regex::bytes::Regex;
-use snafu::ResultExt;
 use vector_lib::file_source::{
     TTLRemovalConfig, convert_to_file_ttl_removal_config, paths_provider::LogFileInfo,
 };
-use crate::sources::util::MultilineConfig;
 
 mod k8s_paths_provider;
 mod lifecycle;
@@ -321,9 +333,15 @@ pub struct Config {
     ))]
     pub start_reading_at: Option<String>,
 
-    // Extra context (i.e. metadata tags) that are added to each log line
+    /// Extra context (i.e. metadata tags) that are added to each log line
     #[serde(default)]
     #[configurable(description = "Additional context applied to each log line")]
+    #[configurable(metadata(
+        docs::examples = "{\"topic\": \"topic_name\", \"tags\": \"tag_value\"}"
+    ))]
+    #[configurable(metadata(
+        docs::human_name = "an optional object of key value pairs to added in each line."
+    ))]
     pub source_context: Option<HashMap<String, String>>,
 
     /// Multiline aggregation configuration.
@@ -758,7 +776,7 @@ impl Source {
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
             file_to_pod_map: Arc::new(Mutex::new(HashMap::new())),
-            start_reading_at: parse_start_reading_at(config.start_reading_at),
+            start_reading_at: parse_start_reading_at(config.start_reading_at.clone()),
             source_context: config.source_context.clone(),
             multiline: config.multiline.clone(),
         })
@@ -804,7 +822,7 @@ impl Source {
             rotate_wait,
             file_to_pod_map,
             start_reading_at,
-            source_context,
+            ref source_context,
             multiline,
         } = self;
 
@@ -981,7 +999,7 @@ impl Source {
             // A handle to the current tokio runtime
             rotate_wait,
             ttl_removal_config: file_ttl_removal_config,
-            source_context,
+            source_context: source_context.clone(),
             file_to_pod_map: Some(file_to_pod_map_ref),
         };
 
@@ -992,7 +1010,7 @@ impl Source {
         let multiline_config = multiline.clone();
         let messages: Box<dyn Stream<Item = Line> + Send + std::marker::Unpin> =
             if let Some(ref multiline_config) = multiline_config {
-                sources::file::wrap_with_line_agg(
+                wrap_with_line_agg(
                     events,
                     multiline_config.try_into().unwrap(), // validated in build
                 )
@@ -1008,7 +1026,7 @@ impl Source {
                 line.text,
                 &line.filename,
                 ingestion_timestamp_field.as_ref(),
-                log_namespace
+                log_namespace,
             );
 
             // Apply additional fields as specified by the source context if needed
@@ -1017,7 +1035,7 @@ impl Source {
                     let path = format!("source_context.{}", key);
                     // We don't want things like namespace consideration here since we want this value to be in a consistent spot
                     // So we don't use the insert_source_metadata function and just directly insert
-                    (&event).insert(path.as_str(), value.clone());
+                    event.as_mut_log().insert(path.as_str(), value.clone());
                 }
             }
 
