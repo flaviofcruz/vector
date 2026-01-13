@@ -62,3 +62,4 @@ This lists custom changes merged in Databricks fork of Vector.
 61. Allow for safe fallback on kuberenetes_logs source file-annotation failure. https://github.com/databricks-eng/vector/pull/351
 62. Instrument blackhole sink with delivery events https://github.com/databricks-eng/vector/pull/352
 63. Parse file paths for container name for deployment logs https://github.com/databricks-eng/vector/pull/360
+64. Add $POD_NAME substitution in hostpath logging annotation for kubernetes_logs source https://github.com/databricks-eng/vector/pull/361
