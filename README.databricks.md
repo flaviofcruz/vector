@@ -61,4 +61,5 @@ This lists custom changes merged in Databricks fork of Vector.
 60. Adds an option to the kuberenetes_logs source which splits the pod log discovery behavior explicitly by whether or not we expect to rely on the logging hostpath annotation to discovery the log directory. https://github.com/databricks-eng/vector/pull/347
 61. Allow for safe fallback on kuberenetes_logs source file-annotation failure. https://github.com/databricks-eng/vector/pull/351
 62. Instrument blackhole sink with delivery events https://github.com/databricks-eng/vector/pull/352
-63. Add $POD_NAME substitution in hostpath logging annotation for kubernetes_logs source https://github.com/databricks-eng/vector/pull/361
+63. Parse file paths for container name for deployment logs https://github.com/databricks-eng/vector/pull/360
+64. Add $POD_NAME substitution in hostpath logging annotation for kubernetes_logs source https://github.com/databricks-eng/vector/pull/361
