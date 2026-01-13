@@ -187,10 +187,12 @@ fn extract_databricks_pod_logs_directory(
                     .map(|value| value.as_str())
             });
         hostpath_logging_annotation.map(|value| {
+            let pod_name = metadata.name.as_deref().unwrap_or("");
+            let resolved_value = value.replace("$POD_NAME", pod_name);
             PathBuf::from(format!(
                 "{}/{}",
                 DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX,
-                value.trim_start_matches('/')
+                resolved_value.trim_start_matches('/')
             ))
         })
     } else {
@@ -321,7 +323,7 @@ mod tests {
             (
                 Pod {
                     metadata: ObjectMeta {
-                        namespace: Some("sandbox0-ns".to_owned()),
+                        namespace: Some("No0-ns".to_owned()),
                         name: Some("sandbox0-name".to_owned()),
                         uid: Some("sandbox0-uid".to_owned()),
                         ..ObjectMeta::default()
@@ -454,7 +456,7 @@ mod tests {
                         annotations: Some(
                             vec![(
                                 "logging.databricks.com/dblet-logs-path".to_owned(),
-                                "/local_disk0/sandbox0-custom-logs-path".to_owned(),
+                                "/local_disk0/sandbox0-custom-logs-path/$POD_NAME".to_owned(),
                             )]
                             .into_iter()
                             .collect(),
@@ -464,7 +466,7 @@ mod tests {
                     ..Pod::default()
                 },
                 true,
-                Some("/databricks/host-root/local_disk0/sandbox0-custom-logs-path"),
+                Some("/databricks/host-root/local_disk0/sandbox0-custom-logs-path/sandbox0-name"),
             ),
         ];
 
