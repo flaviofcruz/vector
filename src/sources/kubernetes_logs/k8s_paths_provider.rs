@@ -323,7 +323,7 @@ mod tests {
             (
                 Pod {
                     metadata: ObjectMeta {
-                        namespace: Some("No0-ns".to_owned()),
+                        namespace: Some("sandbox0-ns".to_owned()),
                         name: Some("sandbox0-name".to_owned()),
                         uid: Some("sandbox0-uid".to_owned()),
                         ..ObjectMeta::default()
