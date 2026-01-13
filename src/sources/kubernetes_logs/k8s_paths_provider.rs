@@ -28,6 +28,25 @@ pub struct K8sPathsProvider {
     use_hostpath_logging_annotation_override: bool,
 }
 
+/// Extracts container name from a log file path.
+/// Only extracts if `extract_databricks_logs` is false (for normal k8s logs).
+/// Otherwise returns `DEFAULT_CONTAINER_NAME`.
+fn extract_container_name_from_path(
+    path: &std::path::Path,
+    extract_databricks_logs: bool,
+) -> String {
+    if !extract_databricks_logs {
+        // Only do this for normal kubernetes logs, as the databricks logs paths may not follow the exact pattern
+        path.parent() // Get directory containing the log file
+            .and_then(|p| p.file_name()) // Get container directory name
+            .and_then(|name| name.to_str())
+            .unwrap_or(DEFAULT_CONTAINER_NAME)
+            .to_string()
+    } else {
+        DEFAULT_CONTAINER_NAME.to_string()
+    }
+}
+
 impl K8sPathsProvider {
     /// Create a new [`K8sPathsProvider`].
     pub const fn new(
@@ -94,17 +113,8 @@ impl PathsProvider for K8sPathsProvider {
                 )
                 // Add the pod metadata associated with the paths.
                 .map(|path| {
-                    // Only extract container_name from the path if extract_databricks_logs is enabled.
-                    // Path format: .../container-name/0.log
-                    let container_name = if self.extract_databricks_logs {
-                        path.parent() // Get directory containing the log file
-                            .and_then(|p| p.file_name()) // Get container directory name
-                            .and_then(|name| name.to_str())
-                            .unwrap_or(DEFAULT_CONTAINER_NAME)
-                            .to_string()
-                    } else {
-                        DEFAULT_CONTAINER_NAME.to_string()
-                    };
+                    let container_name =
+                        extract_container_name_from_path(&path, self.extract_databricks_logs);
 
                     (
                         Some(LogFileInfo {
@@ -989,34 +999,16 @@ mod tests {
 
     #[test]
     fn test_container_name_conditional_extraction() {
-        use super::DEFAULT_CONTAINER_NAME;
+        use super::{DEFAULT_CONTAINER_NAME, extract_container_name_from_path};
 
         let path = PathBuf::from("/var/log/pods/ns_name_uid/my-container/0.log");
 
-        // When extract_databricks_logs is true, extract from path
-        let extract_databricks_logs = true;
-        let container_name = if extract_databricks_logs {
-            path.parent()
-                .and_then(|p| p.file_name())
-                .and_then(|name| name.to_str())
-                .unwrap_or(DEFAULT_CONTAINER_NAME)
-                .to_string()
-        } else {
-            DEFAULT_CONTAINER_NAME.to_string()
-        };
+        // When extract_databricks_logs is false, extract from path
+        let container_name = extract_container_name_from_path(&path, false);
         assert_eq!(container_name, "my-container");
 
-        // When extract_databricks_logs is false, use default
-        let extract_databricks_logs = false;
-        let container_name = if extract_databricks_logs {
-            path.parent()
-                .and_then(|p| p.file_name())
-                .and_then(|name| name.to_str())
-                .unwrap_or(DEFAULT_CONTAINER_NAME)
-                .to_string()
-        } else {
-            DEFAULT_CONTAINER_NAME.to_string()
-        };
+        // When extract_databricks_logs is true, use default
+        let container_name = extract_container_name_from_path(&path, true);
         assert_eq!(container_name, DEFAULT_CONTAINER_NAME);
     }
 }
