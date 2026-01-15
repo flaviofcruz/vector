@@ -350,6 +350,17 @@ pub struct Config {
     #[configurable(derived)]
     #[serde(default)]
     pub multiline: Option<MultilineConfig>,
+
+    /// After reaching EOF, the number of seconds to wait before removing the file, unless new data is written.
+    ///
+    /// If not specified, files are not removed.
+    #[serde(alias = "remove_after", default)]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 0))]
+    #[configurable(metadata(docs::examples = 5))]
+    #[configurable(metadata(docs::examples = 60))]
+    #[configurable(metadata(docs::human_name = "Wait Time Before Removing File"))]
+    pub remove_after_secs: Option<u64>,
 }
 
 const fn default_read_from() -> ReadFromConfig {
@@ -405,6 +416,7 @@ impl Default for Config {
             start_reading_at: None,
             source_context: None,
             multiline: None,
+            remove_after_secs: None,
         }
     }
 }
@@ -679,6 +691,7 @@ struct Source {
     start_reading_at: Option<DateTime<Utc>>,
     source_context: Option<HashMap<String, String>>,
     multiline: Option<MultilineConfig>,
+    remove_after_secs: Option<u64>,
 }
 
 impl Source {
@@ -779,6 +792,7 @@ impl Source {
             start_reading_at: parse_start_reading_at(config.start_reading_at.clone()),
             source_context: config.source_context.clone(),
             multiline: config.multiline.clone(),
+            remove_after_secs: config.remove_after_secs,
         })
     }
 
@@ -824,6 +838,7 @@ impl Source {
             start_reading_at,
             ref source_context,
             multiline,
+            remove_after_secs,
         } = self;
 
         let mut reflectors = Vec::new();
@@ -990,8 +1005,8 @@ impl Source {
                 true,
             ),
             oldest_first,
-            // We do not remove the log files, `kubelet` is responsible for it.
-            remove_after: None,
+            // We do not remove the log files, `kubelet` is responsible for it. not valid for when working in databricks_logs mode.
+            remove_after: remove_after_secs.map(Duration::from_secs),
             // The standard emitter.
             emitter: FileSourceInternalEventsEmitter {
                 include_file_metric_tag,
