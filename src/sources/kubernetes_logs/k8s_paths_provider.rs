@@ -158,15 +158,43 @@ impl PathsProvider for K8sPathsProvider {
 /// See <https://github.com/kubernetes/kubernetes/blob/cea1d4e20b4a7886d8ff65f34c6d4f95efcb4742/pkg/kubelet/pod/mirror_client.go#L80-L81>
 fn extract_pod_logs_directory(pod: &Pod) -> Option<PathBuf> {
     let metadata = &pod.metadata;
-    let namespace = metadata.namespace.as_ref()?;
-    let name = metadata.name.as_ref()?;
+    let pod_name = metadata.name.as_deref().unwrap_or("<unknown>");
+
+    let namespace = match metadata.namespace.as_ref() {
+        Some(ns) => ns,
+        None => {
+            trace!(
+                message = "Skipping pod: missing namespace metadata.",
+                %pod_name,
+            );
+            return None;
+        }
+    };
+
+    let name = match metadata.name.as_ref() {
+        Some(n) => n,
+        None => {
+            trace!(message = "Skipping pod: missing name metadata.",);
+            return None;
+        }
+    };
 
     let uid = if let Some(static_pod_config_hashsum) = extract_static_pod_config_hashsum(metadata) {
         // If there's a static pod config hashsum - use it instead of uid.
         static_pod_config_hashsum
     } else {
         // In the common case - just fallback to the real pod uid.
-        metadata.uid.as_ref()?
+        match metadata.uid.as_ref() {
+            Some(u) => u,
+            None => {
+                trace!(
+                    message = "Skipping pod: missing uid metadata.",
+                    %pod_name,
+                    %namespace,
+                );
+                return None;
+            }
+        }
     };
 
     Some(build_pod_logs_directory(namespace, name, uid))
@@ -185,18 +213,45 @@ const DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX: &str = "/databricks/host-root";
 // 2. The kubelet log directory is used.
 //    For pods that log to a kubelet-managed volume, the emptyDir volume under the pod's UID is
 //    used. This is the default behavior for pods.
+/// The annotation key for the pod name (used when metadata.name includes node suffix).
+const POD_NAME_ANNOTATION_KEY: &str = "dblet.dev/pod-name";
+
 fn extract_databricks_pod_logs_directory(
     pod: &Pod,
     use_hostpath_logging_annotation_override: bool,
 ) -> Option<PathBuf> {
     // Allow the hostPath logging annotation override to be used in place of the kubelet log directory.
     let metadata = &pod.metadata;
+    // Prefer the dblet.dev/pod-name annotation over metadata.name, as metadata.name may include
+    // a node IP suffix in some environments (e.g., pod pools).
+    let pod_name_from_annotation = metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(POD_NAME_ANNOTATION_KEY))
+        .map(|s| s.as_str());
+    let pod_name_from_metadata = metadata.name.as_deref();
+    trace!(
+        message = "Extracting pod name for Databricks logs.",
+        pod_name_from_annotation = ?pod_name_from_annotation,
+        pod_name_from_metadata = ?pod_name_from_metadata,
+    );
+    let pod_name = pod_name_from_annotation.or(pod_name_from_metadata);
+
     let uid = if let Some(static_pod_config_hashsum) = extract_static_pod_config_hashsum(metadata) {
         // If there's a static pod config hashsum - use it instead of uid.
         static_pod_config_hashsum
     } else {
         // In the common case - just fallback to the real pod uid.
-        metadata.uid.as_ref()?
+        match metadata.uid.as_ref() {
+            Some(u) => u,
+            None => {
+                trace!(
+                    message = "Skipping pod: missing uid metadata for Databricks logs.",
+                    pod_name = ?pod_name,
+                );
+                return None;
+            }
+        }
     };
 
     if use_hostpath_logging_annotation_override {
@@ -208,15 +263,45 @@ fn extract_databricks_pod_logs_directory(
                     .get(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY)
                     .map(|value| value.as_str())
             });
-        hostpath_logging_annotation.map(|value| {
-            let pod_name = metadata.name.as_deref().unwrap_or("");
-            let resolved_value = value.replace("$POD_NAME", pod_name);
-            PathBuf::from(format!(
-                "{}/{}",
-                DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX,
-                resolved_value.trim_start_matches('/')
-            ))
-        })
+        match hostpath_logging_annotation {
+            Some(value) => {
+                // If the annotation contains $POD_NAME but we don't have a pod name, skip this pod.
+                let resolved_value = if value.contains("$POD_NAME") {
+                    match pod_name {
+                        Some(name) => value.replace("$POD_NAME", name),
+                        None => {
+                            trace!(
+                                message = "Skipping pod: annotation contains $POD_NAME but pod name is unavailable.",
+                                annotation_value = %value,
+                            );
+                            return None;
+                        }
+                    }
+                } else {
+                    value.to_string()
+                };
+                let resolved_path = PathBuf::from(format!(
+                    "{}/{}",
+                    DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX,
+                    resolved_value.trim_start_matches('/')
+                ));
+                trace!(
+                    message = "Resolved hostpath logging annotation for pod.",
+                    pod_name = ?pod_name,
+                    annotation_value = %value,
+                    resolved_path = %resolved_path.display(),
+                );
+                Some(resolved_path)
+            }
+            None => {
+                trace!(
+                    message = "Skipping pod: missing hostpath logging annotation.",
+                    pod_name = ?pod_name,
+                    annotation_key = %DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY,
+                );
+                None
+            }
+        }
     } else {
         // Use the kubelet log directory to determine the Databricks logs directory.
         Some(build_databricks_k8s_pod_logs_directory(uid))
@@ -273,14 +358,45 @@ where
             .to_str()
             .expect("non-utf8 path to pod logs dir is not supported");
 
-        // Run the glob to get a list of unfiltered paths.
-        let pod_logs_glob_patterns_globs = pod_logs_glob_patterns
+        let pod_name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
+        trace!(
+            message = "Resolved pod logs directory.",
+            %pod_name,
+            pod_logs_directory = %dir,
+        );
+
+        // Build the full glob patterns for logging.
+        let full_glob_patterns: Vec<String> = pod_logs_glob_patterns
             .iter()
-            .map(|pattern| glob_impl(&[dir, pattern].join("/")))
+            .map(|pattern| [dir, pattern].join("/"))
+            .collect();
+
+        trace!(
+            message = "Applying glob patterns to pod logs directory.",
+            %pod_name,
+            glob_patterns = ?full_glob_patterns,
+        );
+
+        // Run the glob to get a list of unfiltered paths.
+        let pod_logs_glob_patterns_globs = full_glob_patterns
+            .iter()
+            .map(|pattern| glob_impl(pattern))
             .collect::<Vec<_>>();
 
         // Combine the paths for the user-specified glob patterns.
-        let path_iter = pod_logs_glob_patterns_globs.into_iter().flatten();
+        // Collect to a Vec so we can log the found paths.
+        let found_paths: Vec<PathBuf> =
+            pod_logs_glob_patterns_globs.into_iter().flatten().collect();
+
+        trace!(
+            message = "Files found by glob patterns.",
+            %pod_name,
+            pod_logs_directory = %dir,
+            files_found = ?found_paths,
+            count = found_paths.len(),
+        );
+
+        let path_iter = found_paths.into_iter();
 
         // Extract the containers to exclude, then build patterns from them
         // and cache the results into a Vec.

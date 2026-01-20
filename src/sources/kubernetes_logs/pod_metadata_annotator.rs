@@ -323,6 +323,11 @@ fn annotate_from_metadata(
     }
 
     if let Some(labels) = &metadata.labels {
+        trace!(
+            message = "Pod metadata labels.",
+            pod_name = ?metadata.name,
+            labels = ?labels,
+        );
         let legacy_key_prefix = fields_spec.pod_labels.path.as_ref().map(|k| &k.path);
 
         for (key, value) in labels.iter() {
@@ -342,6 +347,11 @@ fn annotate_from_metadata(
     }
 
     if let Some(annotations) = &metadata.annotations {
+        trace!(
+            message = "Pod metadata annotations.",
+            pod_name = ?metadata.name,
+            annotations = ?annotations,
+        );
         let legacy_key_prefix = fields_spec.pod_annotations.path.as_ref().map(|k| &k.path);
 
         for (key, value) in annotations.iter() {
