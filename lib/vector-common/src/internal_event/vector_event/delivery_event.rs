@@ -82,10 +82,6 @@ pub struct VectorSinkDeliveryEvent {
     pub delivered_call_count: Arc<AtomicU32>,
 }
 
-pub trait EventWithEventLog {
-    fn compute_event_log(&self) -> VectorSinkDeliveryEvent;
-}
-
 impl VectorSinkDeliveryEvent {
     pub fn new() -> Self {
         Self {

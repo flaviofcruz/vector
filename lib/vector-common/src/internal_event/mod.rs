@@ -3,12 +3,12 @@ mod bytes_sent;
 pub mod cached_event;
 pub mod component_events_dropped;
 pub mod component_events_timed_out;
-pub mod delivery_event;
 mod events_received;
 mod events_sent;
 mod optional_tag;
 mod prelude;
 pub mod service;
+pub mod vector_event;
 
 use std::ops::{Add, AddAssign};
 
@@ -18,13 +18,13 @@ pub use bytes_sent::BytesSent;
 pub use cached_event::{RegisterTaggedInternalEvent, RegisteredEventCache};
 pub use component_events_dropped::{ComponentEventsDropped, INTENTIONAL, UNINTENTIONAL};
 pub use component_events_timed_out::ComponentEventsTimedOut;
-pub use delivery_event::DeliveryReadEvent;
 pub use events_received::{EventsReceived, EventsReceivedHandle};
 pub use events_sent::{DEFAULT_OUTPUT, EventsSent, TaggedEventsSent};
 pub use metrics::SharedString;
 pub use optional_tag::OptionalTag;
 pub use prelude::{error_stage, error_type};
 pub use service::{CallError, PollReadyError};
+pub use vector_event::delivery_event::DeliveryReadEvent;
 
 use crate::json_size::JsonSize;
 

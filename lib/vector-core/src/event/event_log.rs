@@ -8,8 +8,10 @@ use std::sync::OnceLock;
 use crate::event::proto::EventWrapper;
 use crate::event::{Event, EventArray, LogEvent};
 
-use vector_common::internal_event::delivery_event::{
-    EventWithEventLog, MetadataValuesCount, VectorSinkDeliveryEvent,
+use vector_common::internal_event::vector_event::{
+    EventWithEventLog, VectorSinkEventMetadata,
+    delivery_event::{MetadataValuesCount, VectorSinkDeliveryEvent},
+    file_send_event::{FileEventMetadata, VectorFileSendEvent},
 };
 
 use vector_common::byte_size_of::ByteSizeOf;
@@ -19,17 +21,6 @@ pub static EVENT_LOG_METADATA_FIELD: OnceLock<String> = OnceLock::new();
 // One for send/upload events (EVENT_LOG_GRANULARITY_FIELDS) and one for delivery events (DELIVERY_EVENT_LOG_GRANULARITY_FIELDS)
 pub static EVENT_LOG_GRANULARITY_FIELDS: OnceLock<Vec<String>> = OnceLock::new();
 pub static DELIVERY_EVENT_LOG_GRANULARITY_FIELDS: OnceLock<Vec<String>> = OnceLock::new();
-pub static ENABLE_FILE_SEND_EVENTS: OnceLock<bool> = OnceLock::new();
-
-// File send events aren't default enabled until the send/uploading events messages are deprecated
-// Otherwise, we'll be double-sending events in VA which will be a lot of extra volume
-pub fn enable_file_send_events() -> bool {
-    *ENABLE_FILE_SEND_EVENTS.get_or_init(|| {
-        env::var("ENABLE_FILE_SEND_EVENTS")
-            .map(|v| v == "true")
-            .unwrap_or(false)
-    })
-}
 
 // Where we can find the log metadata object
 pub fn get_event_log_metadata_field() -> &'static String {
@@ -158,9 +149,41 @@ pub fn generate_count_map_from_event_array(
     }
 }
 
+fn compute_event_log(event: Event) -> VectorSinkEventMetadata {
+    let delivery_event =
+        VectorSinkDeliveryEvent::with_count_map(generate_count_map(&vec![event.clone()], true));
+    VectorSinkEventMetadata {
+        delivery_event: delivery_event,
+        file_send_event: None,
+    }
+}
+
+fn compute_event_log_with_file_event(
+    event: Event,
+    file_metadata: FileEventMetadata,
+) -> VectorSinkEventMetadata {
+    let delivery_event =
+        VectorSinkDeliveryEvent::with_count_map(generate_count_map(&vec![event.clone()], true));
+    let file_send_event = Some(VectorFileSendEvent {
+        file_metadata: file_metadata,
+        count_map: generate_count_map(&vec![event.clone()], false),
+    });
+    VectorSinkEventMetadata {
+        delivery_event: delivery_event,
+        file_send_event: file_send_event,
+    }
+}
+
 // Impl EventWithEventLog for the used log events
 impl EventWithEventLog for Event {
-    fn compute_event_log(&self) -> VectorSinkDeliveryEvent {
-        VectorSinkDeliveryEvent::with_count_map(generate_count_map(&vec![self.clone()], true))
+    fn compute_event_log(&self) -> VectorSinkEventMetadata {
+        compute_event_log(self.clone())
+    }
+
+    fn compute_event_log_with_file_event(
+        &self,
+        file_metadata: FileEventMetadata,
+    ) -> VectorSinkEventMetadata {
+        compute_event_log_with_file_event(self.clone(), file_metadata)
     }
 }

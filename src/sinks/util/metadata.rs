@@ -1,8 +1,9 @@
 use std::num::NonZeroUsize;
 
 use super::request_builder::EncodeResult;
-use vector_common::internal_event::delivery_event::{
-    EventWithEventLog, VectorSinkDeliveryEvent, combine_sink_delivery_events,
+use vector_common::internal_event::vector_event::{
+    EventWithEventLog, VectorSinkEventMetadata, combine_sink_event_metadata,
+    file_send_event::FileEventMetadata,
 };
 use vector_lib::{
     ByteSizeOf, EstimatedJsonEncodedSizeOf, config,
@@ -15,7 +16,7 @@ pub struct RequestMetadataBuilder {
     events_byte_size: usize,
     grouped_events_byte_size: GroupedCountByteSize,
     // Keep it an option since we can't default expect metadata to work for each sink
-    event_log_metadata: Option<VectorSinkDeliveryEvent>,
+    event_log_metadata: Option<VectorSinkEventMetadata>,
 }
 
 impl RequestMetadataBuilder {
@@ -40,7 +41,10 @@ impl RequestMetadataBuilder {
         }
     }
 
-    pub fn from_events_with_event_log<E>(events: &[E]) -> Self
+    pub fn from_events_with_event_log<E>(
+        events: &[E],
+        file_metadata: Option<FileEventMetadata>,
+    ) -> Self
     where
         // Events is defined to take a generic type that can compute certain metadata
         // To fit this setup, we also require that it can generate event log metadata too
@@ -48,12 +52,18 @@ impl RequestMetadataBuilder {
         E: ByteSizeOf + GetEventCountTags + EstimatedJsonEncodedSizeOf + EventWithEventLog,
     {
         let mut builder = Self::from_events(events);
-        builder.event_log_metadata = Some(combine_sink_delivery_events(
+        let metadatas = if let Some(metadata) = file_metadata {
+            events
+                .iter()
+                .map(|event| event.compute_event_log_with_file_event(metadata.clone()))
+                .collect::<Vec<_>>()
+        } else {
             events
                 .iter()
                 .map(|event| event.compute_event_log())
-                .collect::<Vec<_>>(),
-        ));
+                .collect::<Vec<_>>()
+        };
+        builder.event_log_metadata = Some(combine_sink_event_metadata(metadatas));
         builder
     }
 
@@ -72,12 +82,18 @@ impl RequestMetadataBuilder {
         }
     }
 
-    pub fn from_event_with_event_log<E>(event: &E) -> Self
+    // Passing file_metadata is optional. We will just have a delivery event if not specified
+    pub fn from_event_with_event_log<E>(event: &E, file_metadata: Option<FileEventMetadata>) -> Self
     where
         E: ByteSizeOf + GetEventCountTags + EstimatedJsonEncodedSizeOf + EventWithEventLog,
     {
         let mut builder = Self::from_event(event);
-        builder.event_log_metadata = Some(event.compute_event_log());
+        let event_log_metadata = if let Some(metadata) = file_metadata {
+            event.compute_event_log_with_file_event(metadata)
+        } else {
+            event.compute_event_log()
+        };
+        builder.event_log_metadata = Some(event_log_metadata);
         builder
     }
 
@@ -85,7 +101,7 @@ impl RequestMetadataBuilder {
         event_count: usize,
         events_byte_size: usize,
         grouped_events_byte_size: GroupedCountByteSize,
-        event_log_metadata: Option<VectorSinkDeliveryEvent>,
+        event_log_metadata: Option<VectorSinkEventMetadata>,
     ) -> Self {
         Self {
             event_count,
@@ -131,7 +147,7 @@ impl RequestMetadataBuilder {
             self.grouped_events_byte_size.clone(),
             self.event_log_metadata
                 .clone()
-                .unwrap_or(VectorSinkDeliveryEvent::new()),
+                .unwrap_or(VectorSinkEventMetadata::new()),
         )
     }
 

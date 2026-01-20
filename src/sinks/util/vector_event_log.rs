@@ -42,6 +42,7 @@ where
     S::Future: Send + 'static,
     // This is the base request, which will have a wrapped layer around it to help with delivery event logs
     Req: Finalizable + MetaDescriptive + Send + 'static,
+    S::Error: std::fmt::Debug,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -53,8 +54,15 @@ where
 
     fn call(&mut self, req: Req) -> Self::Future {
         if self.enable_logs {
-            let delivery_event_log = req.get_metadata().event_log_metadata().clone();
+            let event_log_metadata = req.get_metadata().event_log_metadata().clone();
+            let delivery_event_log = event_log_metadata.delivery_event;
+            // let file_send_event_log = event_log_metadata.file_send_event;
+
             delivery_event_log.emit_staged_event();
+            // Only emit if specified (for many sinks it won't be)
+            if let Some(file_send_event_log) = event_log_metadata.file_send_event.as_ref() {
+                file_send_event_log.emit_staged_event();
+            }
             let response = self.inner.call(req);
             // Give back the response from the inner service, but first log the delivery event
             Box::pin(async move {
@@ -62,6 +70,13 @@ where
                 // Only log if the request succeeded (gives back OK)
                 if response.is_ok() {
                     delivery_event_log.emit_delivered_event();
+                    if let Some(file_send_event_log) = event_log_metadata.file_send_event.as_ref() {
+                        file_send_event_log.emit_uploaded_event();
+                    }
+                } else if let Err(ref e) = response {
+                    if let Some(file_send_event_log) = event_log_metadata.file_send_event.as_ref() {
+                        file_send_event_log.emit_error_event(format!("{:?}", e));
+                    }
                 }
                 response
             })
@@ -81,7 +96,7 @@ mod tests {
     use crate::event::EventFinalizers;
     use std::pin::Pin;
     use std::sync::atomic::Ordering;
-    use vector_common::internal_event::delivery_event::VectorSinkDeliveryEvent;
+    use vector_common::internal_event::vector_event::VectorSinkEventMetadata;
     use vector_lib::event::{BatchNotifier, EventFinalizer};
     use vector_lib::request_metadata::GroupedCountByteSize;
     use vector_lib::request_metadata::RequestMetadata;
@@ -96,7 +111,7 @@ mod tests {
     }
 
     impl DoubleRequest {
-        pub fn new(value: u32, event_log: VectorSinkDeliveryEvent) -> Self {
+        pub fn new(value: u32, event_log: VectorSinkEventMetadata) -> Self {
             Self {
                 value,
                 finalizers: EventFinalizers::new(EventFinalizer::new(
@@ -165,12 +180,18 @@ mod tests {
             inner: inner_service,
             enable_logs: true,
         };
-        let event_log = VectorSinkDeliveryEvent::new();
+        let event_log = VectorSinkEventMetadata::new();
         let request = DoubleRequest::new(1, event_log.clone());
         let response = event_logging_service.call(request).await;
 
         assert_eq!(response.unwrap(), 2);
-        assert_eq!(event_log.delivered_call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            event_log
+                .delivery_event
+                .delivered_call_count
+                .load(Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
@@ -181,11 +202,17 @@ mod tests {
             inner: inner_service,
             enable_logs: true,
         };
-        let event_log = VectorSinkDeliveryEvent::new();
+        let event_log = VectorSinkEventMetadata::new();
         let request = DoubleRequest::new(0, event_log.clone());
         let response = event_logging_service.call(request).await;
 
         assert!(response.is_err());
-        assert_eq!(event_log.delivered_call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            event_log
+                .delivery_event
+                .delivered_call_count
+                .load(Ordering::SeqCst),
+            0
+        );
     }
 }

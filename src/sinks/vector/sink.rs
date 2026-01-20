@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use prost::Message;
 use tower::Service;
-use vector_common::internal_event::delivery_event::VectorSinkDeliveryEvent;
+use vector_common::internal_event::vector_event::{
+    VectorSinkEventMetadata, delivery_event::VectorSinkDeliveryEvent,
+};
 use vector_lib::event::event_log::generate_count_map_event_wrapper;
 use vector_lib::{
     ByteSizeOf, EstimatedJsonEncodedSizeOf,
@@ -92,7 +94,10 @@ where
                     event_collection.events.len(),
                     event_collection.events_byte_size,
                     event_collection.events_json_byte_size,
-                    Some(delivery_event_log),
+                    Some(VectorSinkEventMetadata {
+                        delivery_event: delivery_event_log,
+                        file_send_event: None,
+                    }),
                 );
 
                 let encoded_events = proto_vector::PushEventsRequest {

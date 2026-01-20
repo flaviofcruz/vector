@@ -4,8 +4,7 @@ use regex::Regex;
 use serde_json;
 use std::collections::HashMap;
 
-use vector_common::internal_event::delivery_event::MetadataValuesCount;
-use vector_lib::event::event_log::enable_file_send_events;
+use vector_common::internal_event::vector_event::delivery_event::MetadataValuesCount;
 
 // Struct for vector send events (sending, uploaded)
 #[derive(Clone, Debug, Default)]
@@ -34,26 +33,12 @@ impl VectorEventLogSendMetadata {
         // VECTOR_UPLOADED_MESSAGES_EVENT
         // This will be deprecated in favor of log delivery events
         self.emit_count_map("Uploaded events.", 4);
-        if enable_file_send_events() {
-            self.emit_file_send_event(
-                "File send complete.",
-                "VECTOR_FILE_SEND_EVENT",
-                "VECTOR_FILE_SEND_COMPLETE",
-            );
-        }
     }
 
     pub fn emit_sending_event(&self) {
         // VECTOR_SENDING_MESSAGES_EVENT
         // This will be deprecated in favor of log delivery events
         self.emit_count_map("Sending events.", 3);
-        if enable_file_send_events() {
-            self.emit_file_send_event(
-                "File send start.",
-                "VECTOR_FILE_SEND_EVENT",
-                "VECTOR_FILE_SEND_START",
-            );
-        }
     }
 
     fn emit_count_map(&self, message: &str, event_type: usize) {
@@ -66,30 +51,6 @@ impl VectorEventLogSendMetadata {
                 blob = self.blob,
                 container = self.container,
                 vector_event_type = event_type,
-                internal_log_rate_limit = false,
-            );
-        }
-    }
-
-    fn emit_file_send_event(
-        &self,
-        message: &str,
-        vector_event_type: &str,
-        file_send_event_type: &str,
-    ) {
-        // We actually expect all events in a file to have the same metadata fields
-        // But technically, we could send multiple per file if we misconfig + some logs in the same file have different metadata
-        // Better to be more granular than less in this case, so we iterate through the metadata assuming it can have multiple
-        for value in self.count_map.values() {
-            info!(
-                message = message,
-                keys = serde_json::to_string(&value.value_map).unwrap(),
-                bytes = value.size,
-                events_len = value.count,
-                blob = self.blob,
-                container = self.container,
-                vector_event_type = vector_event_type,
-                file_send_event_type = file_send_event_type,
                 internal_log_rate_limit = false,
             );
         }

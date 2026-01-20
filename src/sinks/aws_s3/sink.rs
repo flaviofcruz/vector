@@ -3,6 +3,7 @@ use std::io;
 use bytes::Bytes;
 use chrono::{FixedOffset, Utc};
 use uuid::Uuid;
+use vector_common::internal_event::vector_event::file_send_event::FileEventMetadata;
 use vector_lib::event::event_log::generate_count_map;
 use vector_lib::{codecs::encoding::Framer, event::Finalizable, request_metadata::RequestMetadata};
 
@@ -56,7 +57,11 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
         input: (S3PartitionKey, Vec<Event>),
     ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
         let (partition_key, mut events) = input;
-        let builder = RequestMetadataBuilder::from_events_with_event_log(&events);
+        // We don't need to pass file metadata here especially since it isn't fully populated yet
+        let builder = RequestMetadataBuilder::from_events_with_event_log(
+            &events,
+            Some(FileEventMetadata::default()),
+        );
 
         let finalizers = events.take_finalizers();
         let s3_key_prefix = partition_key.key_prefix.clone();
@@ -126,7 +131,14 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
 
         let body = payload.into_payload();
 
+        let mut request_metadata = request_metadata;
         // Update some components of the metadata since they've been computed now
+        request_metadata.update_file_metadata(
+            body.len(),
+            s3metadata.count,
+            s3metadata.s3_key.clone(),
+            self.bucket.clone(),
+        );
         s3metadata.event_log_metadata.bytes = body.len();
         s3metadata.event_log_metadata.blob = s3metadata.s3_key.clone();
         s3metadata.event_log_metadata.emit_sending_event();

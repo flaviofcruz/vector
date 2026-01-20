@@ -13,7 +13,7 @@ use tokio::{
     sync::watch,
     time::{interval, sleep_until},
 };
-use vector_common::internal_event::delivery_event::VectorSinkDeliveryEvent;
+use vector_common::internal_event::vector_event::delivery_event::VectorSinkDeliveryEvent;
 use vector_lib::event::event_log::generate_count_map_from_event_array;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf,
