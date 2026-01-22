@@ -22,6 +22,7 @@ use kube::{
 };
 use lifecycle::Lifecycle;
 use serde_with::serde_as;
+use vector_lib::internal_event::DeliveryReadEvent;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf, TimeZone,
     codecs::{BytesDeserializer, BytesDeserializerConfig},
@@ -1042,17 +1043,8 @@ impl Source {
                 &line.filename,
                 ingestion_timestamp_field.as_ref(),
                 log_namespace,
+                &self.source_context,
             );
-
-            // Apply additional fields as specified by the source context if needed
-            if let Some(source_context) = &self.source_context {
-                for (key, value) in source_context {
-                    let path = format!("source_context.{}", key);
-                    // We don't want things like namespace consideration here since we want this value to be in a consistent spot
-                    // So we don't use the insert_source_metadata function and just directly insert
-                    event.as_mut_log().insert(path.as_str(), value.clone());
-                }
-            }
 
             let cached_file_info = file_to_pod_map
                 .lock()
@@ -1171,6 +1163,7 @@ fn create_event(
     file: &str,
     ingestion_timestamp_field: Option<&OwnedTargetPath>,
     log_namespace: LogNamespace,
+    source_context: &Option<HashMap<String, String>>,
 ) -> Event {
     let deserializer = BytesDeserializer;
     let mut log = deserializer.parse_single(line, log_namespace);
@@ -1203,6 +1196,24 @@ fn create_event(
         // The CRI/Docker parsers handle inserting the `log_schema().timestamp_key()` value.
         (LogNamespace::Legacy, None) => (),
     };
+
+    // Apply additional fields as specified by the source context if needed
+    if let Some(source_context) = source_context {
+        for (key, value) in source_context {
+            let path = format!("source_context.{}", key);
+            // We don't want things like namespace consideration here since we want this value to be in a consistent spot
+            // So we don't use the insert_source_metadata function and just directly insert
+            log.insert(path.as_str(), value.clone());
+        }
+    };
+
+    emit!(DeliveryReadEvent {
+        path: file.to_string(),
+        bytes_read: log.estimated_json_encoded_size_of().get(),
+        lines_read: 1,
+        source_context: source_context.clone(),
+        emitted_after_multiline_agg: true,
+    });
 
     log.into()
 }
