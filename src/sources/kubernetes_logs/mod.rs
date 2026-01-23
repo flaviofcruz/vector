@@ -3,6 +3,7 @@
 //! at "/var/log/pods" on the host of the Kubernetes Node when Vector itself is
 //! running inside the cluster as a DaemonSet.
 
+#![allow(unused_variables, dead_code, unused_imports)]
 #![deny(missing_docs)]
 use std::{cmp::min, collections::HashMap, path::PathBuf, time::Duration};
 
@@ -1051,7 +1052,7 @@ impl Source {
                 .unwrap()
                 .get(&PathBuf::from(&line.filename))
                 .cloned();
-            let file_info = annotator.annotate(&mut event, &line.filename, cached_file_info);
+            let file_info = annotator.annotate(&mut event, &line.filename, cached_file_info.clone());
 
             emit!(KubernetesLogsEventsReceived {
                 file: &line.filename,
@@ -1063,6 +1064,7 @@ impl Source {
             });
 
             if file_info.is_none() {
+                trace!(message = "Failed to find pod for file", path = ?line.filename, cached_file_info = ?cached_file_info, file_to_pod_map = ?file_to_pod_map);
                 emit!(KubernetesLogsEventAnnotationError { event: &event });
             } else {
                 let namespace = file_info.as_ref().map(|info| info.pod_namespace.to_owned());
@@ -1074,11 +1076,12 @@ impl Source {
                     emit!(KubernetesLogsEventNamespaceAnnotationError { event: &event });
                 }
 
+                /* enable when PLAT-146370 is fixed. this is polluting logs.
                 let node_info = node_annotator.annotate(&mut event, self_node_name.as_str());
-
                 if node_info.is_none() {
                     emit!(KubernetesLogsEventNodeAnnotationError { event: &event });
                 }
+                */
             }
 
             checkpoints.update(line.file_id, line.end_offset);

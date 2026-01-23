@@ -67,3 +67,4 @@ This lists custom changes merged in Databricks fork of Vector.
 66. Add trace logging to kubernetes_logs source for path resolution and debugging; use dblet.dev/pod-name annotation for $POD_NAME substitution https://github.com/databricks-eng/vector/pull/365
 67. Refactor send events + emit error events https://github.com/databricks-eng/vector/pull/364
 68. refactor delivery event log in k8s log source https://github.com/databricks-eng/vector/pull/367
+69. temporarily disable some logs for known issue to stop polluting logs https://github.com/databricks-eng/vector/pull/368
