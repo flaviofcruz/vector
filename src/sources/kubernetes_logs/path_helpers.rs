@@ -10,7 +10,7 @@ use vector_lib::file_source::paths_provider::LogFileInfo;
 /// The root directory for pod logs.
 const K8S_LOGS_DIR: &str = "/var/log/pods";
 const DATABRICKS_K8S_LOGS_DIR: &str = "/var/lib/kubelet/pods";
-const DATABRICKS_K8S_LOGS_DIR_SUFFIX: &str = "/volumes/kubernetes.io~empty-dir";
+const DATABRICKS_K8S_LOGS_DIR_SUFFIX: &str = "volumes/kubernetes.io~empty-dir";
 
 /// The delimiter used in the log path.
 const LOG_PATH_DELIMITER: &str = "_";
