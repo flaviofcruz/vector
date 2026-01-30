@@ -68,3 +68,4 @@ This lists custom changes merged in Databricks fork of Vector.
 67. Refactor send events + emit error events https://github.com/databricks-eng/vector/pull/364
 68. refactor delivery event log in k8s log source https://github.com/databricks-eng/vector/pull/367
 69. temporarily disable some logs for known issue to stop polluting logs https://github.com/databricks-eng/vector/pull/368
+70. Instrument file sink with delivery events https://github.com/databricks-eng/vector/pull/371
