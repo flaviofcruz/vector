@@ -24,16 +24,19 @@ mod headers {
     pub(super) const CONTENT_ENCODING: &str = "Content-Encoding";
     pub(super) const CONTENT_TYPE: &str = "Content-Type";
     pub(super) const X_SCOPE_ORGID: &str = "X-Scope-OrgID";
+    // Tenant header for Thanos
+    pub(super) const THANOS_TENANT: &str = "THANOS-TENANT";
 
     pub(super) const VERSION: &str = "0.1.0";
     pub(super) const APPLICATION_X_PROTOBUF: &str = "application/x-protobuf";
 }
 
-pub const RESERVED_HEADERS: [&str; 4] = [
+pub const RESERVED_HEADERS: [&str; 5] = [
     headers::X_PROMETHEUS_REMOTE_WRITE_VERSION,
     headers::CONTENT_ENCODING,
     headers::CONTENT_TYPE,
     headers::X_SCOPE_ORGID,
+    headers::THANOS_TENANT,
 ];
 
 #[derive(Clone)]
@@ -131,6 +134,8 @@ pub(super) async fn build_request(
 
     if let Some(tenant_id) = tenant_id {
         builder = builder.header(headers::X_SCOPE_ORGID, tenant_id);
+        // Thanos expects the tenant ID in the THANOS-TENANT header
+        builder = builder.header(headers::THANOS_TENANT, tenant_id);
     }
 
     for (header, value) in custom_headers.iter() {

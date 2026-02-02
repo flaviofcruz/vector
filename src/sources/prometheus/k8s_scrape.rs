@@ -323,7 +323,7 @@ async fn scrape_loop(
                     continue;
                 }
 
-                info!(message = "Scraping endpoints from {count} pods.", count = endpoints.len(), ?endpoints, internal_log_rate_secs = 300);
+                info!(message = "Scraping endpoints from pods.", count = endpoints.len(), ?endpoints, internal_log_rate_secs = 300);
 
                 // Scrape all endpoints concurrently
                 let scrape_futures: Vec<_> = endpoints

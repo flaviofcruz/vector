@@ -85,7 +85,7 @@ pub struct RemoteWriteConfig {
 
     /// The tenant ID to send.
     ///
-    /// If set, a header named `X-Scope-OrgID` is added to outgoing requests with the value of this setting.
+    /// If set, 2 headers named `X-Scope-OrgID` and `THANOS-TENANT` are added to outgoing requests with the value of this setting.
     ///
     /// This may be used by Cortex or other remote services to identify the tenant making the request.
     #[serde(default)]
