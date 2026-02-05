@@ -348,8 +348,8 @@ fn get_databricks_pod_logs_directories(
         log_dirs.push(empty_dir_pod_logs_directory.clone());
         // Then, include the direct subdirectories in the list of paths.
         let subdirectories = std::fs::read_dir(&empty_dir_pod_logs_directory);
-        if subdirectories.is_ok() {
-            log_dirs.extend(subdirectories.unwrap().filter_map(|entry| {
+        if let Ok(subdirectories) = subdirectories {
+            log_dirs.extend(subdirectories.filter_map(|entry| {
                 entry
                     .ok()
                     .and_then(|entry| {
@@ -366,6 +366,13 @@ fn get_databricks_pod_logs_directories(
                     })
                     .and_then(|entry| entry.is_dir().then_some(entry))
             }));
+        } else {
+            warn!(
+                message = "Failed to read subdirectories of emptyDir pod logs directory.",
+                pod = ?pod.metadata.name,
+                log_directory = ?empty_dir_pod_logs_directory.to_str(),
+                error = subdirectories.err().map(|e| e.to_string()),
+            );
         }
     }
     // If the hostpath logging annotation override is used, also include the hostpath logs directory
