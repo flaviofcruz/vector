@@ -7,8 +7,16 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::reflector::store::Store;
 use tracing::trace;
 
-/// Type alias for endpoint URLs
-pub type Endpoint = String;
+/// Represents a Kubernetes pod endpoint for Prometheus scraping
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    /// The full URL to scrape metrics from (e.g., "http://10.0.0.1:9090/metrics")
+    pub url: String,
+    /// The name of the pod
+    pub name: String,
+    /// The namespace of the pod
+    pub namespace: String,
+}
 
 /// Trait for providing endpoints for Prometheus scraping
 pub trait EndpointProvider {
@@ -104,6 +112,10 @@ fn extract_metrics_endpoint(pod: &Pod, port_name: &str) -> Option<Endpoint> {
     // Get the pod IP from status
     let pod_ip = pod.status.as_ref()?.pod_ip.as_ref()?;
 
+    // Get pod name and namespace from metadata
+    let name = pod.metadata.name.clone().unwrap_or_default();
+    let namespace = pod.metadata.namespace.clone().unwrap_or_default();
+
     // Find the port number with the specified name
     let port_number = pod.spec.as_ref()?.containers.iter().find_map(|container| {
         container.ports.as_ref()?.iter().find_map(|port| {
@@ -116,16 +128,21 @@ fn extract_metrics_endpoint(pod: &Pod, port_name: &str) -> Option<Endpoint> {
     })?;
 
     // Construct the endpoint URL
-    let endpoint = format!("http://{}:{}/metrics", pod_ip, port_number);
+    let url = format!("http://{}:{}/metrics", pod_ip, port_number);
 
     trace!(
         message = "Created endpoint for pod with named port.",
-        pod = ?pod.metadata.name,
+        pod = %name,
+        namespace = %namespace,
         port_name,
-        endpoint = %endpoint
+        endpoint = %url
     );
 
-    Some(endpoint)
+    Some(Endpoint {
+        url,
+        name,
+        namespace,
+    })
 }
 
 #[cfg(test)]
@@ -192,6 +209,7 @@ mod tests {
         let pod = Pod {
             metadata: ObjectMeta {
                 name: Some("test-pod".to_string()),
+                namespace: Some("test-namespace".to_string()),
                 ..Default::default()
             },
             spec: Some(PodSpec {
@@ -214,7 +232,14 @@ mod tests {
         };
 
         let endpoint = extract_metrics_endpoint(&pod, "user-metrics");
-        assert_eq!(endpoint, Some("http://10.244.1.5:9090/metrics".to_string()));
+        assert_eq!(
+            endpoint,
+            Some(Endpoint {
+                url: "http://10.244.1.5:9090/metrics".to_string(),
+                name: "test-pod".to_string(),
+                namespace: "test-namespace".to_string(),
+            })
+        );
     }
 
     #[test]

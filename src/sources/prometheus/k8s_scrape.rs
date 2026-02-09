@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use vector_lib::{config::LogNamespace, configurable::configurable_component, event::Event};
 
 use super::{
-    k8s_endpoint_provider::{EndpointProvider, K8sEndpointProvider},
+    k8s_endpoint_provider::{Endpoint, EndpointProvider, K8sEndpointProvider},
     parser,
 };
 use crate::kubernetes::reflector::custom_reflector;
@@ -385,7 +385,7 @@ async fn scrape_loop(
 }
 
 async fn scrape_endpoint(
-    endpoint: String,
+    endpoint: Endpoint,
     client: http_client::HttpClient,
     timeout: Duration,
     auth: Option<Auth>,
@@ -397,9 +397,9 @@ async fn scrape_endpoint(
     use http_body::Body as _;
     use hyper::{Body, Request};
 
-    debug!(message = "Scraping endpoint.", %endpoint);
+    debug!(message = "Scraping endpoint.", endpoint = %endpoint.url, pod = %endpoint.name, namespace = %endpoint.namespace);
 
-    let uri: hyper::Uri = endpoint.parse()?;
+    let uri: hyper::Uri = endpoint.url.parse()?;
     let mut request_builder = Request::get(uri);
 
     // Apply authentication if configured
@@ -411,11 +411,13 @@ async fn scrape_endpoint(
 
     let response = tokio::time::timeout(timeout, client.request(request))
         .await
-        .map_err(|_| format!("Request timeout: {}", endpoint))?
+        .map_err(|_| format!("Request timeout: {}", endpoint.url))?
         .map_err(|e| {
             warn!(
                 message = "Failed to scrape endpoint.",
-                %endpoint,
+                endpoint = %endpoint.url,
+                pod = %endpoint.name,
+                namespace = %endpoint.namespace,
                 error = ?e,
                 internal_log_rate_secs = 60
             );
@@ -431,7 +433,10 @@ async fn scrape_endpoint(
         .map_err(|error| {
             emit!(PrometheusParseError {
                 error,
-                url: endpoint.parse().unwrap_or_else(|_| http::Uri::default()),
+                url: endpoint
+                    .url
+                    .parse()
+                    .unwrap_or_else(|_| http::Uri::default()),
                 body: String::from_utf8_lossy(body_bytes.as_ref())
             });
         })
@@ -443,28 +448,25 @@ async fn scrape_endpoint(
             .into_iter()
             .map(|mut event| {
                 if let Event::Metric(ref mut metric) = event {
-                    // Extract pod name and namespace from endpoint URL
-                    // Format is: http://{pod_ip}:{port}/metrics
-                    if let Some(pod_info) = extract_pod_info_from_endpoint(&endpoint) {
-                        if let Some(ref tag) = pod_name_tag {
-                            if honor_labels && metric.tags().and_then(|t| t.get(tag)).is_some() {
-                                // Skip if honor_labels is true and tag already exists
-                            } else {
-                                metric.replace_tag(tag.clone(), pod_info.name.clone());
-                            }
-                        }
-
-                        if let Some(ref tag) = pod_namespace_tag {
-                            if honor_labels && metric.tags().and_then(|t| t.get(tag)).is_some() {
-                                // Skip if honor_labels is true and tag already exists
-                            } else {
-                                metric.replace_tag(tag.clone(), pod_info.namespace.clone());
-                            }
+                    // Use pod name and namespace from the Endpoint struct
+                    if let Some(ref tag) = pod_name_tag {
+                        if honor_labels && metric.tags().and_then(|t| t.get(tag)).is_some() {
+                            // Skip if honor_labels is true and tag already exists
+                        } else {
+                            metric.replace_tag(tag.clone(), endpoint.name.clone());
                         }
                     }
 
-                    // Add endpoint as a tag
-                    metric.replace_tag("endpoint".to_string(), endpoint.clone());
+                    if let Some(ref tag) = pod_namespace_tag {
+                        if honor_labels && metric.tags().and_then(|t| t.get(tag)).is_some() {
+                            // Skip if honor_labels is true and tag already exists
+                        } else {
+                            metric.replace_tag(tag.clone(), endpoint.namespace.clone());
+                        }
+                    }
+
+                    // Add endpoint URL as a tag
+                    metric.replace_tag("scrape_endpoint".to_string(), endpoint.url.clone());
                 }
                 event
             })
@@ -506,25 +508,6 @@ fn apply_auth_headers(
             Ok(builder.header(AUTHORIZATION, header_value))
         }
     }
-}
-
-#[derive(Debug)]
-struct PodInfo {
-    name: String,
-    namespace: String,
-}
-
-fn extract_pod_info_from_endpoint(endpoint: &str) -> Option<PodInfo> {
-    // This is a placeholder - in a real implementation, you'd need to
-    // maintain a mapping from pod IPs to pod names/namespaces
-    // For now, we'll use the IP as the name
-    let url = endpoint.parse::<http::Uri>().ok()?;
-    let ip = url.host()?;
-
-    Some(PodInfo {
-        name: ip.replace('.', "-"),
-        namespace: "default".to_string(),
-    })
 }
 
 // Helper functions
@@ -675,7 +658,11 @@ test_gauge 3.14
         let client = http_client::build_client(&tls, &proxy).unwrap();
 
         // Test scraping
-        let endpoint = format!("http://{}/metrics", addr);
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+        };
         let result = scrape_endpoint(
             endpoint.clone(),
             client,
@@ -702,8 +689,8 @@ test_gauge 3.14
                 // Verify endpoint tag was added
                 assert!(metric.tags().is_some());
                 let tags = metric.tags().unwrap();
-                assert!(tags.contains_key("endpoint"));
-                assert_eq!(tags.get("endpoint").unwrap(), &endpoint);
+                assert!(tags.contains_key("scrape_endpoint"));
+                assert_eq!(tags.get("scrape_endpoint").unwrap(), &endpoint.url);
             }
         }
     }
@@ -738,7 +725,11 @@ test_gauge 3.14
         let proxy = ProxyConfig::default();
         let client = http_client::build_client(&tls, &proxy).unwrap();
 
-        let endpoint = format!("http://{}/metrics", addr);
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+        };
         let result = scrape_endpoint(
             endpoint,
             client,
@@ -785,9 +776,13 @@ test_gauge 3.14
         let proxy = ProxyConfig::default();
         let client = http_client::build_client(&tls, &proxy).unwrap();
 
-        let endpoint = format!("http://{}/metrics", addr);
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+        };
         let result = scrape_endpoint(
-            endpoint.clone(),
+            endpoint,
             client,
             Duration::from_secs(5),
             None,
@@ -810,7 +805,7 @@ test_gauge 3.14
                 // When emit_pod_metadata is false, endpoint/pod tags should not be added
                 // unless they were part of the original metric
                 if let Some(tags) = tags {
-                    assert!(!tags.contains_key("endpoint"));
+                    assert!(!tags.contains_key("scrape_endpoint"));
                 }
             }
         }
@@ -845,7 +840,11 @@ test_gauge 3.14
         let proxy = ProxyConfig::default();
         let client = http_client::build_client(&tls, &proxy).unwrap();
 
-        let endpoint = format!("http://{}/metrics", addr);
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+        };
         let result = scrape_endpoint(
             endpoint,
             client,
@@ -907,7 +906,11 @@ http_requests_total{method="GET",status="200"} 1234
         let proxy = ProxyConfig::default();
         let client = http_client::build_client(&tls, &proxy).unwrap();
 
-        let endpoint = format!("http://{}/metrics", addr);
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+        };
         let result = scrape_endpoint(
             endpoint.clone(),
             client,
@@ -936,22 +939,24 @@ http_requests_total{method="GET",status="200"} 1234
 
                 // Should have endpoint tag
                 assert!(
-                    tags.contains_key("endpoint"),
-                    "Metric should have 'endpoint' tag when emit_pod_metadata is true"
+                    tags.contains_key("scrape_endpoint"),
+                    "Metric should have 'endpoint_url' tag when emit_pod_metadata is true"
                 );
-                assert_eq!(tags.get("endpoint").unwrap(), &endpoint);
+                assert_eq!(tags.get("scrape_endpoint").unwrap(), &endpoint.url);
 
-                // Should have pod_name tag (extracted from endpoint)
+                // Should have pod_name tag
                 assert!(
                     tags.contains_key("pod_name"),
                     "Metric should have 'pod_name' tag when emit_pod_metadata is true"
                 );
+                assert_eq!(tags.get("pod_name").unwrap(), &endpoint.name);
 
                 // Should have pod_namespace tag
                 assert!(
                     tags.contains_key("pod_namespace"),
                     "Metric should have 'pod_namespace' tag when emit_pod_metadata is true"
                 );
+                assert_eq!(tags.get("pod_namespace").unwrap(), &endpoint.namespace);
 
                 // Original metric tags should still be present
                 assert_eq!(tags.get("method").unwrap(), "GET");
@@ -991,9 +996,13 @@ http_requests_total{method="POST",status="201"} 5678
         let proxy = ProxyConfig::default();
         let client = http_client::build_client(&tls, &proxy).unwrap();
 
-        let endpoint = format!("http://{}/metrics", addr);
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+        };
         let result = scrape_endpoint(
-            endpoint.clone(),
+            endpoint,
             client,
             Duration::from_secs(5),
             None,
@@ -1018,8 +1027,8 @@ http_requests_total{method="POST",status="201"} 5678
                 if let Some(tags) = tags {
                     // Should NOT have endpoint tag
                     assert!(
-                        !tags.contains_key("endpoint"),
-                        "Metric should NOT have 'endpoint' tag when emit_pod_metadata is false"
+                        !tags.contains_key("scrape_endpoint"),
+                        "Metric should NOT have 'endpoint_url' tag when emit_pod_metadata is false"
                     );
 
                     // Should NOT have pod_name tag (unless it was in the original metric)
@@ -1041,23 +1050,5 @@ http_requests_total{method="POST",status="201"} 5678
                 }
             }
         }
-    }
-
-    #[test]
-    fn test_extract_pod_info_from_endpoint() {
-        let endpoint = "http://10.244.0.5:8080/metrics";
-        let pod_info = extract_pod_info_from_endpoint(endpoint);
-
-        assert!(pod_info.is_some());
-        let info = pod_info.unwrap();
-        assert_eq!(info.name, "10-244-0-5");
-        assert_eq!(info.namespace, "default");
-    }
-
-    #[test]
-    fn test_extract_pod_info_invalid_endpoint() {
-        let endpoint = "not a valid url";
-        let pod_info = extract_pod_info_from_endpoint(endpoint);
-        assert!(pod_info.is_none());
     }
 }
