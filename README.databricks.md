@@ -71,3 +71,4 @@ This lists custom changes merged in Databricks fork of Vector.
 70. Instrument file sink with delivery events https://github.com/databricks-eng/vector/pull/371
 71. Setting THANOS-TENANT header in prometheus remote write sink - https://github.com/databricks-eng/vector/pull/378
 72. Getting pod name and namespace from pod metadata - https://github.com/databricks-eng/vector/pull/379
+73. Adding Vector File Event as a Vector Event Type to the Internal Events - https://github.com/databricks-eng/vector/pull/380

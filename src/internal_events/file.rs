@@ -299,8 +299,8 @@ mod source {
                 message = "File deleted.",
                 file = %self.file.display(),
                 internal_log_rate_limit = false,
-                // VECTOR_OTHER_EVENT
-                vector_event_type = 1,
+                vector_event_type = "VECTOR_FILE_EVENT",
+                vector_file_event_type = "LOGGING_AGENT_FILE_DELETED"
             );
             if self.include_file_metric_tag {
                 counter!(
@@ -422,8 +422,8 @@ mod source {
                 message = "Found new file to watch.",
                 file = %self.file.display(),
                 internal_log_rate_limit = false,
-                // VECTOR_OTHER_EVENT
-                vector_event_type = 1,
+                vector_event_type = "VECTOR_FILE_EVENT",
+                vector_file_event_type = "LOGGING_AGENT_FILE_DISCOVERED"
             );
             if self.include_file_metric_tag {
                 counter!(
