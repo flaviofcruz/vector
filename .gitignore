@@ -73,3 +73,8 @@ copilot-instructions.md
 CLAUDE.md
 AGENTS.md
 GEMINI.md
+# Files with credentials (local only)
+demo_zerobus*.json
+test_complex_types.sh
+test_strict_validation.sh
+test_unity_catalog_complex_types.rs
