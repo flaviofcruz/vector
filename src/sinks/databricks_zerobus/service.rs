@@ -16,7 +16,9 @@ use vrl::protobuf::descriptor::get_message_descriptor;
 use vrl::protobuf::encode::encode_message;
 use zerobus_prost_types as prost_types;
 
-use super::{config::ZerobusSinkConfig, error::ZerobusSinkError};
+use super::{
+    config::ZerobusSinkConfig, error::ZerobusSinkError, unity_catalog_schema,
+};
 
 /// Request type for the Zerobus service.
 #[derive(Debug)]
@@ -90,16 +92,28 @@ impl ZerobusService {
             message: format!("Failed to create Zerobus SDK: {}", e),
         })?;
 
+        // For Path schema source, load synchronously
+        // For UnityCatalog, defer loading until first use (requires async)
         let descriptor_opt = if let Some(ref schema) = config.schema {
-            let message_descriptor = Self::build_descriptor_from_config(schema).map_err(|e| {
-                ZerobusSinkError::ConfigError {
-                    message: format!("Failed to load descriptor: {}", e),
+            match schema {
+                super::config::SchemaSource::Path { .. } => {
+                    let message_descriptor =
+                        Self::build_descriptor_from_config(schema).map_err(|e| {
+                            ZerobusSinkError::ConfigError {
+                                message: format!("Failed to load descriptor: {}", e),
+                            }
+                        })?;
+                    Some(message_descriptor)
                 }
-            })?;
-            Some(message_descriptor.clone())
+                super::config::SchemaSource::UnityCatalog => {
+                    // Will be loaded asynchronously on first use
+                    None
+                }
+            }
         } else {
             None
         };
+
         let encode_options = vrl::protobuf::encode::Options {
             use_json_names: false,
         };
@@ -131,6 +145,12 @@ impl ZerobusService {
                         }
                     })?;
                 Ok(message_descriptor)
+            }
+            super::config::SchemaSource::UnityCatalog => {
+                // This variant should not reach here - it's handled asynchronously
+                Err(ZerobusSinkError::ConfigError {
+                    message: "UnityCatalog schema should be fetched asynchronously".to_string(),
+                })
             }
         }
     }
@@ -232,17 +252,49 @@ impl ZerobusService {
     }
 
     async fn get_descriptor_or_infer(
+        &self,
         sample_event: &Event,
-        descriptor: &Arc<Mutex<Option<prost_reflect::MessageDescriptor>>>,
     ) -> Result<prost_reflect::MessageDescriptor, ZerobusSinkError> {
-        let mut guard = descriptor.lock().await;
+        let mut guard = self.descriptor.lock().await;
 
         if let Some(existing) = &*guard {
             return Ok(existing.clone());
         }
 
-        // Use configured schema if available, otherwise infer from event
-        let new_value = Self::infer_schema_from_event(sample_event)?;
+        // Check if we should fetch from Unity Catalog
+        let new_value = if let Some(ref schema_source) = self.config.schema {
+            match schema_source {
+                super::config::SchemaSource::UnityCatalog => {
+                    // Fetch schema from Unity Catalog and generate descriptor
+                    let (client_id, client_secret) = match &self.config.auth {
+                        super::config::DatabricksAuthentication::OAuth {
+                            client_id,
+                            client_secret,
+                        } => (client_id.inner(), client_secret.inner()),
+                    };
+
+                    let table_schema = unity_catalog_schema::fetch_table_schema(
+                        &self.config.unity_catalog_endpoint,
+                        &self.config.table_name,
+                        client_id,
+                        client_secret,
+                    )
+                    .await?;
+
+                    unity_catalog_schema::generate_descriptor_from_schema(&table_schema)?
+                }
+                super::config::SchemaSource::Path { .. } => {
+                    // Should have been loaded in new(), this is an error
+                    return Err(ZerobusSinkError::ConfigError {
+                        message: "Path schema should have been loaded during initialization"
+                            .to_string(),
+                    });
+                }
+            }
+        } else {
+            // No schema configured, infer from event
+            Self::infer_schema_from_event(sample_event)?
+        };
 
         *guard = Some(new_value.clone());
         Ok(new_value)
@@ -255,7 +307,7 @@ impl ZerobusService {
         if stream_guard.is_none() {
             // Store the descriptor for encoding
 
-            let descriptor = Self::get_descriptor_or_infer(sample_event, &self.descriptor).await?;
+            let descriptor = self.get_descriptor_or_infer(sample_event).await?;
             let table_properties = TableProperties {
                 table_name: self.config.table_name.clone(),
                 descriptor_proto: Some(descriptor.descriptor_proto().clone()),

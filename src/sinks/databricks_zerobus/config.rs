@@ -40,7 +40,7 @@ pub enum DatabricksAuthentication {
 ///
 /// The schema can be provided as either:
 /// - A path to a protobuf descriptor file (.desc or .pb)
-/// - Raw descriptor bytes (hex or base64 encoded)
+/// - Dynamically fetched from the Unity Catalog table
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -64,6 +64,19 @@ pub enum SchemaSource {
         #[configurable(metadata(docs::examples = "package.Message"))]
         message_type: String,
     },
+
+    /// Dynamically fetch schema from Unity Catalog table.
+    ///
+    /// This will query the Unity Catalog API to get the table schema and
+    /// automatically generate a protobuf descriptor from it.
+    /// Uses the same authentication credentials as the sink.
+    ///
+    /// Example:
+    /// ```toml
+    /// schema = { type = "unity_catalog" }
+    /// ```
+    #[serde(rename = "unity_catalog")]
+    UnityCatalog,
 }
 
 /// Zerobus stream configuration options.
