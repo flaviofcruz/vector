@@ -1,0 +1,59 @@
+{
+  "name": "service_health_event",
+  "catalog_name": "main",
+  "schema_name": "eng_lumberjack_prime_dev",
+  "table_type": "MANAGED",
+  "data_source_format": "DELTA",
+  "columns": [
+    {
+      "name": "_event_time",
+      "type_text": "timestamp",
+      "type_name": "TIMESTAMP",
+      "position": 0,
+      "type_precision": 0,
+      "type_scale": 0,
+      "nullable": true,
+      "type_json": "{\"name\":\"_event_time\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"_event_time\"}}"
+    },
+    {
+      "name": "workspace_id",
+      "type_text": "bigint",
+      "type_name": "LONG",
+      "position": 12,
+      "type_precision": 0,
+      "type_scale": 0,
+      "nullable": true,
+      "type_json": "{\"name\":\"workspace_id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":233,\"delta.columnMapping.physicalName\":\"col-d6c33cf3-3b84-471b-bccf-d5cd8e35cfb4\"}}"
+    },
+    {
+      "name": "service_extra",
+      "type_text": "struct<jobs:struct<job_id:bigint,task_run_id:bigint>>",
+      "type_name": "STRUCT",
+      "position": 13,
+      "type_precision": 0,
+      "type_scale": 0,
+      "nullable": true,
+      "type_json": "{\"name\":\"service_extra\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"jobs\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"job_id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"task_run_id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":234,\"delta.columnMapping.physicalName\":\"col-0e0af09a-e7dd-4ec5-90d4-9055d99aab41\"}}"
+    },
+    {
+      "name": "flag_evaluation_hashes",
+      "type_text": "array<bigint>",
+      "type_name": "ARRAY",
+      "position": 16,
+      "type_precision": 0,
+      "type_scale": 0,
+      "nullable": true,
+      "type_json": "{\"name\":\"flag_evaluation_hashes\",\"type\":{\"type\":\"array\",\"elementType\":\"long\",\"containsNull\":true},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":305,\"delta.columnMapping.physicalName\":\"col-a39cfb63-ab03-4d39-93f9-93e25fd67a78\"}}"
+    },
+    {
+      "name": "attributes",
+      "type_text": "map<string,string>",
+      "type_name": "MAP",
+      "position": 20,
+      "type_precision": 0,
+      "type_scale": 0,
+      "nullable": true,
+      "type_json": "{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"string\",\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":765,\"delta.columnMapping.physicalName\":\"col-f88aec2f-22e1-4f21-8ec0-478420546481\"}}"
+    }
+  ]
+}

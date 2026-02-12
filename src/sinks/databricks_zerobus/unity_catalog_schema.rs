@@ -251,7 +251,21 @@ fn parse_type_json(type_json: &str) -> Result<ComplexType, ZerobusSinkError> {
         }
     })?;
 
-    parse_complex_type(&json)
+    // Unity Catalog wraps types in {"name": "field_name", "type": {...}}
+    // Check if this is the wrapped format by looking for both "name" and "type" fields
+    let type_json = if let Some(obj) = json.as_object() {
+        if obj.contains_key("name") && obj.contains_key("type") {
+            // This is Unity Catalog wrapped format - extract the inner "type"
+            obj.get("type").unwrap()
+        } else {
+            // This is a direct type definition
+            &json
+        }
+    } else {
+        &json
+    };
+
+    parse_complex_type(type_json)
 }
 
 /// Recursively parse a complex type from JSON
@@ -1025,5 +1039,164 @@ mod tests {
 
         let result = generate_descriptor_from_schema(&schema);
         assert!(result.is_err(), "Expected error for malformed type_json");
+    }
+
+    // ========== Fixture-based Tests ==========
+    // These tests use real Unity Catalog schema responses saved as JSON fixtures
+
+    #[test]
+    fn test_fixture_simple_table() {
+        let json = include_str!("tests/fixtures/simple_table_schema.json");
+        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
+            .expect("Failed to parse simple_table fixture");
+
+        let result = generate_descriptor_from_schema(&schema);
+        assert!(result.is_ok(), "Failed to generate descriptor: {:?}", result.err());
+
+        let descriptor = result.unwrap();
+        assert_eq!(descriptor.fields().len(), 4);
+
+        // Verify all fields exist
+        assert!(descriptor.get_field_by_name("id").is_some());
+        assert!(descriptor.get_field_by_name("name").is_some());
+        assert!(descriptor.get_field_by_name("created_at").is_some());
+        assert!(descriptor.get_field_by_name("is_active").is_some());
+    }
+
+    #[test]
+    fn test_fixture_all_primitive_types() {
+        let json = include_str!("tests/fixtures/all_primitive_types_schema.json");
+        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
+            .expect("Failed to parse all_primitive_types fixture");
+
+        let result = generate_descriptor_from_schema(&schema);
+        assert!(result.is_ok(), "Failed to generate descriptor: {:?}", result.err());
+
+        let descriptor = result.unwrap();
+        assert_eq!(descriptor.fields().len(), 9, "Should have 9 primitive type columns");
+
+        // Verify specific types
+        assert!(descriptor.get_field_by_name("col_string").is_some());
+        assert!(descriptor.get_field_by_name("col_int").is_some());
+        assert!(descriptor.get_field_by_name("col_long").is_some());
+        assert!(descriptor.get_field_by_name("col_double").is_some());
+        assert!(descriptor.get_field_by_name("col_float").is_some());
+        assert!(descriptor.get_field_by_name("col_boolean").is_some());
+        assert!(descriptor.get_field_by_name("col_binary").is_some());
+        assert!(descriptor.get_field_by_name("col_timestamp").is_some());
+        assert!(descriptor.get_field_by_name("col_date").is_some());
+    }
+
+    #[test]
+    fn test_fixture_nested_struct() {
+        let json = include_str!("tests/fixtures/nested_struct_schema.json");
+        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
+            .expect("Failed to parse nested_struct fixture");
+
+        let result = generate_descriptor_from_schema(&schema);
+        assert!(result.is_ok(), "Failed to generate descriptor for nested struct: {:?}", result.err());
+
+        let descriptor = result.unwrap();
+        assert_eq!(descriptor.fields().len(), 1);
+
+        // Verify nested struct field exists
+        let user_info_field = descriptor.get_field_by_name("user_info");
+        assert!(user_info_field.is_some(), "user_info field should exist");
+    }
+
+    #[test]
+    fn test_fixture_array_of_structs() {
+        let json = include_str!("tests/fixtures/array_of_structs_schema.json");
+        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
+            .expect("Failed to parse array_of_structs fixture");
+
+        let result = generate_descriptor_from_schema(&schema);
+        assert!(result.is_ok(), "Failed to generate descriptor for array of structs: {:?}", result.err());
+
+        let descriptor = result.unwrap();
+        assert_eq!(descriptor.fields().len(), 1);
+
+        // Verify array field exists
+        let transactions_field = descriptor.get_field_by_name("transactions");
+        assert!(transactions_field.is_some(), "transactions field should exist");
+    }
+
+    #[test]
+    fn test_fixture_service_health_event() {
+        let json = include_str!("tests/fixtures/service_health_event_schema.json");
+        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
+            .expect("Failed to parse service_health_event fixture");
+
+        let result = generate_descriptor_from_schema(&schema);
+        assert!(result.is_ok(), "Failed to generate descriptor for service_health_event: {:?}", result.err());
+
+        let descriptor = result.unwrap();
+        // Note: _event_time has position 0 and is skipped, so we get 4 fields instead of 5
+        assert_eq!(descriptor.fields().len(), 4, "Should have 4 columns (position >= 1)");
+
+        // Verify specific complex type columns (skip _event_time with position 0)
+        assert!(descriptor.get_field_by_name("workspace_id").is_some(), "Should have workspace_id");
+        assert!(descriptor.get_field_by_name("service_extra").is_some(), "Should have service_extra STRUCT");
+        assert!(descriptor.get_field_by_name("flag_evaluation_hashes").is_some(), "Should have flag_evaluation_hashes ARRAY");
+        assert!(descriptor.get_field_by_name("attributes").is_some(), "Should have attributes MAP");
+    }
+
+    #[test]
+    fn test_fixture_service_health_event_struct_parsing() {
+        // Test that the nested STRUCT in service_extra is properly parsed
+        let json = include_str!("tests/fixtures/service_health_event_schema.json");
+        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
+            .expect("Failed to parse service_health_event fixture");
+
+        // Find the service_extra column
+        let service_extra_col = schema.columns.iter()
+            .find(|c| c.name == "service_extra")
+            .expect("Should have service_extra column");
+
+        // Parse its type_json
+        let result = parse_type_json(&service_extra_col.type_json);
+        assert!(result.is_ok(), "Should parse service_extra type_json");
+
+        match result.unwrap() {
+            ComplexType::Struct(struct_type) => {
+                assert_eq!(struct_type.fields.len(), 1, "Should have 1 field (jobs)");
+                assert_eq!(struct_type.fields[0].name, "jobs");
+
+                // Verify nested struct
+                match &struct_type.fields[0].field_type {
+                    ComplexType::Struct(nested) => {
+                        assert_eq!(nested.fields.len(), 2, "jobs should have 2 fields");
+                        assert_eq!(nested.fields[0].name, "job_id");
+                        assert_eq!(nested.fields[1].name, "task_run_id");
+                    }
+                    _ => panic!("Expected nested struct for jobs field"),
+                }
+            }
+            _ => panic!("Expected struct type for service_extra"),
+        }
+    }
+
+    #[test]
+    fn test_fixture_error_handling_empty_type_json() {
+        // Test that empty type_json is handled correctly
+        let result = parse_type_json("");
+        assert!(result.is_err(), "Should fail on empty type_json");
+
+        let result = parse_type_json("{}");
+        assert!(result.is_err(), "Should fail on empty object type_json");
+    }
+
+    #[test]
+    fn test_fixture_error_handling_invalid_json() {
+        // Test that invalid JSON is handled correctly
+        let result = parse_type_json("not valid json");
+        assert!(result.is_err(), "Should fail on invalid JSON");
+    }
+
+    #[test]
+    fn test_fixture_error_handling_missing_type_field() {
+        // Test that missing 'type' field is handled
+        let result = parse_type_json(r#"{"fields": []}"#);
+        assert!(result.is_err(), "Should fail when 'type' field is missing");
     }
 }
