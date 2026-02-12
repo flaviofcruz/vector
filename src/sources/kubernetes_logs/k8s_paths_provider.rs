@@ -336,6 +336,58 @@ fn build_container_exclusion_patterns<'a>(
     })
 }
 
+const VALID_LOG_VOLUME_NAMES: &[&str] = &["logs", "data", "container-build", "event-logs"];
+fn get_databricks_pod_logs_directories(
+    pod: &Pod,
+    empty_dir_pod_logs_directory: Option<PathBuf>,
+    use_hostpath_logging_annotation_override: bool,
+) -> Vec<PathBuf> {
+    let mut log_dirs = Vec::new();
+    if let Some(empty_dir_pod_logs_directory) = empty_dir_pod_logs_directory {
+        // First, include the original pod logs directory (with no subdirectories) in the list of paths.
+        log_dirs.push(empty_dir_pod_logs_directory.clone());
+        // Then, include the direct subdirectories in the list of paths.
+        let subdirectories = std::fs::read_dir(&empty_dir_pod_logs_directory);
+        if let Ok(subdirectories) = subdirectories {
+            log_dirs.extend(subdirectories.filter_map(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| {
+                        VALID_LOG_VOLUME_NAMES
+                            .contains(
+                                &entry
+                                    .path()
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_str()
+                                    .unwrap_or_default(),
+                            )
+                            .then_some(entry.path())
+                    })
+                    .and_then(|entry| entry.is_dir().then_some(entry))
+            }));
+        } else {
+            warn!(
+                message = "Failed to read subdirectories of emptyDir pod logs directory.",
+                pod = ?pod.metadata.name,
+                log_directory = ?empty_dir_pod_logs_directory.to_str(),
+                error = subdirectories.err().map(|e| e.to_string()),
+            );
+        }
+    }
+    // If the hostpath logging annotation override is used, also include the hostpath logs directory
+    // in the list of paths.
+    if use_hostpath_logging_annotation_override {
+        let hostpath_logs_directory = extract_databricks_pod_logs_directory(
+            pod, /*use_hostpath_logging_annotation_override=*/ true,
+        );
+        if let Some(hostpath_logs_directory) = hostpath_logs_directory {
+            log_dirs.push(hostpath_logs_directory);
+        }
+    }
+    log_dirs
+}
+
 fn list_pod_log_paths<'a, G, GI>(
     mut glob_impl: G,
     pod_logs_glob_patterns: &'a [String],
@@ -347,13 +399,25 @@ where
     G: FnMut(&str) -> GI + 'a,
     GI: Iterator<Item = PathBuf> + 'a,
 {
-    if extract_databricks_logs {
-        extract_databricks_pod_logs_directory(pod, use_hostpath_logging_annotation_override)
+    // Extract log file paths from the pod logs directory of the logging empty-dir volume associated
+    // with the pod.
+    // If the use_hostpath_logging_annotation_override flag is set, also extract log file paths from
+    // the hostPath logging annotation override and merge the two sets of paths.
+    let log_dirs = if extract_databricks_logs {
+        let empty_dir_pod_logs_directory = extract_databricks_pod_logs_directory(
+            pod, /*use_hostpath_logging_annotation_override=*/ false,
+        );
+        get_databricks_pod_logs_directories(
+            pod,
+            empty_dir_pod_logs_directory,
+            use_hostpath_logging_annotation_override,
+        )
     } else {
         extract_pod_logs_directory(pod)
-    }
-    .into_iter()
-    .flat_map(move |dir| {
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    log_dirs.into_iter().flat_map(move |dir| {
         let dir = dir
             .to_str()
             .expect("non-utf8 path to pod logs dir is not supported");
@@ -443,13 +507,14 @@ fn filter_paths<'a>(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::ObjectMeta};
 
     use super::{
         build_container_exclusion_patterns, extract_databricks_pod_logs_directory,
         extract_excluded_containers_for_pod, extract_pod_logs_directory, filter_paths,
-        list_pod_log_paths,
+        get_databricks_pod_logs_directories, list_pod_log_paths,
     };
 
     #[test]
@@ -814,6 +879,87 @@ mod tests {
     }
 
     #[test]
+    fn test_get_databricks_pod_logs_directories() {
+        let temp_dir = TempDir::new().unwrap();
+        let temp_dir_path = temp_dir.path();
+        let temp_logs_volume_path = temp_dir_path.join("logs");
+        std::fs::create_dir_all(&temp_logs_volume_path).unwrap();
+        let temp_data_volume_path = temp_dir_path.join("data");
+        std::fs::create_dir_all(&temp_data_volume_path).unwrap();
+        let temp_invalid_volume_path = temp_dir_path.join("invalid_test_volume");
+        std::fs::create_dir_all(&temp_invalid_volume_path).unwrap();
+        // Confirm that the function returns the correct directories for a pod with or without a hostpath logging annotation override.
+        let cases = vec![
+            (
+                Pod {
+                    metadata: ObjectMeta {
+                        namespace: Some("sandbox0-ns".to_owned()),
+                        name: Some("sandbox0-name".to_owned()),
+                        uid: Some("sandbox0-uid".to_owned()),
+                        annotations: Some(
+                            vec![(
+                                super::DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY.to_owned(),
+                                "/local_disk0/sandbox0-custom-logs-path".to_owned(),
+                            )]
+                            .into_iter()
+                            .collect(),
+                        ),
+                        ..ObjectMeta::default()
+                    },
+                    ..Pod::default()
+                },
+                vec![PathBuf::from(
+                    "/databricks/host-root/local_disk0/sandbox0-custom-logs-path",
+                )],
+                vec![
+                    PathBuf::from("/databricks/host-root/local_disk0/sandbox0-custom-logs-path"),
+                    PathBuf::from(temp_dir_path),
+                    temp_data_volume_path.clone(),
+                    temp_logs_volume_path.clone(),
+                ],
+            ),
+            (
+                Pod {
+                    metadata: ObjectMeta {
+                        namespace: Some("sandbox0-ns".to_owned()),
+                        name: Some("sandbox0-name".to_owned()),
+                        uid: Some("sandbox0-uid".to_owned()),
+                        ..ObjectMeta::default()
+                    },
+                    ..Pod::default()
+                },
+                vec![],
+                vec![
+                    PathBuf::from(temp_dir_path),
+                    temp_data_volume_path.clone(),
+                    temp_logs_volume_path.clone(),
+                ],
+            ),
+        ];
+
+        for (pod, expected_directories_no_empty_dir, expected_directories_with_empty_dir) in cases {
+            let mut actual_directories_no_empty_dir =
+                get_databricks_pod_logs_directories(&pod, None, true);
+            actual_directories_no_empty_dir.sort();
+            let mut expected_directories_no_empty_dir = expected_directories_no_empty_dir;
+            expected_directories_no_empty_dir.sort();
+            assert_eq!(
+                actual_directories_no_empty_dir,
+                expected_directories_no_empty_dir
+            );
+            let mut actual_directories_with_empty_dir =
+                get_databricks_pod_logs_directories(&pod, Some(PathBuf::from(temp_dir_path)), true);
+            actual_directories_with_empty_dir.sort();
+            let mut expected_directories_with_empty_dir = expected_directories_with_empty_dir;
+            expected_directories_with_empty_dir.sort();
+            assert_eq!(
+                actual_directories_with_empty_dir,
+                expected_directories_with_empty_dir
+            );
+        }
+    }
+
+    #[test]
     fn test_list_databricks_pod_log_paths() {
         let cases = vec![
             // Pod exists and has some containers that write logs, and some of
@@ -844,6 +990,22 @@ mod tests {
                 },
                 // Calls to the glob mock.
                 vec![
+                    // The first calls are to the base emptyDir directory.
+                    (
+                        // The pattern to expect at the mock.
+                        "/var/lib/kubelet/pods/sandbox0-uid/volumes/kubernetes.io~empty-dir/*/*.log*",
+                        // The paths to return from the mock. No paths returned as this test case
+                        // simulates an unused emptyDir directory.
+                        vec![],
+                    ),
+                    (
+                        "/var/lib/kubelet/pods/sandbox0-uid/volumes/kubernetes.io~empty-dir/*/*.json*",
+                        vec![],
+                    ),
+                    (
+                        "/var/lib/kubelet/pods/sandbox0-uid/volumes/kubernetes.io~empty-dir/*/*.pb.base64*",
+                        vec![],
+                    ),
                     (
                         // The pattern to expect at the mock.
                         "/databricks/host-root/local_disk0/sandbox0-custom-logs-path/*/*.log*",
