@@ -4,15 +4,15 @@ use bytes::Buf;
 use http::{Request, Uri};
 use http_body::Body as HttpBody;
 use hyper::Body;
-use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use zerobus_prost_types as prost_types;
 
+use super::error::ZerobusSinkError;
 use crate::config::ProxyConfig;
 use crate::http::HttpClient;
 use crate::tls::TlsSettings;
-use super::error::ZerobusSinkError;
 
 /// Unity Catalog table column information
 #[derive(Debug, Deserialize, Clone)]
@@ -109,9 +109,11 @@ pub async fn fetch_table_schema(
         message: format!("Invalid Unity Catalog endpoint URL: {}", e),
     })?;
 
-    let http_client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default())
-        .map_err(|e| ZerobusSinkError::ConfigError {
-            message: format!("Failed to create HTTP client: {}", e),
+    let http_client =
+        HttpClient::new(TlsSettings::default(), &ProxyConfig::default()).map_err(|e| {
+            ZerobusSinkError::ConfigError {
+                message: format!("Failed to create HTTP client: {}", e),
+            }
         })?;
 
     let request = Request::get(uri)
@@ -122,11 +124,12 @@ pub async fn fetch_table_schema(
             message: format!("Failed to build request: {}", e),
         })?;
 
-    let response = http_client.send(request).await.map_err(|e| {
-        ZerobusSinkError::ConfigError {
+    let response = http_client
+        .send(request)
+        .await
+        .map_err(|e| ZerobusSinkError::ConfigError {
             message: format!("Failed to fetch table schema: {}", e),
-        }
-    })?;
+        })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -175,9 +178,11 @@ async fn get_oauth_token(
         unity_catalog_endpoint.trim_end_matches('/')
     );
 
-    let uri: Uri = token_url.parse().map_err(|e| ZerobusSinkError::ConfigError {
-        message: format!("Invalid token endpoint URL: {}", e),
-    })?;
+    let uri: Uri = token_url
+        .parse()
+        .map_err(|e| ZerobusSinkError::ConfigError {
+            message: format!("Invalid token endpoint URL: {}", e),
+        })?;
 
     // Build form-encoded body
     let form_body = format!(
@@ -186,9 +191,11 @@ async fn get_oauth_token(
         percent_encode(client_secret.as_bytes(), NON_ALPHANUMERIC)
     );
 
-    let http_client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default())
-        .map_err(|e| ZerobusSinkError::ConfigError {
-            message: format!("Failed to create HTTP client: {}", e),
+    let http_client =
+        HttpClient::new(TlsSettings::default(), &ProxyConfig::default()).map_err(|e| {
+            ZerobusSinkError::ConfigError {
+                message: format!("Failed to create HTTP client: {}", e),
+            }
         })?;
 
     let request = Request::post(uri)
@@ -198,11 +205,12 @@ async fn get_oauth_token(
             message: format!("Failed to build OAuth request: {}", e),
         })?;
 
-    let response = http_client.send(request).await.map_err(|e| {
-        ZerobusSinkError::ConfigError {
+    let response = http_client
+        .send(request)
+        .await
+        .map_err(|e| ZerobusSinkError::ConfigError {
             message: format!("Failed to get OAuth token: {}", e),
-        }
-    })?;
+        })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -245,11 +253,10 @@ fn parse_type_json(type_json: &str) -> Result<ComplexType, ZerobusSinkError> {
         });
     }
 
-    let json: JsonValue = serde_json::from_str(type_json).map_err(|e| {
-        ZerobusSinkError::ConfigError {
+    let json: JsonValue =
+        serde_json::from_str(type_json).map_err(|e| ZerobusSinkError::ConfigError {
             message: format!("Failed to parse type_json: {}", e),
-        }
-    })?;
+        })?;
 
     // Unity Catalog wraps types in {"name": "field_name", "type": {...}}
     // Check if this is the wrapped format by looking for both "name" and "type" fields
@@ -276,12 +283,15 @@ fn parse_complex_type(json: &JsonValue) -> Result<ComplexType, ZerobusSinkError>
     }
 
     // Handle type object
-    let type_obj = json.as_object().ok_or_else(|| ZerobusSinkError::ConfigError {
-        message: format!("Expected type object, got: {:?}", json),
-    })?;
+    let type_obj = json
+        .as_object()
+        .ok_or_else(|| ZerobusSinkError::ConfigError {
+            message: format!("Expected type object, got: {:?}", json),
+        })?;
 
     // Get the "type" field
-    let type_field = type_obj.get("type")
+    let type_field = type_obj
+        .get("type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ZerobusSinkError::ConfigError {
             message: format!("Missing 'type' field in type_json: {:?}", type_obj),
@@ -311,8 +321,11 @@ fn parse_primitive_type(type_str: &str) -> Result<ComplexType, ZerobusSinkError>
         "date" => PrimitiveType::Date,
         other if other.starts_with("decimal") => {
             // Parse decimal(precision, scale)
-            PrimitiveType::Decimal { _precision: 38, _scale: 10 } // Default values
-        },
+            PrimitiveType::Decimal {
+                _precision: 38,
+                _scale: 10,
+            } // Default values
+        }
         unknown => {
             return Err(ZerobusSinkError::ConfigError {
                 message: format!("Unknown primitive type: {}", unknown),
@@ -323,8 +336,11 @@ fn parse_primitive_type(type_str: &str) -> Result<ComplexType, ZerobusSinkError>
 }
 
 /// Parse STRUCT type
-fn parse_struct_type(type_obj: &serde_json::Map<String, JsonValue>) -> Result<ComplexType, ZerobusSinkError> {
-    let fields_json = type_obj.get("fields")
+fn parse_struct_type(
+    type_obj: &serde_json::Map<String, JsonValue>,
+) -> Result<ComplexType, ZerobusSinkError> {
+    let fields_json = type_obj
+        .get("fields")
         .and_then(|v| v.as_array())
         .ok_or_else(|| ZerobusSinkError::ConfigError {
             message: "STRUCT type missing 'fields' array".to_string(),
@@ -332,28 +348,32 @@ fn parse_struct_type(type_obj: &serde_json::Map<String, JsonValue>) -> Result<Co
 
     let mut fields = Vec::new();
     for field_json in fields_json {
-        let field_obj = field_json.as_object().ok_or_else(|| {
-            ZerobusSinkError::ConfigError {
+        let field_obj = field_json
+            .as_object()
+            .ok_or_else(|| ZerobusSinkError::ConfigError {
                 message: format!("Expected field object, got: {:?}", field_json),
-            }
-        })?;
+            })?;
 
-        let name = field_obj.get("name")
+        let name = field_obj
+            .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ZerobusSinkError::ConfigError {
                 message: "Field missing 'name'".to_string(),
             })?
             .to_string();
 
-        let nullable = field_obj.get("nullable")
+        let nullable = field_obj
+            .get("nullable")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
         // Parse the field type (can be nested)
-        let field_type_json = field_obj.get("type")
-            .ok_or_else(|| ZerobusSinkError::ConfigError {
-                message: format!("Field '{}' missing 'type'", name),
-            })?;
+        let field_type_json =
+            field_obj
+                .get("type")
+                .ok_or_else(|| ZerobusSinkError::ConfigError {
+                    message: format!("Field '{}' missing 'type'", name),
+                })?;
 
         let field_type = parse_complex_type(field_type_json)?;
 
@@ -368,27 +388,36 @@ fn parse_struct_type(type_obj: &serde_json::Map<String, JsonValue>) -> Result<Co
 }
 
 /// Parse ARRAY type
-fn parse_array_type(type_obj: &serde_json::Map<String, JsonValue>) -> Result<ComplexType, ZerobusSinkError> {
-    let element_type_json = type_obj.get("elementType")
-        .ok_or_else(|| ZerobusSinkError::ConfigError {
-            message: "ARRAY type missing 'elementType'".to_string(),
-        })?;
+fn parse_array_type(
+    type_obj: &serde_json::Map<String, JsonValue>,
+) -> Result<ComplexType, ZerobusSinkError> {
+    let element_type_json =
+        type_obj
+            .get("elementType")
+            .ok_or_else(|| ZerobusSinkError::ConfigError {
+                message: "ARRAY type missing 'elementType'".to_string(),
+            })?;
 
     let element_type = parse_complex_type(element_type_json)?;
     Ok(ComplexType::Array(Box::new(element_type)))
 }
 
 /// Parse MAP type
-fn parse_map_type(type_obj: &serde_json::Map<String, JsonValue>) -> Result<ComplexType, ZerobusSinkError> {
-    let key_type_json = type_obj.get("keyType")
+fn parse_map_type(
+    type_obj: &serde_json::Map<String, JsonValue>,
+) -> Result<ComplexType, ZerobusSinkError> {
+    let key_type_json = type_obj
+        .get("keyType")
         .ok_or_else(|| ZerobusSinkError::ConfigError {
             message: "MAP type missing 'keyType'".to_string(),
         })?;
 
-    let value_type_json = type_obj.get("valueType")
-        .ok_or_else(|| ZerobusSinkError::ConfigError {
-            message: "MAP type missing 'valueType'".to_string(),
-        })?;
+    let value_type_json =
+        type_obj
+            .get("valueType")
+            .ok_or_else(|| ZerobusSinkError::ConfigError {
+                message: "MAP type missing 'valueType'".to_string(),
+            })?;
 
     let key_type = parse_complex_type(key_type_json)?;
     let value_type = parse_complex_type(value_type_json)?;
@@ -436,12 +465,13 @@ pub fn generate_descriptor_from_schema(
         }
 
         // Try to parse complex types from type_json
-        let (field_type, type_name) = if column.type_name == "STRUCT"
+        let (field_type, type_name, is_repeated) = if column.type_name == "STRUCT"
             || column.type_name == "ARRAY"
-            || column.type_name == "MAP" {
+            || column.type_name == "MAP"
+        {
             // Parse type_json for complex types - STRICT MODE: fail on parse errors
-            let complex_type = parse_type_json(&column.type_json)
-                .map_err(|e| ZerobusSinkError::ConfigError {
+            let complex_type =
+                parse_type_json(&column.type_json).map_err(|e| ZerobusSinkError::ConfigError {
                     message: format!(
                         "Failed to parse complex type for column '{}': {}. \
                          Vector requires all types to be supported. \
@@ -451,21 +481,23 @@ pub fn generate_descriptor_from_schema(
                     ),
                 })?;
 
+            let is_repeated = matches!(
+                complex_type,
+                ComplexType::Array(_) | ComplexType::Map { .. }
+            );
             let path_prefix = column.name.clone();
-            map_complex_type_to_protobuf(
-                &complex_type,
-                &path_prefix,
-                &mut collector,
-            )?
+            let (field_type, type_name) =
+                map_complex_type_to_protobuf(&complex_type, &path_prefix, &mut collector)?;
+            (field_type, type_name, is_repeated)
         } else {
             // Simple types
             let field_type = map_simple_databricks_type(&column.type_name)?;
-            (field_type, None)
+            (field_type, None, false)
         };
 
         // Determine label based on type
-        let label = if column.type_name == "MAP" {
-            // MAPs are represented as repeated map entry messages
+        let label = if is_repeated {
+            // ARRAYs and MAPs are represented as repeated fields
             prost_types::field_descriptor_proto::Label::Repeated as i32
         } else if column.nullable {
             prost_types::field_descriptor_proto::Label::Optional as i32
@@ -484,7 +516,7 @@ pub fn generate_descriptor_from_schema(
             oneof_index: None,
             json_name: Some(column.name.clone()),
             options: None,
-            proto3_optional: Some(column.nullable && column.type_name != "MAP"),
+            proto3_optional: Some(column.nullable && !is_repeated),
         });
     }
 
@@ -608,7 +640,8 @@ fn map_complex_type_to_protobuf(
                 }
                 ComplexType::Struct(_) => {
                     // Array of structs - need to generate the struct message
-                    let element_message_name = format!("{}_element", sanitize_message_name(path_prefix));
+                    let element_message_name =
+                        format!("{}_element", sanitize_message_name(path_prefix));
                     let (_, type_name) = map_complex_type_to_protobuf(
                         element_type,
                         &element_message_name,
@@ -635,7 +668,10 @@ fn map_complex_type_to_protobuf(
             }
         }
 
-        ComplexType::Map { key_type, value_type } => {
+        ComplexType::Map {
+            key_type,
+            value_type,
+        } => {
             // Protobuf maps are represented as:
             // message MapFieldEntry { K key = 1; V value = 2; }
             // repeated MapFieldEntry map_field = N;
@@ -660,11 +696,10 @@ fn map_complex_type_to_protobuf(
             match value_type.as_ref() {
                 ComplexType::Primitive(value_primitive) => {
                     // Generate a map entry message for this field
-                    let entry_message_name = format!("{}_entry", sanitize_message_name(path_prefix));
-                    let entry_message = generate_map_entry_message(
-                        &entry_message_name,
-                        value_primitive,
-                    )?;
+                    let entry_message_name =
+                        format!("{}_entry", sanitize_message_name(path_prefix));
+                    let entry_message =
+                        generate_map_entry_message(&entry_message_name, value_primitive)?;
 
                     collector.add_message(entry_message);
 
@@ -713,19 +748,25 @@ fn generate_struct_message(
 
         // Recursively map the field type
         let path = format!("{}_{}", message_name, field.name);
-        let (field_type, type_name) = map_complex_type_to_protobuf(
-            &field.field_type,
-            &path,
-            collector,
-        )?;
+        let (field_type, type_name) =
+            map_complex_type_to_protobuf(&field.field_type, &path, collector)?;
 
         // Determine if this is a repeated field (for arrays)
         let (label, is_repeated) = if matches!(field.field_type, ComplexType::Array(_)) {
-            (prost_types::field_descriptor_proto::Label::Repeated as i32, true)
+            (
+                prost_types::field_descriptor_proto::Label::Repeated as i32,
+                true,
+            )
         } else if field.nullable {
-            (prost_types::field_descriptor_proto::Label::Optional as i32, false)
+            (
+                prost_types::field_descriptor_proto::Label::Optional as i32,
+                false,
+            )
         } else {
-            (prost_types::field_descriptor_proto::Label::Required as i32, false)
+            (
+                prost_types::field_descriptor_proto::Label::Required as i32,
+                false,
+            )
         };
 
         fields.push(prost_types::FieldDescriptorProto {
@@ -852,7 +893,10 @@ mod tests {
             ("BIGINT", prost_types::field_descriptor_proto::Type::Int64),
             ("BOOLEAN", prost_types::field_descriptor_proto::Type::Bool),
             ("DOUBLE", prost_types::field_descriptor_proto::Type::Double),
-            ("TIMESTAMP", prost_types::field_descriptor_proto::Type::String),
+            (
+                "TIMESTAMP",
+                prost_types::field_descriptor_proto::Type::String,
+            ),
             ("BINARY", prost_types::field_descriptor_proto::Type::Bytes),
         ];
 
@@ -944,12 +988,10 @@ mod tests {
         assert!(result.is_ok());
 
         match result.unwrap() {
-            ComplexType::Array(element_type) => {
-                match element_type.as_ref() {
-                    ComplexType::Primitive(PrimitiveType::String) => {}
-                    _ => panic!("Expected string element type"),
-                }
-            }
+            ComplexType::Array(element_type) => match element_type.as_ref() {
+                ComplexType::Primitive(PrimitiveType::String) => {}
+                _ => panic!("Expected string element type"),
+            },
             _ => panic!("Expected array type"),
         }
     }
@@ -966,7 +1008,10 @@ mod tests {
         assert!(result.is_ok());
 
         match result.unwrap() {
-            ComplexType::Map { key_type, value_type } => {
+            ComplexType::Map {
+                key_type,
+                value_type,
+            } => {
                 assert!(matches!(
                     key_type.as_ref(),
                     ComplexType::Primitive(PrimitiveType::String)
@@ -1001,13 +1046,18 @@ mod tests {
                     type_name: "MAP".to_string(),
                     position: 2,
                     nullable: true,
-                    type_json: r#"{"type":"map","keyType":"string","valueType":"string"}"#.to_string(),
+                    type_json: r#"{"type":"map","keyType":"string","valueType":"string"}"#
+                        .to_string(),
                 },
             ],
         };
 
         let result = generate_descriptor_from_schema(&schema);
-        assert!(result.is_ok(), "Failed to generate descriptor with MAP type: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to generate descriptor with MAP type: {:?}",
+            result.err()
+        );
 
         let descriptor = result.unwrap();
         assert_eq!(descriptor.fields().len(), 2);
@@ -1025,16 +1075,14 @@ mod tests {
             name: "test_table".to_string(),
             catalog_name: "test_catalog".to_string(),
             schema_name: "test_schema".to_string(),
-            columns: vec![
-                UnityCatalogColumn {
-                    name: "unsupported_col".to_string(),
-                    type_text: "struct<...>".to_string(),
-                    type_name: "STRUCT".to_string(),
-                    position: 1,
-                    nullable: true,
-                    type_json: "invalid json".to_string(), // Malformed type_json
-                },
-            ],
+            columns: vec![UnityCatalogColumn {
+                name: "unsupported_col".to_string(),
+                type_text: "struct<...>".to_string(),
+                type_name: "STRUCT".to_string(),
+                position: 1,
+                nullable: true,
+                type_json: "invalid json".to_string(), // Malformed type_json
+            }],
         };
 
         let result = generate_descriptor_from_schema(&schema);
@@ -1047,11 +1095,15 @@ mod tests {
     #[test]
     fn test_fixture_simple_table() {
         let json = include_str!("tests/fixtures/simple_table_schema.json");
-        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
-            .expect("Failed to parse simple_table fixture");
+        let schema: UnityCatalogTableSchema =
+            serde_json::from_str(json).expect("Failed to parse simple_table fixture");
 
         let result = generate_descriptor_from_schema(&schema);
-        assert!(result.is_ok(), "Failed to generate descriptor: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to generate descriptor: {:?}",
+            result.err()
+        );
 
         let descriptor = result.unwrap();
         assert_eq!(descriptor.fields().len(), 4);
@@ -1066,14 +1118,22 @@ mod tests {
     #[test]
     fn test_fixture_all_primitive_types() {
         let json = include_str!("tests/fixtures/all_primitive_types_schema.json");
-        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
-            .expect("Failed to parse all_primitive_types fixture");
+        let schema: UnityCatalogTableSchema =
+            serde_json::from_str(json).expect("Failed to parse all_primitive_types fixture");
 
         let result = generate_descriptor_from_schema(&schema);
-        assert!(result.is_ok(), "Failed to generate descriptor: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to generate descriptor: {:?}",
+            result.err()
+        );
 
         let descriptor = result.unwrap();
-        assert_eq!(descriptor.fields().len(), 9, "Should have 9 primitive type columns");
+        assert_eq!(
+            descriptor.fields().len(),
+            9,
+            "Should have 9 primitive type columns"
+        );
 
         // Verify specific types
         assert!(descriptor.get_field_by_name("col_string").is_some());
@@ -1090,11 +1150,15 @@ mod tests {
     #[test]
     fn test_fixture_nested_struct() {
         let json = include_str!("tests/fixtures/nested_struct_schema.json");
-        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
-            .expect("Failed to parse nested_struct fixture");
+        let schema: UnityCatalogTableSchema =
+            serde_json::from_str(json).expect("Failed to parse nested_struct fixture");
 
         let result = generate_descriptor_from_schema(&schema);
-        assert!(result.is_ok(), "Failed to generate descriptor for nested struct: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to generate descriptor for nested struct: {:?}",
+            result.err()
+        );
 
         let descriptor = result.unwrap();
         assert_eq!(descriptor.fields().len(), 1);
@@ -1107,49 +1171,80 @@ mod tests {
     #[test]
     fn test_fixture_array_of_structs() {
         let json = include_str!("tests/fixtures/array_of_structs_schema.json");
-        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
-            .expect("Failed to parse array_of_structs fixture");
+        let schema: UnityCatalogTableSchema =
+            serde_json::from_str(json).expect("Failed to parse array_of_structs fixture");
 
         let result = generate_descriptor_from_schema(&schema);
-        assert!(result.is_ok(), "Failed to generate descriptor for array of structs: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to generate descriptor for array of structs: {:?}",
+            result.err()
+        );
 
         let descriptor = result.unwrap();
         assert_eq!(descriptor.fields().len(), 1);
 
         // Verify array field exists
         let transactions_field = descriptor.get_field_by_name("transactions");
-        assert!(transactions_field.is_some(), "transactions field should exist");
+        assert!(
+            transactions_field.is_some(),
+            "transactions field should exist"
+        );
     }
 
     #[test]
     fn test_fixture_service_health_event() {
         let json = include_str!("tests/fixtures/service_health_event_schema.json");
-        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
-            .expect("Failed to parse service_health_event fixture");
+        let schema: UnityCatalogTableSchema =
+            serde_json::from_str(json).expect("Failed to parse service_health_event fixture");
 
         let result = generate_descriptor_from_schema(&schema);
-        assert!(result.is_ok(), "Failed to generate descriptor for service_health_event: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to generate descriptor for service_health_event: {:?}",
+            result.err()
+        );
 
         let descriptor = result.unwrap();
         // Note: _event_time has position 0 and is skipped, so we get 4 fields instead of 5
-        assert_eq!(descriptor.fields().len(), 4, "Should have 4 columns (position >= 1)");
+        assert_eq!(
+            descriptor.fields().len(),
+            4,
+            "Should have 4 columns (position >= 1)"
+        );
 
         // Verify specific complex type columns (skip _event_time with position 0)
-        assert!(descriptor.get_field_by_name("workspace_id").is_some(), "Should have workspace_id");
-        assert!(descriptor.get_field_by_name("service_extra").is_some(), "Should have service_extra STRUCT");
-        assert!(descriptor.get_field_by_name("flag_evaluation_hashes").is_some(), "Should have flag_evaluation_hashes ARRAY");
-        assert!(descriptor.get_field_by_name("attributes").is_some(), "Should have attributes MAP");
+        assert!(
+            descriptor.get_field_by_name("workspace_id").is_some(),
+            "Should have workspace_id"
+        );
+        assert!(
+            descriptor.get_field_by_name("service_extra").is_some(),
+            "Should have service_extra STRUCT"
+        );
+        assert!(
+            descriptor
+                .get_field_by_name("flag_evaluation_hashes")
+                .is_some(),
+            "Should have flag_evaluation_hashes ARRAY"
+        );
+        assert!(
+            descriptor.get_field_by_name("attributes").is_some(),
+            "Should have attributes MAP"
+        );
     }
 
     #[test]
     fn test_fixture_service_health_event_struct_parsing() {
         // Test that the nested STRUCT in service_extra is properly parsed
         let json = include_str!("tests/fixtures/service_health_event_schema.json");
-        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
-            .expect("Failed to parse service_health_event fixture");
+        let schema: UnityCatalogTableSchema =
+            serde_json::from_str(json).expect("Failed to parse service_health_event fixture");
 
         // Find the service_extra column
-        let service_extra_col = schema.columns.iter()
+        let service_extra_col = schema
+            .columns
+            .iter()
             .find(|c| c.name == "service_extra")
             .expect("Should have service_extra column");
 

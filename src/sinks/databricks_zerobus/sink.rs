@@ -114,7 +114,10 @@ mod tests {
                 client_secret: SensitiveString::from("test-client-secret".to_string()),
             },
             use_tls: true,
-            schema: crate::sinks::databricks_zerobus::config::SchemaSource::UnityCatalog,
+            schema: crate::sinks::databricks_zerobus::config::SchemaSource::Path {
+                path: "tests/data/protobuf/test_proto.desc".to_string(),
+                message_type: "test_proto.User".to_string(),
+            },
             stream_options: ZerobusStreamOptions::default(),
             custom_headers: None,
             batch: Default::default(),
