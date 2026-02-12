@@ -6,6 +6,7 @@ use http_body::Body as HttpBody;
 use hyper::Body;
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use zerobus_prost_types as prost_types;
 
 use crate::config::ProxyConfig;
@@ -41,6 +42,50 @@ pub struct UnityCatalogTableSchema {
 #[derive(Debug, Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
+}
+
+/// Represents a parsed complex type from type_json
+#[derive(Debug, Clone)]
+enum ComplexType {
+    Primitive(PrimitiveType),
+    Struct(StructType),
+    Array(Box<ComplexType>),
+    Map {
+        key_type: Box<ComplexType>,
+        #[allow(dead_code)] // Will be used for full MAP support
+        value_type: Box<ComplexType>,
+    },
+}
+
+/// Primitive types
+#[derive(Debug, Clone)]
+enum PrimitiveType {
+    String,
+    Long,
+    Integer,
+    Short,
+    Byte,
+    Double,
+    Float,
+    Boolean,
+    Binary,
+    Timestamp,
+    Date,
+    Decimal { _precision: i32, _scale: i32 },
+}
+
+/// Struct field definition from type_json
+#[derive(Debug, Clone)]
+struct StructField {
+    name: String,
+    field_type: ComplexType,
+    nullable: bool,
+}
+
+/// Struct type definition
+#[derive(Debug, Clone)]
+struct StructType {
+    fields: Vec<StructField>,
 }
 
 /// Fetch table schema from Unity Catalog API
@@ -192,11 +237,179 @@ async fn get_oauth_token(
     Ok(token_response.access_token)
 }
 
+/// Parse type_json string into ComplexType
+fn parse_type_json(type_json: &str) -> Result<ComplexType, ZerobusSinkError> {
+    if type_json.is_empty() || type_json == "{}" {
+        return Err(ZerobusSinkError::ConfigError {
+            message: "Empty type_json".to_string(),
+        });
+    }
+
+    let json: JsonValue = serde_json::from_str(type_json).map_err(|e| {
+        ZerobusSinkError::ConfigError {
+            message: format!("Failed to parse type_json: {}", e),
+        }
+    })?;
+
+    parse_complex_type(&json)
+}
+
+/// Recursively parse a complex type from JSON
+fn parse_complex_type(json: &JsonValue) -> Result<ComplexType, ZerobusSinkError> {
+    // Handle simple string types (for nested fields)
+    if let Some(type_str) = json.as_str() {
+        return parse_primitive_type(type_str);
+    }
+
+    // Handle type object
+    let type_obj = json.as_object().ok_or_else(|| ZerobusSinkError::ConfigError {
+        message: format!("Expected type object, got: {:?}", json),
+    })?;
+
+    // Get the "type" field
+    let type_field = type_obj.get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ZerobusSinkError::ConfigError {
+            message: format!("Missing 'type' field in type_json: {:?}", type_obj),
+        })?;
+
+    match type_field {
+        "struct" => parse_struct_type(type_obj),
+        "array" => parse_array_type(type_obj),
+        "map" => parse_map_type(type_obj),
+        primitive => parse_primitive_type(primitive),
+    }
+}
+
+/// Parse primitive type string
+fn parse_primitive_type(type_str: &str) -> Result<ComplexType, ZerobusSinkError> {
+    let primitive = match type_str {
+        "string" => PrimitiveType::String,
+        "long" => PrimitiveType::Long,
+        "integer" => PrimitiveType::Integer,
+        "short" => PrimitiveType::Short,
+        "byte" => PrimitiveType::Byte,
+        "double" => PrimitiveType::Double,
+        "float" => PrimitiveType::Float,
+        "boolean" => PrimitiveType::Boolean,
+        "binary" => PrimitiveType::Binary,
+        "timestamp" => PrimitiveType::Timestamp,
+        "date" => PrimitiveType::Date,
+        other if other.starts_with("decimal") => {
+            // Parse decimal(precision, scale)
+            PrimitiveType::Decimal { _precision: 38, _scale: 10 } // Default values
+        },
+        unknown => {
+            return Err(ZerobusSinkError::ConfigError {
+                message: format!("Unknown primitive type: {}", unknown),
+            });
+        }
+    };
+    Ok(ComplexType::Primitive(primitive))
+}
+
+/// Parse STRUCT type
+fn parse_struct_type(type_obj: &serde_json::Map<String, JsonValue>) -> Result<ComplexType, ZerobusSinkError> {
+    let fields_json = type_obj.get("fields")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ZerobusSinkError::ConfigError {
+            message: "STRUCT type missing 'fields' array".to_string(),
+        })?;
+
+    let mut fields = Vec::new();
+    for field_json in fields_json {
+        let field_obj = field_json.as_object().ok_or_else(|| {
+            ZerobusSinkError::ConfigError {
+                message: format!("Expected field object, got: {:?}", field_json),
+            }
+        })?;
+
+        let name = field_obj.get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ZerobusSinkError::ConfigError {
+                message: "Field missing 'name'".to_string(),
+            })?
+            .to_string();
+
+        let nullable = field_obj.get("nullable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        // Parse the field type (can be nested)
+        let field_type_json = field_obj.get("type")
+            .ok_or_else(|| ZerobusSinkError::ConfigError {
+                message: format!("Field '{}' missing 'type'", name),
+            })?;
+
+        let field_type = parse_complex_type(field_type_json)?;
+
+        fields.push(StructField {
+            name,
+            field_type,
+            nullable,
+        });
+    }
+
+    Ok(ComplexType::Struct(StructType { fields }))
+}
+
+/// Parse ARRAY type
+fn parse_array_type(type_obj: &serde_json::Map<String, JsonValue>) -> Result<ComplexType, ZerobusSinkError> {
+    let element_type_json = type_obj.get("elementType")
+        .ok_or_else(|| ZerobusSinkError::ConfigError {
+            message: "ARRAY type missing 'elementType'".to_string(),
+        })?;
+
+    let element_type = parse_complex_type(element_type_json)?;
+    Ok(ComplexType::Array(Box::new(element_type)))
+}
+
+/// Parse MAP type
+fn parse_map_type(type_obj: &serde_json::Map<String, JsonValue>) -> Result<ComplexType, ZerobusSinkError> {
+    let key_type_json = type_obj.get("keyType")
+        .ok_or_else(|| ZerobusSinkError::ConfigError {
+            message: "MAP type missing 'keyType'".to_string(),
+        })?;
+
+    let value_type_json = type_obj.get("valueType")
+        .ok_or_else(|| ZerobusSinkError::ConfigError {
+            message: "MAP type missing 'valueType'".to_string(),
+        })?;
+
+    let key_type = parse_complex_type(key_type_json)?;
+    let value_type = parse_complex_type(value_type_json)?;
+
+    Ok(ComplexType::Map {
+        key_type: Box::new(key_type),
+        value_type: Box::new(value_type),
+    })
+}
+
+/// Helper structure to collect nested message types during generation
+struct MessageCollector {
+    /// All nested message definitions
+    nested_messages: Vec<prost_types::DescriptorProto>,
+}
+
+impl MessageCollector {
+    fn new() -> Self {
+        Self {
+            nested_messages: Vec::new(),
+        }
+    }
+
+    /// Add a nested message definition
+    fn add_message(&mut self, message: prost_types::DescriptorProto) {
+        self.nested_messages.push(message);
+    }
+}
+
 /// Generate protobuf descriptor from Unity Catalog table schema
 pub fn generate_descriptor_from_schema(
     schema: &UnityCatalogTableSchema,
 ) -> Result<prost_reflect::MessageDescriptor, ZerobusSinkError> {
     let mut proto_fields = Vec::new();
+    let mut collector = MessageCollector::new();
 
     // Sort columns by position to maintain stable field numbers
     let mut columns = schema.columns.clone();
@@ -208,24 +421,56 @@ pub fn generate_descriptor_from_schema(
             continue;
         }
 
-        let field_type = map_databricks_type_to_protobuf(&column)?;
+        // Try to parse complex types from type_json
+        let (field_type, type_name) = if column.type_name == "STRUCT"
+            || column.type_name == "ARRAY"
+            || column.type_name == "MAP" {
+            // Parse type_json for complex types - STRICT MODE: fail on parse errors
+            let complex_type = parse_type_json(&column.type_json)
+                .map_err(|e| ZerobusSinkError::ConfigError {
+                    message: format!(
+                        "Failed to parse complex type for column '{}': {}. \
+                         Vector requires all types to be supported. \
+                         Options: 1) Update Vector to latest version, \
+                                 2) Use explicit .proto schema file",
+                        column.name, e
+                    ),
+                })?;
+
+            let path_prefix = column.name.clone();
+            map_complex_type_to_protobuf(
+                &complex_type,
+                &path_prefix,
+                &mut collector,
+            )?
+        } else {
+            // Simple types
+            let field_type = map_simple_databricks_type(&column.type_name)?;
+            (field_type, None)
+        };
+
+        // Determine label based on type
+        let label = if column.type_name == "MAP" {
+            // MAPs are represented as repeated map entry messages
+            prost_types::field_descriptor_proto::Label::Repeated as i32
+        } else if column.nullable {
+            prost_types::field_descriptor_proto::Label::Optional as i32
+        } else {
+            prost_types::field_descriptor_proto::Label::Required as i32
+        };
 
         proto_fields.push(prost_types::FieldDescriptorProto {
             name: Some(column.name.clone()),
             number: Some(column.position),
-            label: Some(if column.nullable {
-                prost_types::field_descriptor_proto::Label::Optional as i32
-            } else {
-                prost_types::field_descriptor_proto::Label::Required as i32
-            }),
+            label: Some(label),
             r#type: Some(field_type as i32),
-            type_name: None,
+            type_name,
             extendee: None,
             default_value: None,
             oneof_index: None,
             json_name: Some(column.name.clone()),
             options: None,
-            proto3_optional: Some(column.nullable),
+            proto3_optional: Some(column.nullable && column.type_name != "MAP"),
         });
     }
 
@@ -235,7 +480,7 @@ pub fn generate_descriptor_from_schema(
         name: Some(message_name.clone()),
         field: proto_fields,
         extension: vec![],
-        nested_type: vec![],
+        nested_type: collector.nested_messages,
         enum_type: vec![],
         extension_range: vec![],
         oneof_decl: vec![],
@@ -271,47 +516,314 @@ pub fn generate_descriptor_from_schema(
     Ok(message_descriptor)
 }
 
-/// Map Databricks type to protobuf type
-/// Starting with simple types, will expand to complex types later
-fn map_databricks_type_to_protobuf(
-    column: &UnityCatalogColumn,
+/// Map simple Databricks type name to protobuf type
+fn map_simple_databricks_type(
+    type_name: &str,
 ) -> Result<prost_types::field_descriptor_proto::Type, ZerobusSinkError> {
-    match column.type_name.as_str() {
+    match type_name {
         "STRING" => Ok(prost_types::field_descriptor_proto::Type::String),
         "INT" => Ok(prost_types::field_descriptor_proto::Type::Int32),
-        "BIGINT" => Ok(prost_types::field_descriptor_proto::Type::Int64),
+        "LONG" | "BIGINT" => Ok(prost_types::field_descriptor_proto::Type::Int64),
         "BOOLEAN" | "BOOL" => Ok(prost_types::field_descriptor_proto::Type::Bool),
-        "DOUBLE" | "FLOAT" => Ok(prost_types::field_descriptor_proto::Type::Double),
+        "DOUBLE" => Ok(prost_types::field_descriptor_proto::Type::Double),
+        "FLOAT" => Ok(prost_types::field_descriptor_proto::Type::Float),
         "TIMESTAMP" => Ok(prost_types::field_descriptor_proto::Type::String),
+        "DATE" => Ok(prost_types::field_descriptor_proto::Type::String),
         "BINARY" => Ok(prost_types::field_descriptor_proto::Type::Bytes),
-
-        // Complex types - for now, serialize as string
-        // TODO: Implement proper struct/array handling
-        "STRUCT" => {
-            eprintln!(
-                "Warning: Column '{}' has complex STRUCT type, treating as string. \
-                 Use explicit schema file for full complex type support.",
-                column.name
-            );
-            Ok(prost_types::field_descriptor_proto::Type::String)
-        }
-        "ARRAY" => {
-            eprintln!(
-                "Warning: Column '{}' has ARRAY type, treating as string. \
-                 Use explicit schema file for full array support.",
-                column.name
-            );
-            Ok(prost_types::field_descriptor_proto::Type::String)
-        }
+        "DECIMAL" => Ok(prost_types::field_descriptor_proto::Type::String),
 
         unknown => Err(ZerobusSinkError::ConfigError {
-            message: format!(
-                "Unsupported Databricks type '{}' for column '{}'. \
-                 Consider using an explicit schema file for complex types.",
-                unknown, column.name
-            ),
+            message: format!("Unsupported Databricks type: {}", unknown),
         }),
     }
+}
+
+/// Map primitive type to protobuf type
+fn map_primitive_to_protobuf(
+    primitive: &PrimitiveType,
+) -> prost_types::field_descriptor_proto::Type {
+    match primitive {
+        PrimitiveType::String => prost_types::field_descriptor_proto::Type::String,
+        PrimitiveType::Long => prost_types::field_descriptor_proto::Type::Int64,
+        PrimitiveType::Integer => prost_types::field_descriptor_proto::Type::Int32,
+        PrimitiveType::Short => prost_types::field_descriptor_proto::Type::Int32,
+        PrimitiveType::Byte => prost_types::field_descriptor_proto::Type::Int32,
+        PrimitiveType::Double => prost_types::field_descriptor_proto::Type::Double,
+        PrimitiveType::Float => prost_types::field_descriptor_proto::Type::Float,
+        PrimitiveType::Boolean => prost_types::field_descriptor_proto::Type::Bool,
+        PrimitiveType::Binary => prost_types::field_descriptor_proto::Type::Bytes,
+        PrimitiveType::Timestamp => prost_types::field_descriptor_proto::Type::String,
+        PrimitiveType::Date => prost_types::field_descriptor_proto::Type::String,
+        PrimitiveType::Decimal { .. } => prost_types::field_descriptor_proto::Type::String,
+    }
+}
+
+/// Map complex type to protobuf, generating nested messages as needed
+/// Returns (field_type, optional_type_name)
+fn map_complex_type_to_protobuf(
+    complex_type: &ComplexType,
+    path_prefix: &str,
+    collector: &mut MessageCollector,
+) -> Result<(prost_types::field_descriptor_proto::Type, Option<String>), ZerobusSinkError> {
+    match complex_type {
+        ComplexType::Primitive(primitive) => {
+            let proto_type = map_primitive_to_protobuf(primitive);
+            Ok((proto_type, None))
+        }
+
+        ComplexType::Struct(struct_type) => {
+            // Generate a nested message for this struct
+            let message_name = sanitize_message_name(path_prefix);
+            let message_proto = generate_struct_message(&message_name, struct_type, collector)?;
+            collector.add_message(message_proto);
+
+            // Return MESSAGE type with the type name
+            Ok((
+                prost_types::field_descriptor_proto::Type::Message,
+                Some(message_name),
+            ))
+        }
+
+        ComplexType::Array(element_type) => {
+            // Arrays become repeated fields
+            // The element type determines the field type
+            match element_type.as_ref() {
+                ComplexType::Primitive(primitive) => {
+                    let proto_type = map_primitive_to_protobuf(primitive);
+                    Ok((proto_type, None))
+                }
+                ComplexType::Struct(_) => {
+                    // Array of structs - need to generate the struct message
+                    let element_message_name = format!("{}_element", sanitize_message_name(path_prefix));
+                    let (_, type_name) = map_complex_type_to_protobuf(
+                        element_type,
+                        &element_message_name,
+                        collector,
+                    )?;
+
+                    Ok((
+                        prost_types::field_descriptor_proto::Type::Message,
+                        type_name,
+                    ))
+                }
+                ComplexType::Array(_) => {
+                    // Nested arrays not supported by Protobuf directly
+                    Err(ZerobusSinkError::ConfigError {
+                        message: format!("Nested arrays not supported for field: {}", path_prefix),
+                    })
+                }
+                ComplexType::Map { .. } => {
+                    // Array of maps - not directly supported
+                    Err(ZerobusSinkError::ConfigError {
+                        message: format!("Array of maps not supported for field: {}", path_prefix),
+                    })
+                }
+            }
+        }
+
+        ComplexType::Map { key_type, value_type } => {
+            // Protobuf maps are represented as:
+            // message MapFieldEntry { K key = 1; V value = 2; }
+            // repeated MapFieldEntry map_field = N;
+
+            // Check if key is a string (protobuf maps require scalar keys)
+            let key_is_string = matches!(
+                key_type.as_ref(),
+                ComplexType::Primitive(PrimitiveType::String)
+            );
+
+            if !key_is_string {
+                return Err(ZerobusSinkError::ConfigError {
+                    message: format!(
+                        "MAP with non-string keys not supported for field '{}'. \
+                         Protobuf maps require scalar keys. Found key type: {:?}",
+                        path_prefix, key_type
+                    ),
+                });
+            }
+
+            // Check if value is a primitive type
+            match value_type.as_ref() {
+                ComplexType::Primitive(value_primitive) => {
+                    // Generate a map entry message for this field
+                    let entry_message_name = format!("{}_entry", sanitize_message_name(path_prefix));
+                    let entry_message = generate_map_entry_message(
+                        &entry_message_name,
+                        value_primitive,
+                    )?;
+
+                    collector.add_message(entry_message);
+
+                    // Return repeated message type
+                    Ok((
+                        prost_types::field_descriptor_proto::Type::Message,
+                        Some(entry_message_name),
+                    ))
+                }
+                ComplexType::Struct(_) => {
+                    // Map with struct values - need to generate the struct message first
+                    Err(ZerobusSinkError::ConfigError {
+                        message: format!(
+                            "MAP with STRUCT values not yet supported for field '{}'. \
+                             Use explicit .proto schema file for complex map types.",
+                            path_prefix
+                        ),
+                    })
+                }
+                ComplexType::Array(_) | ComplexType::Map { .. } => {
+                    // Map with complex values
+                    Err(ZerobusSinkError::ConfigError {
+                        message: format!(
+                            "MAP with complex values (ARRAY/MAP) not supported for field '{}'. \
+                             Protobuf maps require simple value types.",
+                            path_prefix
+                        ),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Generate a protobuf message definition from a StructType
+fn generate_struct_message(
+    message_name: &str,
+    struct_type: &StructType,
+    collector: &mut MessageCollector,
+) -> Result<prost_types::DescriptorProto, ZerobusSinkError> {
+    let mut fields = Vec::new();
+
+    for (index, field) in struct_type.fields.iter().enumerate() {
+        // Field number starts at 1
+        let field_number = (index + 1) as i32;
+
+        // Recursively map the field type
+        let path = format!("{}_{}", message_name, field.name);
+        let (field_type, type_name) = map_complex_type_to_protobuf(
+            &field.field_type,
+            &path,
+            collector,
+        )?;
+
+        // Determine if this is a repeated field (for arrays)
+        let (label, is_repeated) = if matches!(field.field_type, ComplexType::Array(_)) {
+            (prost_types::field_descriptor_proto::Label::Repeated as i32, true)
+        } else if field.nullable {
+            (prost_types::field_descriptor_proto::Label::Optional as i32, false)
+        } else {
+            (prost_types::field_descriptor_proto::Label::Required as i32, false)
+        };
+
+        fields.push(prost_types::FieldDescriptorProto {
+            name: Some(field.name.clone()),
+            number: Some(field_number),
+            label: Some(label),
+            r#type: Some(field_type as i32),
+            type_name,
+            extendee: None,
+            default_value: None,
+            oneof_index: None,
+            json_name: Some(field.name.clone()),
+            options: None,
+            proto3_optional: Some(field.nullable && !is_repeated),
+        });
+    }
+
+    Ok(prost_types::DescriptorProto {
+        name: Some(message_name.to_string()),
+        field: fields,
+        extension: vec![],
+        nested_type: vec![],
+        enum_type: vec![],
+        extension_range: vec![],
+        oneof_decl: vec![],
+        options: None,
+        reserved_range: vec![],
+        reserved_name: vec![],
+    })
+}
+
+/// Generate a map entry message for protobuf map representation
+/// Maps in protobuf are represented as: repeated MapEntry where MapEntry { key, value }
+fn generate_map_entry_message(
+    message_name: &str,
+    value_type: &PrimitiveType,
+) -> Result<prost_types::DescriptorProto, ZerobusSinkError> {
+    let value_proto_type = map_primitive_to_protobuf(value_type);
+
+    let fields = vec![
+        // key field (always string for our supported maps)
+        prost_types::FieldDescriptorProto {
+            name: Some("key".to_string()),
+            number: Some(1),
+            label: Some(prost_types::field_descriptor_proto::Label::Optional as i32),
+            r#type: Some(prost_types::field_descriptor_proto::Type::String as i32),
+            type_name: None,
+            extendee: None,
+            default_value: None,
+            oneof_index: None,
+            json_name: Some("key".to_string()),
+            options: None,
+            proto3_optional: Some(false),
+        },
+        // value field
+        prost_types::FieldDescriptorProto {
+            name: Some("value".to_string()),
+            number: Some(2),
+            label: Some(prost_types::field_descriptor_proto::Label::Optional as i32),
+            r#type: Some(value_proto_type as i32),
+            type_name: None,
+            extendee: None,
+            default_value: None,
+            oneof_index: None,
+            json_name: Some("value".to_string()),
+            options: None,
+            proto3_optional: Some(true),
+        },
+    ];
+
+    Ok(prost_types::DescriptorProto {
+        name: Some(message_name.to_string()),
+        field: fields,
+        extension: vec![],
+        nested_type: vec![],
+        enum_type: vec![],
+        extension_range: vec![],
+        oneof_decl: vec![],
+        options: Some(prost_types::MessageOptions {
+            map_entry: Some(true), // Mark this as a map entry
+            ..Default::default()
+        }),
+        reserved_range: vec![],
+        reserved_name: vec![],
+    })
+}
+
+/// Sanitize a field name to be a valid protobuf message name
+fn sanitize_message_name(name: &str) -> String {
+    // Convert to PascalCase and remove invalid characters
+    let mut result = String::new();
+    let mut capitalize_next = true;
+
+    for c in name.chars() {
+        if c.is_alphanumeric() {
+            if capitalize_next {
+                result.push(c.to_ascii_uppercase());
+                capitalize_next = false;
+            } else {
+                result.push(c);
+            }
+        } else {
+            capitalize_next = true;
+        }
+    }
+
+    // Ensure it starts with a letter
+    if result.is_empty() || !result.chars().next().unwrap().is_alphabetic() {
+        result.insert(0, 'M');
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -331,16 +843,7 @@ mod tests {
         ];
 
         for (databricks_type, expected_proto_type) in test_cases {
-            let column = UnityCatalogColumn {
-                name: "test_column".to_string(),
-                type_text: databricks_type.to_lowercase(),
-                type_name: databricks_type.to_string(),
-                position: 1,
-                nullable: true,
-                type_json: "{}".to_string(),
-            };
-
-            let result = map_databricks_type_to_protobuf(&column);
+            let result = map_simple_databricks_type(databricks_type);
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), expected_proto_type);
         }
@@ -383,5 +886,144 @@ mod tests {
 
         let message_field = descriptor.get_field_by_name("message");
         assert!(message_field.is_some());
+    }
+
+    #[test]
+    fn test_parse_struct_type_json() {
+        let type_json = r#"{
+            "type": "struct",
+            "fields": [
+                {
+                    "name": "job_id",
+                    "type": "long",
+                    "nullable": true
+                },
+                {
+                    "name": "task_run_id",
+                    "type": "long",
+                    "nullable": true
+                }
+            ]
+        }"#;
+
+        let result = parse_type_json(type_json);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ComplexType::Struct(struct_type) => {
+                assert_eq!(struct_type.fields.len(), 2);
+                assert_eq!(struct_type.fields[0].name, "job_id");
+                assert_eq!(struct_type.fields[1].name, "task_run_id");
+            }
+            _ => panic!("Expected struct type"),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_type_json() {
+        let type_json = r#"{
+            "type": "array",
+            "elementType": "string"
+        }"#;
+
+        let result = parse_type_json(type_json);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ComplexType::Array(element_type) => {
+                match element_type.as_ref() {
+                    ComplexType::Primitive(PrimitiveType::String) => {}
+                    _ => panic!("Expected string element type"),
+                }
+            }
+            _ => panic!("Expected array type"),
+        }
+    }
+
+    #[test]
+    fn test_parse_map_type_json() {
+        let type_json = r#"{
+            "type": "map",
+            "keyType": "string",
+            "valueType": "string"
+        }"#;
+
+        let result = parse_type_json(type_json);
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            ComplexType::Map { key_type, value_type } => {
+                assert!(matches!(
+                    key_type.as_ref(),
+                    ComplexType::Primitive(PrimitiveType::String)
+                ));
+                assert!(matches!(
+                    value_type.as_ref(),
+                    ComplexType::Primitive(PrimitiveType::String)
+                ));
+            }
+            _ => panic!("Expected map type"),
+        }
+    }
+
+    #[test]
+    fn test_generate_descriptor_with_map() {
+        let schema = UnityCatalogTableSchema {
+            name: "test_table".to_string(),
+            catalog_name: "test_catalog".to_string(),
+            schema_name: "test_schema".to_string(),
+            columns: vec![
+                UnityCatalogColumn {
+                    name: "id".to_string(),
+                    type_text: "bigint".to_string(),
+                    type_name: "BIGINT".to_string(),
+                    position: 1,
+                    nullable: false,
+                    type_json: "{}".to_string(),
+                },
+                UnityCatalogColumn {
+                    name: "attributes".to_string(),
+                    type_text: "map<string,string>".to_string(),
+                    type_name: "MAP".to_string(),
+                    position: 2,
+                    nullable: true,
+                    type_json: r#"{"type":"map","keyType":"string","valueType":"string"}"#.to_string(),
+                },
+            ],
+        };
+
+        let result = generate_descriptor_from_schema(&schema);
+        assert!(result.is_ok(), "Failed to generate descriptor with MAP type: {:?}", result.err());
+
+        let descriptor = result.unwrap();
+        assert_eq!(descriptor.fields().len(), 2);
+
+        let id_field = descriptor.get_field_by_name("id");
+        assert!(id_field.is_some());
+
+        let attributes_field = descriptor.get_field_by_name("attributes");
+        assert!(attributes_field.is_some());
+    }
+
+    #[test]
+    fn test_strict_validation_fails_on_unsupported() {
+        let schema = UnityCatalogTableSchema {
+            name: "test_table".to_string(),
+            catalog_name: "test_catalog".to_string(),
+            schema_name: "test_schema".to_string(),
+            columns: vec![
+                UnityCatalogColumn {
+                    name: "unsupported_col".to_string(),
+                    type_text: "struct<...>".to_string(),
+                    type_name: "STRUCT".to_string(),
+                    position: 1,
+                    nullable: true,
+                    type_json: "invalid json".to_string(), // Malformed type_json
+                },
+            ],
+        };
+
+        let result = generate_descriptor_from_schema(&schema);
+        assert!(result.is_err(), "Expected error for malformed type_json");
     }
 }
