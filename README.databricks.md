@@ -73,3 +73,4 @@ This lists custom changes merged in Databricks fork of Vector.
 72. Getting pod name and namespace from pod metadata - https://github.com/databricks-eng/vector/pull/379
 73. Adding Vector File Event as a Vector Event Type to the Internal Events - https://github.com/databricks-eng/vector/pull/380
 74. Reorganize list of directories scanned by the DB logs source https://github.com/databricks-eng/vector/pull/369
+75. Add Unity Catalog schema fetching for Databricks ZeroBus sink with OAuth authentication, dynamic protobuf schema generation from Unity Catalog API, full complex type support (structs, arrays, maps), and comprehensive unit tests for schema conversion https://github.com/databricks-eng/vector/pull/382
