@@ -447,6 +447,106 @@ impl MessageCollector {
     }
 }
 
+/// Format a protobuf MessageDescriptor as a .proto file string for logging
+fn format_descriptor_as_proto(descriptor: &prost_reflect::MessageDescriptor) -> String {
+    let mut output = String::new();
+    format_message_as_proto(descriptor, &mut output, 0);
+    output
+}
+
+/// Recursively format a message and its nested types
+fn format_message_as_proto(
+    descriptor: &prost_reflect::MessageDescriptor,
+    output: &mut String,
+    indent_level: usize,
+) {
+    let indent = "  ".repeat(indent_level);
+
+    // Write message header
+    output.push_str(&format!("{}message {} {{\n", indent, descriptor.name()));
+
+    // Write fields
+    for field in descriptor.fields() {
+        let field_indent = "  ".repeat(indent_level + 1);
+        let field_type = format_field_type(&field);
+        let field_number = field.number();
+        output.push_str(&format!(
+            "{}{}{} = {};\n",
+            field_indent,
+            field_type,
+            field.name(),
+            field_number
+        ));
+    }
+
+    output.push_str(&format!("{}}}\n", indent));
+
+    // Write nested message types
+    for nested in descriptor.child_messages() {
+        output.push('\n');
+        format_message_as_proto(&nested, output, indent_level);
+    }
+}
+
+/// Format a field's type declaration
+fn format_field_type(field: &prost_reflect::FieldDescriptor) -> String {
+    use prost_reflect::Kind;
+
+    if field.is_map() {
+        // Map fields: map<key_type, value_type> field_name
+        if let Kind::Message(map_entry) = field.kind() {
+            let key_field = map_entry.fields().find(|f| f.name() == "key").unwrap();
+            let value_field = map_entry.fields().find(|f| f.name() == "value").unwrap();
+            let key_type = format_scalar_type(&key_field);
+            let value_type = format_scalar_type(&value_field);
+            return format!("map<{}, {}> ", key_type, value_type);
+        }
+    }
+
+    let base_type = match field.kind() {
+        Kind::Message(msg) => msg.name().to_string(),
+        kind => format_kind_type(&kind),
+    };
+
+    if field.is_list() {
+        format!("repeated {} ", base_type)
+    } else {
+        format!("{} ", base_type)
+    }
+}
+
+/// Format a scalar field type (for map keys/values)
+fn format_scalar_type(field: &prost_reflect::FieldDescriptor) -> String {
+    match field.kind() {
+        prost_reflect::Kind::Message(msg) => msg.name().to_string(),
+        kind => format_kind_type(&kind),
+    }
+}
+
+/// Map Kind enum to proto type string
+fn format_kind_type(kind: &prost_reflect::Kind) -> String {
+    use prost_reflect::Kind;
+    match kind {
+        Kind::Double => "double".to_string(),
+        Kind::Float => "float".to_string(),
+        Kind::Int32 => "int32".to_string(),
+        Kind::Int64 => "int64".to_string(),
+        Kind::Uint32 => "uint32".to_string(),
+        Kind::Uint64 => "uint64".to_string(),
+        Kind::Sint32 => "sint32".to_string(),
+        Kind::Sint64 => "sint64".to_string(),
+        Kind::Fixed32 => "fixed32".to_string(),
+        Kind::Fixed64 => "fixed64".to_string(),
+        Kind::Sfixed32 => "sfixed32".to_string(),
+        Kind::Sfixed64 => "sfixed64".to_string(),
+        Kind::Bool => "bool".to_string(),
+        Kind::String => "string".to_string(),
+        Kind::Bytes => "bytes".to_string(),
+        Kind::Message(msg) => msg.name().to_string(),
+        Kind::Enum(e) => e.name().to_string(),
+    }
+}
+
 /// Generate protobuf descriptor from Unity Catalog table schema
 pub fn generate_descriptor_from_schema(
     schema: &UnityCatalogTableSchema,
@@ -459,8 +559,8 @@ pub fn generate_descriptor_from_schema(
     columns.sort_by_key(|c| c.position);
 
     for column in columns {
-        // Skip columns with invalid positions
-        if column.position < 1 {
+        // Skip columns with invalid positions (position should be >= 0)
+        if column.position < 0 {
             continue;
         }
 
@@ -507,7 +607,7 @@ pub fn generate_descriptor_from_schema(
 
         proto_fields.push(prost_types::FieldDescriptorProto {
             name: Some(column.name.clone()),
-            number: Some(column.position),
+            number: Some(column.position + 1), // Protobuf field numbers start at 1, not 0
             label: Some(label),
             r#type: Some(field_type as i32),
             type_name,
@@ -559,6 +659,13 @@ pub fn generate_descriptor_from_schema(
             message: format!("Failed to get message descriptor for {}", full_message_name),
         })?;
 
+    // Log the inferred protobuf schema
+    let proto_schema = format_descriptor_as_proto(&message_descriptor);
+    info!(
+        "Inferred protobuf schema from Unity Catalog table {}.{}.{}:\n{}",
+        schema.catalog_name, schema.schema_name, schema.name, proto_schema
+    );
+
     Ok(message_descriptor)
 }
 
@@ -573,7 +680,7 @@ fn map_simple_databricks_type(
         "BOOLEAN" | "BOOL" => Ok(prost_types::field_descriptor_proto::Type::Bool),
         "DOUBLE" => Ok(prost_types::field_descriptor_proto::Type::Double),
         "FLOAT" => Ok(prost_types::field_descriptor_proto::Type::Float),
-        "TIMESTAMP" => Ok(prost_types::field_descriptor_proto::Type::String),
+        "TIMESTAMP" => Ok(prost_types::field_descriptor_proto::Type::Int64), // Unix timestamp in microseconds
         "DATE" => Ok(prost_types::field_descriptor_proto::Type::String),
         "BINARY" => Ok(prost_types::field_descriptor_proto::Type::Bytes),
         "DECIMAL" => Ok(prost_types::field_descriptor_proto::Type::String),
@@ -854,7 +961,12 @@ fn generate_map_entry_message(
     })
 }
 
-/// Sanitize a field name to be a valid protobuf message name
+// The function converts Unity Catalog field names into valid protobuf message type names:
+// When generating protobuf descriptors from Unity Catalog schemas, nested structures (structs, arrays of structs, maps) 
+// need to become protobuf message types. Protobuf message names must:
+// 1. Start with a letter (not _ or digit)
+// 2. Be alphanumeric (no special characters)
+// 3. Follow PascalCase convention
 fn sanitize_message_name(name: &str) -> String {
     // Convert to PascalCase and remove invalid characters
     let mut result = String::new();
@@ -895,7 +1007,7 @@ mod tests {
             ("DOUBLE", prost_types::field_descriptor_proto::Type::Double),
             (
                 "TIMESTAMP",
-                prost_types::field_descriptor_proto::Type::String,
+                prost_types::field_descriptor_proto::Type::Int64, // Unix timestamp in microseconds
             ),
             ("BINARY", prost_types::field_descriptor_proto::Type::Bytes),
         ];
@@ -1206,14 +1318,18 @@ mod tests {
         );
 
         let descriptor = result.unwrap();
-        // Note: _event_time has position 0 and is skipped, so we get 4 fields instead of 5
+        // All columns including _event_time (position 0) should be included
         assert_eq!(
             descriptor.fields().len(),
-            4,
-            "Should have 4 columns (position >= 1)"
+            5,
+            "Should have 5 columns including _event_time"
         );
 
-        // Verify specific complex type columns (skip _event_time with position 0)
+        // Verify specific complex type columns including _event_time
+        assert!(
+            descriptor.get_field_by_name("_event_time").is_some(),
+            "Should have _event_time"
+        );
         assert!(
             descriptor.get_field_by_name("workspace_id").is_some(),
             "Should have workspace_id"
@@ -1293,5 +1409,337 @@ mod tests {
         // Test that missing 'type' field is handled
         let result = parse_type_json(r#"{"fields": []}"#);
         assert!(result.is_err(), "Should fail when 'type' field is missing");
+    }
+
+    // ========== Comprehensive Proto Compatibility Test ==========
+
+    /// Helper function to assert a field exists with expected type
+    fn assert_field_exists_with_type(
+        descriptor: &prost_reflect::MessageDescriptor,
+        field_name: &str,
+        expected_type: &str,
+    ) {
+        let field = descriptor
+            .get_field_by_name(field_name)
+            .unwrap_or_else(|| panic!("Field '{}' should exist", field_name));
+
+        let actual_type = format_field_type_simple(&field);
+        assert_eq!(
+            actual_type, expected_type,
+            "Field '{}' should have type '{}'",
+            field_name, expected_type
+        );
+    }
+
+    /// Helper function to assert a field is a message type with expected name
+    fn assert_field_is_message(
+        descriptor: &prost_reflect::MessageDescriptor,
+        field_name: &str,
+        message_type: &str,
+    ) {
+        let field = descriptor
+            .get_field_by_name(field_name)
+            .unwrap_or_else(|| panic!("Field '{}' should exist", field_name));
+
+        match field.kind() {
+            prost_reflect::Kind::Message(msg) => {
+                assert_eq!(
+                    msg.name(),
+                    message_type,
+                    "Field '{}' should be message type '{}'",
+                    field_name,
+                    message_type
+                );
+            }
+            _ => panic!("Field '{}' should be a message type", field_name),
+        }
+    }
+
+    /// Helper function to assert a field is repeated (array)
+    fn assert_field_is_repeated(
+        descriptor: &prost_reflect::MessageDescriptor,
+        field_name: &str,
+    ) {
+        let field = descriptor
+            .get_field_by_name(field_name)
+            .unwrap_or_else(|| panic!("Field '{}' should exist", field_name));
+
+        assert!(
+            field.is_list(),
+            "Field '{}' should be repeated/list",
+            field_name
+        );
+    }
+
+    /// Helper function to format field type as simple string
+    fn format_field_type_simple(field: &prost_reflect::FieldDescriptor) -> String {
+        use prost_reflect::Kind;
+        match field.kind() {
+            Kind::String => "string".to_string(),
+            Kind::Int64 => "int64".to_string(),
+            Kind::Int32 => "int32".to_string(),
+            Kind::Bool => "bool".to_string(),
+            Kind::Double => "double".to_string(),
+            Kind::Float => "float".to_string(),
+            Kind::Bytes => "bytes".to_string(),
+            Kind::Message(msg) => msg.name().to_string(),
+            _ => "unknown".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_complete_service_health_event_matches_proto_definition() {
+        // This test verifies that the Unity Catalog schema for service_health_event
+        // matches the source proto definition from universe/proto/logs/sla/service_health_event.proto
+        //
+        // Comparison rules:
+        // - Ignore fields starting with _ (ETL metadata)
+        // - Ignore field number differences (reordering during ETL)
+        // - Treat enums as strings (OutcomeType, RequestType, SourceType)
+
+        let json = include_str!("tests/fixtures/service_health_event_complete_schema.json");
+        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
+            .expect("Failed to parse complete service_health_event schema");
+
+        let descriptor = generate_descriptor_from_schema(&schema)
+            .expect("Failed to generate descriptor from complete schema");
+
+        // === 1. VERIFY MAIN MESSAGE STRUCTURE ===
+
+        assert_eq!(
+            descriptor.name(),
+            "eng_lumberjack_prime_dev_service_health_event",
+            "Main message should have expected name"
+        );
+
+        // Count non-underscore fields (business fields from proto)
+        let non_underscore_fields: Vec<_> = descriptor
+            .fields()
+            .filter(|f| !f.name().starts_with('_'))
+            .collect();
+
+        assert_eq!(
+            non_underscore_fields.len(),
+            13,
+            "Should have exactly 13 business fields from ServiceHealthEvent proto"
+        );
+
+        // === 2. VERIFY ALL PRIMITIVE FIELDS ===
+
+        assert_field_exists_with_type(&descriptor, "event_name", "string");
+        assert_field_exists_with_type(&descriptor, "outcome", "string");
+        assert_field_exists_with_type(&descriptor, "outcome_type", "string"); // enum → string
+        assert_field_exists_with_type(&descriptor, "duration_ms", "int64");
+        assert_field_exists_with_type(&descriptor, "workspace_id", "int64");
+        assert_field_exists_with_type(&descriptor, "classification_low_confidence", "bool");
+        assert_field_exists_with_type(&descriptor, "dbr_version", "string");
+        assert_field_exists_with_type(&descriptor, "outcome_details", "string");
+        assert_field_exists_with_type(&descriptor, "is_suppressed", "bool");
+
+        // === 3. VERIFY COMPLEX MESSAGE TYPES ===
+
+        assert_field_is_message(&descriptor, "service_extra", "ServiceExtra");
+        assert_field_is_message(&descriptor, "rpc_info", "RpcInfo");
+        assert_field_is_message(&descriptor, "request_info", "RequestInfo");
+
+        // === 4. VERIFY ARRAY FIELDS ===
+
+        assert_field_is_repeated(&descriptor, "flag_evaluation_hashes");
+
+        let flag_hashes_field = descriptor
+            .get_field_by_name("flag_evaluation_hashes")
+            .expect("flag_evaluation_hashes should exist");
+        // Check element type is int64
+        let element_type = format_field_type_simple(&flag_hashes_field);
+        assert_eq!(
+            element_type, "int64",
+            "flag_evaluation_hashes should be repeated int64"
+        );
+
+        // === 5. VERIFY NESTED MESSAGE: RpcInfo ===
+
+        let rpc_info_field = descriptor
+            .get_field_by_name("rpc_info")
+            .expect("rpc_info field should exist");
+
+        if let prost_reflect::Kind::Message(rpc_msg) = rpc_info_field.kind() {
+            assert_eq!(
+                rpc_msg.fields().len(),
+                2,
+                "RpcInfo should have exactly 2 fields"
+            );
+
+            assert!(
+                rpc_msg.get_field_by_name("rpc_handler").is_some(),
+                "RpcInfo should have rpc_handler field"
+            );
+            assert!(
+                rpc_msg.get_field_by_name("exception_class").is_some(),
+                "RpcInfo should have exception_class field"
+            );
+        } else {
+            panic!("rpc_info should be a message type");
+        }
+
+        // === 6. VERIFY NESTED MESSAGE: RequestInfo ===
+
+        let request_info_field = descriptor
+            .get_field_by_name("request_info")
+            .expect("request_info field should exist");
+
+        if let prost_reflect::Kind::Message(req_msg) = request_info_field.kind() {
+            assert_eq!(
+                req_msg.fields().len(),
+                6,
+                "RequestInfo should have exactly 6 fields"
+            );
+
+            // Verify all RequestInfo fields exist
+            let expected_fields = vec![
+                "request_type",
+                "handler",
+                "exception_class",
+                "http_method",
+                "source_type",
+                "retry_count",
+            ];
+
+            for field_name in expected_fields {
+                assert!(
+                    req_msg.get_field_by_name(field_name).is_some(),
+                    "RequestInfo should have {} field",
+                    field_name
+                );
+            }
+
+            // Verify retry_count is int32
+            let retry_count = req_msg
+                .get_field_by_name("retry_count")
+                .expect("retry_count should exist");
+            match retry_count.kind() {
+                prost_reflect::Kind::Int32 => {
+                    // Correct type
+                }
+                _ => panic!("retry_count should be int32"),
+            }
+        } else {
+            panic!("request_info should be a message type");
+        }
+
+        // === 7. VERIFY NESTED MESSAGE: ServiceExtra ===
+
+        let service_extra_field = descriptor
+            .get_field_by_name("service_extra")
+            .expect("service_extra field should exist");
+
+        if let prost_reflect::Kind::Message(se_msg) = service_extra_field.kind() {
+            // ServiceExtra is a union type with multiple service-specific fields
+            // Verify key service types exist
+            let expected_services = vec!["jobs", "pipelines", "clusters", "notebooks"];
+
+            for service in expected_services {
+                assert!(
+                    se_msg.get_field_by_name(service).is_some(),
+                    "ServiceExtra should have {} field",
+                    service
+                );
+            }
+
+            // Verify Jobs nested structure
+            let jobs_field = se_msg
+                .get_field_by_name("jobs")
+                .expect("ServiceExtra should have jobs field");
+
+            if let prost_reflect::Kind::Message(jobs_msg) = jobs_field.kind() {
+                assert!(
+                    jobs_msg.get_field_by_name("job_id").is_some(),
+                    "Jobs should have job_id field"
+                );
+                assert!(
+                    jobs_msg.get_field_by_name("task_run_id").is_some(),
+                    "Jobs should have task_run_id field"
+                );
+            }
+        } else {
+            panic!("service_extra should be a message type");
+        }
+
+        // === 8. VERIFY ETL METADATA FIELDS (prefixed with _) ===
+
+        // These fields are added during ETL ingestion and should be present
+        let underscore_fields: Vec<_> = descriptor
+            .fields()
+            .filter(|f| f.name().starts_with('_'))
+            .collect();
+
+        assert!(
+            !underscore_fields.is_empty(),
+            "Should have ETL metadata fields starting with _"
+        );
+
+        // Verify key ETL fields
+        assert!(
+            descriptor.get_field_by_name("_event_time").is_some(),
+            "Should have _event_time field for partitioning"
+        );
+        assert!(
+            descriptor.get_field_by_name("_partition_date").is_some(),
+            "Should have _partition_date field for partitioning"
+        );
+
+        // === SUCCESS ===
+        // If we reach here, the UC schema successfully matches the proto definition!
+        println!(
+            "✅ Unity Catalog schema matches proto definition with {} business fields + {} ETL fields",
+            non_underscore_fields.len(),
+            underscore_fields.len()
+        );
+    }
+
+    #[test]
+    fn test_proto_schema_snapshot() {
+        // Snapshot test: verify the generated proto text matches expected format
+        let json = include_str!("tests/fixtures/service_health_event_complete_schema.json");
+        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
+            .expect("Failed to parse complete service_health_event schema");
+
+        let descriptor = generate_descriptor_from_schema(&schema)
+            .expect("Failed to generate descriptor");
+
+        // Format as proto text
+        let proto_text = format_descriptor_as_proto(&descriptor);
+
+        // Verify key structures are present in the proto text
+        assert!(
+            proto_text.contains("message eng_lumberjack_prime_dev_service_health_event"),
+            "Proto should have main message definition"
+        );
+        assert!(
+            proto_text.contains("string event_name"),
+            "Proto should have event_name field"
+        );
+        assert!(
+            proto_text.contains("int64 workspace_id"),
+            "Proto should have workspace_id field"
+        );
+        assert!(
+            proto_text.contains("repeated int64 flag_evaluation_hashes"),
+            "Proto should have flag_evaluation_hashes as repeated int64"
+        );
+        assert!(
+            proto_text.contains("message RpcInfo"),
+            "Proto should have RpcInfo nested message"
+        );
+        assert!(
+            proto_text.contains("message RequestInfo"),
+            "Proto should have RequestInfo nested message"
+        );
+        assert!(
+            proto_text.contains("message ServiceExtra"),
+            "Proto should have ServiceExtra nested message"
+        );
+
+        println!("✅ Proto schema snapshot test passed");
+        println!("\nGenerated proto schema:\n{}", proto_text);
     }
 }
