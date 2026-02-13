@@ -962,7 +962,7 @@ fn generate_map_entry_message(
 }
 
 // The function converts Unity Catalog field names into valid protobuf message type names:
-// When generating protobuf descriptors from Unity Catalog schemas, nested structures (structs, arrays of structs, maps) 
+// When generating protobuf descriptors from Unity Catalog schemas, nested structures (structs, arrays of structs, maps)
 // need to become protobuf message types. Protobuf message names must:
 // 1. Start with a letter (not _ or digit)
 // 2. Be alphanumeric (no special characters)
@@ -1456,10 +1456,7 @@ mod tests {
     }
 
     /// Helper function to assert a field is repeated (array)
-    fn assert_field_is_repeated(
-        descriptor: &prost_reflect::MessageDescriptor,
-        field_name: &str,
-    ) {
+    fn assert_field_is_repeated(descriptor: &prost_reflect::MessageDescriptor, field_name: &str) {
         let field = descriptor
             .get_field_by_name(field_name)
             .unwrap_or_else(|| panic!("Field '{}' should exist", field_name));
@@ -1703,8 +1700,8 @@ mod tests {
         let schema: UnityCatalogTableSchema = serde_json::from_str(json)
             .expect("Failed to parse complete service_health_event schema");
 
-        let descriptor = generate_descriptor_from_schema(&schema)
-            .expect("Failed to generate descriptor");
+        let descriptor =
+            generate_descriptor_from_schema(&schema).expect("Failed to generate descriptor");
 
         // Format as proto text
         let proto_text = format_descriptor_as_proto(&descriptor);
