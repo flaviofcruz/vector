@@ -8,5 +8,6 @@ mod error;
 mod request_builder;
 mod service;
 mod sink;
+mod unity_catalog_schema;
 
 pub use config::ZerobusSinkConfig;

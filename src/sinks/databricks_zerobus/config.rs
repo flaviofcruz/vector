@@ -40,7 +40,7 @@ pub enum DatabricksAuthentication {
 ///
 /// The schema can be provided as either:
 /// - A path to a protobuf descriptor file (.desc or .pb)
-/// - Raw descriptor bytes (hex or base64 encoded)
+/// - Dynamically fetched from the Unity Catalog table
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -64,6 +64,19 @@ pub enum SchemaSource {
         #[configurable(metadata(docs::examples = "package.Message"))]
         message_type: String,
     },
+
+    /// Dynamically fetch schema from Unity Catalog table.
+    ///
+    /// This will query the Unity Catalog API to get the table schema and
+    /// automatically generate a protobuf descriptor from it.
+    /// Uses the same authentication credentials as the sink.
+    ///
+    /// Example:
+    /// ```toml
+    /// schema = { type = "unity_catalog" }
+    /// ```
+    #[serde(rename = "unity_catalog")]
+    UnityCatalog,
 }
 
 /// Zerobus stream configuration options.
@@ -182,19 +195,18 @@ pub struct ZerobusSinkConfig {
     #[configurable(metadata(docs::examples = true))]
     pub use_tls: bool,
 
-    /// Explicit schema definition for the table.
+    /// Schema definition for the table.
     ///
-    /// If not provided, the schema will be inferred from the first event.
-    /// The schema should be provided as a protobuf descriptor, either as a file path
-    /// or as base64-encoded bytes.
+    /// The schema must be provided either as:
+    /// - A path to a protobuf descriptor file
+    /// - Unity Catalog table schema (fetched automatically)
     ///
     /// Protobuf descriptors can be generated using protoc:
     /// ```sh
     /// protoc --descriptor_set_out=schema.desc --include_imports your_schema.proto
     /// ```
-    #[serde(default)]
     #[configurable(derived)]
-    pub schema: Option<SchemaSource>,
+    pub schema: SchemaSource,
 
     /// Zerobus stream configuration options.
     #[serde(default)]
@@ -236,7 +248,7 @@ impl GenerateConfig for ZerobusSinkConfig {
                 client_secret: SensitiveString::from("${DATABRICKS_CLIENT_SECRET}".to_string()),
             },
             use_tls: true,
-            schema: None,
+            schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
             custom_headers: None,
             batch: BatchConfig::default(),
@@ -251,7 +263,7 @@ impl GenerateConfig for ZerobusSinkConfig {
 #[typetag::serde(name = "databricks_zerobus")]
 impl SinkConfig for ZerobusSinkConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let service = ZerobusService::new(self.clone())?;
+        let service = ZerobusService::new(self.clone()).await?;
         let sink = ZerobusSink::new(service, self.batch.clone())?;
 
         let healthcheck = async {
@@ -394,7 +406,7 @@ mod tests {
                 client_secret: SensitiveString::from("test-client-secret".to_string()),
             },
             use_tls: true,
-            schema: None,
+            schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
             custom_headers: None,
             batch: Default::default(),

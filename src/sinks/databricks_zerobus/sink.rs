@@ -114,7 +114,10 @@ mod tests {
                 client_secret: SensitiveString::from("test-client-secret".to_string()),
             },
             use_tls: true,
-            schema: None,
+            schema: crate::sinks::databricks_zerobus::config::SchemaSource::Path {
+                path: "tests/data/protobuf/test_proto.desc".to_string(),
+                message_type: "test_proto.User".to_string(),
+            },
             stream_options: ZerobusStreamOptions::default(),
             custom_headers: None,
             batch: Default::default(),
@@ -126,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn test_sink_creation() {
         let config = create_test_config();
-        let service = ZerobusService::new(config.clone()).unwrap();
+        let service = ZerobusService::new(config.clone()).await.unwrap();
         let sink = ZerobusSink::new(service, config.batch).unwrap();
 
         // Just verify the sink was created successfully
