@@ -119,7 +119,6 @@ impl ZerobusService {
                 unity_catalog_schema::generate_descriptor_from_schema(&table_schema)?
             }
         };
-
         let encode_options = vrl::protobuf::encode::Options {
             use_json_names: false,
         };

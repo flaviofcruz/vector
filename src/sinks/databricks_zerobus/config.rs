@@ -70,11 +70,6 @@ pub enum SchemaSource {
     /// This will query the Unity Catalog API to get the table schema and
     /// automatically generate a protobuf descriptor from it.
     /// Uses the same authentication credentials as the sink.
-    ///
-    /// Example:
-    /// ```toml
-    /// schema = { type = "unity_catalog" }
-    /// ```
     #[serde(rename = "unity_catalog")]
     UnityCatalog,
 }
