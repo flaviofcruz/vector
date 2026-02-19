@@ -783,21 +783,20 @@ fn map_complex_type_to_protobuf(
             // message MapFieldEntry { K key = 1; V value = 2; }
             // repeated MapFieldEntry map_field = N;
 
-            // Check if key is a string (protobuf maps require scalar keys)
-            let key_is_string = matches!(
-                key_type.as_ref(),
-                ComplexType::Primitive(PrimitiveType::String)
-            );
-
-            if !key_is_string {
-                return Err(ZerobusSinkError::ConfigError {
-                    message: format!(
-                        "MAP with non-string keys not supported for field '{}'. \
-                         Protobuf maps require scalar keys. Found key type: {:?}",
-                        path_prefix, key_type
-                    ),
-                });
-            }
+            // Protobuf maps support any scalar primitive key (int32, int64, bool, string, etc.)
+            // but not complex types (struct, array, nested map).
+            let key_primitive = match key_type.as_ref() {
+                ComplexType::Primitive(p) => p,
+                _ => {
+                    return Err(ZerobusSinkError::ConfigError {
+                        message: format!(
+                            "MAP with non-scalar keys not supported for field '{}'. \
+                             Protobuf maps require scalar (primitive) keys. Found key type: {:?}",
+                            path_prefix, key_type
+                        ),
+                    });
+                }
+            };
 
             // Check if value is a primitive type
             match value_type.as_ref() {
@@ -806,7 +805,7 @@ fn map_complex_type_to_protobuf(
                     let entry_message_name =
                         format!("{}_entry", sanitize_message_name(path_prefix));
                     let entry_message =
-                        generate_map_entry_message(&entry_message_name, value_primitive)?;
+                        generate_map_entry_message(&entry_message_name, key_primitive, value_primitive)?;
 
                     collector.add_message(entry_message);
 
@@ -909,17 +908,19 @@ fn generate_struct_message(
 /// Maps in protobuf are represented as: repeated MapEntry where MapEntry { key, value }
 fn generate_map_entry_message(
     message_name: &str,
+    key_type: &PrimitiveType,
     value_type: &PrimitiveType,
 ) -> Result<prost_types::DescriptorProto, ZerobusSinkError> {
+    let key_proto_type = map_primitive_to_protobuf(key_type);
     let value_proto_type = map_primitive_to_protobuf(value_type);
 
     let fields = vec![
-        // key field (always string for our supported maps)
+        // key field — any scalar primitive type supported by protobuf maps
         prost_types::FieldDescriptorProto {
             name: Some("key".to_string()),
             number: Some(1),
             label: Some(prost_types::field_descriptor_proto::Label::Optional as i32),
-            r#type: Some(prost_types::field_descriptor_proto::Type::String as i32),
+            r#type: Some(key_proto_type as i32),
             type_name: None,
             extendee: None,
             default_value: None,
@@ -1738,5 +1739,41 @@ mod tests {
 
         println!("✅ Proto schema snapshot test passed");
         println!("\nGenerated proto schema:\n{}", proto_text);
+    }
+
+    #[test]
+    fn test_query_profile_log_succeeds_with_non_string_map_keys() {
+        // Verifies that the Unity Catalog schema for query_profile_log succeeds when
+        // processing QueryMetrics.boolean_config_access and double_config_access,
+        // which are map<int64, bool/double> — protobuf-valid scalar-keyed maps.
+        //
+        // Proto definition (proto/logs/qpl/query_profile.proto, QueryMetrics):
+        //   map<int64, bool>   boolean_config_access = 11
+        //   map<int64, double> double_config_access   = 12
+        //
+        // Delta/UC schema maps these as map<bigint, boolean> and map<bigint, double>.
+        // Protobuf maps support any scalar key type (int64 included), so this should
+        // succeed and produce map entry messages with int64 keys.
+
+        let json = include_str!("tests/fixtures/query_profile_log_complete_schema.json");
+        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
+            .expect("Failed to parse query_profile_log schema");
+
+        let descriptor = generate_descriptor_from_schema(&schema)
+            .expect("Should succeed: map<bigint,boolean> and map<bigint,double> use valid scalar keys");
+
+        let proto_text = format_descriptor_as_proto(&descriptor);
+
+        // Both map entry messages must be present with int64 keys
+        assert!(
+            proto_text.contains("boolean_config_access"),
+            "Proto should contain boolean_config_access map field, got:\n{}",
+            proto_text
+        );
+        assert!(
+            proto_text.contains("double_config_access"),
+            "Proto should contain double_config_access map field, got:\n{}",
+            proto_text
+        );
     }
 }

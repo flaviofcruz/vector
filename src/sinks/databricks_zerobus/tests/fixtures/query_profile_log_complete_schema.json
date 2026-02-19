@@ -1,0 +1,185 @@
+{
+  "name": "query_profile_log",
+  "catalog_name": "main",
+  "schema_name": "eng_lumberjack_prime_dev",
+  "table_type": "MANAGED",
+  "data_source_format": "DELTA",
+  "columns": [
+    {
+      "name": "_event_time",
+      "type_text": "bigint",
+      "type_name": "LONG",
+      "position": 0,
+      "nullable": true,
+      "type_json": "{\"name\":\"_event_time\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "_partition_date",
+      "type_text": "string",
+      "type_name": "STRING",
+      "position": 1,
+      "nullable": true,
+      "type_json": "{\"name\":\"_partition_date\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "id",
+      "type_text": "string",
+      "type_name": "STRING",
+      "position": 2,
+      "nullable": true,
+      "type_json": "{\"name\":\"id\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "app_id",
+      "type_text": "string",
+      "type_name": "STRING",
+      "position": 3,
+      "nullable": true,
+      "type_json": "{\"name\":\"app_id\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "execution_id",
+      "type_text": "string",
+      "type_name": "STRING",
+      "position": 4,
+      "nullable": true,
+      "type_json": "{\"name\":\"execution_id\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "time_submitted_unix_ms",
+      "type_text": "bigint",
+      "type_name": "LONG",
+      "position": 5,
+      "nullable": true,
+      "type_json": "{\"name\":\"time_submitted_unix_ms\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "time_completed_unix_ms",
+      "type_text": "bigint",
+      "type_name": "LONG",
+      "position": 6,
+      "nullable": true,
+      "type_json": "{\"name\":\"time_completed_unix_ms\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "is_streaming",
+      "type_text": "boolean",
+      "type_name": "BOOLEAN",
+      "position": 7,
+      "nullable": true,
+      "type_json": "{\"name\":\"is_streaming\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "is_success",
+      "type_text": "boolean",
+      "type_name": "BOOLEAN",
+      "position": 8,
+      "nullable": true,
+      "type_json": "{\"name\":\"is_success\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "failure",
+      "type_text": "struct<error_class:string,sub_error_class:string,sql_state:string,stack_trace:string,redacted_exception:string>",
+      "type_name": "STRUCT",
+      "position": 9,
+      "nullable": true,
+      "type_json": "{\"name\":\"failure\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"error_class\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"sub_error_class\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"sql_state\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"stack_trace\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"redacted_exception\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "query_tags",
+      "type_text": "array<string>",
+      "type_name": "ARRAY",
+      "position": 10,
+      "nullable": true,
+      "type_json": "{\"name\":\"query_tags\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "query_metrics",
+      "type_text": "struct<parsing_time_ns:bigint,analysis_time_ns:bigint,optimization_time_ns:bigint,physical_planning_time_ns:bigint,parsing_time_ns_nano_time:bigint,analysis_time_ns_nano_time:bigint,optimization_time_ns_nano_time:bigint,physical_planning_time_ns_nano_time:bigint,boolean_config_access:map<bigint,boolean>,double_config_access:map<bigint,double>>",
+      "type_name": "STRUCT",
+      "position": 11,
+      "nullable": true,
+      "type_json": "{\"name\":\"query_metrics\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"parsing_time_ns\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"analysis_time_ns\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"optimization_time_ns\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"physical_planning_time_ns\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"parsing_time_ns_nano_time\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"analysis_time_ns_nano_time\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"optimization_time_ns_nano_time\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"physical_planning_time_ns_nano_time\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"boolean_config_access\",\"type\":{\"type\":\"map\",\"keyType\":\"long\",\"valueType\":\"boolean\",\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}},{\"name\":\"double_config_access\",\"type\":{\"type\":\"map\",\"keyType\":\"long\",\"valueType\":\"double\",\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "entry_point",
+      "type_text": "string",
+      "type_name": "STRING",
+      "position": 12,
+      "nullable": true,
+      "type_json": "{\"name\":\"entry_point\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "query_signatures",
+      "type_text": "struct<literal_sensitive_analyzed_plan_hash:bigint,literal_insensitive_analyzed_plan_hash:bigint,literal_sensitive_optimized_plan_hash:bigint,literal_insensitive_optimized_plan_hash:bigint>",
+      "type_name": "STRUCT",
+      "position": 13,
+      "nullable": true,
+      "type_json": "{\"name\":\"query_signatures\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"literal_sensitive_analyzed_plan_hash\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"literal_insensitive_analyzed_plan_hash\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"literal_sensitive_optimized_plan_hash\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"literal_insensitive_optimized_plan_hash\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "is_serverless",
+      "type_text": "boolean",
+      "type_name": "BOOLEAN",
+      "position": 14,
+      "nullable": true,
+      "type_json": "{\"name\":\"is_serverless\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "is_dbsql",
+      "type_text": "boolean",
+      "type_name": "BOOLEAN",
+      "position": 15,
+      "nullable": true,
+      "type_json": "{\"name\":\"is_dbsql\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "sql_warehouse_id",
+      "type_text": "string",
+      "type_name": "STRING",
+      "position": 16,
+      "nullable": true,
+      "type_json": "{\"name\":\"sql_warehouse_id\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "id_with_date",
+      "type_text": "string",
+      "type_name": "STRING",
+      "position": 17,
+      "nullable": true,
+      "type_json": "{\"name\":\"id_with_date\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "statement_type",
+      "type_text": "string",
+      "type_name": "STRING",
+      "position": 18,
+      "nullable": true,
+      "type_json": "{\"name\":\"statement_type\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "exception",
+      "type_text": "string",
+      "type_name": "STRING",
+      "position": 19,
+      "nullable": true,
+      "type_json": "{\"name\":\"exception\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "redacted_sql",
+      "type_text": "string",
+      "type_name": "STRING",
+      "position": 20,
+      "nullable": true,
+      "type_json": "{\"name\":\"redacted_sql\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}"
+    },
+    {
+      "name": "contributing_query_ids",
+      "type_text": "array<string>",
+      "type_name": "ARRAY",
+      "position": 21,
+      "nullable": true,
+      "type_json": "{\"name\":\"contributing_query_ids\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{}}"
+    }
+  ]
+}
