@@ -183,7 +183,9 @@ where
                     error!(message = "Retries exhausted; dropping the request.", %error);
                     return None;
                 }
-
+                // First attempt to cast the error into something of type L::Error
+                // L::Error is the error specified in the definition of the RetryLogic (HTTPError for AzureRetryLogic for ex.)
+                // So it's looking for an error that is compatible with the retry logic type
                 if let Some(expected) = error.downcast_ref::<L::Error>() {
                     if self.logic.is_retriable_error(expected) {
                         self.logic.on_retriable_error(expected);
@@ -196,17 +198,25 @@ where
                         );
                         None
                     }
+                // Next attempt to cast the error into a timeout error
                 } else if error.downcast_ref::<Elapsed>().is_some() {
                     warn!(
                         "Request timed out. If this happens often while the events are actually reaching their destination, try decreasing `batch.max_bytes` and/or using `compression` if applicable. Alternatively `request.timeout_secs` can be increased."
                     );
                     Some(self.build_retry())
                 } else {
+                    // If we can't cast to either of the above cases, then give up
+                    // However, for Azure, we may end up in this case for transient issues
+                    // For example, a connection reset error that occasionally pops up registers with status code 104
+                    // This is not a status code defined for the HTTPError and the downcast fails even though we can retry in this case
+                    // As such, we currently retry with all unexpected errors like this (TODO: refine down to more specific issues)
                     error!(
-                        message = "Unexpected error type; dropping the request.",
-                        %error
+                        // message = "Unexpected error type; dropping the request.",
+                        message = "Unexpected error type encountered... Retrying",
+                        %error,
+                        internal_log_rate_limit = true
                     );
-                    None
+                    Some(self.build_retry())
                 }
             }
         }
@@ -307,6 +317,39 @@ mod tests {
         let mut fut = task::spawn(svc.call("hello"));
         assert_request_eq!(handle, "hello").send_error(Error(false));
         assert_ready_err!(fut.poll());
+    }
+
+    #[tokio::test]
+    async fn service_error_retry_even_with_diff_error() {
+        trace_init();
+
+        time::pause();
+
+        let policy = FibonacciRetryPolicy::new(
+            5,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            SvcRetryLogic,
+            JitterMode::None,
+        );
+
+        let (mut svc, mut handle) = mock::spawn_layer(RetryLayer::new(policy));
+
+        assert_ready_ok!(svc.poll_ready());
+
+        let fut = svc.call("hello");
+        let mut fut = task::spawn(fut);
+
+        // Even if you can't re-cast, you should still retry
+        assert_request_eq!(handle, "hello").send_error(BadError);
+
+        assert_pending!(fut.poll());
+
+        time::advance(Duration::from_secs(2)).await;
+        assert_pending!(fut.poll());
+
+        assert_request_eq!(handle, "hello").send_response("world");
+        assert_eq!(fut.await.unwrap(), "world");
     }
 
     #[tokio::test]
@@ -435,4 +478,16 @@ mod tests {
     }
 
     impl std::error::Error for Error {}
+
+    // Dummy base error that isn't of expected type
+    #[derive(Debug)]
+    struct BadError;
+
+    impl fmt::Display for BadError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "error")
+        }
+    }
+
+    impl std::error::Error for BadError {}
 }

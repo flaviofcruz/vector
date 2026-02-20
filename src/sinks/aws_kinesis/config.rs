@@ -8,6 +8,7 @@ use super::{
     request_builder::KinesisRequestBuilder,
     sink::{BatchKinesisRequest, KinesisSink},
 };
+use crate::sinks::util::vector_event_log::EventLoggingService;
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint},
     sinks::{
@@ -111,6 +112,7 @@ where
             _phantom_t: PhantomData,
             _phantom_e: PhantomData,
         });
+    let event_logging_service = EventLoggingService::new(service);
 
     let transformer = config.encoding.transformer();
     let serializer = config.encoding.build()?;
@@ -124,7 +126,7 @@ where
 
     let sink = KinesisSink {
         batch_settings,
-        service,
+        service: event_logging_service,
         request_builder,
         partition_key_field,
         _phantom: PhantomData,

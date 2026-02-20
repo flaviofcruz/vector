@@ -8,6 +8,7 @@ mod events_sent;
 mod optional_tag;
 mod prelude;
 pub mod service;
+pub mod vector_event;
 
 use std::ops::{Add, AddAssign};
 
@@ -23,6 +24,7 @@ pub use metrics::SharedString;
 pub use optional_tag::OptionalTag;
 pub use prelude::{error_stage, error_type};
 pub use service::{CallError, PollReadyError};
+pub use vector_event::delivery_event::DeliveryReadEvent;
 
 use crate::json_size::JsonSize;
 

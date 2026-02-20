@@ -47,7 +47,7 @@ async fn ensure_required_fields(event: Event) -> Option<Event> {
     let mut log = event.into_log();
 
     if !log.contains(event_path!("title")) {
-        emit!(ParserMissingFieldError::<DROP_EVENT> { field: "title" });
+        emit!(ParserMissingFieldError::<{ DROP_EVENT }> { field: "title" });
         return None;
     }
 

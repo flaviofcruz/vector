@@ -51,7 +51,7 @@ impl FunctionTransform for Cri {
             None => {
                 // The message field was missing, inexplicably. If we can't find the message field, there's nothing for
                 // us to actually decode, so there's no event we could emit, and so we just emit the error and return.
-                emit!(ParserMissingFieldError::<DROP_EVENT> {
+                emit!(ParserMissingFieldError::<{ DROP_EVENT }> {
                     field: &message_path.to_string()
                 });
                 return;

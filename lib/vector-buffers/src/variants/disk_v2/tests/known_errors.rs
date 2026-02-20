@@ -1,5 +1,8 @@
 use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut};
 use memmap2::MmapMut;
+use memmap2::MmapMut;
+use std::ops::Add;
 use std::{
     io::{self, SeekFrom},
     path::PathBuf,
@@ -699,7 +702,7 @@ async fn reader_throws_error_when_record_is_undecodable_via_metadata() {
     static GET_METADATA_VALUE: AtomicU32 = AtomicU32::new(0);
     static CAN_DECODE_VALUE: AtomicU32 = AtomicU32::new(0);
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct ControllableRecord(u8);
 
     impl Encodable for ControllableRecord {

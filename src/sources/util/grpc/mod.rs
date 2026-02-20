@@ -9,6 +9,7 @@ use tonic::{
     transport::server::{Routes, Server},
 };
 use tower::Service;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{
     classify::{GrpcErrorsAsFailures, SharedClassifier},
     trace::TraceLayer,
@@ -29,6 +30,7 @@ pub async fn run_grpc_server<S>(
     tls_settings: MaybeTlsSettings,
     service: S,
     shutdown: ShutdownSignal,
+    max_concurrent_requests: Option<usize>,
 ) -> crate::Result<()>
 where
     S: Service<Request<Body>, Response = Response<BoxBody>, Error = Infallible>
@@ -44,22 +46,41 @@ where
     let stream = listener.accept_stream();
 
     info!(%address, "Building gRPC server.");
-
-    Server::builder()
-        .layer(build_grpc_trace_layer(span.clone()))
-        // This layer explicitly decompresses payloads, if compressed, and reports the number of message bytes we've
-        // received if the message is processed successfully, aka `BytesReceived`. We do this because otherwise the only
-        // access we have is either the event-specific bytes (the in-memory representation) or the raw bytes over the
-        // wire prior to decompression... and if that case, any bytes at all, not just the ones we successfully process.
-        //
-        // The weaving of `tonic`, `axum`, `tower`, and `hyper` is fairly complex and there currently exists no way to
-        // use independent `tower` layers when the request body itself (the body type, not the actual bytes) must be
-        // modified or wrapped.. so instead of a cleaner design, we're opting here to bake it all together until the
-        // crates are sufficiently flexible for us to craft a better design.
-        .layer(DecompressionAndMetricsLayer)
-        .add_service(service)
-        .serve_with_incoming_shutdown(stream, shutdown.map(|token| tx.send(token).unwrap()))
-        .await?;
+    if max_concurrent_requests.is_some() {
+        Server::builder()
+            // Ok to use ConcurrencyLimitLayer because service will be crated once in Server::serve_with_shutdown using all these layers.
+            .layer(ConcurrencyLimitLayer::new(max_concurrent_requests.unwrap()))
+            .layer(build_grpc_trace_layer(span.clone()))
+            // This layer explicitly decompresses payloads, if compressed, and reports the number of message bytes we've
+            // received if the message is processed successfully, aka `BytesReceived`. We do this because otherwise the only
+            // access we have is either the event-specific bytes (the in-memory representation) or the raw bytes over the
+            // wire prior to decompression... and if that case, any bytes at all, not just the ones we successfully process.
+            //
+            // The weaving of `tonic`, `axum`, `tower`, and `hyper` is fairly complex and there currently exists no way to
+            // use independent `tower` layers when the request body itself (the body type, not the actual bytes) must be
+            // modified or wrapped.. so instead of a cleaner design, we're opting here to bake it all together until the
+            // crates are sufficiently flexible for us to craft a better design.
+            .layer(DecompressionAndMetricsLayer)
+            .add_service(service)
+            .serve_with_incoming_shutdown(stream, shutdown.map(|token| tx.send(token).unwrap()))
+            .await?;
+    } else {
+        Server::builder()
+            .layer(build_grpc_trace_layer(span.clone()))
+            // This layer explicitly decompresses payloads, if compressed, and reports the number of message bytes we've
+            // received if the message is processed successfully, aka `BytesReceived`. We do this because otherwise the only
+            // access we have is either the event-specific bytes (the in-memory representation) or the raw bytes over the
+            // wire prior to decompression... and if that case, any bytes at all, not just the ones we successfully process.
+            //
+            // The weaving of `tonic`, `axum`, `tower`, and `hyper` is fairly complex and there currently exists no way to
+            // use independent `tower` layers when the request body itself (the body type, not the actual bytes) must be
+            // modified or wrapped.. so instead of a cleaner design, we're opting here to bake it all together until the
+            // crates are sufficiently flexible for us to craft a better design.
+            .layer(DecompressionAndMetricsLayer)
+            .add_service(service)
+            .serve_with_incoming_shutdown(stream, shutdown.map(|token| tx.send(token).unwrap()))
+            .await?;
+    }
 
     drop(rx.await);
 

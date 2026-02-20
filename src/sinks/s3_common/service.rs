@@ -17,6 +17,8 @@ use vector_lib::{
 
 use super::{config::S3Options, partitioner::S3PartitionKey};
 
+use crate::internal_events::vector_event::VectorEventLogSendMetadata;
+
 #[derive(Debug, Clone)]
 pub struct S3Request {
     pub body: Bytes,
@@ -47,12 +49,17 @@ impl MetaDescriptive for S3Request {
 pub struct S3Metadata {
     pub partition_key: S3PartitionKey,
     pub s3_key: String,
+    pub count: usize,
     pub finalizers: EventFinalizers,
+    // Specify additional information relevant for vector send event logs
+    pub event_log_metadata: VectorEventLogSendMetadata,
 }
 
 #[derive(Debug)]
 pub struct S3Response {
-    events_byte_size: GroupedCountByteSize,
+    pub events_byte_size: GroupedCountByteSize,
+    // Extending S3 response with additional information relevant for vector send event logs
+    pub event_log_metadata: VectorEventLogSendMetadata,
 }
 
 impl DriverResponse for S3Response {
@@ -122,6 +129,8 @@ impl Service<S3Request> for S3Service {
             .request_metadata
             .into_events_estimated_json_encoded_byte_size();
 
+        let event_log_metadata = request.metadata.event_log_metadata;
+
         let client = self.client.clone();
 
         Box::pin(async move {
@@ -153,7 +162,10 @@ impl Service<S3Request> for S3Service {
                     key = request.metadata.s3_key
                 );
 
-                S3Response { events_byte_size }
+                S3Response {
+                    events_byte_size,
+                    event_log_metadata,
+                }
             })
         })
     }

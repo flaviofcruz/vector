@@ -8,6 +8,8 @@ on:
     types: [synchronize, review_requested]
 
   pull_request:
+    branches-ignore:
+      - 'v*-custom'
     types: [synchronize, review_requested]
 
 jobs:

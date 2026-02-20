@@ -1,0 +1,35 @@
+syntax = "proto2";
+
+package kafkaproducerproxy;
+
+
+service KafkaProducerProxyService {
+
+  rpc produceMessage(KafkaMessage) returns (KafkaMessage.Response) {
+  }
+
+  rpc produceMessages(KafkaMessages) returns (KafkaMessages.Response) {
+  }
+
+}
+
+message KafkaMessage {
+  optional string topic_name = 1;
+  optional string key = 2;
+  optional bytes data = 3;
+  optional bytes log_entry = 4;
+
+  message Response {
+    optional int32 error_code = 1;
+    optional string error_msg = 2;
+  }
+}
+
+message KafkaMessages {
+  repeated KafkaMessage messages = 1;
+
+  message Response {
+    repeated KafkaMessage.Response responses = 1;
+    optional bool all_succeed = 2;
+  }
+}

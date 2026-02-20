@@ -1,4 +1,5 @@
 mod cri;
+mod databricks_parser;
 mod docker;
 mod test_util;
 
@@ -21,6 +22,9 @@ enum ParserState {
 
     /// CRI is being used.
     Cri(cri::Cri),
+
+    /// Databricks logs are being extracted.
+    DatabricksParser(databricks_parser::DatabricksParser),
 }
 
 #[derive(Clone, Debug)]
@@ -30,9 +34,17 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub const fn new(log_namespace: LogNamespace) -> Self {
+    pub const fn new(log_namespace: LogNamespace, extract_databricks_logs: bool) -> Self {
+        let parser_state = if extract_databricks_logs {
+            // If we're extracting Databricks logs, use the Databricks parser instead of inferring
+            // the parser type from the message.
+            ParserState::DatabricksParser(databricks_parser::DatabricksParser::new(log_namespace))
+        } else {
+            // Default to letting the transform method choose the parser based on the message.
+            ParserState::Uninitialized
+        };
         Self {
-            state: ParserState::Uninitialized,
+            state: parser_state,
             log_namespace,
         }
     }
@@ -72,6 +84,7 @@ impl FunctionTransform for Parser {
             }
             ParserState::Docker(t) => t.transform(output, event),
             ParserState::Cri(t) => t.transform(output, event),
+            ParserState::DatabricksParser(t) => t.transform(output, event),
         }
     }
 }
@@ -88,11 +101,18 @@ mod tests {
         test_util::trace_init,
     };
 
-    /// Picker has to work for all test cases for underlying parsers.
+    /// Picker has to work for all test cases for underlying parsers, except Databricks logs - the
+    /// parser is not inferred for them. For Databricks logs, we test the parser directly.
     fn valid_cases(log_namespace: LogNamespace) -> Vec<(Bytes, Vec<Event>)> {
         let mut valid_cases = vec![];
         valid_cases.extend(docker::tests::valid_cases(log_namespace));
         valid_cases.extend(cri::tests::valid_cases(log_namespace));
+        valid_cases
+    }
+
+    fn valid_databricks_cases(log_namespace: LogNamespace) -> Vec<(Bytes, Vec<Event>)> {
+        let mut valid_cases = vec![];
+        valid_cases.extend(databricks_parser::tests::valid_cases(log_namespace));
         valid_cases
     }
 
@@ -106,7 +126,7 @@ mod tests {
     fn test_parsing_valid_vector_namespace() {
         trace_init();
         test_util::test_parser(
-            || Parser::new(LogNamespace::Vector),
+            || Parser::new(LogNamespace::Vector, false),
             |bytes| Event::Log(LogEvent::from(value!(bytes))),
             valid_cases(LogNamespace::Vector),
         );
@@ -116,10 +136,40 @@ mod tests {
     fn test_parsing_valid_legacy_namespace() {
         trace_init();
         test_util::test_parser(
-            || Parser::new(LogNamespace::Legacy),
+            || Parser::new(LogNamespace::Legacy, false),
             |bytes| Event::Log(LogEvent::from(bytes)),
             valid_cases(LogNamespace::Legacy),
         );
+    }
+
+    #[test]
+    fn test_parsing_valid_databricks_vector_namespace() {
+        trace_init();
+        for (message, expected) in valid_databricks_cases(LogNamespace::Vector) {
+            let input = Event::Log(LogEvent::from(value!(message)));
+            let mut parser = Parser::new(LogNamespace::Vector, true);
+            let mut output = OutputBuffer::default();
+            parser.transform(&mut output, input);
+
+            let actual = output.into_events().collect::<Vec<_>>();
+
+            test_util::compare_log_events_without_timestamp(LogNamespace::Vector, expected, actual);
+        }
+    }
+
+    #[test]
+    fn test_parsing_valid_databricks_legacy_namespace() {
+        trace_init();
+        for (message, expected) in valid_databricks_cases(LogNamespace::Legacy) {
+            let input = Event::Log(LogEvent::from(message));
+            let mut parser = Parser::new(LogNamespace::Legacy, true);
+            let mut output = OutputBuffer::default();
+            parser.transform(&mut output, input);
+
+            let actual = output.into_events().collect::<Vec<_>>();
+
+            test_util::compare_log_events_without_timestamp(LogNamespace::Legacy, expected, actual);
+        }
     }
 
     #[test]
@@ -129,7 +179,7 @@ mod tests {
         let cases = invalid_cases();
 
         for bytes in cases {
-            let mut parser = Parser::new(LogNamespace::Legacy);
+            let mut parser = Parser::new(LogNamespace::Legacy, false);
             let input = LogEvent::from(bytes);
             let mut output = OutputBuffer::default();
             parser.transform(&mut output, input.into());
@@ -158,7 +208,7 @@ mod tests {
         ];
 
         for (input, log_namespace) in cases {
-            let mut parser = Parser::new(log_namespace);
+            let mut parser = Parser::new(log_namespace, false);
             let mut output = OutputBuffer::default();
             parser.transform(&mut output, input.into());
 

@@ -27,6 +27,7 @@ pub mod udp;
 #[cfg(unix)]
 pub mod unix;
 pub mod uri;
+pub mod vector_event_log;
 pub mod zstd;
 
 use std::borrow::Cow;

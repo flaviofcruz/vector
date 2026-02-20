@@ -4,14 +4,59 @@ use futures::{StreamExt, stream};
 use tokio::{select, time::sleep};
 use tokio_test::{assert_pending, task::spawn};
 use tracing::Instrument;
-use vector_common::finalization::Finalizable;
+use vector_common::finalization::BatchNotifier;
+use vector_common::finalization::{AddBatchNotifier, BatchStatus, Finalizable};
 
 use super::{create_default_buffer_v2, read_next, read_next_some};
+use crate::variants::disk_v2::WriterError;
 use crate::{
     EventCount, assert_buffer_is_empty, assert_buffer_records,
     test::{MultiEventRecord, SizedRecord, acknowledge, install_tracing_helpers, with_temp_dir},
     variants::disk_v2::{tests::create_default_buffer_v2_with_usage, writer::RecordWriter},
 };
+
+// Test to validate that the record is not acknowledged even when there is data file full error in write file to disk.
+#[tokio::test]
+async fn archive_record_not_acknowledge_when_data_file_full() {
+    let mut record_writer = RecordWriter::new(Cursor::new(Vec::new()), 99, 16_384, 105, 55);
+    let mut record = SizedRecord::new(1);
+    let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+    record.add_batch_notifier(batch);
+    let result = record_writer.archive_record(1, record);
+    assert!(
+        result.is_err(),
+        "Was expecting WriterError::DataFileFull but got Ok"
+    );
+    let err = result.unwrap_err();
+    // Verify the other type of error
+    assert!(
+        matches!(err, WriterError::DataFileFull { .. }),
+        "Was expecting WriterError::DataFileFull but got {err}"
+    );
+    // Verify the receiver has no more messages
+    assert!(
+        receiver.try_recv().is_err(),
+        "Was expecting receiver's try_recv to not complete"
+    );
+}
+
+// Test to validate that the record is acknowledged written to disk/archived.
+#[tokio::test]
+async fn archive_record_acknowledge_when_archived() {
+    let mut record_writer = RecordWriter::new(Cursor::new(Vec::new()), 0, 16_384, 105, 55);
+    let mut record = SizedRecord::new(1);
+    let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+    record.add_batch_notifier(batch);
+
+    let record = record_writer.archive_record(1, record);
+    assert!(record.is_ok(), "Was expecting archive record to succeed");
+
+    let result = receiver.try_recv();
+    assert!(
+        matches!(result, Ok(BatchStatus::Delivered)),
+        "Was expecting receiver's try_recv to complete"
+    );
+}
 
 #[tokio::test]
 async fn basic_read_write_loop() {

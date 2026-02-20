@@ -32,6 +32,7 @@ async fn experiment(actions: Vec<FileWatcherAction>) {
         path.clone(),
         ReadFrom::Beginning,
         None,
+        None,
         100_000,
         Bytes::from("\n"),
     )

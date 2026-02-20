@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use chrono::Utc;
 use uuid::Uuid;
+use vector_lib::event::event_log::generate_count_map;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf, codecs::encoding::Framer, request_metadata::RequestMetadata,
 };
@@ -8,6 +9,7 @@ use vector_lib::{
 use crate::{
     codecs::{Encoder, Transformer},
     event::{Event, Finalizable},
+    internal_events::vector_event::VectorEventLogSendMetadata,
     sinks::{
         azure_common::config::{AzureBlobMetadata, AzureBlobRequest},
         util::{
@@ -48,11 +50,27 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
     ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
         let (partition_key, mut events) = input;
         let finalizers = events.take_finalizers();
+
+        // Create event metadata here as this is where the list of events are available pre-encoding
+        // And we want to access this list to process the raw events to see specific field values
+        let event_log_metadata = VectorEventLogSendMetadata {
+            // Events are not encoded here yet, so byte size is not yet known
+            // Setting as 0 here and updating when it is set in build_request()
+            bytes: 0,
+            events_len: events.len(),
+            // Similarly the exact blob isn't determined here yet
+            blob: "".to_string(),
+            container: self.container_name.clone(),
+            count_map: generate_count_map(&events, false),
+        };
+
         let azure_metadata = AzureBlobMetadata {
             partition_key,
+            container_name: self.container_name.clone(),
             count: events.len(),
             byte_size: events.estimated_json_encoded_size_of(),
             finalizers,
+            event_log_metadata,
         };
 
         let builder = RequestMetadataBuilder::from_events(&events);
@@ -81,13 +99,10 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
 
         let blob_data = payload.into_payload();
 
-        debug!(
-            message = "Sending events.",
-            bytes = ?blob_data.len(),
-            events_len = ?azure_metadata.count,
-            blob = ?azure_metadata.partition_key,
-            container = ?self.container_name,
-        );
+        // Update some components of the metadata since they've been computed now
+        azure_metadata.event_log_metadata.bytes = blob_data.len();
+        azure_metadata.event_log_metadata.blob = azure_metadata.partition_key.clone();
+        azure_metadata.event_log_metadata.emit_sending_event();
 
         AzureBlobRequest {
             blob_data,

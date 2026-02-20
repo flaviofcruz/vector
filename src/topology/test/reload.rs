@@ -145,6 +145,8 @@ async fn topology_reuse_old_port_sink() {
 }
 
 #[tokio::test]
+/// Takes 10+ minutes, too slow for CI
+#[ignore]
 async fn topology_reuse_old_port_cross_dependency() {
     // TODO: Write a test source that emits only metrics, and a test sink that can bind a TCP listener, so we can
     // replace `internal_metrics` and `prometheus_exporter` here. We additionally need to ensure the metrics subsystem

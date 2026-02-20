@@ -61,6 +61,7 @@ impl Service<AzureBlobRequest> for AzureBlobService {
                     .request_metadata
                     .into_events_estimated_json_encoded_byte_size(),
                 byte_size,
+                event_log_metadata: request.metadata.event_log_metadata,
             })
         })
     }

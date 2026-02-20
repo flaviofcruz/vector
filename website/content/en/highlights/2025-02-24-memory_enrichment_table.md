@@ -13,8 +13,7 @@ badges:
 
 We are excited to announce the `memory` enrichment table!
 
-Special thanks to [@esensar](https://github.com/esensar) for implementing this feature and to
-[Quad9](https://quad9.net/) for sponsoring this work.
+Special thanks to [@esensar](https://github.com/esensar) for this contribution.
 
 ## Data Model
 

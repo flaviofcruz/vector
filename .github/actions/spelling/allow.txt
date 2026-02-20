@@ -556,3 +556,13 @@ zstandard
 ZTE
 Zync
 sighup
+envsubst
+jimmystewpot
+esensar
+jchap-pnnl
+jhbigler-pnnl
+jlambatl
+jorgehermo9
+notchairmk
+yjagdale
+xxh

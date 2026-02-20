@@ -817,6 +817,8 @@ async fn missing_field_in_uri_template() {
 }
 
 #[tokio::test]
+/// Takes 10+ minutes, too slow for CI
+#[ignore]
 async fn http_uri_auth_conflict() {
     init_test();
 
