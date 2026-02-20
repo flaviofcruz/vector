@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use vector_lib::config::{LogNamespace, clone_input_definitions};
+use vector_lib::config::{clone_input_definitions};
 use vector_lib::configurable::configurable_component;
 
 use crate::{
@@ -70,9 +70,8 @@ impl TransformConfig for RedactConfig {
 
     fn outputs(
         &self,
-        _enrichment_tables: vector_lib::enrichment::TableRegistry,
+        _context: &TransformContext,
         input_definitions: &[(OutputId, schema::Definition)],
-        _: LogNamespace,
     ) -> Vec<TransformOutput> {
         vec![TransformOutput::new(
             DataType::Log,

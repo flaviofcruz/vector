@@ -338,9 +338,6 @@ impl PulsarSinkConfig {
             batch_size: self.batch.max_events,
             batch_byte_size: self.batch.max_bytes,
             compression: None,
-            batch_timeout: Some(std::time::Duration::from_millis(1000)), // Default to 1 second
-            block_queue_if_full: false, // Don't block, return errors if queue is full
-            routing_policy: None,
         };
 
         match &self.compression {

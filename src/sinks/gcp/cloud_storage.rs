@@ -687,6 +687,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
     fn gcs_build_request_respect_content_encoding_option() {
         let compression_scheme = Compression::gzip_default();
         let request = build_request(None, false, compression_scheme, None);
