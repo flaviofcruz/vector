@@ -172,6 +172,14 @@ impl Application {
         let (runtime, app) =
             Self::prepare_start(extra_context).unwrap_or_else(|code| std::process::exit(code));
 
+        info!(
+            message = "Started Vector instance.",
+            // VECTOR_SERVICE_EVENT
+            vector_event_type = 2,
+            // VECTOR_PROCESS_START
+            service_event = 1,
+            internal_log_rate_limit = false,
+        );
         runtime.block_on(app.run())
     }
 
@@ -461,6 +469,16 @@ impl FinishedApplication {
             internal_topologies,
         } = self;
 
+        // Emit a vector event indicating the shutdown.
+        info!(
+            message = "Shutting down Vector instance.",
+            // VECTOR_SERVICE_EVENT
+            vector_event_type = 2,
+            // VECTOR_PROCESS_TERMINATION_SIGNAL_RECEIVED
+            service_event = 4,
+            internal_log_rate_limit = false,
+        );
+
         // At this point, we'll have the only reference to the shared topology controller and can
         // safely remove it from the wrapper to shut down the topology.
         let topology_controller = topology_controller
@@ -587,11 +605,11 @@ pub async fn load_configs(
 
         for (name, sink) in config.sinks() {
             let files = sink.inner.files_to_watch();
-            let component_config = ComponentConfig::new(
-                files.into_iter().cloned().collect(),
-                name.clone(),
-                ComponentType::Sink,
-            );
+            let mut config_paths: Vec<PathBuf> = files.into_iter().cloned().collect();
+            config_paths.append(&mut sink.files_to_watch.clone());
+
+            let component_config =
+                ComponentConfig::new(config_paths, name.clone(), ComponentType::Sink);
             watched_component_paths.push(component_config);
         }
 

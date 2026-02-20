@@ -167,6 +167,7 @@ pub fn spawn_grpc_server<S>(
             tls_settings,
             service,
             shutdown_signal,
+            None,
         );
         pin!(server);
 

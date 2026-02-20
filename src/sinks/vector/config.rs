@@ -11,6 +11,7 @@ use super::{
     service::{VectorRequest, VectorResponse, VectorService},
     sink::VectorSink,
 };
+use crate::sinks::util::vector_event_log::EventLoggingService;
 use crate::{
     config::{
         AcknowledgementsConfig, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext,
@@ -129,10 +130,11 @@ impl SinkConfig for VectorConfig {
         let service = ServiceBuilder::new()
             .settings(request_settings, VectorGrpcRetryLogic)
             .service(service);
+        let event_log_service = EventLoggingService::new(service);
 
         let sink = VectorSink {
             batch_settings,
-            service,
+            service: event_log_service,
         };
 
         Ok((

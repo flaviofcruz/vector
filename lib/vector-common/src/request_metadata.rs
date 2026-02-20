@@ -3,6 +3,9 @@ use std::{
     ops::{Add, AddAssign},
 };
 
+use crate::internal_event::vector_event::{
+    VectorSinkEventMetadata, file_send_event::FileEventMetadata,
+};
 use crate::{
     internal_event::{
         CountByteSize, InternalEventHandle, RegisterTaggedInternalEvent, RegisteredEventCache,
@@ -263,6 +266,8 @@ pub struct RequestMetadata {
     ///
     /// This is akin to the bytes sent/received over the network, regardless of whether or not compression was used.
     request_wire_size: usize,
+    /// Event log metadata for the batch request.
+    event_log_metadata: VectorSinkEventMetadata,
 }
 
 impl RequestMetadata {
@@ -280,7 +285,49 @@ impl RequestMetadata {
             events_estimated_json_encoded_byte_size,
             request_encoded_size,
             request_wire_size,
+            event_log_metadata: VectorSinkEventMetadata::new(),
         }
+    }
+
+    pub fn new_with_event_log(
+        event_count: usize,
+        events_byte_size: usize,
+        request_encoded_size: usize,
+        request_wire_size: usize,
+        events_estimated_json_encoded_byte_size: GroupedCountByteSize,
+        event_log_metadata: VectorSinkEventMetadata,
+    ) -> Self {
+        Self {
+            event_count,
+            events_byte_size,
+            events_estimated_json_encoded_byte_size,
+            request_encoded_size,
+            request_wire_size,
+            event_log_metadata: event_log_metadata,
+        }
+    }
+
+    pub fn event_log_metadata(&self) -> &VectorSinkEventMetadata {
+        &self.event_log_metadata
+    }
+
+    pub fn set_event_log_metadata(&mut self, event_log_metadata: VectorSinkEventMetadata) {
+        self.event_log_metadata = event_log_metadata;
+    }
+
+    /// Updates the file metadata within the event log metadata.
+    /// This is a convenience method that clones, updates, and sets back the event log metadata.
+    pub fn update_file_metadata(
+        &mut self,
+        bytes: usize,
+        events_len: usize,
+        blob: String,
+        container: String,
+    ) {
+        let mut event_log_metadata = self.event_log_metadata.clone();
+        event_log_metadata
+            .update_file_metadata(FileEventMetadata::new(bytes, events_len, blob, container));
+        self.event_log_metadata = event_log_metadata;
     }
 
     #[must_use]
@@ -339,6 +386,7 @@ impl<'a> Add<&'a RequestMetadata> for RequestMetadata {
                 + &other.events_estimated_json_encoded_byte_size,
             request_encoded_size: self.request_encoded_size + other.request_encoded_size,
             request_wire_size: self.request_wire_size + other.request_wire_size,
+            event_log_metadata: self.event_log_metadata + other.event_log_metadata.clone(),
         }
     }
 }

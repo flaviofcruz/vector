@@ -16,6 +16,7 @@ use vector_lib::{
 
 use crate::{
     event::{EventFinalizers, EventStatus, Finalizable},
+    internal_events::{CheckRetryEvent, vector_event::VectorEventLogSendMetadata},
     sinks::{Healthcheck, util::retries::RetryLogic},
 };
 
@@ -47,9 +48,12 @@ impl MetaDescriptive for AzureBlobRequest {
 #[derive(Clone, Debug)]
 pub struct AzureBlobMetadata {
     pub partition_key: String,
+    pub container_name: String,
     pub count: usize,
     pub byte_size: JsonSize,
     pub finalizers: EventFinalizers,
+    // Specify additional information relevant for vector send event logs
+    pub event_log_metadata: VectorEventLogSendMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -61,8 +65,22 @@ impl RetryLogic for AzureBlobRetryLogic {
     type Response = AzureBlobResponse;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
-        error.status().is_server_error()
-            || StatusCode::TOO_MANY_REQUESTS.as_u16() == Into::<u16>::into(error.status())
+        // For now, retry request in all cases
+
+        // error.status().is_server_error()
+        //     || StatusCode::TOO_MANY_REQUESTS.as_u16() == Into::<u16>::into(error.status())
+        let retry = true;
+        info!(
+            message = "Considered retry on error.",
+            error = %error,
+            retry = retry,
+        );
+
+        emit!(CheckRetryEvent {
+            status_code: error.error_code().unwrap_or(""),
+            retry,
+        });
+        retry
     }
 }
 
@@ -71,6 +89,8 @@ pub struct AzureBlobResponse {
     pub inner: PutBlockBlobResponse,
     pub events_byte_size: GroupedCountByteSize,
     pub byte_size: usize,
+    // Extending Azure response with additional information relevant for vector send event logs
+    pub event_log_metadata: VectorEventLogSendMetadata,
 }
 
 impl DriverResponse for AzureBlobResponse {
@@ -156,4 +176,32 @@ pub fn build_client(
         .container_client(container_name)
     };
     Ok(Arc::new(client))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use azure_core::error::HttpError;
+    use azure_core::http::{StatusCode, headers::Headers, response::RawResponse};
+    use bytes::Bytes;
+    use futures::stream;
+
+    #[tokio::test]
+    async fn test_retriable() {
+        // Create dummy response with BadRequest (400) status code
+        // This test verifies that errors are retriable
+
+        // Create a pinned stream for the response body
+        let body_stream =
+            stream::once(async { Ok::<Bytes, azure_core::Error>(Bytes::from("test")) });
+        let pinned_stream = Box::pin(body_stream);
+
+        // Create RawResponse
+        let response = RawResponse::new(StatusCode::BadRequest, Headers::new(), pinned_stream);
+
+        // Create HttpError from the response
+        let error = HttpError::new(response).await;
+
+        assert!(AzureBlobRetryLogic.is_retriable_error(&error));
+    }
 }

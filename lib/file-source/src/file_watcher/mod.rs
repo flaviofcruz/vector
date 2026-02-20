@@ -48,6 +48,7 @@ pub struct RawLineResult {
 /// longer exist.
 pub struct FileWatcher {
     pub path: PathBuf,
+    pub is_active: bool,
     findable: bool,
     reader: Box<dyn AsyncBufRead + Send + Unpin>,
     file_position: FilePosition,
@@ -73,6 +74,7 @@ impl FileWatcher {
         path: PathBuf,
         read_from: ReadFrom,
         ignore_before: Option<DateTime<Utc>>,
+        start_reading_at: Option<DateTime<Utc>>,
         max_line_bytes: usize,
         line_delimiter: Bytes,
     ) -> Result<FileWatcher, std::io::Error> {
@@ -96,55 +98,75 @@ impl FileWatcher {
             false
         };
 
+        // If the file was modified before the start_reading_at timestamp, this component is inactive. Therefore, we don't read it.
+        let inactive = if let (Some(start_reading_at), Ok(modified_time)) = (
+            start_reading_at,
+            metadata.modified().map(DateTime::<Utc>::from),
+        ) {
+            modified_time < start_reading_at
+        } else {
+            false
+        };
+
         let gzipped = is_gzipped(&mut reader).await?;
 
         // Determine the actual position at which we should start reading
         let (reader, file_position): (Box<dyn AsyncBufRead + Send + Unpin>, FilePosition) =
-            match (gzipped, too_old, read_from) {
-                (true, true, _) => {
-                    debug!(
-                        message = "Not reading gzipped file older than `ignore_older`.",
-                        ?path,
-                    );
-                    (Box::new(null_reader()), 0)
-                }
-                (true, _, ReadFrom::Checkpoint(file_position)) => {
-                    debug!(
-                        message = "Not re-reading gzipped file with existing stored offset.",
-                        ?path,
-                        %file_position
-                    );
-                    (Box::new(null_reader()), file_position)
-                }
-                // TODO: This may become the default, leading us to stop reading gzipped files that
-                // we were reading before. Should we merge this and the next branch to read
-                // compressed file from the beginning even when `read_from = "end"` (implicitly via
-                // default or explicitly via config)?
-                (true, _, ReadFrom::End) => {
-                    debug!(
-                        message = "Can't read from the end of already-compressed file.",
-                        ?path,
-                    );
-                    (Box::new(null_reader()), 0)
-                }
-                (true, false, ReadFrom::Beginning) => {
-                    (Box::new(BufReader::new(GzipDecoder::new(reader))), 0)
-                }
-                (false, true, _) => {
-                    let pos = reader.seek(SeekFrom::End(0)).await.unwrap();
-                    (Box::new(reader), pos)
-                }
-                (false, false, ReadFrom::Checkpoint(file_position)) => {
-                    let pos = reader.seek(SeekFrom::Start(file_position)).await.unwrap();
-                    (Box::new(reader), pos)
-                }
-                (false, false, ReadFrom::Beginning) => {
-                    let pos = reader.seek(SeekFrom::Start(0)).await.unwrap();
-                    (Box::new(reader), pos)
-                }
-                (false, false, ReadFrom::End) => {
-                    let pos = reader.seek(SeekFrom::End(0)).await.unwrap();
-                    (Box::new(reader), pos)
+            if inactive {
+                debug!(
+                    message = "Not reading file modified before `start_reading_at`.",
+                    ?path,
+                );
+                (Box::new(null_reader()), 0)
+            } else {
+                match (gzipped, too_old, read_from) {
+                    (true, true, _) => {
+                        if too_old {
+                            debug!(
+                                message = "Not reading gzipped file older than `ignore_older`.",
+                                ?path,
+                            );
+                        }
+                        (Box::new(null_reader()), 0)
+                    }
+                    (true, _, ReadFrom::Checkpoint(file_position)) => {
+                        debug!(
+                            message = "Not re-reading gzipped file with existing stored offset.",
+                            ?path,
+                            %file_position
+                        );
+                        (Box::new(null_reader()), file_position)
+                    }
+                    // TODO: This may become the default, leading us to stop reading gzipped files that
+                    // we were reading before. Should we merge this and the next branch to read
+                    // compressed file from the beginning even when `read_from = "end"` (implicitly via
+                    // default or explicitly via config)?
+                    (true, _, ReadFrom::End) => {
+                        debug!(
+                            message = "Can't read from the end of already-compressed file.",
+                            ?path,
+                        );
+                        (Box::new(null_reader()), 0)
+                    }
+                    (true, false, ReadFrom::Beginning) => {
+                        (Box::new(BufReader::new(GzipDecoder::new(reader))), 0)
+                    }
+                    (false, true, _) => {
+                        let pos = reader.seek(SeekFrom::End(0)).await.unwrap();
+                        (Box::new(reader), pos)
+                    }
+                    (false, false, ReadFrom::Checkpoint(file_position)) => {
+                        let pos = reader.seek(SeekFrom::Start(file_position)).await.unwrap();
+                        (Box::new(reader), pos)
+                    }
+                    (false, false, ReadFrom::Beginning) => {
+                        let pos = reader.seek(SeekFrom::Start(0)).await.unwrap();
+                        (Box::new(reader), pos)
+                    }
+                    (false, false, ReadFrom::End) => {
+                        let pos = reader.seek(SeekFrom::End(0)).await.unwrap();
+                        (Box::new(reader), pos)
+                    }
                 }
             };
 
@@ -170,6 +192,7 @@ impl FileWatcher {
             max_line_bytes,
             line_delimiter,
             buf: BytesMut::new(),
+            is_active: !inactive,
         })
     }
 

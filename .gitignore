@@ -37,6 +37,7 @@ sample.log
 # Profiling tools
 heaptrack.*
 massif.*
+.idea
 
 # Checkpoints
 checkpoints/*
@@ -64,3 +65,11 @@ volumes/
 
 # LLM tools
 copilot-instructions.md
+
+# AI rule files (go/ai/rules) 
+.cursorrules
+.cursor
+.goosehints
+CLAUDE.md
+AGENTS.md
+GEMINI.md

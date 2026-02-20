@@ -346,17 +346,19 @@ mod tests {
 
     // NOTE: This test requires #[serial] because it directly interacts with global tracing state.
     // This is a pre-existing limitation around tracing initialization in tests.
+    // We use error!() level logs because another test may have initialized tracing first
+    // with a filter that excludes info-level logs.
     #[tokio::test]
     #[serial]
     async fn repeated_logs_are_not_rate_limited() {
-        trace::init(false, false, "info", 10);
+        trace::init(false, false, "error", 10);
         trace::reset_early_buffer();
 
         let rx = start_source().await;
 
         // Generate 20 identical log messages with the same component_id
         for _ in 0..20 {
-            info!(component_id = "test", "Repeated test message.");
+            error!(component_id = "test", "Repeated test message.");
         }
 
         sleep(Duration::from_millis(50)).await;

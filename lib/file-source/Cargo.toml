@@ -12,16 +12,55 @@ winapi = { version = "0.3", features = ["winioctl"] }
 
 [dependencies]
 glob.workspace = true
-chrono.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 indexmap = { version = "2.11.0", default-features = false, features = ["serde"] }
-bytes.workspace = true
 futures = { version = "0.3.31", default-features = false, features = ["executor"] }
 futures-util.workspace = true
 vector-common = { path = "../vector-common", default-features = false }
 file-source-common = { path = "../file-source-common" }
 async-compression = { version = "0.4.27", features = ["tokio", "gzip"] }
+vector-config = { path = "../vector-config", default-features = false }
+
+[dependencies.bstr]
+version = "1.11"
+default-features = false
+features = []
+
+[dependencies.bytes]
+workspace = true
+default-features = false
+features = []
+
+[dependencies.chrono]
+workspace = true
+default-features = false
+features = ["clock", "serde"]
+
+[dependencies.dashmap]
+version = "6.1"
+default-features = false
+features = []
+
+[dependencies.flate2]
+version = "1.0"
+default-features = false
+features = ["rust_backend"]
+
+[dependencies.serde]
+version = "1.0"
+default-features = false
+features = ["derive"]
+
+[dependencies.serde_with]
+version = "3.14.0"
+default-features = false
+features = ["macros", "std"]
+
+[dependencies.serde_json]
+version = "1.0"
+default-features = false
+features = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

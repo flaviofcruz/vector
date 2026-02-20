@@ -15,7 +15,10 @@ use aws_sdk_sqs::{
         receive_message::ReceiveMessageError,
         send_message_batch::{SendMessageBatchError, SendMessageBatchOutput},
     },
-    types::{DeleteMessageBatchRequestEntry, Message, SendMessageBatchRequestEntry},
+    types::{
+        DeleteMessageBatchRequestEntry, Message, MessageSystemAttributeName,
+        SendMessageBatchRequestEntry,
+    },
 };
 use aws_smithy_runtime_api::client::{orchestrator::HttpResponse, result::SdkError};
 use aws_types::region::Region;
@@ -41,19 +44,22 @@ use vector_lib::{
     source_sender::SendError,
 };
 
+use crate::codecs::Decoder;
+use crate::event::{Event, LogEvent};
+use crate::sources::util::{ClickHouseDeduplicator, DeduplicationClient};
 use crate::{
     SourceSender,
     aws::AwsTimeout,
-    codecs::Decoder,
     common::backoff::ExponentialBackoff,
     config::{SourceAcknowledgementsConfig, SourceContext},
-    event::{BatchNotifier, BatchStatus, EstimatedJsonEncodedSizeOf, Event, LogEvent},
+    event::{BatchNotifier, BatchStatus, EstimatedJsonEncodedSizeOf},
     internal_events::{
         EventsReceived, S3ObjectProcessingFailed, S3ObjectProcessingSucceeded,
         SqsMessageDeleteBatchError, SqsMessageDeletePartialError, SqsMessageDeleteSucceeded,
         SqsMessageProcessingError, SqsMessageProcessingSucceeded, SqsMessageReceiveError,
         SqsMessageReceiveSucceeded, SqsMessageSendBatchError, SqsMessageSentPartialError,
         SqsMessageSentSucceeded, SqsS3EventRecordInvalidEventIgnored, StreamClosedError,
+        emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
     },
     line_agg::{self, LineAgg},
     shutdown::ShutdownSignal,
@@ -63,6 +69,8 @@ use crate::{
 
 static SUPPORTED_S3_EVENT_VERSION: LazyLock<semver::VersionReq> =
     LazyLock::new(|| semver::VersionReq::parse("~2").unwrap());
+
+const CLOUD_PROVIDER: &str = "aws";
 
 /// Configuration for deferring events based on their age.
 #[serde_as]
@@ -291,6 +299,7 @@ pub struct State {
     delete_message: bool,
     delete_failed_message: bool,
     decoder: Decoder,
+    deduplication_client: Option<DeduplicationClient>,
 
     deferred: Option<DeferredConfig>,
 }
@@ -308,12 +317,16 @@ impl Ingestor {
         compression: super::Compression,
         multiline: Option<line_agg::Config>,
         decoder: Decoder,
+        clickhouse_dedupe: Option<ClickHouseDeduplicator>,
     ) -> Result<Ingestor, IngestorNewError> {
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 10 {
             return Err(IngestorNewError::InvalidNumberOfMessages {
                 messages: config.max_number_of_messages,
             });
         }
+
+        let deduplication_client = clickhouse_dedupe.and_then(DeduplicationClient::new);
+
         let state = Arc::new(State {
             region,
 
@@ -334,6 +347,7 @@ impl Ingestor {
             delete_message: config.delete_message,
             delete_failed_message: config.delete_failed_message,
             decoder,
+            deduplication_client,
 
             deferred: config.deferred,
         });
@@ -598,6 +612,11 @@ impl IngestorProcess {
     }
 
     async fn handle_sqs_message(&mut self, message: Message) -> Result<(), ProcessingError> {
+        // queue_notification_create_timestamp is extracted from the SQS message
+        // and represents the time the notification was sent by the SNS service.
+        let queue_notification_create_timestamp =
+            extract_queue_notification_create_timestamp(&message);
+
         let sqs_body = message.body.unwrap_or_default();
         let sqs_body = serde_json::from_str::<SnsNotification>(sqs_body.as_ref())
             .map(|notification| notification.message)
@@ -615,14 +634,25 @@ impl IngestorProcess {
                 debug!(?message.message_id, message = "Found S3 Test Event.");
                 Ok(())
             }
-            SqsEvent::Event(s3_event) => self.handle_s3_event(s3_event).await,
+            SqsEvent::Event(s3_event) => {
+                self.handle_s3_event(s3_event, queue_notification_create_timestamp)
+                    .await
+            }
         }
     }
 
-    async fn handle_s3_event(&mut self, s3_event: S3Event) -> Result<(), ProcessingError> {
+    async fn handle_s3_event(
+        &mut self,
+        s3_event: S3Event,
+        queue_notification_create_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), ProcessingError> {
         for record in s3_event.records {
-            self.handle_s3_event_record(record, self.log_namespace)
-                .await?
+            self.handle_s3_event_record(
+                record,
+                self.log_namespace,
+                queue_notification_create_timestamp,
+            )
+            .await?
         }
         Ok(())
     }
@@ -631,6 +661,7 @@ impl IngestorProcess {
         &mut self,
         s3_event: S3EventRecord,
         log_namespace: LogNamespace,
+        queue_notification_create_timestamp: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), ProcessingError> {
         let event_version: semver::Version = s3_event.event_version.clone().into();
         if !SUPPORTED_S3_EVENT_VERSION.matches(&event_version) {
@@ -638,6 +669,18 @@ impl IngestorProcess {
                 version: event_version.clone(),
             });
         }
+
+        // Capture timestamps for metrics
+        let processing_start_time = Utc::now();
+
+        // Emit metrics (queue delay and processing lag) as we have all the required information
+        emit_object_storage_non_ack_metrics(
+            &s3_event.event_time,
+            queue_notification_create_timestamp,
+            processing_start_time,
+            CLOUD_PROVIDER,
+            &s3_event.s3.bucket.name,
+        );
 
         if s3_event.event_name.kind != "ObjectCreated" {
             emit!(SqsS3EventRecordInvalidEventIgnored {
@@ -659,14 +702,45 @@ impl IngestorProcess {
             });
         }
 
+        // Check for deduplication if configured
+        if let Some(dedup_client) = &self.state.deduplication_client {
+            let file_size = s3_event.s3.object.size;
+
+            // Check if we should ingest this file
+            if !dedup_client
+                .should_ingest(&s3_event.s3.object.key, file_size)
+                .await
+            {
+                debug!(
+                    message = "Skipping S3 object due to deduplication check.",
+                    bucket = %s3_event.s3.bucket.name,
+                    key = %s3_event.s3.object.key,
+                    log_path = %s3_event.s3.object.key,
+                    internal_log_rate_limit = true
+                );
+                return Ok(());
+            }
+
+            debug!(
+                message = "Proceeding to process S3 object after deduplication check.",
+                bucket = %s3_event.s3.bucket.name,
+                key = %s3_event.s3.object.key,
+                log_path = %s3_event.s3.object.key,
+                internal_log_rate_limit = true
+            );
+        }
+
         if let Some(deferred) = &self.state.deferred {
-            let delta = Utc::now() - s3_event.event_time;
-            if delta.num_seconds() > deferred.max_age_secs as i64 {
-                return Err(ProcessingError::FileTooOld {
-                    bucket: s3_event.s3.bucket.name.clone(),
-                    key: s3_event.s3.object.key.clone(),
-                    deferred_queue: deferred.queue_url.clone(),
-                });
+            // Parse event_time string (ISO-8601 format) to DateTime
+            if let Ok(event_dt) = chrono::DateTime::parse_from_rfc3339(&s3_event.event_time) {
+                let delta = Utc::now() - event_dt.with_timezone(&Utc);
+                if delta.num_seconds() > deferred.max_age_secs as i64 {
+                    return Err(ProcessingError::FileTooOld {
+                        bucket: s3_event.s3.bucket.name.clone(),
+                        key: s3_event.s3.object.key.clone(),
+                        deferred_queue: deferred.queue_url.clone(),
+                    });
+                }
             }
         }
 
@@ -693,7 +767,9 @@ impl IngestorProcess {
             key = s3_event.s3.object.key,
         );
 
-        let metadata = object.metadata;
+        let metadata = object.metadata.clone();
+        let object_content_length = object.content_length().unwrap_or(0) as u64;
+        let object_key = s3_event.s3.object.key.clone();
 
         let timestamp = object.last_modified.map(|ts| {
             Utc.timestamp_opt(ts.secs(), ts.subsec_nanos())
@@ -809,7 +885,7 @@ impl IngestorProcess {
         // reference must be dropped before the status of the batch is sent to the channel.
         drop(batch);
 
-        if let Some(error) = read_error {
+        let processing_result = if let Some(error) = read_error {
             Err(ProcessingError::ReadObject {
                 source: error,
                 bucket: s3_event.s3.bucket.name.clone(),
@@ -826,6 +902,12 @@ impl IngestorProcess {
                 None => Ok(()),
                 Some(receiver) => {
                     let result = receiver.await;
+                    emit_object_storage_ack_metrics(
+                        processing_start_time,
+                        CLOUD_PROVIDER,
+                        &s3_event.s3.bucket.name,
+                    );
+
                     match result {
                         BatchStatus::Delivered => {
                             debug!(
@@ -860,7 +942,25 @@ impl IngestorProcess {
                     }
                 }
             }
+        };
+
+        // Mark completion status in ClickHouse if deduplication is configured
+        if let Some(dedup_client) = &self.state.deduplication_client {
+            let file_creation_timestamp = s3_event.event_time.as_str();
+            let success = processing_result.is_ok();
+
+            // Note: Errors are logged internally by the DeduplicationClient
+            dedup_client
+                .mark_completion(
+                    &object_key,
+                    file_creation_timestamp,
+                    object_content_length,
+                    success,
+                )
+                .await;
         }
+
+        processing_result
     }
 
     async fn receive_messages(
@@ -873,6 +973,11 @@ impl IngestorProcess {
             .max_number_of_messages(self.state.max_number_of_messages)
             .visibility_timeout(self.state.visibility_timeout_secs)
             .wait_time_seconds(self.state.poll_secs)
+            // Add the "SentTimestamp" to the requested attributes
+            // This is the timestamp is the UNIX epoch time when the message was sent to the queue by SNS
+            // We make use of it during lag / delay metric calculations
+            // Ref: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html#API_ReceiveMessage_RequestSyntax
+            .message_system_attribute_names(MessageSystemAttributeName::SentTimestamp)
             .send()
             .map_ok(|res| res.messages.unwrap_or_default())
             .await
@@ -977,6 +1082,30 @@ fn handle_single_log(
     };
 }
 
+/// Extracts the notification timestamp from SQS message attributes.
+///
+/// This function attempts to parse the SentTimestamp from the message attributes,
+/// logging warnings if the attributes or timestamp are missing or invalid.
+fn extract_queue_notification_create_timestamp(message: &Message) -> Option<DateTime<Utc>> {
+    message
+        .attributes
+        .as_ref()? // Check if attributes is Some
+        .get(&MessageSystemAttributeName::SentTimestamp) // Get the SentTimestamp
+        .and_then(|ts| {
+            // ts is a string with epoch time in milliseconds
+            let milliseconds = ts.parse::<i64>().ok()?;
+            Utc.timestamp_opt(milliseconds / 1000, 0).single()
+        })
+        .or_else(|| {
+            warn!(
+                message = "Failed to extract or parse SentTimestamp from SQS message.",
+                message_id = ?message.message_id,
+                attributes = ?message.attributes
+            );
+            None
+        })
+}
+
 // https://docs.aws.amazon.com/sns/latest/dg/sns-sqs-as-subscriber.html
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -1015,7 +1144,10 @@ pub struct S3EventRecord {
     pub event_source: String,
     pub aws_region: String,
     pub event_name: S3EventName,
-    pub event_time: DateTime<Utc>,
+
+    /// The time associated with the event in ISO-8601 format (for example, 1970-01-01T00:00:00.000Z).
+    /// For Blob storage events, this is the time the blob was last modified.
+    pub event_time: String,
 
     pub s3: S3Message,
 }
@@ -1136,6 +1268,9 @@ pub struct S3Object {
     // https://docs.aws.amazon.com/AmazonS3/latest/userguide/notification-content-structure.html
     #[serde(with = "urlencoded_string")]
     pub key: String,
+
+    // The object size in bytes
+    pub size: u64,
 }
 
 mod urlencoded_string {
@@ -1176,18 +1311,20 @@ mod urlencoded_string {
 
 #[test]
 fn test_key_deserialize() {
-    let value = serde_json::from_str(r#"{"key": "noog+nork"}"#).unwrap();
+    let value = serde_json::from_str(r#"{"key": "noog+nork","size": 12345}"#).unwrap();
     assert_eq!(
         S3Object {
             key: "noog nork".to_string(),
+            size: 12345,
         },
         value
     );
 
-    let value = serde_json::from_str(r#"{"key": "noog%2bnork"}"#).unwrap();
+    let value = serde_json::from_str(r#"{"key": "noog%2bnork", "size": 98765}"#).unwrap();
     assert_eq!(
         S3Object {
             key: "noog+nork".to_string(),
+            size: 98765,
         },
         value
     );

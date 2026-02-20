@@ -3,11 +3,13 @@
 //! at "/var/log/pods" on the host of the Kubernetes Node when Vector itself is
 //! running inside the cluster as a DaemonSet.
 
+#![allow(unused_variables, dead_code, unused_imports)]
 #![deny(missing_docs)]
-use std::{cmp::min, path::PathBuf, time::Duration};
+use std::{cmp::min, collections::HashMap, path::PathBuf, time::Duration};
 
+use crate::sources::file::{deserialize_iso8601_timestamp, wrap_with_line_agg};
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{future::FutureExt, stream::StreamExt};
 use futures_util::Stream;
 use http_1::{HeaderName, HeaderValue};
@@ -21,6 +23,7 @@ use kube::{
 };
 use lifecycle::Lifecycle;
 use serde_with::serde_as;
+use vector_lib::internal_event::DeliveryReadEvent;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf, TimeZone,
     codecs::{BytesDeserializer, BytesDeserializerConfig},
@@ -28,6 +31,7 @@ use vector_lib::{
     configurable::configurable_component,
     file_source::file_server::{
         FileServer, Line, Shutdown as FileServerShutdown, calculate_ignore_before,
+        parse_start_reading_at,
     },
     file_source_common::{
         Checkpointer, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
@@ -37,6 +41,7 @@ use vector_lib::{
 };
 use vrl::value::{Kind, kind::Collection};
 
+use crate::sources::util::MultilineConfig;
 use crate::{
     SourceSender,
     built_info::{PKG_NAME, PKG_VERSION},
@@ -52,10 +57,15 @@ use crate::{
         KubernetesLogsPodInfo, StreamClosedError,
     },
     kubernetes::{custom_reflector, meta_cache::MetaCache},
+    line_agg,
     shutdown::ShutdownSignal,
     sources,
     sources::kubernetes_logs::partial_events_merger::merge_partial_events,
     transforms::{FunctionTransform, OutputBuffer},
+};
+use std::sync::{Arc, Mutex};
+use vector_lib::file_source::{
+    TTLRemovalConfig, convert_to_file_ttl_removal_config, paths_provider::LogFileInfo,
 };
 
 mod k8s_paths_provider;
@@ -117,6 +127,32 @@ pub struct Config {
     #[serde(default = "default_insert_namespace_fields")]
     insert_namespace_fields: bool,
 
+    /// Specifies whether or not to extract Databricks-specific logs from the pod logs directory
+    /// in lieu of the actual Kubernetes logs.
+    ///
+    /// Setting to `true` will cause this source to extract the Databricks-specific logs from the
+    /// Databricks pod logs directory, whether that is the hostPath logging-annotation-override
+    /// directory or the kubelet log directory.
+    ///
+    #[serde(default = "default_extract_databricks_logs")]
+    extract_databricks_logs: bool,
+
+    /// Specifies whether or not to rely on the HostPath logging-annotation-override directory to
+    /// extract Databricks logs.
+    ///
+    /// If set to `true`, we will assume the Databricks logs are located in the
+    /// HostPath logging-annotation-override directory.
+    /// If set to `false`, we will assume the Databricks logs are located in the
+    /// kubelet log directory.
+    #[serde(default = "default_use_hostpath_logging_annotation_override")]
+    use_hostpath_logging_annotation_override: bool,
+
+    /// Specifies the [file TTL removal config][file_ttl_removal_config] to use for the file source.
+    /// TTL removal configuration for file management
+    /// This allows us to specify the behavior of TTL file removal by file patterns
+    #[serde(default)]
+    pub ttl_removal_config: Option<TTLRemovalConfig>,
+
     /// The name of the Kubernetes [Node][node] that is running.
     ///
     /// Configured to use an environment variable by default, to be evaluated to a value provided by
@@ -165,6 +201,17 @@ pub struct Config {
 
     #[configurable(derived)]
     node_annotation_fields: node_metadata_annotator::FieldsSpec,
+
+    /// Specifies the glob patterns to scan for to extract logs using this source. This glob pattern
+    /// is relative to the pod logs directory.
+    ///
+    /// [pod_logs_directory]: https://kubernetes.io/docs/concepts/cluster-administration/kubelet/#pod-logs-directory
+    #[configurable(metadata(
+        docs::examples = "**/*.log*",
+        docs::examples = "**/*.json*",
+        docs::examples = "**/*.pb.base64*"
+    ))]
+    pod_logs_glob_patterns: Vec<String>,
 
     /// A list of glob patterns to include while reading the files.
     #[configurable(metadata(docs::examples = "**/include/**"))]
@@ -278,6 +325,44 @@ pub struct Config {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     rotate_wait: Duration,
+
+    /// Only read files if their last modification timestamp is later than the specified absolute unix timestamp.
+    /// If not set, all files matching the include patterns will be read.
+    #[serde(default, deserialize_with = "deserialize_iso8601_timestamp")]
+    #[configurable(metadata(docs::examples = "2022-01-01T12:00:00Z"))]
+    #[configurable(metadata(
+        docs::human_name = "Read Only Files Modified After This Absolute Timestamp"
+    ))]
+    pub start_reading_at: Option<String>,
+
+    /// Extra context (i.e. metadata tags) that are added to each log line
+    #[serde(default)]
+    #[configurable(description = "Additional context applied to each log line")]
+    #[configurable(metadata(
+        docs::examples = "{\"topic\": \"topic_name\", \"tags\": \"tag_value\"}"
+    ))]
+    #[configurable(metadata(
+        docs::human_name = "an optional object of key value pairs to added in each line."
+    ))]
+    pub source_context: Option<HashMap<String, String>>,
+
+    /// Multiline aggregation configuration.
+    ///
+    /// If not specified, multiline aggregation is disabled.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub multiline: Option<MultilineConfig>,
+
+    /// After reaching EOF, the number of seconds to wait before removing the file, unless new data is written.
+    ///
+    /// If not specified, files are not removed.
+    #[serde(alias = "remove_after", default)]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 0))]
+    #[configurable(metadata(docs::examples = 5))]
+    #[configurable(metadata(docs::examples = 60))]
+    #[configurable(metadata(docs::human_name = "Wait Time Before Removing File"))]
+    pub remove_after_secs: Option<u64>,
 }
 
 const fn default_read_from() -> ReadFromConfig {
@@ -301,6 +386,9 @@ impl Default for Config {
             extra_label_selector: "".to_string(),
             extra_namespace_label_selector: "".to_string(),
             insert_namespace_fields: true,
+            extract_databricks_logs: false,
+            use_hostpath_logging_annotation_override: false,
+            ttl_removal_config: None,
             self_node_name: default_self_node_name_env_template(),
             extra_field_selector: "".to_string(),
             auto_partial_merge: true,
@@ -308,6 +396,7 @@ impl Default for Config {
             pod_annotation_fields: pod_metadata_annotator::FieldsSpec::default(),
             namespace_annotation_fields: namespace_metadata_annotator::FieldsSpec::default(),
             node_annotation_fields: node_metadata_annotator::FieldsSpec::default(),
+            pod_logs_glob_patterns: default_pod_logs_glob_patterns(),
             include_paths_glob_patterns: default_path_inclusion(),
             exclude_paths_glob_patterns: default_path_exclusion(),
             read_from: default_read_from(),
@@ -326,6 +415,10 @@ impl Default for Config {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            start_reading_at: None,
+            source_context: None,
+            multiline: None,
+            remove_after_secs: None,
         }
     }
 }
@@ -336,6 +429,14 @@ impl SourceConfig for Config {
     async fn build(&self, cx: SourceContext) -> crate::Result<sources::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let source = Source::new(self, &cx.globals, &cx.key).await?;
+
+        // Clippy rule, because async_trait?
+        #[allow(clippy::suspicious_else_formatting)]
+        {
+            if let Some(ref config) = self.multiline {
+                let _: line_agg::Config = config.try_into()?;
+            }
+        }
 
         Ok(Box::pin(
             source
@@ -567,8 +668,12 @@ struct Source {
     label_selector: String,
     namespace_label_selector: String,
     insert_namespace_fields: bool,
+    extract_databricks_logs: bool,
+    use_hostpath_logging_annotation_override: bool,
+    ttl_removal_config: Option<TTLRemovalConfig>,
     node_selector: String,
     self_node_name: String,
+    pod_logs_glob_patterns: Vec<String>,
     include_paths: Vec<glob::Pattern>,
     exclude_paths: Vec<glob::Pattern>,
     read_from: ReadFrom,
@@ -584,6 +689,11 @@ struct Source {
     delay_deletion: Duration,
     include_file_metric_tag: bool,
     rotate_wait: Duration,
+    file_to_pod_map: Arc<Mutex<HashMap<PathBuf, LogFileInfo>>>,
+    start_reading_at: Option<DateTime<Utc>>,
+    source_context: Option<HashMap<String, String>>,
+    multiline: Option<MultilineConfig>,
+    remove_after_secs: Option<u64>,
 }
 
 impl Source {
@@ -632,6 +742,8 @@ impl Source {
 
         let data_dir = globals.resolve_and_make_data_subdir(config.data_dir.as_ref(), key.id())?;
 
+        let pod_logs_glob_patterns = config.pod_logs_glob_patterns.clone();
+
         let include_paths = prepare_include_paths(config)?;
 
         let exclude_paths = prepare_exclude_paths(config)?;
@@ -656,8 +768,13 @@ impl Source {
             label_selector,
             namespace_label_selector,
             insert_namespace_fields: config.insert_namespace_fields,
+            extract_databricks_logs: config.extract_databricks_logs,
+            use_hostpath_logging_annotation_override: config
+                .use_hostpath_logging_annotation_override,
+            ttl_removal_config: config.ttl_removal_config.clone(),
             node_selector,
             self_node_name,
+            pod_logs_glob_patterns,
             include_paths,
             exclude_paths,
             read_from: ReadFrom::from(config.read_from),
@@ -673,6 +790,11 @@ impl Source {
             delay_deletion,
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
+            file_to_pod_map: Arc::new(Mutex::new(HashMap::new())),
+            start_reading_at: parse_start_reading_at(config.start_reading_at.clone()),
+            source_context: config.source_context.clone(),
+            multiline: config.multiline.clone(),
+            remove_after_secs: config.remove_after_secs,
         })
     }
 
@@ -693,8 +815,12 @@ impl Source {
             label_selector,
             namespace_label_selector,
             insert_namespace_fields,
+            extract_databricks_logs,
+            use_hostpath_logging_annotation_override,
+            ttl_removal_config,
             node_selector,
             self_node_name,
+            pod_logs_glob_patterns,
             include_paths,
             exclude_paths,
             read_from,
@@ -710,6 +836,11 @@ impl Source {
             delay_deletion,
             include_file_metric_tag,
             rotate_wait,
+            file_to_pod_map,
+            start_reading_at,
+            ref source_context,
+            multiline,
+            remove_after_secs,
         } = self;
 
         let mut reflectors = Vec::new();
@@ -797,9 +928,12 @@ impl Source {
         let paths_provider = K8sPathsProvider::new(
             pod_state.clone(),
             ns_state.clone(),
+            pod_logs_glob_patterns,
             include_paths,
             exclude_paths,
             insert_namespace_fields,
+            extract_databricks_logs,
+            use_hostpath_logging_annotation_override,
         );
         let annotator = PodMetadataAnnotator::new(pod_state, pod_fields_spec, log_namespace);
         let ns_annotator =
@@ -815,10 +949,19 @@ impl Source {
                 max_merged_line_bytes.unwrap_or(max_line_bytes),
             );
         }
+        // Convert the TTL removal config to FileTTLRemovalConfig used by file_server
+        // Primarily involves converting Pathbufs -> glob patterns
+        let file_ttl_removal_config = match ttl_removal_config {
+            Some(ttl_removal_config_value) => Some(convert_to_file_ttl_removal_config(
+                &ttl_removal_config_value,
+            )),
+            None => None,
+        };
 
         // TODO: maybe more of the parameters have to be configurable.
 
         let checkpointer = Checkpointer::new(&data_dir);
+        let file_to_pod_map_ref = Arc::clone(&file_to_pod_map);
         let file_server = FileServer {
             // Use our special paths provider.
             paths_provider,
@@ -838,6 +981,8 @@ impl Source {
             // be other, more sound ways for users considering the use of this
             // option to solve their use case, so take consideration.
             ignore_before,
+            // For kubernetes logs, we don't support start_reading_at filtering
+            start_reading_at,
             // The maximum number of bytes a line can contain before being discarded. This
             // protects against malformed lines or tailing incorrect files.
             max_line_bytes: resolved_max_line_bytes,
@@ -862,22 +1007,35 @@ impl Source {
                 true,
             ),
             oldest_first,
-            // We do not remove the log files, `kubelet` is responsible for it.
-            remove_after: None,
+            // We do not remove the log files, `kubelet` is responsible for it. not valid for when working in databricks_logs mode.
+            remove_after: remove_after_secs.map(Duration::from_secs),
             // The standard emitter.
             emitter: FileSourceInternalEventsEmitter {
                 include_file_metric_tag,
             },
             // A handle to the current tokio runtime
             rotate_wait,
+            ttl_removal_config: file_ttl_removal_config,
+            source_context: source_context.clone(),
+            file_to_pod_map: Some(file_to_pod_map_ref),
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
 
         let checkpoints = checkpointer.view();
         let events = file_source_rx.flat_map(futures::stream::iter);
+        let multiline_config = multiline.clone();
+        let messages: Box<dyn Stream<Item = Line> + Send + std::marker::Unpin> =
+            if let Some(ref multiline_config) = multiline_config {
+                wrap_with_line_agg(
+                    events,
+                    multiline_config.try_into().unwrap(), // validated in build
+                )
+            } else {
+                Box::new(events)
+            };
         let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
-        let events = events.map(move |line| {
+        let events = messages.map(move |line| {
             let byte_size = line.text.len();
             bytes_received.emit(ByteSize(byte_size));
 
@@ -886,9 +1044,15 @@ impl Source {
                 &line.filename,
                 ingestion_timestamp_field.as_ref(),
                 log_namespace,
+                &self.source_context,
             );
 
-            let file_info = annotator.annotate(&mut event, &line.filename);
+            let cached_file_info = file_to_pod_map
+                .lock()
+                .unwrap()
+                .get(&PathBuf::from(&line.filename))
+                .cloned();
+            let file_info = annotator.annotate(&mut event, &line.filename, cached_file_info.clone());
 
             emit!(KubernetesLogsEventsReceived {
                 file: &line.filename,
@@ -900,29 +1064,31 @@ impl Source {
             });
 
             if file_info.is_none() {
+                trace!(message = "Failed to find pod for file", path = ?line.filename, cached_file_info = ?cached_file_info, file_to_pod_map = ?file_to_pod_map);
                 emit!(KubernetesLogsEventAnnotationError { event: &event });
             } else {
-                let namespace = file_info.as_ref().map(|info| info.pod_namespace);
+                let namespace = file_info.as_ref().map(|info| info.pod_namespace.to_owned());
 
                 if insert_namespace_fields
                     && let Some(name) = namespace
-                    && ns_annotator.annotate(&mut event, name).is_none()
+                    && ns_annotator.annotate(&mut event, &name).is_none()
                 {
                     emit!(KubernetesLogsEventNamespaceAnnotationError { event: &event });
                 }
 
+                /* enable when PLAT-146370 is fixed. this is polluting logs.
                 let node_info = node_annotator.annotate(&mut event, self_node_name.as_str());
-
                 if node_info.is_none() {
                     emit!(KubernetesLogsEventNodeAnnotationError { event: &event });
                 }
+                */
             }
 
             checkpoints.update(line.file_id, line.end_offset);
             event
         });
 
-        let mut parser = Parser::new(log_namespace);
+        let mut parser = Parser::new(log_namespace, extract_databricks_logs);
         let events = events.flat_map(move |event| {
             let mut buf = OutputBuffer::with_capacity(1);
             parser.transform(&mut buf, event);
@@ -1000,6 +1166,7 @@ fn create_event(
     file: &str,
     ingestion_timestamp_field: Option<&OwnedTargetPath>,
     log_namespace: LogNamespace,
+    source_context: &Option<HashMap<String, String>>,
 ) -> Event {
     let deserializer = BytesDeserializer;
     let mut log = deserializer.parse_single(line, log_namespace);
@@ -1033,6 +1200,24 @@ fn create_event(
         (LogNamespace::Legacy, None) => (),
     };
 
+    // Apply additional fields as specified by the source context if needed
+    if let Some(source_context) = source_context {
+        for (key, value) in source_context {
+            let path = format!("source_context.{}", key);
+            // We don't want things like namespace consideration here since we want this value to be in a consistent spot
+            // So we don't use the insert_source_metadata function and just directly insert
+            log.insert(path.as_str(), value.clone());
+        }
+    };
+
+    emit!(DeliveryReadEvent {
+        path: file.to_string(),
+        bytes_read: log.estimated_json_encoded_size_of().get(),
+        lines_read: 1,
+        source_context: source_context.clone(),
+        emitted_after_multiline_agg: true,
+    });
+
     log.into()
 }
 
@@ -1040,6 +1225,12 @@ fn create_event(
 /// as it should be at the generated config file.
 fn default_self_node_name_env_template() -> String {
     format!("${{{}}}", SELF_NODE_NAME_ENV_KEY.to_owned())
+}
+
+// By default, we only scan for *.log files, the default Kubernetes logs format.
+// This can be overridden by the user to scan for other file types, such as *.json or *.pb.base64.
+fn default_pod_logs_glob_patterns() -> Vec<String> {
+    vec!["*/*.log*".to_string()]
 }
 
 fn default_path_inclusion() -> Vec<PathBuf> {
@@ -1063,6 +1254,14 @@ const fn default_oldest_first() -> bool {
 // It might make sense to disable this for clusters with a very large number of namespaces.
 const fn default_insert_namespace_fields() -> bool {
     true
+}
+
+const fn default_extract_databricks_logs() -> bool {
+    false
+}
+
+const fn default_use_hostpath_logging_annotation_override() -> bool {
+    false
 }
 
 const fn default_max_line_bytes() -> usize {

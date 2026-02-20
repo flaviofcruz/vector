@@ -17,11 +17,9 @@ use vector_lib::{
     },
 };
 
-use super::{
-    Config,
-    path_helpers::{LogFileInfo, parse_log_file_path},
-};
+use super::{Config, path_helpers::parse_log_file_path};
 use crate::event::{Event, LogEvent};
+use vector_lib::file_source::paths_provider::LogFileInfo;
 
 /// Configuration for how the events are enriched with Pod metadata.
 #[configurable_component]
@@ -197,53 +195,64 @@ impl PodMetadataAnnotator {
 
 impl PodMetadataAnnotator {
     /// Annotates an event with the information from the [`Pod::metadata`].
-    pub fn annotate<'a>(&self, event: &mut Event, file: &'a str) -> Option<LogFileInfo<'a>> {
+    pub fn annotate<'a>(
+        &self,
+        event: &mut Event,
+        file: &'a str,
+        cached_file_info: Option<LogFileInfo>,
+    ) -> Option<LogFileInfo> {
         let log = event.as_mut_log();
-        let file_info = parse_log_file_path(file)?;
-        let obj = ObjectRef::<Pod>::new(file_info.pod_name).within(file_info.pod_namespace);
-        let resource = self.pods_state_reader.get(&obj)?;
-        let pod: &Pod = resource.as_ref();
+        let file_info_opt: Option<LogFileInfo> =
+            cached_file_info.or_else(|| parse_log_file_path(file));
+        if let Some(file_info) = file_info_opt {
+            let obj =
+                ObjectRef::<Pod>::new(&(file_info.pod_name)).within(&(file_info.pod_namespace));
+            let resource = self.pods_state_reader.get(&obj)?;
+            let pod: &Pod = resource.as_ref();
 
-        annotate_from_file_info(log, &self.fields_spec, &file_info, self.log_namespace);
-        annotate_from_metadata(log, &self.fields_spec, &pod.metadata, self.log_namespace);
+            annotate_from_file_info(log, &self.fields_spec, &file_info, self.log_namespace);
+            annotate_from_metadata(log, &self.fields_spec, &pod.metadata, self.log_namespace);
 
-        let container;
-        if let Some(ref pod_spec) = pod.spec {
-            annotate_from_pod_spec(log, &self.fields_spec, pod_spec, self.log_namespace);
+            let container;
+            if let Some(ref pod_spec) = pod.spec {
+                annotate_from_pod_spec(log, &self.fields_spec, pod_spec, self.log_namespace);
 
-            container = pod_spec
-                .containers
-                .iter()
-                .find(|c| c.name == file_info.container_name);
-            if let Some(container) = container {
-                annotate_from_container(log, &self.fields_spec, container, self.log_namespace);
-            }
-        }
-
-        if let Some(ref pod_status) = pod.status {
-            annotate_from_pod_status(log, &self.fields_spec, pod_status, self.log_namespace);
-            if let Some(ref container_statuses) = pod_status.container_statuses {
-                let container_status = container_statuses
+                container = pod_spec
+                    .containers
                     .iter()
                     .find(|c| c.name == file_info.container_name);
-                if let Some(container_status) = container_status {
-                    annotate_from_container_status(
-                        log,
-                        &self.fields_spec,
-                        container_status,
-                        self.log_namespace,
-                    )
+                if let Some(container) = container {
+                    annotate_from_container(log, &self.fields_spec, container, self.log_namespace);
                 }
             }
+
+            if let Some(ref pod_status) = pod.status {
+                annotate_from_pod_status(log, &self.fields_spec, pod_status, self.log_namespace);
+                if let Some(ref container_statuses) = pod_status.container_statuses {
+                    let container_status = container_statuses
+                        .iter()
+                        .find(|c| c.name == file_info.container_name);
+                    if let Some(container_status) = container_status {
+                        annotate_from_container_status(
+                            log,
+                            &self.fields_spec,
+                            container_status,
+                            self.log_namespace,
+                        )
+                    }
+                }
+            }
+            Some(file_info)
+        } else {
+            None
         }
-        Some(file_info)
     }
 }
 
 fn annotate_from_file_info(
     log: &mut LogEvent,
     fields_spec: &FieldsSpec,
-    file_info: &LogFileInfo<'_>,
+    file_info: &LogFileInfo,
     log_namespace: LogNamespace,
 ) {
     let legacy_key = fields_spec
@@ -258,7 +267,7 @@ fn annotate_from_file_info(
         log,
         legacy_key,
         path!("container_name"),
-        file_info.container_name.to_owned(),
+        file_info.container_name.clone(),
     );
 }
 
@@ -314,6 +323,11 @@ fn annotate_from_metadata(
     }
 
     if let Some(labels) = &metadata.labels {
+        trace!(
+            message = "Pod metadata labels.",
+            pod_name = ?metadata.name,
+            labels = ?labels,
+        );
         let legacy_key_prefix = fields_spec.pod_labels.path.as_ref().map(|k| &k.path);
 
         for (key, value) in labels.iter() {
@@ -333,6 +347,11 @@ fn annotate_from_metadata(
     }
 
     if let Some(annotations) = &metadata.annotations {
+        trace!(
+            message = "Pod metadata annotations.",
+            pod_name = ?metadata.name,
+            annotations = ?annotations,
+        );
         let legacy_key_prefix = fields_spec.pod_annotations.path.as_ref().map(|k| &k.path);
 
         for (key, value) in annotations.iter() {

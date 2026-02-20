@@ -31,6 +31,8 @@ on:
         required: false
         type: string
   pull_request:
+    branches-ignore:
+      - 'v*-custom'
   merge_group:
     types: [checks_requested]
   schedule:

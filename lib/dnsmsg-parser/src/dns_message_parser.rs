@@ -536,6 +536,7 @@ impl DnsMessageParser {
         }
     }
 
+    #[allow(deprecated)]
     fn format_rdata(&self, rdata: &RData) -> DnsParserResult<(Option<String>, Option<Vec<u8>>)> {
         match rdata {
             RData::A(ip) => Ok((Some(ip.to_string()), None)),

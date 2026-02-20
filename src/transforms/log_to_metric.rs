@@ -874,7 +874,7 @@ impl FunctionTransform for LogToMetric {
                             })
                         }
                         TransformError::PathNotFound { path } => {
-                            emit!(ParserMissingFieldError::<DROP_EVENT> {
+                            emit!(ParserMissingFieldError::<{ DROP_EVENT }> {
                                 field: path.as_ref()
                             })
                         }
@@ -913,7 +913,7 @@ impl FunctionTransform for LogToMetric {
                                 })
                             }
                             TransformError::PathNotFound { path } => {
-                                emit!(ParserMissingFieldError::<DROP_EVENT> {
+                                emit!(ParserMissingFieldError::<{ DROP_EVENT }> {
                                     field: path.as_ref()
                                 })
                             }

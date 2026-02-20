@@ -1,27 +1,29 @@
 use std::{convert::TryInto, future, path::PathBuf, time::Duration};
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
 use regex::bytes::Regex;
+use serde::{Deserialize, Deserializer};
 use serde_with::serde_as;
 use snafu::{ResultExt, Snafu};
+use std::collections::HashMap;
 use tokio::sync::oneshot;
 use tracing::{Instrument, Span};
+use vector_lib::codecs::{BytesDeserializer, BytesDeserializerConfig};
+use vector_lib::configurable::configurable_component;
+use vector_lib::file_source::{
+    Checkpointer, FileFingerprint, FileServer, FingerprintStrategy, Fingerprinter, Line, ReadFrom,
+    ReadFromConfig, TTLRemovalConfig, calculate_ignore_before, convert_to_file_ttl_removal_config,
+    parse_start_reading_at,
+    paths_provider::{Glob, MatchOptions},
+};
+use vector_lib::finalizer::OrderedFinalizer;
+use vector_lib::internal_event::DeliveryReadEvent;
+use vector_lib::lookup::{OwnedValuePath, lookup_v2::OptionalValuePath, owned_value_path, path};
 use vector_lib::{
     EstimatedJsonEncodedSizeOf,
-    codecs::{BytesDeserializer, BytesDeserializerConfig},
     config::{LegacyKey, LogNamespace},
-    configurable::configurable_component,
-    file_source::{
-        file_server::{FileServer, Line, calculate_ignore_before},
-        paths_provider::{Glob, MatchOptions},
-    },
-    file_source_common::{
-        Checkpointer, FileFingerprint, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
-    },
-    finalizer::OrderedFinalizer,
-    lookup::{OwnedValuePath, lookup_v2::OptionalValuePath, owned_value_path, path},
 };
 use vrl::value::Kind;
 
@@ -54,6 +56,26 @@ enum BuildError {
         indicator: String,
         source: regex::Error,
     },
+}
+
+/// Custom deserializer for ISO-8601 timestamp validation
+pub fn deserialize_iso8601_timestamp<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt_string: Option<String> = Option::deserialize(deserializer)?;
+
+    if let Some(ref timestamp) = opt_string {
+        // Validate ISO-8601 format using RFC 3339 parser
+        if let Err(e) = DateTime::parse_from_rfc3339(timestamp) {
+            return Err(serde::de::Error::custom(format!(
+                "Invalid ISO-8601 timestamp format: '{}'. {}. Expected format: '2022-01-01T12:00:00Z' or '2022-01-01T12:00:00-05:00'",
+                timestamp, e
+            )));
+        }
+    }
+
+    Ok(opt_string)
 }
 
 /// Configuration for the `file` source.
@@ -108,6 +130,15 @@ pub struct FileConfig {
     #[configurable(metadata(docs::examples = 600))]
     #[configurable(metadata(docs::human_name = "Ignore Older Files"))]
     pub ignore_older_secs: Option<u64>,
+
+    /// Only read files if their last modification timestamp is later than the specified absolute unix timestamp.
+    /// If not set, all files matching the include patterns will be read.
+    #[serde(default, deserialize_with = "deserialize_iso8601_timestamp")]
+    #[configurable(metadata(docs::examples = "2022-01-01T12:00:00Z"))]
+    #[configurable(metadata(
+        docs::human_name = "Read Only Files Modified After This Absolute Timestamp"
+    ))]
+    pub start_reading_at: Option<String>,
 
     /// The maximum size of a line before it is discarded.
     ///
@@ -243,6 +274,16 @@ pub struct FileConfig {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     pub rotate_wait: Duration,
+
+    /// TTL removal configuration for file management
+    /// This allows us to specify the behavior of TTL file removal by file patterns
+    #[serde(default)]
+    pub ttl_removal_config: Option<TTLRemovalConfig>,
+
+    // Extra context (i.e. metadata tags) that are added to each log line
+    #[serde(default)]
+    #[configurable(description = "Additional context applied to each log line")]
+    pub source_context: Option<HashMap<String, String>>,
 }
 
 fn default_max_line_bytes() -> usize {
@@ -364,6 +405,7 @@ impl Default for FileConfig {
             ignore_checkpoints: None,
             read_from: default_read_from(),
             ignore_older_secs: None,
+            start_reading_at: None,
             max_line_bytes: default_max_line_bytes(),
             fingerprint: FingerprintConfig::default(),
             ignore_not_found: false,
@@ -383,6 +425,8 @@ impl Default for FileConfig {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            ttl_removal_config: None,
+            source_context: None,
         }
     }
 }
@@ -503,6 +547,7 @@ pub fn file_source(
         .map(|path_buf| path_buf.iter().collect::<std::path::PathBuf>())
         .collect::<Vec<PathBuf>>();
     let ignore_before = calculate_ignore_before(config.ignore_older_secs);
+    let start_reading_at = parse_start_reading_at(config.start_reading_at.clone());
     let glob_minimum_cooldown = config.glob_minimum_cooldown_ms;
     let (ignore_checkpoints, read_from) = reconcile_position_options(
         config.start_at_beginning,
@@ -531,6 +576,15 @@ pub fn file_source(
         None => Bytes::from(config.line_delimiter.clone()),
     };
 
+    // Convert the TTL removal config to FileTTLRemovalConfig used by file_server
+    // Primarily involves converting Pathbufs -> glob patterns
+    let file_ttl_removal_config = match &config.ttl_removal_config {
+        Some(ttl_removal_config_value) => Some(convert_to_file_ttl_removal_config(
+            &ttl_removal_config_value,
+        )),
+        None => None,
+    };
+
     let checkpointer = Checkpointer::new(&data_dir);
     let strategy = config.fingerprint.clone().into();
 
@@ -540,6 +594,7 @@ pub fn file_source(
         ignore_checkpoints,
         read_from,
         ignore_before,
+        start_reading_at,
         max_line_bytes: config.max_line_bytes,
         line_delimiter: line_delimiter_as_bytes,
         data_dir,
@@ -549,6 +604,10 @@ pub fn file_source(
         remove_after: config.remove_after_secs.map(Duration::from_secs),
         emitter,
         rotate_wait: config.rotate_wait,
+        ttl_removal_config: file_ttl_removal_config,
+        source_context: config.source_context.clone(),
+        // The file source has no way of retrieving pod information, so we don't need to track it.
+        file_to_pod_map: None,
     };
 
     let event_metadata = EventMetadata {
@@ -560,6 +619,7 @@ pub fn file_source(
         hostname: crate::get_hostname().ok(),
         file_key: config.file_key.clone().path,
         offset_key: config.offset_key.clone().and_then(|k| k.path),
+        source_context: config.source_context.clone(),
     };
 
     let include = config.include.clone();
@@ -724,7 +784,7 @@ fn reconcile_position_options(
     }
 }
 
-fn wrap_with_line_agg(
+pub fn wrap_with_line_agg(
     rx: impl Stream<Item = Line> + Send + std::marker::Unpin + 'static,
     config: line_agg::Config,
 ) -> Box<dyn Stream<Item = Line> + Send + std::marker::Unpin + 'static> {
@@ -759,6 +819,7 @@ struct EventMetadata {
     hostname: Option<String>,
     file_key: Option<OwnedValuePath>,
     offset_key: Option<OwnedValuePath>,
+    source_context: Option<HashMap<String, String>>,
 }
 
 fn create_event(
@@ -815,6 +876,24 @@ fn create_event(
         file,
     );
 
+    // Apply additional fields as specified by the source context if needed
+    if let Some(source_context) = &meta.source_context {
+        for (key, value) in source_context {
+            let path = format!("source_context.{}", key);
+            // We don't want things like namespace consideration here since we want this value to be in a consistent spot
+            // So we don't use the insert_source_metadata function and just directly insert
+            event.insert(path.as_str(), value.clone());
+        }
+    }
+
+    emit!(DeliveryReadEvent {
+        path: file.to_string(),
+        bytes_read: event.estimated_json_encoded_size_of().get(),
+        lines_read: 1,
+        source_context: meta.source_context.clone(),
+        emitted_after_multiline_agg: true,
+    });
+
     emit!(FileEventsReceived {
         count: 1,
         file,
@@ -832,12 +911,16 @@ mod tests {
         fs::{self, File},
         future::Future,
         io::{Seek, Write},
+        os::unix::io::AsRawFd,
+        time::{Duration as StdDuration, SystemTime},
     };
 
+    use chrono::{DateTime, Utc};
     use encoding_rs::UTF_16LE;
     use similar_asserts::assert_eq;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
     use tokio::time::{Duration, sleep, timeout};
+    use vector_lib::file_source::FileTTLAction;
     use vector_lib::schema::Definition;
     use vrl::{value, value::kind::Collection};
 
@@ -951,6 +1034,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.read_from, ReadFromConfig::End);
+
+        let config: FileConfig = toml::from_str(
+            r#"
+        include = [ "/var/log/**/*.log" ]
+        start_reading_at = "2022-01-01T12:00:00Z"
+        read_from = "end"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.start_reading_at,
+            Some("2022-01-01T12:00:00Z".to_string())
+        );
+        assert_eq!(config.read_from, ReadFromConfig::End);
     }
 
     #[test]
@@ -1053,6 +1150,7 @@ mod tests {
             hostname: Some("Some.Machine".to_string()),
             file_key: Some(owned_value_path!("file")),
             offset_key: Some(owned_value_path!("offset")),
+            source_context: None,
         };
         let log = create_event(line, offset, file, &meta, LogNamespace::Legacy, false);
 
@@ -1075,6 +1173,7 @@ mod tests {
             hostname: Some("Some.Machine".to_string()),
             file_key: Some(owned_value_path!("file_path")),
             offset_key: Some(owned_value_path!("off")),
+            source_context: None,
         };
         let log = create_event(line, offset, file, &meta, LogNamespace::Legacy, false);
 
@@ -1097,6 +1196,7 @@ mod tests {
             hostname: Some("Some.Machine".to_string()),
             file_key: Some(owned_value_path!("ignored")),
             offset_key: Some(owned_value_path!("ignored")),
+            source_context: None,
         };
         let log = create_event(line, offset, file, &meta, LogNamespace::Vector, false);
 
@@ -1138,6 +1238,27 @@ mod tests {
                 .unwrap(),
             &value!("some_file.rs")
         );
+    }
+
+    #[test]
+    fn create_event_with_source_context() {
+        let line = Bytes::from("hello world");
+        let file = "some_file.rs";
+        let offset: u64 = 0;
+        let source_context = HashMap::from([("topic".to_string(), "security-log".to_string())]);
+
+        let meta = EventMetadata {
+            host_key: Some(owned_value_path!("hostname")),
+            hostname: Some("Some.Machine".to_string()),
+            file_key: Some(owned_value_path!("file_path")),
+            offset_key: Some(owned_value_path!("off")),
+            source_context: Some(source_context),
+        };
+        let log = create_event(line, offset, file, &meta, LogNamespace::Legacy, false);
+
+        assert_eq!(log["file_path"], "some_file.rs".into());
+        assert_eq!(log["hostname"], "Some.Machine".into());
+        assert_eq!(log["source_context.topic"], "security-log".into());
     }
 
     #[tokio::test]
@@ -2445,6 +2566,94 @@ mod tests {
         }
     }
 
+    // Validation for active v. rotated file (active file should be TTL'd after read)
+    async fn validate_files_after_ttl(
+        config: &file::FileConfig,
+        dir: &TempDir,
+        remove_after_secs: u64,
+    ) {
+        let older_path = dir.path().join("rotated.gz");
+        let mut older = File::create(&older_path).unwrap();
+
+        sleep_500_millis().await;
+
+        let newer_path = dir.path().join("active.log");
+        let mut newer = File::create(&newer_path).unwrap();
+
+        writeln!(&mut older, "hello i am the old file").unwrap();
+
+        writeln!(&mut newer, "and i am the new file").unwrap();
+
+        sleep_500_millis().await;
+
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
+            sleep(Duration::from_secs(remove_after_secs + 2)).await;
+        })
+        .await;
+
+        let received = extract_messages_value(received);
+
+        assert_eq!(
+            received,
+            vec![
+                "hello i am the old file".into(),
+                "and i am the new file".into(),
+            ]
+        );
+
+        // Active file should exist, but rotated file shouldn't
+        match File::open(&older_path) {
+            Ok(_) => panic!("File wasn't removed"),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        }
+        match File::open(&newer_path) {
+            Ok(_) => {}
+            Err(_error) => panic!("Active file was deleted"),
+        }
+    }
+
+    // Test the option to configure TTL by specifying patterns to keep
+    #[tokio::test]
+    async fn test_file_ttl_keep() {
+        let dir = tempdir().unwrap();
+        let remove_after_secs = 3;
+        let ttl_removal_config = file::TTLRemovalConfig {
+            action: FileTTLAction::Keep,
+            patterns: vec![dir.path().join("*.log")],
+        };
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            max_read_bytes: 1,
+            oldest_first: false,
+            remove_after_secs: Some(remove_after_secs),
+            ttl_removal_config: Some(ttl_removal_config),
+            ..test_default_file_config(&dir)
+        };
+
+        validate_files_after_ttl(&config, &dir, remove_after_secs).await;
+    }
+
+    // Test the option to configure TTL by specifying patterns to remove
+    #[tokio::test]
+    async fn test_file_ttl_remove() {
+        let dir = tempdir().unwrap();
+        let remove_after_secs = 3;
+        let ttl_removal_config = file::TTLRemovalConfig {
+            action: FileTTLAction::Remove,
+            patterns: vec![dir.path().join("*.gz")],
+        };
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            max_read_bytes: 1,
+            oldest_first: false,
+            remove_after_secs: Some(remove_after_secs),
+            ttl_removal_config: Some(ttl_removal_config),
+            ..test_default_file_config(&dir)
+        };
+
+        validate_files_after_ttl(&config, &dir, remove_after_secs).await;
+    }
+
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum AckingMode {
         NoAcks,      // No acknowledgement handling and no finalization
@@ -2521,5 +2730,360 @@ mod tests {
             .map(Event::into_log)
             .map(|log| log.get_message().unwrap().clone())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn test_start_reading_at_timestamp_filtering() {
+        // Read only files that are modified after the start_reading_at timestamp.
+
+        let dir = tempdir().unwrap();
+
+        // Set start_reading_at to 5 seconds ago using ISO 8601 format
+        let threshold_time = SystemTime::now() - StdDuration::from_secs(5);
+        let threshold_datetime = DateTime::<Utc>::from(threshold_time);
+        let threshold_timestamp_string = threshold_datetime.to_rfc3339();
+
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*.log")],
+            start_reading_at: Some(threshold_timestamp_string),
+            ..test_default_file_config(&dir)
+        };
+
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
+            // Create temporary files that don't match the glob pattern yet
+            let old_temp_path = dir.path().join("old_file.tmp");
+            let new_temp_path = dir.path().join("new_file.tmp");
+            let mut old_file = File::create(&old_temp_path).unwrap();
+            let mut new_file = File::create(&new_temp_path).unwrap();
+
+            // Write unique content to identify each file
+            writeln!(&mut old_file, "old file content").unwrap();
+            writeln!(&mut new_file, "new file content").unwrap();
+
+            // Close files to ensure content is written
+            drop(old_file);
+            drop(new_file);
+
+            {
+                // Set file modification times before files are discoverable
+                let old_time = SystemTime::now() - StdDuration::from_secs(10); // 10 seconds ago (before threshold)
+                let new_time = SystemTime::now() - StdDuration::from_secs(2); // 2 seconds ago (after threshold)
+
+                let old_timeval = libc::timeval {
+                    tv_sec: old_time
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as _,
+                    tv_usec: 0,
+                };
+                let old_times = [old_timeval, old_timeval];
+
+                let new_timeval = libc::timeval {
+                    tv_sec: new_time
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as _,
+                    tv_usec: 0,
+                };
+                let new_times = [new_timeval, new_timeval];
+
+                // Open files just to set their times
+                let old_file = File::open(&old_temp_path).unwrap();
+                let new_file = File::open(&new_temp_path).unwrap();
+
+                unsafe {
+                    libc::futimes(old_file.as_raw_fd(), old_times.as_ptr());
+                    libc::futimes(new_file.as_raw_fd(), new_times.as_ptr());
+                }
+            }
+
+            // Now rename files to match the glob pattern - file source will discover them with correct times
+            let old_final_path = dir.path().join("old_file.log");
+            let new_final_path = dir.path().join("new_file.log");
+            fs::rename(&old_temp_path, &old_final_path).unwrap();
+            fs::rename(&new_temp_path, &new_final_path).unwrap();
+
+            sleep_500_millis().await;
+        })
+        .await;
+
+        // Extract messages and verify only the new file was read
+        let messages: Vec<String> = received
+            .iter()
+            .map(|event| {
+                event.as_log()[log_schema().message_key().unwrap().to_string()]
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        // Should only contain content from the new file (modified after threshold)
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], "new file content");
+
+        // Verify that no events came from the old file
+        let old_file_events: Vec<_> = received
+            .iter()
+            .filter(|event| {
+                event.as_log()["file"]
+                    .to_string_lossy()
+                    .ends_with("old_file.log")
+            })
+            .collect();
+        assert_eq!(
+            old_file_events.len(),
+            0,
+            "Old file should not have been read"
+        );
+
+        // Verify that events came from the new file
+        let new_file_events: Vec<_> = received
+            .iter()
+            .filter(|event| {
+                event.as_log()["file"]
+                    .to_string_lossy()
+                    .ends_with("new_file.log")
+            })
+            .collect();
+        assert_eq!(new_file_events.len(), 1, "New file should have been read");
+    }
+
+    #[tokio::test]
+    async fn test_start_reading_at_old_file_with_modification_time_after_threshold() {
+        // Test scenario: file with old modification time but has modification time after the threshold should be read
+        let dir = tempdir().unwrap();
+
+        // Set start_reading_at to 5 seconds ago using ISO 8601 format
+        let threshold_time = SystemTime::now() - StdDuration::from_secs(5);
+        let threshold_datetime = DateTime::<Utc>::from(threshold_time);
+        let threshold_timestamp_string = threshold_datetime.to_rfc3339();
+
+        // Global cooldown is 100ms, so Vector should have no issue discovering the file at the beginning, and read the whole file in the end.
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*.log")],
+            start_reading_at: Some(threshold_timestamp_string),
+            ..test_default_file_config(&dir)
+        };
+
+        let file_path = dir.path().join("active.log");
+        let mut file = File::create(&file_path).unwrap();
+        writeln!(&mut file, "old log entry from before threshold").unwrap();
+        // Temporarily set old modification time (10 seconds ago)
+        let old_time = SystemTime::now() - StdDuration::from_secs(10);
+        let old_timeval = libc::timeval {
+            tv_sec: old_time
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as _,
+            tv_usec: 0,
+        };
+
+        let old_times = [old_timeval, old_timeval];
+        unsafe {
+            libc::futimes(file.as_raw_fd(), old_times.as_ptr());
+        }
+        drop(file); // Close the file to set the modification time
+
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
+            sleep_500_millis().await; // Give vector some time to start
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(&file_path)
+                .unwrap();
+            // Writing new content sets the modification time past the threshold
+            writeln!(&mut file, "new log entry after threshold").unwrap();
+            drop(file);
+            sleep_500_millis().await; // Give Vector some time to read the file
+        })
+        .await;
+
+        // Extract all messages
+        let messages: Vec<String> = received
+            .iter()
+            .map(|event| {
+                event.as_log()[log_schema().message_key().unwrap().to_string()]
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            messages.len(),
+            2,
+            "Should read all the content from the file because it gets modified after the threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_reading_at_timezone_formats() {
+        // Test that different timezone formats are parsed correctly
+        use vector_lib::file_source::parse_start_reading_at;
+
+        // Test ISO 8601 with UTC
+        let utc_result = parse_start_reading_at(Some("2022-01-01T12:00:00Z".to_string()));
+        assert!(utc_result.is_some());
+
+        // Test ISO 8601 with timezone offset
+        let offset_result = parse_start_reading_at(Some("2022-01-01T12:00:00-05:00".to_string()));
+        assert!(offset_result.is_some());
+
+        // Test that non-ISO format is rejected
+        let invalid_result = parse_start_reading_at(Some("2022-01-01 12:00:00".to_string()));
+        assert!(
+            invalid_result.is_none(),
+            "Non-ISO 8601 format should be rejected"
+        );
+
+        // Verify UTC conversion: EST -05:00 should be 5 hours ahead when converted to UTC
+        let est_time =
+            parse_start_reading_at(Some("2022-01-01T12:00:00-05:00".to_string())).unwrap();
+        let utc_time = parse_start_reading_at(Some("2022-01-01T17:00:00Z".to_string())).unwrap();
+        assert_eq!(est_time, utc_time, "EST 12:00 should equal UTC 17:00");
+    }
+
+    #[tokio::test]
+    async fn test_start_reading_at_invalid_timestamp() {
+        // Test scenario: invalid timestamp should fall back to reading all files
+
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*.log")],
+            // Use an invalid ISO 8601 timestamp
+            start_reading_at: Some("2022-13-01T25:70:99Z".to_string()),
+            ..test_default_file_config(&dir)
+        };
+
+        let received = run_file_source(&config, true, NoAcks, LogNamespace::Legacy, async {
+            // Create old file (normally would be filtered out)
+            let old_temp_path = dir.path().join("old_file.tmp");
+            let mut file = File::create(&old_temp_path).unwrap();
+            writeln!(&mut file, "old log entry that should still be read").unwrap();
+            drop(file);
+
+            // Set modification time to 10 seconds ago (would normally be filtered)
+            let old_time = SystemTime::now() - StdDuration::from_secs(10);
+            let old_timeval = libc::timeval {
+                tv_sec: old_time
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as _,
+                tv_usec: 0,
+            };
+            let old_times = [old_timeval, old_timeval];
+
+            let file = File::open(&old_temp_path).unwrap();
+            unsafe {
+                libc::futimes(file.as_raw_fd(), old_times.as_ptr());
+            }
+            drop(file);
+
+            // Move to discoverable location
+            let old_path = dir.path().join("old_file.log");
+            fs::rename(&old_temp_path, &old_path).unwrap();
+
+            // Create new file
+            let new_temp_path = dir.path().join("new_file.tmp");
+            let mut file = File::create(&new_temp_path).unwrap();
+            writeln!(&mut file, "new log entry").unwrap();
+            drop(file);
+
+            // Move to discoverable location (no timestamp modification needed - uses current time)
+            let new_path = dir.path().join("new_file.log");
+            fs::rename(&new_temp_path, &new_path).unwrap();
+
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let messages: Vec<String> = received
+            .into_iter()
+            .map(|event| {
+                event.as_log()[log_schema().message_key().unwrap().to_string()]
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        // With invalid timestamp, should fall back to reading ALL files (no filtering)
+        assert_eq!(
+            messages.len(),
+            2,
+            "Should read all files when timestamp is invalid"
+        );
+        assert!(
+            messages.contains(&"old log entry that should still be read".to_string()),
+            "Should read old file with invalid timestamp"
+        );
+        assert!(
+            messages.contains(&"new log entry".to_string()),
+            "Should read new file with invalid timestamp"
+        );
+    }
+
+    #[test]
+    fn test_start_reading_at_validation_during_deserialization() {
+        // Test valid ISO-8601 timestamps
+        let valid_config_yaml = r#"
+include:
+  - "/tmp/*.log"
+start_reading_at: "2022-01-01T12:00:00Z"
+"#;
+        let result: Result<FileConfig, _> = serde_yaml::from_str(valid_config_yaml);
+        assert!(
+            result.is_ok(),
+            "Valid ISO-8601 timestamp should deserialize successfully"
+        );
+
+        let valid_config_with_offset_yaml = r#"
+include:
+  - "/tmp/*.log"
+start_reading_at: "2022-01-01T12:00:00-05:00"
+"#;
+        let result: Result<FileConfig, _> = serde_yaml::from_str(valid_config_with_offset_yaml);
+        assert!(
+            result.is_ok(),
+            "Valid ISO-8601 timestamp with offset should deserialize successfully"
+        );
+
+        // Test invalid timestamp format
+        let invalid_config_yaml = r#"
+include:
+  - "/tmp/*.log"
+start_reading_at: "2022-01-01 12:00:00"
+"#;
+        let result: Result<FileConfig, _> = serde_yaml::from_str(invalid_config_yaml);
+        assert!(
+            result.is_err(),
+            "Invalid timestamp format should fail deserialization"
+        );
+
+        let error = result.unwrap_err();
+        let error_msg = error.to_string();
+        assert!(
+            error_msg.contains("Invalid ISO-8601 timestamp format"),
+            "Error message should mention ISO-8601 format: {}",
+            error_msg
+        );
+
+        // Test completely invalid timestamp
+        let invalid_config_yaml2 = r#"
+include:
+  - "/tmp/*.log"
+start_reading_at: "not-a-timestamp"
+"#;
+        let result: Result<FileConfig, _> = serde_yaml::from_str(invalid_config_yaml2);
+        assert!(
+            result.is_err(),
+            "Invalid timestamp should fail deserialization"
+        );
+
+        let error = result.unwrap_err();
+        let error_msg = error.to_string();
+        assert!(
+            error_msg.contains("Invalid ISO-8601 timestamp format"),
+            "Error message should mention ISO-8601 format: {}",
+            error_msg
+        );
     }
 }

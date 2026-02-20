@@ -11,6 +11,8 @@ name: Changelog
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
+    branches-ignore:
+      - 'v*-custom'
 
   # Required by GitHub merge queue due to branch protection rules. Should always be successful
   merge_group:

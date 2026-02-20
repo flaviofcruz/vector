@@ -86,6 +86,11 @@ where
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub proxy: ProxyConfig,
 
+    /// List of files to watch to trigger a reload of this sink
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub files_to_watch: Vec<PathBuf>,
+
     #[serde(flatten)]
     #[configurable(metadata(docs::hidden))]
     pub inner: BoxedSink,
@@ -108,6 +113,7 @@ where
             inner: inner.into(),
             proxy: Default::default(),
             graph: Default::default(),
+            files_to_watch: vec![],
         }
     }
 
@@ -167,6 +173,7 @@ where
             healthcheck_uri: self.healthcheck_uri,
             proxy: self.proxy,
             graph: self.graph,
+            files_to_watch: self.files_to_watch,
         }
     }
 }

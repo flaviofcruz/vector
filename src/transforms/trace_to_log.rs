@@ -1,9 +1,11 @@
 use vector_lib::config::clone_input_definitions;
 use vector_lib::configurable::configurable_component;
 
-use crate::config::OutputId;
 use crate::{
-    config::{DataType, GenerateConfig, Input, TransformConfig, TransformContext, TransformOutput},
+    config::{
+        DataType, GenerateConfig, Input, OutputId, TransformConfig, TransformContext,
+        TransformOutput,
+    },
     event::{Event, LogEvent},
     schema::Definition,
     transforms::{FunctionTransform, OutputBuffer, Transform},

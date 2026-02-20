@@ -17,6 +17,7 @@ use crate::{
     event::{EventFinalizers, EventStatus, Finalizable},
     gcp::GcpAuthenticator,
     http::{HttpClient, HttpError},
+    internal_events::vector_event::VectorEventLogSendMetadata,
 };
 
 #[derive(Debug, Clone)]
@@ -37,12 +38,21 @@ impl GcsService {
 }
 
 #[derive(Clone, Debug)]
+pub struct GcsMetadata {
+    pub partition_key: String,
+    pub finalizers: EventFinalizers,
+    // Specify additional information relevant for vector send event logs
+    pub event_log_metadata: VectorEventLogSendMetadata,
+}
+
+#[derive(Clone, Debug)]
 pub struct GcsRequest {
     pub key: String,
     pub body: Bytes,
     pub settings: GcsRequestSettings,
     pub finalizers: EventFinalizers,
     pub metadata: RequestMetadata,
+    pub event_log_metadata: VectorEventLogSendMetadata,
 }
 
 impl Finalizable for GcsRequest {
@@ -77,6 +87,7 @@ pub struct GcsRequestSettings {
 pub struct GcsResponse {
     pub inner: http::Response<Body>,
     pub metadata: RequestMetadata,
+    pub event_log_metadata: VectorEventLogSendMetadata,
 }
 
 impl DriverResponse for GcsResponse {
@@ -113,6 +124,7 @@ impl Service<GcsRequest> for GcsService {
     fn call(&mut self, request: GcsRequest) -> Self::Future {
         let settings = request.settings;
         let metadata = request.metadata;
+        let event_log_metadata = request.event_log_metadata;
 
         let uri = merge_url_and_key(&self.base_url, &request.key);
 
@@ -140,7 +152,11 @@ impl Service<GcsRequest> for GcsService {
         let mut client = self.client.clone();
         Box::pin(async move {
             let result = client.call(http_request).await;
-            result.map(|inner| GcsResponse { inner, metadata })
+            result.map(|inner| GcsResponse {
+                inner,
+                metadata,
+                event_log_metadata,
+            })
         })
     }
 }

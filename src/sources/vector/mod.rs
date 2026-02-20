@@ -138,6 +138,11 @@ pub struct VectorConfig {
     #[serde(default)]
     #[configurable(metadata(docs::hidden))]
     pub log_namespace: Option<bool>,
+
+    /// The maximum number of request source will handle concurrently.
+    #[configurable(derived)]
+    #[serde(default)]
+    max_concurrent_requests: Option<usize>,
 }
 
 impl VectorConfig {
@@ -158,6 +163,7 @@ impl Default for VectorConfig {
             tls: None,
             acknowledgements: Default::default(),
             log_namespace: None,
+            max_concurrent_requests: None,
         }
     }
 }
@@ -185,10 +191,16 @@ impl SourceConfig for VectorConfig {
         // Tonic added a default of 4MB in 0.9. This replaces the old behavior.
         .max_decoding_message_size(usize::MAX);
 
-        let source =
-            run_grpc_server(self.address, tls_settings, service, cx.shutdown).map_err(|error| {
-                error!(message = "Source future failed.", %error);
-            });
+        let source = run_grpc_server(
+            self.address,
+            tls_settings,
+            service,
+            cx.shutdown,
+            self.max_concurrent_requests,
+        )
+        .map_err(|error| {
+            error!(message = "Source future failed.", %error);
+        });
 
         Ok(Box::pin(source))
     }

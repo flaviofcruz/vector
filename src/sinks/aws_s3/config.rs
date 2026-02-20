@@ -11,6 +11,7 @@ use vector_lib::{
 };
 
 use super::sink::S3RequestOptions;
+use crate::sinks::util::vector_event_log::EventLoggingService;
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint},
     codecs::{Encoder, EncodingConfigWithFraming, SinkType},
@@ -21,7 +22,7 @@ use crate::{
             self,
             config::{RetryStrategy, S3Options},
             partitioner::S3KeyPartitioner,
-            service::S3Service,
+            service::{S3Response, S3Service},
             sink::S3Sink,
         },
         util::{
@@ -223,7 +224,16 @@ impl S3SinkConfig {
         let retry_strategy = self.retry_strategy.clone();
         let service = ServiceBuilder::new()
             .settings(request_limits, retry_strategy)
+            // Add another layer after retries for emitting our event log message
+            // Returns back the same result so it continues to work downstream
+            .map_result(|result: Result<S3Response, _>| {
+                if let Ok(ref response) = result {
+                    response.event_log_metadata.emit_upload_event();
+                }
+                result
+            })
             .service(service);
+        let event_logging_service = EventLoggingService::new(service);
 
         let offset = self
             .timezone
@@ -260,7 +270,12 @@ impl S3SinkConfig {
             filename_tz_offset: offset,
         };
 
-        let sink = S3Sink::new(service, request_options, partitioner, batch_settings);
+        let sink = S3Sink::new(
+            event_logging_service,
+            request_options,
+            partitioner,
+            batch_settings,
+        );
 
         Ok(VectorSink::from_event_streamsink(sink))
     }

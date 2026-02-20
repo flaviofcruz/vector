@@ -1238,10 +1238,12 @@ mod test {
             let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             for line in input_lines {
                 socket.send_to(line.as_bytes(), in_addr).await.unwrap();
+                // Space things out slightly to try to avoid dropped packets
+                sleep(Duration::from_micros(500)).await;
             }
 
             // Wait a short period of time to ensure the messages get sent.
-            sleep(Duration::from_secs(2)).await;
+            sleep(Duration::from_millis(100)).await;
 
             // Shutdown the source, and make sure we've got all the messages we sent in.
             shutdown

@@ -17,6 +17,8 @@ use tokio::{
     io::AsyncWriteExt,
 };
 use tokio_util::{codec::Encoder as _, time::delay_queue::Expired};
+use vector_common::internal_event::vector_event::delivery_event::VectorSinkDeliveryEvent;
+use vector_lib::event::event_log::generate_count_map;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf, TimeZone,
     codecs::{
@@ -401,6 +403,7 @@ impl FileSink {
 
         trace!(message = "Writing an event to file.", path = ?path);
         let event_size = event.estimated_json_encoded_size_of();
+        let count_map = generate_count_map(&vec![event.clone()], true);
         let finalizers = event.take_finalizers();
         match write_event_to_file(file, event, &self.transformer, &mut self.encoder).await {
             Ok(byte_size) => {
@@ -411,6 +414,9 @@ impl FileSink {
                     file: String::from_utf8_lossy(&path),
                     include_file_metric_tag: self.include_file_metric_tag,
                 });
+
+                let delivery_event_log = VectorSinkDeliveryEvent::with_count_map(count_map);
+                delivery_event_log.emit_delivered_event();
             }
             Err(error) => {
                 finalizers.update_status(EventStatus::Errored);
