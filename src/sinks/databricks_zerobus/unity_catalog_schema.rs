@@ -815,15 +815,28 @@ fn map_complex_type_to_protobuf(
                         Some(entry_message_name),
                     ))
                 }
-                ComplexType::Struct(_) => {
-                    // Map with struct values - need to generate the struct message first
-                    Err(ZerobusSinkError::ConfigError {
-                        message: format!(
-                            "MAP with STRUCT values not yet supported for field '{}'. \
-                             Use explicit .proto schema file for complex map types.",
-                            path_prefix
-                        ),
-                    })
+                ComplexType::Struct(struct_type) => {
+                    // Map with struct values: generate the value struct message, then a
+                    // map-entry message that references it.
+                    let value_message_name =
+                        format!("{}Value", sanitize_message_name(path_prefix));
+                    let value_message =
+                        generate_struct_message(&value_message_name, struct_type, collector)?;
+                    collector.add_message(value_message);
+
+                    let entry_message_name =
+                        format!("{}Entry", sanitize_message_name(path_prefix));
+                    let entry_message = generate_map_entry_message_with_message_value(
+                        &entry_message_name,
+                        key_primitive,
+                        &value_message_name,
+                    )?;
+                    collector.add_message(entry_message);
+
+                    Ok((
+                        prost_types::field_descriptor_proto::Type::Message,
+                        Some(entry_message_name),
+                    ))
                 }
                 ComplexType::Array(_) | ComplexType::Map { .. } => {
                     // Map with complex values
@@ -955,6 +968,60 @@ fn generate_map_entry_message(
         oneof_decl: vec![],
         options: Some(prost_types::MessageOptions {
             map_entry: Some(true), // Mark this as a map entry
+            ..Default::default()
+        }),
+        reserved_range: vec![],
+        reserved_name: vec![],
+    })
+}
+
+/// Generate a map entry message where the value is a message (struct) type
+fn generate_map_entry_message_with_message_value(
+    message_name: &str,
+    key_type: &PrimitiveType,
+    value_type_name: &str,
+) -> Result<prost_types::DescriptorProto, ZerobusSinkError> {
+    let key_proto_type = map_primitive_to_protobuf(key_type);
+
+    let fields = vec![
+        prost_types::FieldDescriptorProto {
+            name: Some("key".to_string()),
+            number: Some(1),
+            label: Some(prost_types::field_descriptor_proto::Label::Optional as i32),
+            r#type: Some(key_proto_type as i32),
+            type_name: None,
+            extendee: None,
+            default_value: None,
+            oneof_index: None,
+            json_name: Some("key".to_string()),
+            options: None,
+            proto3_optional: Some(false),
+        },
+        prost_types::FieldDescriptorProto {
+            name: Some("value".to_string()),
+            number: Some(2),
+            label: Some(prost_types::field_descriptor_proto::Label::Optional as i32),
+            r#type: Some(prost_types::field_descriptor_proto::Type::Message as i32),
+            type_name: Some(value_type_name.to_string()),
+            extendee: None,
+            default_value: None,
+            oneof_index: None,
+            json_name: Some("value".to_string()),
+            options: None,
+            proto3_optional: Some(true),
+        },
+    ];
+
+    Ok(prost_types::DescriptorProto {
+        name: Some(message_name.to_string()),
+        field: fields,
+        extension: vec![],
+        nested_type: vec![],
+        enum_type: vec![],
+        extension_range: vec![],
+        oneof_decl: vec![],
+        options: Some(prost_types::MessageOptions {
+            map_entry: Some(true),
             ..Default::default()
         }),
         reserved_range: vec![],
@@ -1742,38 +1809,91 @@ mod tests {
     }
 
     #[test]
-    fn test_query_profile_log_succeeds_with_non_string_map_keys() {
-        // Verifies that the Unity Catalog schema for query_profile_log succeeds when
-        // processing QueryMetrics.boolean_config_access and double_config_access,
-        // which are map<int64, bool/double> — protobuf-valid scalar-keyed maps.
+    fn test_query_profile_log_complete_schema() {
+        // Regression test: verifies that the FULL 91-column query_profile_log schema
+        // (as returned by the real Unity Catalog API) generates a valid protobuf
+        // descriptor without errors.
         //
-        // Proto definition (proto/logs/qpl/query_profile.proto, QueryMetrics):
-        //   map<int64, bool>   boolean_config_access = 11
-        //   map<int64, double> double_config_access   = 12
+        // This fixture was previously incomplete (22 columns) and missed the
+        // query_metadata column, which contains a deeply-nested
+        //   STRUCT<referenced_objects: ARRAY<STRUCT<table_stats: STRUCT<col_stats: MAP<string, STRUCT>>>>>
+        // pattern that was not yet implemented (MAP with STRUCT values).
         //
-        // Delta/UC schema maps these as map<bigint, boolean> and map<bigint, double>.
-        // Protobuf maps support any scalar key type (int64 included), so this should
-        // succeed and produce map entry messages with int64 keys.
+        // Coverage:
+        //   - map<bigint, bool>   (QueryMetrics.boolean_config_access)  — non-string scalar key
+        //   - map<bigint, double> (QueryMetrics.double_config_access)   — non-string scalar key
+        //   - map<string, STRUCT> (QueryMetadata...col_stats)           — MAP with struct value
+        //   - ARRAY<STRUCT> with deeply nested fields (StageData, ExecutedPlanNodes, …)
+        //   - All 91 real columns including ETL metadata fields (_log_metadata, _environment, …)
 
         let json = include_str!("tests/fixtures/query_profile_log_complete_schema.json");
-        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
-            .expect("Failed to parse query_profile_log schema");
+        let schema: UnityCatalogTableSchema =
+            serde_json::from_str(json).expect("Failed to parse query_profile_log schema");
 
-        let descriptor = generate_descriptor_from_schema(&schema)
-            .expect("Should succeed: map<bigint,boolean> and map<bigint,double> use valid scalar keys");
+        assert_eq!(
+            schema.columns.len(),
+            91,
+            "Fixture must contain all 91 real columns from Unity Catalog"
+        );
+
+        let descriptor = generate_descriptor_from_schema(&schema).expect(
+            "Should succeed: all column types in query_profile_log must be supported",
+        );
 
         let proto_text = format_descriptor_as_proto(&descriptor);
 
-        // Both map entry messages must be present with int64 keys
+        // --- non-string scalar map keys (original PR fix) ---
         assert!(
             proto_text.contains("boolean_config_access"),
-            "Proto should contain boolean_config_access map field, got:\n{}",
-            proto_text
+            "Should contain boolean_config_access (map<int64, bool>)"
         );
         assert!(
             proto_text.contains("double_config_access"),
-            "Proto should contain double_config_access map field, got:\n{}",
-            proto_text
+            "Should contain double_config_access (map<int64, double>)"
+        );
+
+        // --- MAP with STRUCT value (bug found during live run) ---
+        // query_metadata.referenced_objects[].table_stats.col_stats is map<string, struct<…>>
+        assert!(
+            proto_text.contains("col_stats"),
+            "Should contain col_stats (map<string, STRUCT>) from query_metadata"
+        );
+
+        // --- key top-level fields ---
+        assert!(
+            descriptor.get_field_by_name("_event_time").is_some(),
+            "Should have _event_time"
+        );
+        assert!(
+            descriptor.get_field_by_name("_partition_date").is_some(),
+            "Should have _partition_date"
+        );
+        assert!(
+            descriptor.get_field_by_name("_log_metadata").is_some(),
+            "Should have _log_metadata (complex ETL metadata struct)"
+        );
+        assert!(
+            descriptor.get_field_by_name("query_metrics").is_some(),
+            "Should have query_metrics"
+        );
+        assert!(
+            descriptor.get_field_by_name("query_metadata").is_some(),
+            "Should have query_metadata (contains MAP<string, STRUCT>)"
+        );
+        assert!(
+            descriptor.get_field_by_name("stage_data").is_some(),
+            "Should have stage_data (ARRAY<complex STRUCT>)"
+        );
+        assert!(
+            descriptor.get_field_by_name("executed_plan_nodes").is_some(),
+            "Should have executed_plan_nodes (deeply nested ARRAY<STRUCT>)"
+        );
+
+        // total field count must match all 91 columns
+        assert_eq!(
+            descriptor.fields().len(),
+            91,
+            "Descriptor should have exactly 91 fields matching the 91 UC columns"
         );
     }
 }
