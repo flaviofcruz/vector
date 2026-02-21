@@ -104,9 +104,18 @@ pub struct PrometheusK8sScrapeConfig {
     /// The name of the container port to look for when discovering pods.
     ///
     /// Only pods with a container port matching this name will be scraped.
+    /// Set to `null` to disable named-port-based discovery entirely.
     #[serde(default = "default_named_port")]
     #[configurable(metadata(docs::examples = "metrics", docs::examples = "prometheus"))]
-    named_port: String,
+    named_port: Option<String>,
+
+    /// The pod annotation key used for annotation-based endpoint discovery.
+    ///
+    /// Pods carrying this annotation will be scraped on the port number given as
+    /// the annotation value. Set to `null` to disable annotation-based discovery.
+    #[serde(default = "default_annotation_name")]
+    #[configurable(metadata(docs::examples = "system_metrics_enabled"))]
+    annotation_name: Option<String>,
 
     /// Controls whether to add pod metadata (pod_name, pod_namespace, endpoint) to scraped metrics.
     ///
@@ -137,6 +146,7 @@ impl Default for PrometheusK8sScrapeConfig {
             pod_namespace_tag: Some("pod_namespace".to_string()),
             honor_labels: false,
             named_port: default_named_port(),
+            annotation_name: default_annotation_name(),
             emit_pod_metadata: true,
             tls: None,
             auth: None,
@@ -194,6 +204,7 @@ impl SourceConfig for PrometheusK8sScrapeConfig {
                 config.pod_namespace_tag,
                 config.honor_labels,
                 config.named_port,
+                config.annotation_name,
                 config.emit_pod_metadata,
                 config.auth,
                 tls,
@@ -227,7 +238,8 @@ async fn run_source(
     pod_name_tag: Option<String>,
     pod_namespace_tag: Option<String>,
     honor_labels: bool,
-    named_port: String,
+    named_port: Option<String>,
+    annotation_name: Option<String>,
     emit_pod_metadata: bool,
     auth: Option<Auth>,
     tls: TlsSettings,
@@ -270,7 +282,7 @@ async fn run_source(
     ));
 
     // Create endpoint provider
-    let endpoint_provider = K8sEndpointProvider::new(pod_state, named_port);
+    let endpoint_provider = K8sEndpointProvider::new(pod_state, named_port, annotation_name);
 
     // Run the scraping loop
     let scrape_result = scrape_loop(
@@ -559,8 +571,12 @@ fn default_use_apiserver_cache() -> bool {
     false
 }
 
-fn default_named_port() -> String {
-    "user-metrics".to_string()
+fn default_named_port() -> Option<String> {
+    Some("user-metrics".to_string())
+}
+
+fn default_annotation_name() -> Option<String> {
+    Some("system_metrics_enabled".to_string())
 }
 
 mod http_client {

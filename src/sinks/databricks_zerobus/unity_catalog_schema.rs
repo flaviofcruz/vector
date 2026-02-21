@@ -804,8 +804,11 @@ fn map_complex_type_to_protobuf(
                     // Generate a map entry message for this field
                     let entry_message_name =
                         format!("{}_entry", sanitize_message_name(path_prefix));
-                    let entry_message =
-                        generate_map_entry_message(&entry_message_name, key_primitive, value_primitive)?;
+                    let entry_message = generate_map_entry_message(
+                        &entry_message_name,
+                        key_primitive,
+                        value_primitive,
+                    )?;
 
                     collector.add_message(entry_message);
 
@@ -818,14 +821,12 @@ fn map_complex_type_to_protobuf(
                 ComplexType::Struct(struct_type) => {
                     // Map with struct values: generate the value struct message, then a
                     // map-entry message that references it.
-                    let value_message_name =
-                        format!("{}Value", sanitize_message_name(path_prefix));
+                    let value_message_name = format!("{}Value", sanitize_message_name(path_prefix));
                     let value_message =
                         generate_struct_message(&value_message_name, struct_type, collector)?;
                     collector.add_message(value_message);
 
-                    let entry_message_name =
-                        format!("{}Entry", sanitize_message_name(path_prefix));
+                    let entry_message_name = format!("{}Entry", sanitize_message_name(path_prefix));
                     let entry_message = generate_map_entry_message_with_message_value(
                         &entry_message_name,
                         key_primitive,
@@ -1836,9 +1837,8 @@ mod tests {
             "Fixture must contain all 91 real columns from Unity Catalog"
         );
 
-        let descriptor = generate_descriptor_from_schema(&schema).expect(
-            "Should succeed: all column types in query_profile_log must be supported",
-        );
+        let descriptor = generate_descriptor_from_schema(&schema)
+            .expect("Should succeed: all column types in query_profile_log must be supported");
 
         let proto_text = format_descriptor_as_proto(&descriptor);
 
@@ -1885,7 +1885,9 @@ mod tests {
             "Should have stage_data (ARRAY<complex STRUCT>)"
         );
         assert!(
-            descriptor.get_field_by_name("executed_plan_nodes").is_some(),
+            descriptor
+                .get_field_by_name("executed_plan_nodes")
+                .is_some(),
             "Should have executed_plan_nodes (deeply nested ARRAY<STRUCT>)"
         );
 

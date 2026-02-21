@@ -47,10 +47,10 @@ pub mod databricks_zerobus;
     feature = "sinks-datadog_traces"
 ))]
 pub mod datadog;
-#[cfg(feature = "sinks-doris")]
-pub mod doris;
 #[cfg(feature = "sinks-azure-delta-table")]
 pub mod delta_table;
+#[cfg(feature = "sinks-doris")]
+pub mod doris;
 #[cfg(feature = "sinks-elasticsearch")]
 pub mod elasticsearch;
 #[cfg(feature = "sinks-file")]

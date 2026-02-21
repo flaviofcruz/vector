@@ -21,12 +21,20 @@ pub static EVENT_LOG_METADATA_FIELD: OnceLock<String> = OnceLock::new();
 // One for send/upload events (EVENT_LOG_GRANULARITY_FIELDS) and one for delivery events (DELIVERY_EVENT_LOG_GRANULARITY_FIELDS)
 pub static EVENT_LOG_GRANULARITY_FIELDS: OnceLock<Vec<String>> = OnceLock::new();
 pub static DELIVERY_EVENT_LOG_GRANULARITY_FIELDS: OnceLock<Vec<String>> = OnceLock::new();
+pub static EVENT_LOG_COUNT_OVERRIDE_FIELD: OnceLock<String> = OnceLock::new();
 
 // Where we can find the log metadata object
 pub fn get_event_log_metadata_field() -> &'static String {
     // Initialize the static variable once, or return the value if it's already initialized/computed
     EVENT_LOG_METADATA_FIELD
         .get_or_init(|| env::var("EVENT_LOG_METADATA_FIELD").unwrap_or_else(|_| "".to_string()))
+}
+
+// Where we can find the message count override field
+pub fn get_event_log_count_override_field() -> &'static String {
+    EVENT_LOG_COUNT_OVERRIDE_FIELD.get_or_init(|| {
+        env::var("EVENT_LOG_COUNT_OVERRIDE_FIELD").unwrap_or_else(|_| "".to_string())
+    })
 }
 
 // Within the log metadata object itself, these are fields we care to parse for
@@ -85,6 +93,28 @@ fn build_map(
     val_map
 }
 
+// Sometimes, an event might actually be a batch of messages
+// To handle this, we allow the option for message itself to tell us the count to use
+// If specified we use it, otherwise we default to 1
+fn get_message_count(
+    event: &Event,
+    log_metadata_field: &str,
+    message_count_override_field: &str,
+) -> usize {
+    let path = format!("{}.{}", log_metadata_field, message_count_override_field);
+    match event.as_log().parse_path_and_get_value(path) {
+        Ok(Some(value)) => {
+            // If it's an integer, use that value as the count
+            if let Some(count) = value.as_integer() {
+                count as usize
+            } else {
+                1
+            }
+        }
+        _ => 1,
+    }
+}
+
 /*
 * On a list of events, iterate through them and track the counts per unique combination of
 * specified fields
@@ -99,14 +129,17 @@ pub fn generate_count_map(
 ) -> HashMap<String, MetadataValuesCount> {
     let log_metadata_field = get_event_log_metadata_field();
     let granularity_fields = get_event_log_granularity_fields(for_delivery_events);
+    let message_count_override_field = get_event_log_count_override_field();
     let mut count_map = HashMap::new();
     for event in events {
         // Check if it's a log event (see enum defined in lib/vector-core/src/event/mod.rs)
         if let Event::Log(log_event) = event {
+            let message_count =
+                get_message_count(event, log_metadata_field, message_count_override_field);
             count_map
                 .entry(build_key(log_event, log_metadata_field, granularity_fields))
                 .and_modify(|x: &mut MetadataValuesCount| {
-                    x.count += 1;
+                    x.count += message_count;
                     // For now, using pre-defined allocated bytes measure for size of event
                     // This may not be fully consistent with the real size of logs
                     // But having this a placeholder as consistent size measurement is tricky
@@ -114,8 +147,8 @@ pub fn generate_count_map(
                 })
                 .or_insert(MetadataValuesCount {
                     value_map: build_map(log_event, log_metadata_field, granularity_fields),
-                    count: 1,
-                    size: 0,
+                    count: message_count,
+                    size: log_event.size_of(),
                 });
         }
     }
