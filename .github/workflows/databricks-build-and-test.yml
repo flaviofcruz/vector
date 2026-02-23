@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: databricks-eng/vrl
-          ref: v0.29.0-custom
+          ref: v0.30.0-custom
           token: ${{ steps.generate-token-gh-app.outputs.token }}
           persist-credentials: false
           path: vrl
