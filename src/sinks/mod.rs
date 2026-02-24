@@ -32,6 +32,8 @@ pub mod azure_common;
 pub mod azure_monitor_logs;
 #[cfg(feature = "sinks-blackhole")]
 pub mod blackhole;
+#[cfg(feature = "sinks-bricklens-ingest")]
+pub mod bricklens_ingest;
 #[cfg(feature = "sinks-clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "sinks-console")]

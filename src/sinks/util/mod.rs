@@ -34,8 +34,9 @@ use std::borrow::Cow;
 
 pub use batch::{
     Batch, BatchConfig, BatchSettings, BatchSize, BulkSizeBasedDefaultBatchSettings, Merged,
-    NoDefaultsBatchSettings, PushResult, RealtimeEventBasedDefaultBatchSettings,
-    RealtimeSizeBasedDefaultBatchSettings, SinkBatchSettings, Unmerged,
+    NoDefaultsBatchSettings, OneEventPerBatchSettings, PushResult,
+    RealtimeEventBasedDefaultBatchSettings, RealtimeSizeBasedDefaultBatchSettings,
+    SinkBatchSettings, Unmerged,
 };
 pub use buffer::{
     Buffer, Compression, PartitionBuffer, PartitionInnerBuffer,

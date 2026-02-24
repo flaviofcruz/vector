@@ -1,0 +1,608 @@
+use std::task::{Context, Poll};
+
+use futures::future::BoxFuture;
+use http::{Request, Uri};
+use hyper::Body;
+use prost_reflect::{MethodDescriptor, prost::Message};
+use tower::Service;
+use tracing::debug;
+
+use vector_lib::finalization::{EventFinalizers, Finalizable};
+use vector_lib::internal_event::{ComponentEventsDropped, INTENTIONAL, UNINTENTIONAL};
+use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
+use vector_lib::stream::DriverResponse;
+
+/// Builds the gRPC request URI from the endpoint and RPC path.
+/// The TCP connection always goes to `endpoint` (e.g. 127.0.0.3:443 for the s2s-proxy sidecar).
+/// SNI is set separately via the TLS callback in sink.rs using `server_name`, which is how the
+/// s2s-proxy sidecar determines which backend to route to. The URI authority is intentionally
+/// kept as the endpoint address so that hyper connects to the sidecar rather than DNS-resolving
+/// the privileged DBNS hostname directly.
+fn build_request_uri(endpoint: &Uri, path: &str) -> crate::Result<Uri> {
+    let endpoint_str = endpoint.to_string();
+    let endpoint_base = endpoint_str.trim_end_matches('/');
+    format!("{}{}", endpoint_base, path)
+        .parse::<Uri>()
+        .map_err(|e| format!("Invalid URI: {}", e).into())
+}
+
+/// Wraps a serialized protobuf message with the 5-byte gRPC framing prefix
+/// (1 byte compression flag + 4 bytes big-endian message length).
+fn encode_grpc_message(message: Vec<u8>) -> Vec<u8> {
+    let len = message.len() as u32;
+    let mut framed = Vec::with_capacity(5 + message.len());
+    framed.push(0); // compression flag: 0 = uncompressed
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(&message);
+    framed
+}
+
+#[derive(Debug)]
+pub struct BricklensIngestRequest {
+    pub events: Vec<vector_lib::event::Event>,
+    pub metadata: RequestMetadata,
+    pub finalizers: EventFinalizers,
+}
+
+#[derive(Debug)]
+pub struct BricklensIngestResponse {
+    pub accepted_count: usize,
+}
+
+impl Finalizable for BricklensIngestRequest {
+    fn take_finalizers(&mut self) -> EventFinalizers {
+        std::mem::take(&mut self.finalizers)
+    }
+}
+
+impl MetaDescriptive for BricklensIngestRequest {
+    fn get_metadata(&self) -> &RequestMetadata {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut RequestMetadata {
+        &mut self.metadata
+    }
+}
+
+impl DriverResponse for BricklensIngestResponse {
+    fn event_status(&self) -> vector_lib::event::EventStatus {
+        vector_lib::event::EventStatus::Delivered
+    }
+
+    fn events_sent(&self) -> &GroupedCountByteSize {
+        use std::sync::LazyLock;
+        static ZERO_SIZE: LazyLock<GroupedCountByteSize> =
+            LazyLock::new(|| GroupedCountByteSize::new_untagged());
+        &ZERO_SIZE
+    }
+
+    fn bytes_sent(&self) -> Option<usize> {
+        None
+    }
+}
+
+#[derive(Clone)]
+pub struct BricklensIngestService {
+    client: hyper::Client<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>,
+    endpoint: Uri,
+    method: MethodDescriptor,
+}
+
+impl BricklensIngestService {
+    pub fn new(
+        client: hyper::Client<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>,
+        endpoint: Uri,
+        method: MethodDescriptor,
+    ) -> Self {
+        Self {
+            client,
+            endpoint,
+            method,
+        }
+    }
+
+    /// Convert a Vector LogEvent to a VRL Value for dynamic protobuf encoding.
+    /// This preserves the entire event structure as shaped by VRL transforms.
+    fn log_event_to_vrl_value(
+        log: &vector_lib::event::LogEvent,
+    ) -> Result<vrl::value::Value, String> {
+        // LogEvent internally stores a vrl::value::Value - just clone it
+        // No JSON intermediate representation needed
+        Ok(log.value().clone())
+    }
+
+    /// Validates the service configuration without making a network request.
+    /// This ensures the gRPC request path can be constructed correctly.
+    pub fn validate_configuration(&self) -> crate::Result<()> {
+        let path = self.grpc_path();
+        build_request_uri(&self.endpoint, &path)?;
+        Ok(())
+    }
+
+    fn grpc_path(&self) -> String {
+        format!(
+            "/{}/{}",
+            self.method.parent_service().full_name(),
+            self.method.name()
+        )
+    }
+
+    fn build_grpc_request(&self, request: BricklensIngestRequest) -> crate::Result<Request<Body>> {
+        let input_desc = self.method.input();
+        use vrl::protobuf::encode::encode_message;
+
+        let encode_options = vrl::protobuf::encode::Options {
+            use_json_names: false,
+        };
+
+        // Convert events to VRL values, tracking drops by type so we can emit metrics.
+        let mut intentional_drops: usize = 0; // non-log events (Metric, Trace): sink is log-only
+        let mut unintentional_drops: usize = 0; // conversion failures: should not happen
+        let event_values: Vec<vrl::value::Value> = request
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                vector_lib::event::Event::Log(log) => match Self::log_event_to_vrl_value(log) {
+                    Ok(value) => Some(value),
+                    Err(e) => {
+                        tracing::error!("Failed to convert log event to VRL value: {}", e);
+                        unintentional_drops += 1;
+                        None
+                    }
+                },
+                _ => {
+                    intentional_drops += 1;
+                    None
+                }
+            })
+            .collect();
+
+        if intentional_drops > 0 {
+            emit!(ComponentEventsDropped::<INTENTIONAL> {
+                count: intentional_drops,
+                reason: "bricklens_ingest only supports log events",
+            });
+        }
+        if unintentional_drops > 0 {
+            emit!(ComponentEventsDropped::<UNINTENTIONAL> {
+                count: unintentional_drops,
+                reason: "failed to convert log event to VRL value",
+            });
+        }
+
+        if event_values.is_empty() {
+            return Err("No events to encode".into());
+        }
+
+        // The event is expected to already be the full proto message, shaped by a VRL
+        // remap + reduce transform pipeline. The reduce transform aggregates per-record
+        // events into one merged event containing the complete BatchCreateLogRecordsRequest
+        // structure (batch-level fields + a 'requests' array). Use max_events = 1 on the
+        // sink so exactly one merged event arrives per call.
+        if event_values.len() > 1 {
+            tracing::warn!(
+                count = event_values.len(),
+                "bricklens_ingest received multiple events; only the first will be encoded. \
+                 Use max_events = 1 with a reduce transform for batching."
+            );
+        }
+        let event_value = event_values.into_iter().next().unwrap();
+
+        // Encode using VRL's dynamic protobuf encoder
+        let dynamic_msg =
+            encode_message(&input_desc, event_value, &encode_options).map_err(|e| {
+                tracing::error!("Encode failed: {}", e);
+                format!("Failed to encode message: {}", e)
+            })?;
+
+        // Encode to bytes
+        let buf = dynamic_msg.encode_to_vec();
+
+        // Build gRPC HTTP/2 request
+        let path = self.grpc_path();
+        let uri = build_request_uri(&self.endpoint, &path)?;
+
+        let req = Request::builder()
+            .uri(uri)
+            .method("POST")
+            .header("content-type", "application/grpc+proto")
+            .header("te", "trailers")
+            .header("grpc-encoding", "identity")
+            .body(Body::from(encode_grpc_message(buf)))
+            .map_err(|e| format!("Failed to build request: {}", e))?;
+
+        Ok(req)
+    }
+
+    fn parse_grpc_response(
+        &self,
+        mut body: impl bytes::Buf,
+    ) -> crate::Result<BricklensIngestResponse> {
+        use prost_reflect::DynamicMessage;
+
+        // Parse gRPC framing (5-byte prefix: 1 byte compression flag + 4 bytes message length)
+        if body.remaining() < 5 {
+            return Err("Response too short".into());
+        }
+
+        let compression_flag = body.get_u8();
+
+        // Validate compression - we only support uncompressed messages (flag = 0)
+        if compression_flag != 0 {
+            return Err(format!(
+                "Compressed responses not supported (compression flag: {})",
+                compression_flag
+            )
+            .into());
+        }
+
+        let message_len = body.get_u32() as usize;
+
+        if body.remaining() < message_len {
+            return Err("Incomplete message".into());
+        }
+
+        let message_bytes = body.copy_to_bytes(message_len);
+
+        // Decode using dynamic message
+        let output_desc = self.method.output();
+        let dynamic_response = DynamicMessage::decode(output_desc, message_bytes.as_ref())
+            .map_err(|e| format!("Failed to decode response: {}", e))?;
+
+        // Count successfully accepted records from BatchCreateLogRecordsResponse.results
+        let accepted_count = dynamic_response
+            .get_field_by_name("results")
+            .and_then(|f| f.as_list().map(|l| l.len()))
+            .unwrap_or(0);
+
+        Ok(BricklensIngestResponse { accepted_count })
+    }
+}
+
+impl Service<BricklensIngestRequest> for BricklensIngestService {
+    type Response = BricklensIngestResponse;
+    type Error = crate::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: BricklensIngestRequest) -> Self::Future {
+        let client = self.client.clone();
+        let service = self.clone();
+
+        Box::pin(async move {
+            let http_req = service.build_grpc_request(req)?;
+
+            let response = client
+                .request(http_req)
+                .await
+                .map_err(|e| format!("gRPC request failed: {}", e))?;
+
+            // Check gRPC status
+            let status = response
+                .headers()
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+
+            if status != 0 {
+                let message = response
+                    .headers()
+                    .get("grpc-message")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("Unknown error");
+                return Err(format!("gRPC error {}: {}", status, message).into());
+            }
+
+            // Using hyper::body::to_bytes which is deprecated in favor of http_body_util::BodyExt.
+            // We continue using this API because:
+            // 1. The replacement requires migrating to hyper 1.0 and http-body-util crate
+            // 2. Vector's ecosystem is currently on hyper 0.14
+            // 3. This API is stable and will remain available until Vector migrates to hyper 1.0
+            #[allow(deprecated)]
+            let body = hyper::body::to_bytes(response.into_body())
+                .await
+                .map_err(|e| format!("Failed to read response body: {}", e))?;
+
+            let response = service.parse_grpc_response(body)?;
+
+            // Log accepted count for observability
+            debug!(
+                message = "Bricklens request completed",
+                accepted_count = response.accepted_count
+            );
+
+            Ok(response)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use prost_reflect::{
+        DynamicMessage,
+        prost_types::{
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+            MethodDescriptorProto, ServiceDescriptorProto, field_descriptor_proto,
+        },
+    };
+    use vector_lib::event::{Event, LogEvent};
+
+    use super::*;
+
+    const GRPC_PATH: &str = "/databricks.bricklensingestinternal.api.v1.BricklensIngestInternalService/BatchCreateLogRecords";
+
+    // --- build_request_uri ---
+
+    #[test]
+    fn test_build_request_uri_uses_endpoint_authority() {
+        let endpoint: Uri = "https://127.0.0.3:443".parse().unwrap();
+        let uri = build_request_uri(&endpoint, GRPC_PATH).unwrap();
+        assert_eq!(uri.host(), Some("127.0.0.3"));
+        assert_eq!(uri.port_u16(), Some(443));
+        assert_eq!(uri.path(), GRPC_PATH);
+        assert_eq!(uri.scheme_str(), Some("https"));
+    }
+
+    #[test]
+    fn test_build_request_uri_preserves_scheme_and_port() {
+        let endpoint: Uri = "https://127.0.0.3:9090".parse().unwrap();
+        let uri = build_request_uri(&endpoint, "/some.Service/Method").unwrap();
+        assert_eq!(uri.host(), Some("127.0.0.3"));
+        assert_eq!(uri.port_u16(), Some(9090));
+        assert_eq!(uri.scheme_str(), Some("https"));
+        assert_eq!(uri.path(), "/some.Service/Method");
+    }
+
+    // --- encode_grpc_message ---
+
+    #[test]
+    fn test_encode_grpc_message_adds_5_byte_framing_prefix() {
+        let message = b"hello world".to_vec();
+        let framed = encode_grpc_message(message.clone());
+        assert_eq!(framed.len(), 5 + message.len());
+        assert_eq!(framed[0], 0, "compression flag must be 0 (uncompressed)");
+        let length = u32::from_be_bytes([framed[1], framed[2], framed[3], framed[4]]);
+        assert_eq!(length as usize, message.len());
+        assert_eq!(&framed[5..], message.as_slice());
+    }
+
+    #[test]
+    fn test_encode_grpc_message_empty_payload() {
+        let framed = encode_grpc_message(vec![]);
+        assert_eq!(framed.len(), 5);
+        assert_eq!(framed[0], 0);
+        let length = u32::from_be_bytes([framed[1], framed[2], framed[3], framed[4]]);
+        assert_eq!(length, 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test helpers for build_grpc_request / parse_grpc_response
+    // ---------------------------------------------------------------------------
+
+    /// Builds a minimal in-memory descriptor pool containing:
+    ///   test.Record         { string message = 1; }
+    ///   test.BatchRequest   { repeated Record records = 1; }
+    ///   test.Response       { int32 accepted_count = 1; }
+    ///   test.TestService    { rpc Batch(BatchRequest) returns (Response); }
+    fn make_test_pool() -> prost_reflect::DescriptorPool {
+        let file = FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("Record".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("message".to_string()),
+                        number: Some(1),
+                        label: Some(field_descriptor_proto::Label::Optional as i32),
+                        r#type: Some(field_descriptor_proto::Type::String as i32),
+                        json_name: Some("message".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("BatchRequest".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("records".to_string()),
+                        number: Some(1),
+                        label: Some(field_descriptor_proto::Label::Repeated as i32),
+                        r#type: Some(field_descriptor_proto::Type::Message as i32),
+                        type_name: Some(".test.Record".to_string()),
+                        json_name: Some("records".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("Result".to_string()),
+                    field: vec![],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("Response".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("results".to_string()),
+                        number: Some(1),
+                        label: Some(field_descriptor_proto::Label::Repeated as i32),
+                        r#type: Some(field_descriptor_proto::Type::Message as i32),
+                        type_name: Some(".test.Result".to_string()),
+                        json_name: Some("results".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            service: vec![ServiceDescriptorProto {
+                name: Some("TestService".to_string()),
+                method: vec![MethodDescriptorProto {
+                    name: Some("Batch".to_string()),
+                    input_type: Some(".test.BatchRequest".to_string()),
+                    output_type: Some(".test.Response".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        prost_reflect::DescriptorPool::from_file_descriptor_set(FileDescriptorSet {
+            file: vec![file],
+        })
+        .expect("test descriptor pool")
+    }
+
+    fn make_test_service(endpoint: &str) -> BricklensIngestService {
+        let pool = make_test_pool();
+        let svc = pool.get_service_by_name("test.TestService").unwrap();
+        let method = svc.methods().next().unwrap();
+
+        let mut http_connector = hyper::client::HttpConnector::new();
+        http_connector.enforce_http(false);
+        let ssl_builder =
+            openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()).unwrap();
+        let https_connector =
+            hyper_openssl::HttpsConnector::with_connector(http_connector, ssl_builder).unwrap();
+        let client = hyper::Client::builder()
+            .http2_only(true)
+            .build(https_connector);
+
+        BricklensIngestService {
+            client,
+            endpoint: endpoint.parse().unwrap(),
+            method,
+        }
+    }
+
+    fn make_request(events: Vec<Event>) -> BricklensIngestRequest {
+        BricklensIngestRequest {
+            events,
+            metadata: vector_lib::request_metadata::RequestMetadata::default(),
+            finalizers: Default::default(),
+        }
+    }
+
+    fn log_event(message: &str) -> Event {
+        let mut log = LogEvent::default();
+        log.insert("message", message);
+        Event::Log(log)
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_grpc_request
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_build_grpc_request_sets_grpc_headers_and_path() {
+        let svc = make_test_service("https://example.com:443");
+        let req = svc
+            .build_grpc_request(make_request(vec![log_event("hello")]))
+            .unwrap();
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.headers()["content-type"], "application/grpc+proto");
+        assert_eq!(req.headers()["te"], "trailers");
+        assert_eq!(req.headers()["grpc-encoding"], "identity");
+        assert_eq!(req.uri().path(), "/test.TestService/Batch");
+    }
+
+    #[test]
+    fn test_build_grpc_request_uses_endpoint_host_regardless_of_server_name() {
+        // server_name is used only for TLS SNI (via the TLS callback), not for URI authority.
+        // The TCP connection always goes to the endpoint so the s2s-proxy sidecar is not bypassed.
+        let svc = make_test_service("https://127.0.0.3:443");
+        let req = svc
+            .build_grpc_request(make_request(vec![log_event("hello")]))
+            .unwrap();
+        assert_eq!(req.uri().host(), Some("127.0.0.3"));
+        assert_eq!(req.uri().port_u16(), Some(443));
+    }
+
+    #[test]
+    fn test_build_grpc_request_empty_events_returns_error() {
+        let svc = make_test_service("https://example.com:443");
+        let err = svc.build_grpc_request(make_request(vec![])).unwrap_err();
+        assert!(
+            err.to_string().contains("No events"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_grpc_request_encodes_event_directly_as_proto_message() {
+        // With the reduce approach the sink receives one merged event that already IS the
+        // full proto message (e.g. BatchRequest { records: [...] }).  The sink encodes it
+        // directly without any wrapping.
+        let svc = make_test_service("https://example.com:443");
+
+        // Build an event whose structure matches test.BatchRequest { repeated Record records }
+        let mut log = LogEvent::default();
+        log.insert("records[0].message", "hello");
+        let req = svc
+            .build_grpc_request(make_request(vec![Event::Log(log)]))
+            .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        #[allow(deprecated)]
+        let body = rt.block_on(hyper::body::to_bytes(req.into_body())).unwrap();
+
+        let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+        let msg_bytes = &body[5..5 + msg_len];
+
+        let pool = make_test_pool();
+        let input_desc = pool.get_message_by_name("test.BatchRequest").unwrap();
+        let decoded = DynamicMessage::decode(input_desc, msg_bytes).unwrap();
+        let records = decoded.get_field_by_name("records").unwrap();
+        match &*records {
+            prost_reflect::Value::List(items) => {
+                assert_eq!(items.len(), 1, "expected 1 record from direct encoding");
+            }
+            other => panic!("expected list for records field, got {:?}", other),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // parse_grpc_response
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_grpc_response_counts_results() {
+        let svc = make_test_service("https://example.com:443");
+        // proto3 hand-encoding of: Response { results: [{}, {}, {}] } (3 empty Result messages)
+        // field 1, wire type 2 (length-delimited): tag = (1 << 3) | 2 = 0x0A, length = 0x00
+        let msg_bytes = vec![0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00];
+        let body = bytes::Bytes::from(encode_grpc_message(msg_bytes));
+        let resp = svc.parse_grpc_response(body).unwrap();
+        assert_eq!(resp.accepted_count, 3);
+    }
+
+    #[test]
+    fn test_parse_grpc_response_rejects_short_body() {
+        let svc = make_test_service("https://example.com:443");
+        let body = bytes::Bytes::from(vec![0x00, 0x00, 0x00, 0x00]); // 4 bytes, need 5
+        let err = svc.parse_grpc_response(body).unwrap_err();
+        assert!(
+            err.to_string().contains("too short"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_grpc_response_rejects_compressed_flag() {
+        let svc = make_test_service("https://example.com:443");
+        // 5-byte gRPC frame with compression flag = 1 and empty body
+        let body = bytes::Bytes::from(vec![0x01, 0x00, 0x00, 0x00, 0x00]);
+        let err = svc.parse_grpc_response(body).unwrap_err();
+        assert!(
+            err.to_string().contains("Compressed"),
+            "unexpected error: {}",
+            err
+        );
+    }
+}

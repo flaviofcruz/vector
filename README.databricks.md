@@ -78,3 +78,4 @@ This lists custom changes merged in Databricks fork of Vector.
 77. Adding annotation name based pod discovery for prometheus k8s scrape source - https://github.com/databricks-eng/vector/pull/389
 78. make inter component buffer parameter configurable. https://github.com/databricks-eng/vector/pull/400
 79. Add observability metrics for ClickHouse sink batching and insert latency https://github.com/databricks-eng/vector/pull/401
+80. Add a bricklens ingest sink - https://github.com/databricks-eng/vector/pull/385

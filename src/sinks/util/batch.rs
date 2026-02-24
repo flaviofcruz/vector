@@ -45,6 +45,18 @@ impl SinkBatchSettings for RealtimeEventBasedDefaultBatchSettings {
     const TIMEOUT_SECS: f64 = 1.0;
 }
 
+/// Default batch settings for sinks that send one event per request (e.g. one message per gRPC call).
+/// Use when the sink encodes a single event per request and does not support batching multiple
+/// events into one payload.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OneEventPerBatchSettings;
+
+impl SinkBatchSettings for OneEventPerBatchSettings {
+    const MAX_EVENTS: Option<usize> = Some(1);
+    const MAX_BYTES: Option<usize> = None;
+    const TIMEOUT_SECS: f64 = 1.0;
+}
+
 /// Reasonable default batch settings for sinks with timeliness concerns, limited by byte size.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RealtimeSizeBasedDefaultBatchSettings;
