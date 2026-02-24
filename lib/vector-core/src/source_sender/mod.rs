@@ -17,7 +17,13 @@ pub use errors::SendError;
 use output::Output;
 pub use sender::{SourceSender, SourceSenderItem};
 
-pub const CHUNK_SIZE: usize = 1000;
+pub static CHUNK_SIZE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("VECTOR_CHUNK_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(1000)
+});
 
 #[cfg(any(test, feature = "test"))]
 const TEST_BUFFER_SIZE: usize = 100;

@@ -28,6 +28,8 @@ mod aws_kinesis_firehose;
 #[cfg(any(feature = "sources-aws_s3", feature = "sources-aws_sqs",))]
 mod aws_sqs;
 mod batch;
+#[cfg(feature = "sinks-clickhouse")]
+mod clickhouse;
 mod common;
 mod conditions;
 #[cfg(feature = "sources-datadog_agent")]
@@ -191,6 +193,8 @@ pub(crate) use self::aws_kinesis::*;
 pub(crate) use self::aws_kinesis_firehose::*;
 #[cfg(any(feature = "sources-aws_s3", feature = "sources-aws_sqs",))]
 pub(crate) use self::aws_sqs::*;
+#[cfg(feature = "sinks-clickhouse")]
+pub(crate) use self::clickhouse::*;
 #[cfg(feature = "sources-datadog_agent")]
 pub(crate) use self::datadog_agent::*;
 #[cfg(feature = "sinks-datadog_metrics")]

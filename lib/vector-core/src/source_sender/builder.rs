@@ -19,7 +19,7 @@ pub struct Builder {
 impl Default for Builder {
     fn default() -> Self {
         Self {
-            buf_size: CHUNK_SIZE,
+            buf_size: *CHUNK_SIZE,
             default_output: None,
             named_outputs: Default::default(),
             lag_time: Some(histogram!(LAG_TIME_NAME)),

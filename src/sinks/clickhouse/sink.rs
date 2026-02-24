@@ -1,7 +1,17 @@
 //! Implementation of the `clickhouse` sink.
 
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    task::{Context, Poll},
+    time::Instant,
+};
+
 use super::{config::Format, request_builder::ClickhouseRequestBuilder};
-use crate::sinks::{prelude::*, util::http::HttpRequest};
+use crate::{
+    internal_events::{ClickhouseBatchFlushed, ClickhouseBatchInterval, ClickhouseInsertCompleted},
+    sinks::{prelude::*, util::http::HttpRequest},
+};
 
 pub struct ClickhouseSink<S> {
     batch_settings: BatcherSettings,
@@ -39,6 +49,7 @@ where
 
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         let batch_settings = self.batch_settings;
+        let last_flush_times: Mutex<HashMap<PartitionKey, Instant>> = Mutex::new(HashMap::new());
 
         input
             .batched_partitioned(
@@ -46,6 +57,28 @@ where
                 || batch_settings.as_byte_size_config(),
             )
             .filter_map(|(key, batch)| async move { key.map(move |k| (k, batch)) })
+            .map(|(key, batch)| {
+                let event_count = batch.len();
+                let in_memory_byte_size: usize = batch.iter().map(|e| e.size_of()).sum();
+
+                emit!(ClickhouseBatchFlushed {
+                    event_count,
+                    in_memory_byte_size,
+                });
+
+                let now = Instant::now();
+                {
+                    let mut map = last_flush_times.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(last_time) = map.get(&key) {
+                        emit!(ClickhouseBatchInterval {
+                            interval: now.duration_since(*last_time),
+                        });
+                    }
+                    map.insert(key.clone(), now);
+                }
+
+                (key, batch)
+            })
             .request_builder(
                 default_request_builder_concurrency_limit(),
                 self.request_builder,
@@ -59,7 +92,9 @@ where
                     Ok(req) => Some(req),
                 }
             })
-            .into_driver(self.service)
+            .into_driver(InstrumentedClickhouseService {
+                inner: self.service,
+            })
             .run()
             .await
     }
@@ -130,6 +165,54 @@ impl Partitioner for KeyPartitioner {
             database,
             table,
             format: self.format,
+        })
+    }
+}
+
+/// Service wrapper that measures insert latency and compressed batch size for
+/// each ClickHouse HTTP request.
+struct InstrumentedClickhouseService<S> {
+    inner: S,
+}
+
+impl<S> Service<HttpRequest<PartitionKey>> for InstrumentedClickhouseService<S>
+where
+    S: Service<HttpRequest<PartitionKey>> + Send + 'static,
+    S::Future: Send + 'static,
+    S::Response: DriverResponse + Send + 'static,
+    S::Error: std::fmt::Debug + Into<crate::Error> + Send,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = BoxFuture<'static, Result<S::Response, S::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
+        let compressed_byte_size = request.get_metadata().request_encoded_size();
+        let start = Instant::now();
+        let future = self.inner.call(request);
+
+        Box::pin(async move {
+            let result = future.await;
+            let latency = start.elapsed();
+            let status = match &result {
+                Ok(response) => match response.event_status() {
+                    EventStatus::Delivered => "success",
+                    EventStatus::Errored => "error",
+                    EventStatus::Rejected => "rejected",
+                    _ => "error",
+                },
+                Err(_) => "error",
+            };
+            emit!(ClickhouseInsertCompleted {
+                latency,
+                compressed_byte_size,
+                status,
+            });
+            result
         })
     }
 }

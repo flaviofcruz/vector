@@ -76,3 +76,5 @@ This lists custom changes merged in Databricks fork of Vector.
 75. Add Unity Catalog schema fetching for Databricks ZeroBus sink with OAuth authentication, dynamic protobuf schema generation from Unity Catalog API, full complex type support (structs, arrays, maps), and comprehensive unit tests for schema conversion https://github.com/databricks-eng/vector/pull/382
 76. Add overridable message count option for event logs https://github.com/databricks-eng/vector/pull/370
 77. Adding annotation name based pod discovery for prometheus k8s scrape source - https://github.com/databricks-eng/vector/pull/389
+78. make inter component buffer parameter configurable. https://github.com/databricks-eng/vector/pull/400
+79. Add observability metrics for ClickHouse sink batching and insert latency https://github.com/databricks-eng/vector/pull/401

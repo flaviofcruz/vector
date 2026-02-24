@@ -205,7 +205,7 @@ impl Output {
         S: Stream<Item = E> + Unpin,
         E: Into<Event> + ByteSizeOf,
     {
-        let mut stream = events.ready_chunks(CHUNK_SIZE);
+        let mut stream = events.ready_chunks(*CHUNK_SIZE);
         while let Some(events) = stream.next().await {
             self.send_batch(events.into_iter()).await?;
         }
@@ -223,7 +223,7 @@ impl Output {
         // `ComponentEventsDropped` events.
         let events = events.into_iter().map(Into::into);
         let mut unsent_event_count = UnsentEventCount::new(events.len());
-        for events in array::events_into_arrays(events, Some(CHUNK_SIZE)) {
+        for events in array::events_into_arrays(events, Some(*CHUNK_SIZE)) {
             self.send(events, &mut unsent_event_count)
                 .await
                 .inspect_err(|error| match error {
