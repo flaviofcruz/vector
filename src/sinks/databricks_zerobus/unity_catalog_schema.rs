@@ -1374,85 +1374,80 @@ mod tests {
     }
 
     #[test]
-    fn test_fixture_service_health_event() {
-        let json = include_str!("tests/fixtures/service_health_event_schema.json");
+    fn test_fixture_mixed_types() {
+        // Tests a schema with 5 columns covering: timestamp, bigint, nested struct,
+        // array<bigint>, and map<string,string>.
+        let json = include_str!("tests/fixtures/mixed_types_schema.json");
         let schema: UnityCatalogTableSchema =
-            serde_json::from_str(json).expect("Failed to parse service_health_event fixture");
+            serde_json::from_str(json).expect("Failed to parse mixed_types fixture");
 
         let result = generate_descriptor_from_schema(&schema);
         assert!(
             result.is_ok(),
-            "Failed to generate descriptor for service_health_event: {:?}",
+            "Failed to generate descriptor for mixed_types: {:?}",
             result.err()
         );
 
         let descriptor = result.unwrap();
-        // All columns including _event_time (position 0) should be included
-        assert_eq!(
-            descriptor.fields().len(),
-            5,
-            "Should have 5 columns including _event_time"
-        );
+        assert_eq!(descriptor.fields().len(), 5, "Should have 5 columns");
 
-        // Verify specific complex type columns including _event_time
+        // Verify all fields exist: timestamp, bigint, struct, array, map
         assert!(
-            descriptor.get_field_by_name("_event_time").is_some(),
-            "Should have _event_time"
+            descriptor.get_field_by_name("field_001").is_some(),
+            "Should have field_001 (timestamp)"
         );
         assert!(
-            descriptor.get_field_by_name("workspace_id").is_some(),
-            "Should have workspace_id"
+            descriptor.get_field_by_name("field_002").is_some(),
+            "Should have field_002 (bigint)"
         );
         assert!(
-            descriptor.get_field_by_name("service_extra").is_some(),
-            "Should have service_extra STRUCT"
+            descriptor.get_field_by_name("field_003").is_some(),
+            "Should have field_003 (STRUCT)"
         );
         assert!(
-            descriptor
-                .get_field_by_name("flag_evaluation_hashes")
-                .is_some(),
-            "Should have flag_evaluation_hashes ARRAY"
+            descriptor.get_field_by_name("field_007").is_some(),
+            "Should have field_007 (ARRAY)"
         );
         assert!(
-            descriptor.get_field_by_name("attributes").is_some(),
-            "Should have attributes MAP"
+            descriptor.get_field_by_name("field_008").is_some(),
+            "Should have field_008 (MAP)"
         );
     }
 
     #[test]
-    fn test_fixture_service_health_event_struct_parsing() {
-        // Test that the nested STRUCT in service_extra is properly parsed
-        let json = include_str!("tests/fixtures/service_health_event_schema.json");
+    fn test_fixture_mixed_types_struct_parsing() {
+        // Test that the nested STRUCT column is properly parsed
+        let json = include_str!("tests/fixtures/mixed_types_schema.json");
         let schema: UnityCatalogTableSchema =
-            serde_json::from_str(json).expect("Failed to parse service_health_event fixture");
+            serde_json::from_str(json).expect("Failed to parse mixed_types fixture");
 
-        // Find the service_extra column
-        let service_extra_col = schema
+        // Find the struct column (field_003)
+        let struct_col = schema
             .columns
             .iter()
-            .find(|c| c.name == "service_extra")
-            .expect("Should have service_extra column");
+            .find(|c| c.name == "field_003")
+            .expect("Should have field_003 column");
 
         // Parse its type_json
-        let result = parse_type_json(&service_extra_col.type_json);
-        assert!(result.is_ok(), "Should parse service_extra type_json");
+        let result = parse_type_json(&struct_col.type_json);
+        assert!(result.is_ok(), "Should parse field_003 type_json");
 
         match result.unwrap() {
             ComplexType::Struct(struct_type) => {
-                assert_eq!(struct_type.fields.len(), 1, "Should have 1 field (jobs)");
-                assert_eq!(struct_type.fields[0].name, "jobs");
+                assert_eq!(struct_type.fields.len(), 1, "Should have 1 field");
+                assert_eq!(struct_type.fields[0].name, "field_004");
 
                 // Verify nested struct
                 match &struct_type.fields[0].field_type {
                     ComplexType::Struct(nested) => {
-                        assert_eq!(nested.fields.len(), 2, "jobs should have 2 fields");
-                        assert_eq!(nested.fields[0].name, "job_id");
-                        assert_eq!(nested.fields[1].name, "task_run_id");
+                        assert_eq!(nested.fields.len(), 2, "Nested struct should have 2 fields");
+                        assert_eq!(nested.fields[0].name, "field_005");
+                        assert_eq!(nested.fields[1].name, "field_006");
                     }
-                    _ => panic!("Expected nested struct for jobs field"),
+                    _ => panic!("Expected nested struct"),
                 }
             }
-            _ => panic!("Expected struct type for service_extra"),
+            _ => panic!("Expected struct type for field_003"),
         }
     }
 
@@ -1554,18 +1549,13 @@ mod tests {
     }
 
     #[test]
-    fn test_complete_service_health_event_matches_proto_definition() {
-        // This test verifies that the Unity Catalog schema for service_health_event
-        // matches the source proto definition from universe/proto/logs/sla/service_health_event.proto
-        //
-        // Comparison rules:
-        // - Ignore fields starting with _ (ETL metadata)
-        // - Ignore field number differences (reordering during ETL)
-        // - Treat enums as strings (OutcomeType, RequestType, SourceType)
+    fn test_nested_structs_complete_schema() {
+        // Verifies that a 15-column schema with nested structs, arrays, and
+        // various primitive types generates a correct protobuf descriptor.
 
-        let json = include_str!("tests/fixtures/service_health_event_complete_schema.json");
-        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
-            .expect("Failed to parse complete service_health_event schema");
+        let json = include_str!("tests/fixtures/nested_structs_complete_schema.json");
+        let schema: UnityCatalogTableSchema =
+            serde_json::from_str(json).expect("Failed to parse nested_structs_complete schema");
 
         let descriptor = generate_descriptor_from_schema(&schema)
             .expect("Failed to generate descriptor from complete schema");
@@ -1574,200 +1564,132 @@ mod tests {
 
         assert_eq!(
             descriptor.name(),
-            "eng_lumberjack_prime_dev_service_health_event",
+            "test_schema_nested_structs_table",
             "Main message should have expected name"
         );
 
-        // Count non-underscore fields (business fields from proto)
-        let non_underscore_fields: Vec<_> = descriptor
-            .fields()
-            .filter(|f| !f.name().starts_with('_'))
-            .collect();
-
         assert_eq!(
-            non_underscore_fields.len(),
-            13,
-            "Should have exactly 13 business fields from ServiceHealthEvent proto"
+            descriptor.fields().len(),
+            15,
+            "Should have exactly 15 fields"
         );
 
-        // === 2. VERIFY ALL PRIMITIVE FIELDS ===
+        // === 2. VERIFY PRIMITIVE FIELDS ===
 
-        assert_field_exists_with_type(&descriptor, "event_name", "string");
-        assert_field_exists_with_type(&descriptor, "outcome", "string");
-        assert_field_exists_with_type(&descriptor, "outcome_type", "string"); // enum → string
-        assert_field_exists_with_type(&descriptor, "duration_ms", "int64");
-        assert_field_exists_with_type(&descriptor, "workspace_id", "int64");
-        assert_field_exists_with_type(&descriptor, "classification_low_confidence", "bool");
-        assert_field_exists_with_type(&descriptor, "dbr_version", "string");
-        assert_field_exists_with_type(&descriptor, "outcome_details", "string");
-        assert_field_exists_with_type(&descriptor, "is_suppressed", "bool");
+        assert_field_exists_with_type(&descriptor, "field_001", "int64"); // bigint
+        assert_field_exists_with_type(&descriptor, "field_002", "string");
+        assert_field_exists_with_type(&descriptor, "field_003", "string");
+        assert_field_exists_with_type(&descriptor, "field_004", "string");
+        assert_field_exists_with_type(&descriptor, "field_005", "string");
+        assert_field_exists_with_type(&descriptor, "field_006", "int64"); // bigint
+        assert_field_exists_with_type(&descriptor, "field_007", "int64"); // bigint
+        assert_field_exists_with_type(&descriptor, "field_028", "bool");
+        assert_field_exists_with_type(&descriptor, "field_029", "string");
+        assert_field_exists_with_type(&descriptor, "field_030", "string");
+        assert_field_exists_with_type(&descriptor, "field_031", "bool");
 
         // === 3. VERIFY COMPLEX MESSAGE TYPES ===
 
-        assert_field_is_message(&descriptor, "service_extra", "ServiceExtra");
-        assert_field_is_message(&descriptor, "rpc_info", "RpcInfo");
-        assert_field_is_message(&descriptor, "request_info", "RequestInfo");
+        assert_field_is_message(&descriptor, "field_008", "Field008");
+        assert_field_is_message(&descriptor, "field_018", "Field018");
+        assert_field_is_message(&descriptor, "field_021", "Field021");
 
-        // === 4. VERIFY ARRAY FIELDS ===
+        // === 4. VERIFY ARRAY FIELD ===
 
-        assert_field_is_repeated(&descriptor, "flag_evaluation_hashes");
+        assert_field_is_repeated(&descriptor, "field_027");
 
-        let flag_hashes_field = descriptor
-            .get_field_by_name("flag_evaluation_hashes")
-            .expect("flag_evaluation_hashes should exist");
-        // Check element type is int64
-        let element_type = format_field_type_simple(&flag_hashes_field);
-        assert_eq!(
-            element_type, "int64",
-            "flag_evaluation_hashes should be repeated int64"
-        );
+        let array_field = descriptor
+            .get_field_by_name("field_027")
+            .expect("field_027 should exist");
+        let element_type = format_field_type_simple(&array_field);
+        assert_eq!(element_type, "int64", "field_027 should be repeated int64");
 
-        // === 5. VERIFY NESTED MESSAGE: RpcInfo ===
+        // === 5. VERIFY NESTED MESSAGE: Field018 (2 string fields) ===
 
-        let rpc_info_field = descriptor
-            .get_field_by_name("rpc_info")
-            .expect("rpc_info field should exist");
+        let field_018 = descriptor
+            .get_field_by_name("field_018")
+            .expect("field_018 should exist");
 
-        if let prost_reflect::Kind::Message(rpc_msg) = rpc_info_field.kind() {
-            assert_eq!(
-                rpc_msg.fields().len(),
-                2,
-                "RpcInfo should have exactly 2 fields"
-            );
-
-            assert!(
-                rpc_msg.get_field_by_name("rpc_handler").is_some(),
-                "RpcInfo should have rpc_handler field"
-            );
-            assert!(
-                rpc_msg.get_field_by_name("exception_class").is_some(),
-                "RpcInfo should have exception_class field"
-            );
+        if let prost_reflect::Kind::Message(msg) = field_018.kind() {
+            assert_eq!(msg.fields().len(), 2, "Field018 should have 2 fields");
+            assert!(msg.get_field_by_name("field_019").is_some());
+            assert!(msg.get_field_by_name("field_020").is_some());
         } else {
-            panic!("rpc_info should be a message type");
+            panic!("field_018 should be a message type");
         }
 
-        // === 6. VERIFY NESTED MESSAGE: RequestInfo ===
+        // === 6. VERIFY NESTED MESSAGE: Field021 (6 fields incl. int32) ===
 
-        let request_info_field = descriptor
-            .get_field_by_name("request_info")
-            .expect("request_info field should exist");
+        let field_021 = descriptor
+            .get_field_by_name("field_021")
+            .expect("field_021 should exist");
 
-        if let prost_reflect::Kind::Message(req_msg) = request_info_field.kind() {
-            assert_eq!(
-                req_msg.fields().len(),
-                6,
-                "RequestInfo should have exactly 6 fields"
-            );
+        if let prost_reflect::Kind::Message(msg) = field_021.kind() {
+            assert_eq!(msg.fields().len(), 6, "Field021 should have 6 fields");
 
-            // Verify all RequestInfo fields exist
             let expected_fields = vec![
-                "request_type",
-                "handler",
-                "exception_class",
-                "http_method",
-                "source_type",
-                "retry_count",
+                "field_022",
+                "field_023",
+                "field_020",
+                "field_024",
+                "field_025",
+                "field_026",
             ];
-
             for field_name in expected_fields {
                 assert!(
-                    req_msg.get_field_by_name(field_name).is_some(),
-                    "RequestInfo should have {} field",
+                    msg.get_field_by_name(field_name).is_some(),
+                    "Field021 should have {} field",
                     field_name
                 );
             }
 
-            // Verify retry_count is int32
-            let retry_count = req_msg
-                .get_field_by_name("retry_count")
-                .expect("retry_count should exist");
-            match retry_count.kind() {
-                prost_reflect::Kind::Int32 => {
-                    // Correct type
-                }
-                _ => panic!("retry_count should be int32"),
+            // Verify field_026 is int32
+            let f026 = msg
+                .get_field_by_name("field_026")
+                .expect("field_026 should exist");
+            match f026.kind() {
+                prost_reflect::Kind::Int32 => {}
+                _ => panic!("field_026 should be int32"),
             }
         } else {
-            panic!("request_info should be a message type");
+            panic!("field_021 should be a message type");
         }
 
-        // === 7. VERIFY NESTED MESSAGE: ServiceExtra ===
+        // === 7. VERIFY NESTED MESSAGE: Field008 (4 nested struct fields) ===
 
-        let service_extra_field = descriptor
-            .get_field_by_name("service_extra")
-            .expect("service_extra field should exist");
+        let field_008 = descriptor
+            .get_field_by_name("field_008")
+            .expect("field_008 should exist");
 
-        if let prost_reflect::Kind::Message(se_msg) = service_extra_field.kind() {
-            // ServiceExtra is a union type with multiple service-specific fields
-            // Verify key service types exist
-            let expected_services = vec!["jobs", "pipelines", "clusters", "notebooks"];
-
-            for service in expected_services {
+        if let prost_reflect::Kind::Message(msg) = field_008.kind() {
+            let expected_nested = vec!["field_009", "field_012", "field_014", "field_016"];
+            for nested in expected_nested {
                 assert!(
-                    se_msg.get_field_by_name(service).is_some(),
-                    "ServiceExtra should have {} field",
-                    service
+                    msg.get_field_by_name(nested).is_some(),
+                    "Field008 should have {} field",
+                    nested
                 );
             }
 
-            // Verify Jobs nested structure
-            let jobs_field = se_msg
-                .get_field_by_name("jobs")
-                .expect("ServiceExtra should have jobs field");
-
-            if let prost_reflect::Kind::Message(jobs_msg) = jobs_field.kind() {
-                assert!(
-                    jobs_msg.get_field_by_name("job_id").is_some(),
-                    "Jobs should have job_id field"
-                );
-                assert!(
-                    jobs_msg.get_field_by_name("task_run_id").is_some(),
-                    "Jobs should have task_run_id field"
-                );
+            // Verify field_009 nested structure has 2 fields
+            let f009 = msg
+                .get_field_by_name("field_009")
+                .expect("field_009 should exist");
+            if let prost_reflect::Kind::Message(nested_msg) = f009.kind() {
+                assert!(nested_msg.get_field_by_name("field_010").is_some());
+                assert!(nested_msg.get_field_by_name("field_011").is_some());
             }
         } else {
-            panic!("service_extra should be a message type");
+            panic!("field_008 should be a message type");
         }
-
-        // === 8. VERIFY ETL METADATA FIELDS (prefixed with _) ===
-
-        // These fields are added during ETL ingestion and should be present
-        let underscore_fields: Vec<_> = descriptor
-            .fields()
-            .filter(|f| f.name().starts_with('_'))
-            .collect();
-
-        assert!(
-            !underscore_fields.is_empty(),
-            "Should have ETL metadata fields starting with _"
-        );
-
-        // Verify key ETL fields
-        assert!(
-            descriptor.get_field_by_name("_event_time").is_some(),
-            "Should have _event_time field for partitioning"
-        );
-        assert!(
-            descriptor.get_field_by_name("_partition_date").is_some(),
-            "Should have _partition_date field for partitioning"
-        );
-
-        // === SUCCESS ===
-        // If we reach here, the UC schema successfully matches the proto definition!
-        println!(
-            "✅ Unity Catalog schema matches proto definition with {} business fields + {} ETL fields",
-            non_underscore_fields.len(),
-            underscore_fields.len()
-        );
     }
 
     #[test]
     fn test_proto_schema_snapshot() {
         // Snapshot test: verify the generated proto text matches expected format
-        let json = include_str!("tests/fixtures/service_health_event_complete_schema.json");
-        let schema: UnityCatalogTableSchema = serde_json::from_str(json)
-            .expect("Failed to parse complete service_health_event schema");
+        let json = include_str!("tests/fixtures/nested_structs_complete_schema.json");
+        let schema: UnityCatalogTableSchema =
+            serde_json::from_str(json).expect("Failed to parse nested_structs_complete schema");
 
         let descriptor =
             generate_descriptor_from_schema(&schema).expect("Failed to generate descriptor");
@@ -1777,125 +1699,114 @@ mod tests {
 
         // Verify key structures are present in the proto text
         assert!(
-            proto_text.contains("message eng_lumberjack_prime_dev_service_health_event"),
+            proto_text.contains("message test_schema_nested_structs_table"),
             "Proto should have main message definition"
         );
         assert!(
-            proto_text.contains("string event_name"),
-            "Proto should have event_name field"
+            proto_text.contains("string field_003"),
+            "Proto should have field_003 (string)"
         );
         assert!(
-            proto_text.contains("int64 workspace_id"),
-            "Proto should have workspace_id field"
+            proto_text.contains("int64 field_007"),
+            "Proto should have field_007 (int64)"
         );
         assert!(
-            proto_text.contains("repeated int64 flag_evaluation_hashes"),
-            "Proto should have flag_evaluation_hashes as repeated int64"
+            proto_text.contains("repeated int64 field_027"),
+            "Proto should have field_027 as repeated int64"
         );
         assert!(
-            proto_text.contains("message RpcInfo"),
-            "Proto should have RpcInfo nested message"
+            proto_text.contains("message Field018"),
+            "Proto should have Field018 nested message"
         );
         assert!(
-            proto_text.contains("message RequestInfo"),
-            "Proto should have RequestInfo nested message"
+            proto_text.contains("message Field021"),
+            "Proto should have Field021 nested message"
         );
         assert!(
-            proto_text.contains("message ServiceExtra"),
-            "Proto should have ServiceExtra nested message"
+            proto_text.contains("message Field008"),
+            "Proto should have Field008 nested message"
         );
-
-        println!("✅ Proto schema snapshot test passed");
-        println!("\nGenerated proto schema:\n{}", proto_text);
     }
 
     #[test]
-    fn test_query_profile_log_complete_schema() {
-        // Regression test: verifies that the FULL 91-column query_profile_log schema
-        // (as returned by the real Unity Catalog API) generates a valid protobuf
+    fn test_complex_schema_with_all_type_patterns() {
+        // Regression test: verifies that a large 91-column schema exercising
+        // all supported Unity Catalog type patterns generates a valid protobuf
         // descriptor without errors.
         //
-        // This fixture was previously incomplete (22 columns) and missed the
-        // query_metadata column, which contains a deeply-nested
-        //   STRUCT<referenced_objects: ARRAY<STRUCT<table_stats: STRUCT<col_stats: MAP<string, STRUCT>>>>>
-        // pattern that was not yet implemented (MAP with STRUCT values).
-        //
         // Coverage:
-        //   - map<bigint, bool>   (QueryMetrics.boolean_config_access)  — non-string scalar key
-        //   - map<bigint, double> (QueryMetrics.double_config_access)   — non-string scalar key
-        //   - map<string, STRUCT> (QueryMetadata...col_stats)           — MAP with struct value
-        //   - ARRAY<STRUCT> with deeply nested fields (StageData, ExecutedPlanNodes, …)
-        //   - All 91 real columns including ETL metadata fields (_log_metadata, _environment, …)
+        //   - map<bigint, bool>   (field_142) — non-string scalar key
+        //   - map<bigint, double> (field_143) — non-string scalar key
+        //   - map<string, STRUCT> (field_725) — MAP with struct value
+        //   - ARRAY<STRUCT> with deeply nested fields
+        //   - Deeply nested STRUCTs (4+ levels)
 
-        let json = include_str!("tests/fixtures/query_profile_log_complete_schema.json");
+        let json = include_str!("tests/fixtures/complex_nested_types_schema.json");
         let schema: UnityCatalogTableSchema =
-            serde_json::from_str(json).expect("Failed to parse query_profile_log schema");
+            serde_json::from_str(json).expect("Failed to parse schema fixture");
 
         assert_eq!(
             schema.columns.len(),
             91,
-            "Fixture must contain all 91 real columns from Unity Catalog"
+            "Fixture must contain all 91 columns"
         );
 
         let descriptor = generate_descriptor_from_schema(&schema)
-            .expect("Should succeed: all column types in query_profile_log must be supported");
+            .expect("Should succeed: all column types must be supported");
 
         let proto_text = format_descriptor_as_proto(&descriptor);
 
-        // --- non-string scalar map keys (original PR fix) ---
+        // --- non-string scalar map keys ---
         assert!(
-            proto_text.contains("boolean_config_access"),
-            "Should contain boolean_config_access (map<int64, bool>)"
+            proto_text.contains("field_142"),
+            "Should contain field_142 (map<int64, bool>)"
         );
         assert!(
-            proto_text.contains("double_config_access"),
-            "Should contain double_config_access (map<int64, double>)"
+            proto_text.contains("field_143"),
+            "Should contain field_143 (map<int64, double>)"
         );
 
-        // --- MAP with STRUCT value (bug found during live run) ---
-        // query_metadata.referenced_objects[].table_stats.col_stats is map<string, struct<…>>
+        // --- MAP with STRUCT value ---
         assert!(
-            proto_text.contains("col_stats"),
-            "Should contain col_stats (map<string, STRUCT>) from query_metadata"
+            proto_text.contains("field_725"),
+            "Should contain field_725 (map<string, STRUCT>)"
         );
 
         // --- key top-level fields ---
         assert!(
-            descriptor.get_field_by_name("_event_time").is_some(),
-            "Should have _event_time"
+            descriptor.get_field_by_name("field_001").is_some(),
+            "Should have field_001 (timestamp)"
         );
         assert!(
-            descriptor.get_field_by_name("_partition_date").is_some(),
-            "Should have _partition_date"
+            descriptor.get_field_by_name("field_002").is_some(),
+            "Should have field_002 (string)"
         );
         assert!(
-            descriptor.get_field_by_name("_log_metadata").is_some(),
-            "Should have _log_metadata (complex ETL metadata struct)"
+            descriptor.get_field_by_name("field_007").is_some(),
+            "Should have field_007 (deeply nested metadata struct)"
         );
         assert!(
-            descriptor.get_field_by_name("query_metrics").is_some(),
-            "Should have query_metrics"
+            descriptor.get_field_by_name("field_117").is_some(),
+            "Should have field_117 (struct with map fields)"
         );
         assert!(
-            descriptor.get_field_by_name("query_metadata").is_some(),
-            "Should have query_metadata (contains MAP<string, STRUCT>)"
+            descriptor.get_field_by_name("field_721").is_some(),
+            "Should have field_721 (struct containing MAP<string, STRUCT>)"
         );
         assert!(
-            descriptor.get_field_by_name("stage_data").is_some(),
-            "Should have stage_data (ARRAY<complex STRUCT>)"
+            descriptor.get_field_by_name("field_149").is_some(),
+            "Should have field_149 (ARRAY<complex STRUCT>)"
         );
         assert!(
-            descriptor
-                .get_field_by_name("executed_plan_nodes")
-                .is_some(),
-            "Should have executed_plan_nodes (deeply nested ARRAY<STRUCT>)"
+            descriptor.get_field_by_name("field_278").is_some(),
+            "Should have field_278 (deeply nested ARRAY<STRUCT>)"
         );
 
         // total field count must match all 91 columns
         assert_eq!(
             descriptor.fields().len(),
             91,
-            "Descriptor should have exactly 91 fields matching the 91 UC columns"
+            "Descriptor should have exactly 91 fields"
         );
     }
 }

@@ -10,10 +10,14 @@ pub mod serializer;
 mod transformer;
 pub use chunking::{Chunker, Chunking, GelfChunker};
 pub use config::{EncodingConfig, EncodingConfigWithFraming, SinkType};
-pub use encoder::{BatchEncoder, BatchSerializer, Encoder, EncoderKind};
+pub use encoder::{BatchEncoder, BatchOutput, BatchSerializer, Encoder, EncoderKind};
 #[cfg(feature = "arrow")]
 pub use format::{
     ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig, SchemaProvider,
+    build_record_batch, record_batch_to_arrow_ipc_stream,
+};
+pub use format::{
+    ProtoBatchEncodingError, ProtoBatchSerializer, ProtoBatchSerializerConfig,
 };
 pub use format::{
     AvroSerializer, AvroSerializerConfig, AvroSerializerOptions, CefSerializer,
@@ -35,9 +39,7 @@ pub use framing::{
     NewlineDelimitedEncoderConfig, VarintLengthDelimitedEncoder,
     VarintLengthDelimitedEncoderConfig,
 };
-#[cfg(feature = "arrow")]
-pub use serializer::BatchSerializerConfig;
-pub use serializer::{Serializer, SerializerConfig};
+pub use serializer::{BatchSerializerConfig, Serializer, SerializerConfig};
 pub use transformer::{TimestampFormat, Transformer};
 
 /// An error that occurred while building an encoder.

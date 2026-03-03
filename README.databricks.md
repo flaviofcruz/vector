@@ -41,7 +41,7 @@ This lists custom changes merged in Databricks fork of Vector.
 40. Add `redact` transform based on the logging redactor in `universe` https://github.com/databricks-eng/vector/pull/293
 41. Fix Databricks GitHub workflows to point to the correct VRL branch and build correctly. https://github.com/databricks-eng/vector/pull/297
 42. Add back missing GCP send events.  https://github.com/databricks-eng/vector/pull/300
-43. Add a Databricks ZeroBus sink to vector. https://github.com/databricks-eng/vector/pull/294 https://github.com/databricks-eng/vector/pull/305 https://github.com/databricks-eng/vector/pull/350
+43. Add a Databricks ZeroBus sink to vector. https://github.com/databricks-eng/vector/pull/294 https://github.com/databricks-eng/vector/pull/305 https://github.com/databricks-eng/vector/pull/350 https://github.com/databricks-eng/vector/pull/406
 44. Add metrics for the `redact` transform https://github.com/databricks-eng/vector/pull/298
 45. Fix to handle shutdown signal in case of disk buffer with batched sink https://github.com/databricks-eng/vector/pull/306
 46. Turn off internal log rate limits for VEL https://github.com/databricks-eng/vector/pull/308

@@ -1,67 +1,119 @@
 //! The main Zerobus sink implementation.
 
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
 use futures::stream::BoxStream;
 
-use crate::codecs::Transformer;
-use crate::sinks::prelude::*;
-use crate::sinks::util::RealtimeSizeBasedDefaultBatchSettings;
+use vector_lib::codecs::encoding::{BatchEncoder, BatchOutput};
+use vector_lib::event::EventStatus;
+use vector_lib::finalization::Finalizable;
 
-use super::request_builder::ZerobusRequestBuilder;
-use super::service::ZerobusService;
+use crate::sinks::prelude::*;
+use crate::sinks::util::metadata::RequestMetadataBuilder;
+use crate::sinks::util::request_builder::default_request_builder_concurrency_limit;
+use crate::sinks::util::{RealtimeSizeBasedDefaultBatchSettings, TowerRequestSettings};
+
+use super::service::{ZerobusPayload, ZerobusRequest, ZerobusRetryLogic, ZerobusService};
 
 /// The main Zerobus sink.
 pub struct ZerobusSink {
     service: ZerobusService,
+    request_limits: TowerRequestSettings,
     batch_settings: BatcherSettings,
+    encoder: BatchEncoder,
 }
 
 impl ZerobusSink {
     pub fn new(
         service: ZerobusService,
+        request_limits: TowerRequestSettings,
         batch_config: BatchConfig<RealtimeSizeBasedDefaultBatchSettings>,
+        encoder: BatchEncoder,
     ) -> Result<Self, crate::Error> {
         let batch_settings = batch_config.into_batcher_settings()?;
 
         Ok(Self {
             service,
+            request_limits,
             batch_settings,
+            encoder,
+        })
+    }
+
+    fn encode_batch(
+        encoder: &BatchEncoder,
+        mut events: Vec<Event>,
+    ) -> Result<ZerobusRequest, String> {
+        let finalizers = events.take_finalizers();
+        let metadata_builder = RequestMetadataBuilder::from_events(&events);
+
+        let batch_output = match encoder.encode_batch(&events) {
+            Ok(output) => output,
+            Err(e) => {
+                finalizers.update_status(EventStatus::Rejected);
+                return Err(format!("Failed to encode batch: {}", e));
+            }
+        };
+
+        let (payload, byte_size) = match batch_output {
+            BatchOutput::Records(records) => {
+                let size = records.iter().map(|r| r.len()).sum::<usize>();
+                (ZerobusPayload::Records(records), size)
+            }
+            #[cfg(feature = "codecs-arrow")]
+            BatchOutput::Arrow(record_batch) => {
+                let size = record_batch.get_array_memory_size();
+                (ZerobusPayload::Arrow(record_batch), size)
+            }
+            #[allow(unreachable_patterns)]
+            _ => {
+                finalizers.update_status(EventStatus::Rejected);
+                return Err("Unexpected batch output type".to_string());
+            }
+        };
+
+        let request_size = NonZeroUsize::new(byte_size).unwrap_or(NonZeroUsize::MIN);
+        let metadata = metadata_builder.with_request_size(request_size);
+
+        Ok(ZerobusRequest {
+            payload,
+            metadata,
+            finalizers,
         })
     }
 
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
-        // Note: The encoder is required by the RequestBuilder trait but not actually used.
-        // Zerobus encoding happens in the service layer using protobuf via prost-reflect.
-        // The RequestBuilder ignores the encoded payload and passes raw events instead.
-        use vector_lib::codecs::encoding::{
-            Framer, FramingConfig, JsonSerializerConfig, SerializerConfig,
+        let encoder = Arc::new(self.encoder.clone());
+
+        let result = {
+            let tower_service = ServiceBuilder::new()
+                .settings(self.request_limits, ZerobusRetryLogic)
+                .service(self.service.clone());
+
+            input
+                .batched(self.batch_settings.as_byte_size_config())
+                .concurrent_map(default_request_builder_concurrency_limit(), move |events| {
+                    let encoder = Arc::clone(&encoder);
+                    Box::pin(async move { Self::encode_batch(&encoder, events) })
+                })
+                .filter_map(|result| async move {
+                    match result {
+                        Err(error) => {
+                            emit!(SinkRequestBuildError { error });
+                            None
+                        }
+                        Ok(req) => Some(req),
+                    }
+                })
+                .into_driver(tower_service)
+                .run()
+                .await
         };
 
-        let serializer = SerializerConfig::Json(JsonSerializerConfig::default())
-            .build()
-            .expect("Failed to build serializer");
-        let framer = FramingConfig::NewlineDelimited.build();
-        let encoder_inner = Encoder::<Framer>::new(framer, serializer);
-        let encoder = (Transformer::default(), encoder_inner);
+        self.service.close_stream().await;
 
-        input
-            .batched(self.batch_settings.as_byte_size_config())
-            .request_builder(
-                // Limit concurrency to what the SDK allows.
-                self.service.config.stream_options.max_inflight_requests,
-                ZerobusRequestBuilder::new(Compression::None, encoder),
-            )
-            .filter_map(|request| async move {
-                match request {
-                    Err(error) => {
-                        emit!(SinkRequestBuildError { error });
-                        None
-                    }
-                    Ok(req) => Some(req),
-                }
-            })
-            .into_driver(self.service)
-            .run()
-            .await
+        result
     }
 }
 
@@ -69,85 +121,5 @@ impl ZerobusSink {
 impl StreamSink<Event> for ZerobusSink {
     async fn run(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         self.run_inner(input).await
-    }
-}
-
-/// Partitioner for Zerobus events.
-/// For simplicity, we use a single partition (all events go to the same table).
-#[allow(dead_code)]
-struct ZerobusPartitioner {
-    table_key: Option<String>,
-}
-
-#[allow(dead_code)]
-impl ZerobusPartitioner {
-    fn new() -> Self {
-        Self { table_key: None }
-    }
-}
-
-impl Partitioner for ZerobusPartitioner {
-    type Item = Event;
-    type Key = Option<String>;
-
-    fn partition(&self, _item: &Self::Item) -> Self::Key {
-        // For now, all events go to the same partition (same table)
-        // In the future, we could partition by table name if supporting multi-table sinks
-        self.table_key.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sinks::databricks_zerobus::config::{ZerobusSinkConfig, ZerobusStreamOptions};
-    use vector_lib::event::LogEvent;
-    use vector_lib::sensitive_string::SensitiveString;
-
-    fn create_test_config() -> ZerobusSinkConfig {
-        ZerobusSinkConfig {
-            ingestion_endpoint: "https://test.databricks.com".to_string(),
-            table_name: "test.default.logs".to_string(),
-            unity_catalog_endpoint: "https://test-workspace.databricks.com".to_string(),
-            auth: crate::sinks::databricks_zerobus::config::DatabricksAuthentication::OAuth {
-                client_id: SensitiveString::from("test-client-id".to_string()),
-                client_secret: SensitiveString::from("test-client-secret".to_string()),
-            },
-            use_tls: true,
-            schema: crate::sinks::databricks_zerobus::config::SchemaSource::Path {
-                path: "tests/data/protobuf/test_proto.desc".to_string(),
-                message_type: "test_proto.User".to_string(),
-            },
-            stream_options: ZerobusStreamOptions::default(),
-            custom_headers: None,
-            batch: Default::default(),
-            request: Default::default(),
-            acknowledgements: Default::default(),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_sink_creation() {
-        let config = create_test_config();
-        let service = ZerobusService::new(config.clone()).await.unwrap();
-        let sink = ZerobusSink::new(service, config.batch).unwrap();
-
-        // Just verify the sink was created successfully
-        assert!(sink.batch_settings.item_limit > 0);
-    }
-
-    #[test]
-    fn test_partitioner() {
-        let partitioner = ZerobusPartitioner::new();
-
-        let mut log_event = LogEvent::default();
-        log_event.insert("message", "test");
-        let event = Event::Log(log_event);
-
-        let key1 = partitioner.partition(&event);
-        let key2 = partitioner.partition(&event);
-
-        // All events should get the same partition key
-        assert_eq!(key1, key2);
     }
 }

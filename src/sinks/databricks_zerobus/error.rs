@@ -20,12 +20,12 @@ pub enum ZerobusSinkError {
     ZerobusError { source: ZerobusError },
 
     /// Stream initialization failed.
-    #[snafu(display("Stream initialization failed: {}", message))]
-    StreamInitError { message: String },
+    #[snafu(display("Stream initialization failed: {}", source))]
+    StreamInitError { source: ZerobusError },
 
     /// Record ingestion failed.
-    #[snafu(display("Record ingestion failed: {}", message))]
-    IngestionError { message: String },
+    #[snafu(display("Record ingestion failed: {}", source))]
+    IngestionError { source: ZerobusError },
 }
 
 impl From<ZerobusError> for ZerobusSinkError {
@@ -38,12 +38,12 @@ impl From<ZerobusError> for ZerobusSinkError {
 impl From<ZerobusSinkError> for EventStatus {
     fn from(error: ZerobusSinkError) -> Self {
         match error {
-            ZerobusSinkError::ConfigError { .. } => EventStatus::Rejected,
-            ZerobusSinkError::EncodingError { .. } => EventStatus::Rejected,
-            ZerobusSinkError::StreamInitError { .. } => EventStatus::Errored,
-            ZerobusSinkError::IngestionError { .. } => EventStatus::Errored,
-            ZerobusSinkError::ZerobusError { source } => {
-                // Map retryable errors to Failed, non-retryable to Rejected
+            ZerobusSinkError::ConfigError { .. } | ZerobusSinkError::EncodingError { .. } => {
+                EventStatus::Rejected
+            }
+            ZerobusSinkError::ZerobusError { source }
+            | ZerobusSinkError::StreamInitError { source }
+            | ZerobusSinkError::IngestionError { source } => {
                 if source.is_retryable() {
                     EventStatus::Errored
                 } else {
@@ -51,5 +51,110 @@ impl From<ZerobusSinkError> for EventStatus {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sinks::databricks_zerobus::service::ZerobusRetryLogic;
+    use crate::sinks::util::retries::RetryLogic;
+
+    fn retryable_error() -> ZerobusError {
+        // ChannelCreationError is always retryable
+        ZerobusError::ChannelCreationError("connection reset".to_string())
+    }
+
+    fn non_retryable_error() -> ZerobusError {
+        // InvalidArgument is never retryable
+        ZerobusError::InvalidArgument("bad field".to_string())
+    }
+
+    #[test]
+    fn retryable_ingestion_error_maps_to_errored() {
+        let error = ZerobusSinkError::IngestionError {
+            source: retryable_error(),
+        };
+        assert_eq!(EventStatus::from(error), EventStatus::Errored);
+    }
+
+    #[test]
+    fn non_retryable_ingestion_error_maps_to_rejected() {
+        let error = ZerobusSinkError::IngestionError {
+            source: non_retryable_error(),
+        };
+        assert_eq!(EventStatus::from(error), EventStatus::Rejected);
+    }
+
+    #[test]
+    fn retryable_stream_init_error_maps_to_errored() {
+        let error = ZerobusSinkError::StreamInitError {
+            source: retryable_error(),
+        };
+        assert_eq!(EventStatus::from(error), EventStatus::Errored);
+    }
+
+    #[test]
+    fn non_retryable_stream_init_error_maps_to_rejected() {
+        let error = ZerobusSinkError::StreamInitError {
+            source: non_retryable_error(),
+        };
+        assert_eq!(EventStatus::from(error), EventStatus::Rejected);
+    }
+
+    #[test]
+    fn config_error_maps_to_rejected() {
+        let error = ZerobusSinkError::ConfigError {
+            message: "bad config".to_string(),
+        };
+        assert_eq!(EventStatus::from(error), EventStatus::Rejected);
+    }
+
+    #[test]
+    fn encoding_error_maps_to_rejected() {
+        let error = ZerobusSinkError::EncodingError {
+            message: "encode failed".to_string(),
+        };
+        assert_eq!(EventStatus::from(error), EventStatus::Rejected);
+    }
+
+    #[test]
+    fn retry_logic_retryable_errors() {
+        let logic = ZerobusRetryLogic;
+
+        let error = ZerobusSinkError::IngestionError {
+            source: retryable_error(),
+        };
+        assert!(logic.is_retriable_error(&error));
+
+        let error = ZerobusSinkError::StreamInitError {
+            source: retryable_error(),
+        };
+        assert!(logic.is_retriable_error(&error));
+
+        let error = ZerobusSinkError::ZerobusError {
+            source: retryable_error(),
+        };
+        assert!(logic.is_retriable_error(&error));
+    }
+
+    #[test]
+    fn retry_logic_non_retryable_errors() {
+        let logic = ZerobusRetryLogic;
+
+        let error = ZerobusSinkError::IngestionError {
+            source: non_retryable_error(),
+        };
+        assert!(!logic.is_retriable_error(&error));
+
+        let error = ZerobusSinkError::ConfigError {
+            message: "bad".to_string(),
+        };
+        assert!(!logic.is_retriable_error(&error));
+
+        let error = ZerobusSinkError::EncodingError {
+            message: "bad".to_string(),
+        };
+        assert!(!logic.is_retriable_error(&error));
     }
 }

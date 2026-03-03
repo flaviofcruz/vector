@@ -577,6 +577,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-flight"
+version = "56.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c8b0ba0784d56bc6266b79f5de7a24b47024e7b3a0045d2ad4df3d9b686099f"
+dependencies = [
+ "arrow-array 56.2.0",
+ "arrow-buffer 56.2.0",
+ "arrow-cast 56.2.0",
+ "arrow-ipc 56.2.0",
+ "arrow-schema 56.2.0",
+ "base64 0.22.1",
+ "bytes 1.10.1",
+ "futures 0.3.31",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "tonic 0.13.1",
+]
+
+[[package]]
 name = "arrow-ipc"
 version = "55.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -601,6 +620,8 @@ dependencies = [
  "arrow-schema 56.2.0",
  "arrow-select 56.2.0",
  "flatbuffers",
+ "lz4_flex",
+ "zstd 0.13.2",
 ]
 
 [[package]]
@@ -1885,7 +1906,7 @@ dependencies = [
  "http-body 0.4.6",
  "hyper 0.14.32",
  "itoa",
- "matchit",
+ "matchit 0.7.3",
  "memchr",
  "mime",
  "percent-encoding",
@@ -1913,7 +1934,7 @@ dependencies = [
  "http-body 1.0.0",
  "http-body-util",
  "itoa",
- "matchit",
+ "matchit 0.7.3",
  "memchr",
  "mime",
  "percent-encoding",
@@ -1922,6 +1943,31 @@ dependencies = [
  "serde",
  "sync_wrapper 1.0.1",
  "tower 0.4.13",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "axum"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b52af3cb4058c895d37317bb27508dccc8e5f2d39454016b297bf4a400597b8"
+dependencies = [
+ "axum-core 0.5.6",
+ "bytes 1.10.1",
+ "futures-util",
+ "http 1.3.1",
+ "http-body 1.0.0",
+ "http-body-util",
+ "itoa",
+ "matchit 0.8.4",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
+ "sync_wrapper 1.0.1",
+ "tower 0.5.2",
  "tower-layer",
  "tower-service",
 ]
@@ -1958,6 +2004,24 @@ dependencies = [
  "mime",
  "pin-project-lite",
  "rustversion",
+ "sync_wrapper 1.0.1",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes 1.10.1",
+ "futures-core",
+ "http 1.3.1",
+ "http-body 1.0.0",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
  "sync_wrapper 1.0.1",
  "tower-layer",
  "tower-service",
@@ -3702,22 +3766,29 @@ dependencies = [
 
 [[package]]
 name = "databricks-zerobus-ingest-sdk"
-version = "0.1.1"
-source = "git+https://github.com/databricks/zerobus-sdk-rs?rev=19b4805#19b48054b6b0349bb1a160fc05f2c76b631d9e8b"
+version = "0.6.0"
+source = "git+https://github.com/databricks/zerobus-sdk-rs?rev=326f97e7048fc411165b8ffba7cfef460b04c86a#326f97e7048fc411165b8ffba7cfef460b04c86a"
 dependencies = [
+ "arrow-array 56.2.0",
+ "arrow-flight",
+ "arrow-ipc 56.2.0",
+ "arrow-schema 56.2.0",
  "async-trait",
+ "futures 0.3.31",
  "prost 0.13.5",
  "prost-types 0.13.5",
  "protoc-bin-vendored",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "smallvec",
  "thiserror 1.0.68",
  "tokio",
  "tokio-retry",
  "tokio-stream",
- "tonic 0.12.3",
- "tonic-build 0.12.3",
+ "tokio-util",
+ "tonic 0.13.1",
+ "tonic-build 0.13.1",
  "tracing 0.1.41",
 ]
 
@@ -7269,6 +7340,12 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "matrixmultiply"
@@ -12483,6 +12560,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "slab",
  "tokio",
@@ -12655,13 +12733,41 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost 0.13.5",
+ "socket2 0.5.10",
+ "tokio",
+ "tokio-stream",
+ "tower 0.4.13",
+ "tower-layer",
+ "tower-service",
+ "tracing 0.1.41",
+]
+
+[[package]]
+name = "tonic"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
+dependencies = [
+ "async-trait",
+ "axum 0.8.8",
+ "base64 0.22.1",
+ "bytes 1.10.1",
+ "h2 0.4.12",
+ "http 1.3.1",
+ "http-body 1.0.0",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-timeout 0.5.1",
+ "hyper-util",
+ "percent-encoding",
+ "pin-project",
+ "prost 0.13.5",
  "rustls-native-certs 0.8.1",
- "rustls-pemfile 2.1.0",
  "socket2 0.5.10",
  "tokio",
  "tokio-rustls 0.26.2",
  "tokio-stream",
- "tower 0.4.13",
+ "tower 0.5.2",
  "tower-layer",
  "tower-service",
  "tracing 0.1.41",
@@ -12695,9 +12801,9 @@ dependencies = [
 
 [[package]]
 name = "tonic-build"
-version = "0.12.3"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9557ce109ea773b399c9b9e5dca39294110b74f1f342cb347a80d1fce8c26a11"
+checksum = "eac6f67be712d12f0b41328db3137e0d0757645d8904b4cb7d51cd9c2279e847"
 dependencies = [
  "prettyplease 0.2.15",
  "proc-macro2 1.0.101",

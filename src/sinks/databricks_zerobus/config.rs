@@ -1,20 +1,23 @@
 //! Configuration for the Zerobus sink.
 
-use std::collections::HashMap;
-use std::num::NonZeroUsize;
-
-use serde_with::serde_as;
 use vector_lib::configurable::configurable_component;
 use vector_lib::sensitive_string::SensitiveString;
 
 use crate::config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext};
 use crate::sinks::{
     prelude::*,
-    util::{BatchConfig, RealtimeSizeBasedDefaultBatchSettings, http::RequestConfig},
+    util::{BatchConfig, RealtimeSizeBasedDefaultBatchSettings},
 };
-use databricks_zerobus_ingest_sdk::databricks::zerobus::RecordType;
 
-use super::{error::ZerobusSinkError, service::ZerobusService, sink::ZerobusSink};
+use vector_lib::codecs::encoding::{
+    BatchEncoder, BatchSerializerConfig, ProtoBatchSerializerConfig,
+};
+
+use super::{
+    error::ZerobusSinkError,
+    service::{StreamMode, ZerobusService},
+    sink::ZerobusSink,
+};
 
 /// Authentication configuration for Databricks.
 #[configurable_component]
@@ -82,75 +85,52 @@ pub enum SchemaSource {
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ZerobusStreamOptions {
-    /// Maximum number of in-flight records before applying backpressure.
-    #[serde(default = "default_max_inflight_requests")]
-    #[configurable(metadata(docs::examples = 10))]
-    pub max_inflight_requests: NonZeroUsize,
-
-    /// Number of retry attempts for stream recovery.
-    #[serde(default = "default_recovery_retries")]
-    #[configurable(metadata(docs::examples = 5))]
-    pub recovery_retries: u32,
-
-    /// Backoff time in milliseconds between stream recovery attempts.
-    #[serde(default = "default_recovery_backoff_ms")]
-    #[configurable(metadata(docs::examples = 1000))]
-    pub recovery_backoff_ms: u64,
-
     /// Timeout in milliseconds for flush operations.
     #[serde(default = "default_flush_timeout_ms")]
     #[configurable(metadata(docs::examples = 30000))]
     pub flush_timeout_ms: u64,
 
-    /// Timeout in milliseconds for stream recovery operations.
-    #[serde(default = "default_recovery_timeout_ms")]
-    #[configurable(metadata(docs::examples = 10000))]
-    pub recovery_timeout_ms: u64,
-
     /// Timeout in milliseconds for server acknowledgments.
     #[serde(default = "default_server_ack_timeout_ms")]
     #[configurable(metadata(docs::examples = 60000))]
     pub server_lack_of_ack_timeout_ms: u64,
-
-    /// Whether to enable automatic stream recovery on errors.
-    #[serde(default = "default_recovery")]
-    #[configurable(metadata(docs::examples = true))]
-    pub recovery: bool,
 }
 
 impl Default for ZerobusStreamOptions {
     fn default() -> Self {
         Self {
-            max_inflight_requests: default_max_inflight_requests(),
-            recovery_retries: default_recovery_retries(),
-            recovery_backoff_ms: default_recovery_backoff_ms(),
             flush_timeout_ms: default_flush_timeout_ms(),
-            recovery_timeout_ms: default_recovery_timeout_ms(),
             server_lack_of_ack_timeout_ms: default_server_ack_timeout_ms(),
-            recovery: default_recovery(),
         }
     }
 }
 
 impl From<ZerobusStreamOptions> for databricks_zerobus_ingest_sdk::StreamConfigurationOptions {
     fn from(options: ZerobusStreamOptions) -> Self {
-        // Thin wrapper conversion - all fields map 1:1 to the SDK type.
-        // This wrapper exists only to add Vector's configuration system support.
         Self {
-            max_inflight_requests: options.max_inflight_requests.into(),
-            recovery: options.recovery,
-            recovery_timeout_ms: options.recovery_timeout_ms,
-            recovery_backoff_ms: options.recovery_backoff_ms,
-            recovery_retries: options.recovery_retries,
+            recovery: true,
+            recovery_retries: 4,
             server_lack_of_ack_timeout_ms: options.server_lack_of_ack_timeout_ms,
             flush_timeout_ms: options.flush_timeout_ms,
-            record_type: RecordType::Proto,
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(feature = "codecs-arrow")]
+impl From<ZerobusStreamOptions> for databricks_zerobus_ingest_sdk::ArrowStreamConfigurationOptions {
+    fn from(options: ZerobusStreamOptions) -> Self {
+        Self {
+            recovery: true,
+            recovery_retries: 4,
+            server_lack_of_ack_timeout_ms: options.server_lack_of_ack_timeout_ms,
+            flush_timeout_ms: options.flush_timeout_ms,
+            ..Default::default()
         }
     }
 }
 
 /// Configuration for the Databricks Zerobus sink.
-#[serde_as]
 #[configurable_component(sink(
     "databricks_zerobus",
     "Stream observability data to Databricks Unity Catalog via Zerobus."
@@ -185,11 +165,6 @@ pub struct ZerobusSinkConfig {
     #[configurable(derived)]
     pub auth: DatabricksAuthentication,
 
-    /// Whether to use TLS for the connection.
-    #[serde(default = "default_use_tls")]
-    #[configurable(metadata(docs::examples = true))]
-    pub use_tls: bool,
-
     /// Schema definition for the table.
     ///
     /// The schema must be provided either as:
@@ -207,13 +182,13 @@ pub struct ZerobusSinkConfig {
     #[serde(default)]
     pub stream_options: ZerobusStreamOptions,
 
-    /// Custom headers to include in requests to Zerobus.
+    /// The batch encoding configuration for encoding events in batches.
     ///
-    /// This can be used to pass additional authentication or metadata headers.
-    /// Header values can reference environment variables using `${VAR_NAME}` syntax.
-    #[serde(default)]
-    #[configurable(metadata(docs::examples = "example_custom_headers()"))]
-    pub custom_headers: Option<HashMap<String, SensitiveString>>,
+    /// Defaults to protobuf batch encoding, which serializes each event
+    /// individually as a protobuf message.
+    #[configurable(derived)]
+    #[serde(default = "default_batch_encoding")]
+    pub batch_encoding: BatchSerializerConfig,
 
     #[configurable(derived)]
     #[serde(default)]
@@ -221,7 +196,7 @@ pub struct ZerobusSinkConfig {
 
     #[configurable(derived)]
     #[serde(default)]
-    pub request: RequestConfig,
+    pub request: TowerRequestConfig,
 
     #[configurable(derived)]
     #[serde(
@@ -242,12 +217,11 @@ impl GenerateConfig for ZerobusSinkConfig {
                 client_id: SensitiveString::from("${DATABRICKS_CLIENT_ID}".to_string()),
                 client_secret: SensitiveString::from("${DATABRICKS_CLIENT_SECRET}".to_string()),
             },
-            use_tls: true,
             schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
-            custom_headers: None,
+            batch_encoding: default_batch_encoding(),
             batch: BatchConfig::default(),
-            request: RequestConfig::default(),
+            request: TowerRequestConfig::default(),
             acknowledgements: AcknowledgementsConfig::default(),
         })
         .unwrap()
@@ -258,12 +232,44 @@ impl GenerateConfig for ZerobusSinkConfig {
 #[typetag::serde(name = "databricks_zerobus")]
 impl SinkConfig for ZerobusSinkConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let service = ZerobusService::new(self.clone()).await?;
-        let sink = ZerobusSink::new(service, self.batch.clone())?;
+        let descriptor = ZerobusService::resolve_descriptor(self).await?;
 
-        let healthcheck = async {
-            // TODO: Implement actual healthcheck by creating a test stream
-            Ok(())
+        let mut batch_encoding = self.batch_encoding.clone();
+        let stream_mode = match &mut batch_encoding {
+            BatchSerializerConfig::ProtoBatch(config) => {
+                config.descriptor = Some(descriptor.clone());
+                StreamMode::Proto {
+                    descriptor_proto: std::sync::Arc::new(descriptor.descriptor_proto().clone()),
+                }
+            }
+            #[cfg(feature = "codecs-arrow")]
+            BatchSerializerConfig::ArrowStream(arrow_config) => {
+                let arrow_schema =
+                    super::proto_to_arrow::proto_descriptor_to_arrow_schema(&descriptor)?;
+                arrow_config.schema = Some(arrow_schema.clone());
+                StreamMode::Arrow {
+                    arrow_schema: std::sync::Arc::new(arrow_schema),
+                }
+            }
+        };
+        let batch_serializer = batch_encoding
+            .build()
+            .map_err(|e| format!("Failed to build batch serializer: {}", e))?;
+        let encoder = BatchEncoder::new(batch_serializer);
+
+        let service =
+            ZerobusService::new(self.clone(), stream_mode, self.acknowledgements.enabled()).await?;
+        let healthcheck_service = service.clone();
+
+        let request_limits = self.request.into_settings();
+
+        let sink = ZerobusSink::new(service, request_limits, self.batch.clone(), encoder)?;
+
+        let healthcheck = async move {
+            healthcheck_service
+                .ensure_stream()
+                .await
+                .map_err(|e| e.into())
         };
 
         Ok((
@@ -344,46 +350,16 @@ impl ZerobusSinkConfig {
 }
 
 // Default value functions
-fn default_max_inflight_requests() -> NonZeroUsize {
-    default_request_builder_concurrency_limit()
-}
-
-// 4 retries, 1 initial attempt for a total of 5 attempts
-fn default_recovery_retries() -> u32 {
-    4
-}
-
-fn default_recovery_backoff_ms() -> u64 {
-    1000
-}
-
 fn default_flush_timeout_ms() -> u64 {
     30000
-}
-
-fn default_recovery_timeout_ms() -> u64 {
-    10000
 }
 
 fn default_server_ack_timeout_ms() -> u64 {
     60000
 }
 
-fn default_recovery() -> bool {
-    true
-}
-
-fn default_use_tls() -> bool {
-    true
-}
-
-fn example_custom_headers() -> HashMap<String, SensitiveString> {
-    let mut headers = HashMap::new();
-    headers.insert(
-        "s2s-principal-context-sig-bin".to_string(),
-        SensitiveString::from("${SSP_BYTE_STRING}".to_string()),
-    );
-    headers
+fn default_batch_encoding() -> BatchSerializerConfig {
+    BatchSerializerConfig::ProtoBatch(ProtoBatchSerializerConfig::default())
 }
 
 #[cfg(test)]
@@ -400,10 +376,9 @@ mod tests {
                 client_id: SensitiveString::from("test-client-id".to_string()),
                 client_secret: SensitiveString::from("test-client-secret".to_string()),
             },
-            use_tls: true,
             schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
-            custom_headers: None,
+            batch_encoding: default_batch_encoding(),
             batch: Default::default(),
             request: Default::default(),
             acknowledgements: Default::default(),
@@ -512,43 +487,14 @@ mod tests {
     #[test]
     fn test_stream_options_conversion() {
         let options = ZerobusStreamOptions {
-            max_inflight_requests: NonZeroUsize::new(20).expect("static"),
-            recovery_retries: 10,
-            recovery_backoff_ms: 2000,
             flush_timeout_ms: 45000,
-            recovery_timeout_ms: 15000,
             server_lack_of_ack_timeout_ms: 90000,
-            recovery: false,
         };
 
         let sdk_options: databricks_zerobus_ingest_sdk::StreamConfigurationOptions = options.into();
-        assert_eq!(sdk_options.max_inflight_requests, 20);
-        assert_eq!(sdk_options.recovery_retries, 10);
-        assert_eq!(sdk_options.recovery_backoff_ms, 2000);
         assert_eq!(sdk_options.flush_timeout_ms, 45000);
-        assert_eq!(sdk_options.recovery_timeout_ms, 15000);
         assert_eq!(sdk_options.server_lack_of_ack_timeout_ms, 90000);
-        assert_eq!(sdk_options.recovery, false);
-    }
-
-    #[test]
-    fn test_custom_headers_with_databricks_specific_header() {
-        use std::collections::HashMap;
-
-        let mut config = create_test_config();
-        let mut headers = HashMap::new();
-
-        // Test the example header from the config
-        headers.insert(
-            "s2s-principal-context-sig-bin".to_string(),
-            SensitiveString::from("YmFzZTY0ZW5jb2RlZHZhbHVl".to_string()),
-        );
-        config.custom_headers = Some(headers);
-
-        assert!(config.validate().is_ok());
-
-        let custom_headers = config.custom_headers.as_ref().unwrap();
-        assert_eq!(custom_headers.len(), 1);
-        assert!(custom_headers.contains_key("s2s-principal-context-sig-bin"));
+        assert_eq!(sdk_options.recovery, true);
+        assert_eq!(sdk_options.recovery_retries, 4);
     }
 }

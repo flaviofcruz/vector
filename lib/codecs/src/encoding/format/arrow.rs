@@ -8,9 +8,9 @@ use arrow::{
     array::{
         ArrayRef, BinaryBuilder, BooleanBuilder, Decimal128Builder, Decimal256Builder,
         Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder,
-        StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
-        TimestampNanosecondBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
-        UInt32Builder, UInt64Builder,
+        LargeBinaryBuilder, LargeStringBuilder, StringBuilder, TimestampMicrosecondBuilder,
+        TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
+        UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
     },
     datatypes::{DataType, Schema, TimeUnit, i256},
     ipc::writer::StreamWriter,
@@ -126,6 +126,17 @@ impl ArrowStreamSerializer {
         Ok(Self {
             schema: Arc::new(schema),
         })
+    }
+
+    /// Encode a batch of events into an Arrow RecordBatch.
+    pub fn encode_to_record_batch(
+        &self,
+        events: &[Event],
+    ) -> Result<RecordBatch, ArrowEncodingError> {
+        if events.is_empty() {
+            return Err(ArrowEncodingError::NoEvents);
+        }
+        build_record_batch(Arc::clone(&self.schema), events)
     }
 }
 
@@ -253,8 +264,21 @@ fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Fie
         .with_nullable(true)
 }
 
+/// Serializes a RecordBatch into Arrow IPC streaming format bytes.
+pub fn record_batch_to_arrow_ipc_stream(record_batch: &RecordBatch) -> Result<Bytes, ArrowEncodingError> {
+    let ipc_err = |source| ArrowEncodingError::IpcWrite { source };
+
+    let mut buffer = BytesMut::new().writer();
+    let mut writer =
+        StreamWriter::try_new(&mut buffer, record_batch.schema_ref()).map_err(ipc_err)?;
+    writer.write(record_batch).map_err(ipc_err)?;
+    writer.finish().map_err(ipc_err)?;
+
+    Ok(buffer.into_inner().freeze())
+}
+
 /// Builds an Arrow RecordBatch from events
-fn build_record_batch(
+pub fn build_record_batch(
     schema: Arc<Schema>,
     events: &[Event],
 ) -> Result<RecordBatch, ArrowEncodingError> {
@@ -269,6 +293,7 @@ fn build_record_batch(
                 build_timestamp_array(events, field_name, *time_unit, nullable)?
             }
             DataType::Utf8 => build_string_array(events, field_name, nullable)?,
+            DataType::LargeUtf8 => build_large_string_array(events, field_name, nullable)?,
             DataType::Int8 => build_int8_array(events, field_name, nullable)?,
             DataType::Int16 => build_int16_array(events, field_name, nullable)?,
             DataType::Int32 => build_int32_array(events, field_name, nullable)?,
@@ -281,6 +306,7 @@ fn build_record_batch(
             DataType::Float64 => build_float64_array(events, field_name, nullable)?,
             DataType::Boolean => build_boolean_array(events, field_name, nullable)?,
             DataType::Binary => build_binary_array(events, field_name, nullable)?,
+            DataType::LargeBinary => build_large_binary_array(events, field_name, nullable)?,
             DataType::Decimal128(precision, scale) => {
                 build_decimal128_array(events, field_name, *precision, *scale, nullable)?
             }
@@ -540,6 +566,72 @@ fn build_binary_array(
     nullable: bool,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let mut builder = BinaryBuilder::with_capacity(events.len(), 0);
+
+    for event in events {
+        if let Event::Log(log) = event {
+            match log.get(field_name) {
+                Some(Value::Bytes(bytes)) => builder.append_value(bytes),
+                _ => handle_null_constraints!(builder, nullable, field_name),
+            }
+        }
+    }
+
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_large_string_array(
+    events: &[Event],
+    field_name: &str,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let mut builder = LargeStringBuilder::with_capacity(events.len(), 0);
+
+    for event in events {
+        if let Event::Log(log) = event {
+            let mut appended = false;
+            if let Some(value) = log.get(field_name) {
+                match value {
+                    Value::Bytes(bytes) => {
+                        match std::str::from_utf8(bytes) {
+                            Ok(s) => builder.append_value(s),
+                            Err(_) => builder.append_value(&String::from_utf8_lossy(bytes)),
+                        }
+                        appended = true;
+                    }
+                    Value::Object(obj) => {
+                        if let Ok(s) = serde_json::to_string(&obj) {
+                            builder.append_value(s);
+                            appended = true;
+                        }
+                    }
+                    Value::Array(arr) => {
+                        if let Ok(s) = serde_json::to_string(&arr) {
+                            builder.append_value(s);
+                            appended = true;
+                        }
+                    }
+                    _ => {
+                        builder.append_value(&value.to_string_lossy());
+                        appended = true;
+                    }
+                }
+            }
+
+            if !appended {
+                handle_null_constraints!(builder, nullable, field_name);
+            }
+        }
+    }
+
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_large_binary_array(
+    events: &[Event],
+    field_name: &str,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let mut builder = LargeBinaryBuilder::with_capacity(events.len(), 0);
 
     for event in events {
         if let Event::Log(log) = event {

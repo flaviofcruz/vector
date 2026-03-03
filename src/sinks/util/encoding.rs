@@ -156,6 +156,10 @@ impl Encoder<Vec<Event>> for (Transformer, vector_lib::codecs::EncoderKind) {
             vector_lib::codecs::EncoderKind::Batch(encoder) => {
                 (self.0.clone(), encoder.clone()).encode_input(events, writer)
             }
+            #[cfg(not(feature = "codecs-arrow"))]
+            vector_lib::codecs::EncoderKind::Batch(_) => unreachable!(
+                "Batch encoding via io::Write is only supported with the codecs-arrow feature"
+            ),
         }
     }
 }

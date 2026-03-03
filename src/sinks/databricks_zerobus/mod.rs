@@ -5,7 +5,8 @@
 
 mod config;
 mod error;
-mod request_builder;
+#[cfg(feature = "codecs-arrow")]
+mod proto_to_arrow;
 mod service;
 mod sink;
 mod unity_catalog_schema;
