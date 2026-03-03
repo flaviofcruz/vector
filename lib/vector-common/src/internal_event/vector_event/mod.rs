@@ -3,7 +3,7 @@ pub mod file_send_event;
 
 use delivery_event::{VectorSinkDeliveryEvent, combine_sink_delivery_events};
 use file_send_event::{FileEventMetadata, VectorFileSendEvent, combine_file_send_events};
-use std::ops::Add;
+use std::ops::{Add, AddAssign};
 
 #[derive(Clone, Debug, Default)]
 pub struct VectorSinkEventMetadata {
@@ -59,6 +59,12 @@ impl Add<VectorSinkEventMetadata> for VectorSinkEventMetadata {
 
     fn add(self, other: VectorSinkEventMetadata) -> Self::Output {
         combine_sink_event_metadata(vec![self, other])
+    }
+}
+
+impl AddAssign for VectorSinkEventMetadata {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = std::mem::take(self).add(rhs);
     }
 }
 

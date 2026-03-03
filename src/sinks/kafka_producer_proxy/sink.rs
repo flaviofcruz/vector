@@ -5,6 +5,7 @@ use futures::{StreamExt, future, stream::BoxStream};
 use futures_util::Stream;
 use prost::Message;
 use tower::Service;
+use vector_common::internal_event::vector_event::{EventWithEventLog, VectorSinkEventMetadata};
 use vector_lib::internal_event::{ComponentEventsDropped, UNINTENTIONAL};
 use vector_lib::request_metadata::GroupedCountByteSize;
 use vector_lib::stream::{BatcherSettings, DriverResponse, batcher::data::BatchReduce};
@@ -39,6 +40,7 @@ struct EventCollection {
     pub events: Vec<KafkaMessage>,
     pub events_byte_size: usize,
     pub events_json_byte_size: GroupedCountByteSize,
+    pub event_log_metadata: VectorSinkEventMetadata,
 }
 
 /// Event with additional metadata
@@ -47,6 +49,7 @@ struct KafkaEvent {
     byte_size: usize,
     json_byte_size: GroupedCountByteSize,
     message: proto_kpp::KafkaMessage,
+    event_log_metadata: VectorSinkEventMetadata,
 }
 
 impl<S> KafkaProducerProxySink<S>
@@ -109,6 +112,9 @@ where
                         data: message,
                         log_entry: log_entry.clone(),
                     },
+                    // This sink is special since it doesn't use the standard util classes
+                    // So we compute event log metadata manually
+                    event_log_metadata: event.compute_event_log(),
                 }
             })
             .batched(batch_settings.as_reducer_config(
@@ -118,16 +124,18 @@ where
                     event_collection.events.push(item.message);
                     event_collection.events_byte_size += item.byte_size;
                     event_collection.events_json_byte_size += item.json_byte_size;
+                    event_collection.event_log_metadata += item.event_log_metadata;
                 }),
             ))
             // This logic is similar to RequestBuilder. The building of the request is split into two parts:
             // RequestMetadataBuilder and EventCollection
             // This can be separated into a RequestBuilder if additional logic is required in the future
             .map(|event_collection| {
-                let builder = RequestMetadataBuilder::new(
+                let builder = RequestMetadataBuilder::new_with_event_log(
                     event_collection.events.len(),
                     event_collection.events_byte_size,
                     event_collection.events_json_byte_size,
+                    Some(event_collection.event_log_metadata),
                 );
 
                 let encoded_events = proto_kpp::KafkaMessages {

@@ -16,6 +16,7 @@ use super::{
     service::{KPPRequest, KPPResponse, KPPService},
     sink::KafkaProducerProxySink,
 };
+use crate::sinks::util::vector_event_log::EventLoggingService;
 use crate::{
     config::{AcknowledgementsConfig, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext},
     http::build_proxy_connector,
@@ -176,13 +177,15 @@ impl SinkConfig for KafkaProducerProxyConfig {
             .layer(blacklist_layer)
             .service(service);
 
+        let event_log_service = EventLoggingService::new(service);
+
         let sink = KafkaProducerProxySink {
             topic: self.topic.clone(),
             key_field: self.key_field.parse().unwrap(),
             message_field: self.message_field.parse().unwrap(),
             log_entry: self.log_entry.parse().unwrap(),
             batch_settings,
-            service,
+            service: event_log_service,
         };
 
         Ok((
