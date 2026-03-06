@@ -56,16 +56,15 @@ impl BatchEncoder {
         match &self.serializer {
             #[cfg(feature = "arrow")]
             BatchSerializer::Arrow(serializer) => {
-                let record_batch =
-                    serializer.encode_to_record_batch(events).map_err(|err| {
-                        use crate::encoding::ArrowEncodingError;
-                        match err {
-                            ArrowEncodingError::NullConstraint { .. } => {
-                                Error::SchemaConstraintViolation(Box::new(err))
-                            }
-                            _ => Error::SerializingError(Box::new(err)),
+                let record_batch = serializer.encode_to_record_batch(events).map_err(|err| {
+                    use crate::encoding::ArrowEncodingError;
+                    match err {
+                        ArrowEncodingError::NullConstraint { .. } => {
+                            Error::SchemaConstraintViolation(Box::new(err))
                         }
-                    })?;
+                        _ => Error::SerializingError(Box::new(err)),
+                    }
+                })?;
                 Ok(BatchOutput::Arrow(record_batch))
             }
             BatchSerializer::ProtoBatch(serializer) => {
