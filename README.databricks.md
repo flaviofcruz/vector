@@ -81,3 +81,4 @@ This lists custom changes merged in Databricks fork of Vector.
 80. Add a bricklens ingest sink - https://github.com/databricks-eng/vector/pull/385
 81. Instrument Kafka sink https://github.com/databricks-eng/vector/pull/409
 81. Use option to use dynamic allocation in fingerprinter https://github.com/databricks-eng/vector/pull/413
+82. Add support for static bearer token authentication in GCP auth config. https://github.com/databricks-eng/vector/pull/415

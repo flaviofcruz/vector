@@ -55,6 +55,7 @@ async fn sends_metric() {
         auth: GcpAuthConfig {
             api_key: None,
             credentials_path: None,
+            token: None,
             skip_authentication: true,
         },
         ..Default::default()
@@ -115,6 +116,7 @@ async fn sends_multiple_metrics() {
         auth: GcpAuthConfig {
             api_key: None,
             credentials_path: None,
+            token: None,
             skip_authentication: true,
         },
         batch,
@@ -202,6 +204,7 @@ async fn does_not_aggregate_metrics() {
         auth: GcpAuthConfig {
             api_key: None,
             credentials_path: None,
+            token: None,
             skip_authentication: true,
         },
         batch,
