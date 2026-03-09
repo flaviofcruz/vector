@@ -67,6 +67,7 @@ pub struct RunningTopology {
     watch: (WatchTx, WatchRx),
     pub(crate) running: Arc<AtomicBool>,
     graceful_shutdown_duration: Option<Duration>,
+    graceful_data_source_shutdown_duration: Option<Duration>,
     utilization_registry: Option<UtilizationRegistry>,
     utilization_task: Option<TaskHandle>,
     utilization_task_shutdown_trigger: Option<Trigger>,
@@ -90,6 +91,7 @@ impl RunningTopology {
             watch: watch::channel(TapResource::default()),
             running: Arc::new(AtomicBool::new(true)),
             graceful_shutdown_duration: config.graceful_shutdown_duration,
+            graceful_data_source_shutdown_duration: config.graceful_data_source_shutdown_duration,
             config,
             utilization_registry: None,
             utilization_task: None,
@@ -148,21 +150,60 @@ impl RunningTopology {
     pub fn stop(self) -> impl Future<Output = ()> {
         // Update the API's health endpoint to signal shutdown
         self.running.store(false, Ordering::Relaxed);
-        // Create handy handles collections of all tasks for the subsequent
-        // operations.
-        let mut wait_handles = Vec::new();
-        // We need a Vec here since source components have two tasks. One for
-        // pump in self.tasks, and the other for source in self.source_tasks.
-        let mut check_handles = HashMap::<ComponentKey, Vec<_>>::new();
 
         let map_closure = |_result| ();
 
-        // We need to give some time to the sources to gracefully shutdown, so
-        // we will merge them with other tasks.
+        // If we reach this, we will forcefully shutdown the sources. If None, we will never force shutdown.
+        let deadline = self
+            .graceful_shutdown_duration
+            .map(|grace_period| Instant::now() + grace_period);
+
+        let data_source_deadline = self
+            .graceful_data_source_shutdown_duration
+            .map(|grace_period| Instant::now() + grace_period);
+
+        // Cancel utilization and metrics tasks.
+        if let Some(trigger) = self.utilization_task_shutdown_trigger {
+            trigger.cancel();
+        }
+        if let Some(trigger) = self.metrics_task_shutdown_trigger {
+            trigger.cancel();
+        }
+
+        // Split the shutdown into two waves if there are deferred sources and a data source
+        // deadline is configured. Otherwise, use the existing single-pass shutdown to maintain
+        // backward compatibility.
+        let (wave1_complete, deferred_shutdowns) =
+            self.shutdown_coordinator.shutdown_non_deferred(
+                data_source_deadline.or(deadline),
+            );
+
+        let two_wave_enabled = self.config.global.two_wave_shutdown.enabled();
+        let use_two_wave = two_wave_enabled && deferred_shutdowns.has_deferred_sources() && data_source_deadline.is_some();
+
+        // In two-wave mode, compute which components are exclusively downstream of
+        // non-deferred sources. Only those components should be waited on in wave 1.
+        // Components with ANY deferred source in their ancestry stay alive until wave 2.
+        let exclusively_non_deferred_keys = if use_two_wave {
+            let deferred_source_keys = deferred_shutdowns.deferred_keys();
+            Self::compute_exclusively_non_deferred_components(&self.config, &deferred_source_keys)
+        } else {
+            HashSet::new()
+        };
+
+        // Create handy handles collections of all tasks for the subsequent operations.
+        let mut wait_handles = Vec::new();
+        let mut wave1_wait_handles = Vec::new();
+        let mut check_handles = HashMap::<ComponentKey, Vec<_>>::new();
+
+        // Source components have two tasks: pump in self.tasks, and source in self.source_tasks.
         for (key, task) in self.tasks.into_iter().chain(self.source_tasks.into_iter()) {
             let task = task.map(map_closure).shared();
 
             wait_handles.push(task.clone());
+            if use_two_wave && exclusively_non_deferred_keys.contains(&key) {
+                wave1_wait_handles.push(task.clone());
+            }
             check_handles.entry(key).or_default().push(task);
         }
 
@@ -173,11 +214,6 @@ impl RunningTopology {
         if let Some(metrics_task) = self.metrics_task {
             wait_handles.push(metrics_task.map(map_closure).shared());
         }
-
-        // If we reach this, we will forcefully shutdown the sources. If None, we will never force shutdown.
-        let deadline = self
-            .graceful_shutdown_duration
-            .map(|grace_period| Instant::now() + grace_period);
 
         let timeout = if let Some(deadline) = deadline {
             // If we reach the deadline, this future will print out which components
@@ -260,16 +296,106 @@ impl RunningTopology {
             Box::pin(success) as future::BoxFuture<'static, ()>,
         ]);
 
-        // Now kick off the shutdown process by shutting down the sources.
-        let source_shutdown_complete = self.shutdown_coordinator.shutdown_all(deadline);
-        if let Some(trigger) = self.utilization_task_shutdown_trigger {
-            trigger.cancel();
+        if use_two_wave {
+            // Two-wave shutdown.
+            //
+            // Wave 1: Non-deferred (data) sources shut down, then we wait for all
+            // exclusively-non-deferred transforms/sinks to drain. Components with ANY
+            // deferred source in their ancestry stay alive — their deferred source input
+            // keeps the channel open so they naturally continue running.
+            //
+            // Wave 2: Deferred (internal) sources shut down. Their downstream components
+            // (including any with mixed inputs) close naturally as the remaining input
+            // channels drop.
+
+            let source_shutdown_complete = async move {
+                info!(
+                    message = "Wave 1: Shutting down data sources.",
+                    internal_log_rate_limit = false,
+                );
+                wave1_complete.await;
+
+                // Wait for all exclusively-non-deferred components to finish draining.
+                info!(
+                    message = "Wave 1 complete. Waiting for exclusively-non-deferred transforms and sinks to drain.",
+                    internal_log_rate_limit = false,
+                );
+                futures::future::join_all(wave1_wait_handles).await;
+
+                // Wave 2: Shut down deferred (internal) sources with remaining main deadline.
+                info!(
+                    message = "Wave 2: Shutting down deferred (internal) sources.",
+                    internal_log_rate_limit = false,
+                );
+                deferred_shutdowns.shutdown_all(deadline).await;
+            };
+
+            futures::future::join(source_shutdown_complete, shutdown_complete_future).map(|_| ())
+                .boxed()
+        } else {
+            // No deferred sources or no data source deadline: use original single-pass behavior.
+            let source_shutdown_complete = async move {
+                wave1_complete.await;
+                deferred_shutdowns.shutdown_all(deadline).await;
+            };
+
+            futures::future::join(source_shutdown_complete, shutdown_complete_future).map(|_| ())
+                .boxed()
         }
-        if let Some(trigger) = self.metrics_task_shutdown_trigger {
-            trigger.cancel();
+    }
+
+    /// Computes the set of component keys that are exclusively downstream of non-deferred
+    /// sources. A component is "exclusively non-deferred" if every path from it back to a
+    /// source ends at a non-deferred source — i.e., it has NO deferred source anywhere in
+    /// its transitive input ancestry.
+    ///
+    /// These components can be safely drained in wave 1 since their only inputs come from
+    /// non-deferred sources that are being shut down. Components with any deferred ancestor
+    /// stay alive until wave 2.
+    fn compute_exclusively_non_deferred_components(
+        config: &Config,
+        deferred_source_keys: &HashSet<ComponentKey>,
+    ) -> HashSet<ComponentKey> {
+        // Start with all non-deferred sources.
+        let mut non_deferred: HashSet<ComponentKey> = config.sources()
+            .map(|(k, _)| k.clone())
+            .filter(|k| !deferred_source_keys.contains(k))
+            .collect();
+
+        // Iteratively add transforms/sinks whose inputs are ALL in the non-deferred set.
+        loop {
+            let mut changed = false;
+
+            for (key, transform) in config.transforms() {
+                if non_deferred.contains(key) {
+                    continue;
+                }
+                if !transform.inputs.is_empty()
+                    && transform.inputs.iter().all(|input| non_deferred.contains(&input.component))
+                {
+                    non_deferred.insert(key.clone());
+                    changed = true;
+                }
+            }
+
+            for (key, sink) in config.sinks() {
+                if non_deferred.contains(key) {
+                    continue;
+                }
+                if !sink.inputs.is_empty()
+                    && sink.inputs.iter().all(|input| non_deferred.contains(&input.component))
+                {
+                    non_deferred.insert(key.clone());
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                break;
+            }
         }
 
-        futures::future::join(source_shutdown_complete, shutdown_complete_future).map(|_| ())
+        non_deferred
     }
 
     /// Attempts to load a new configuration and update this running topology.

@@ -68,6 +68,11 @@ impl ApplicationConfig {
         let graceful_shutdown_duration = (!opts.no_graceful_shutdown_limit)
             .then(|| Duration::from_secs(u64::from(opts.graceful_shutdown_limit_secs)));
 
+        let graceful_data_source_shutdown_duration = graceful_shutdown_duration.and_then(|main| {
+            let data = Duration::from_secs(u64::from(opts.graceful_data_source_shutdown_limit_secs));
+            if data < main { Some(data) } else { None }
+        });
+
         let watcher_conf = if opts.watch_config {
             Some(watcher_config(
                 opts.watch_config_method,
@@ -84,6 +89,7 @@ impl ApplicationConfig {
             opts.allow_empty_config,
             !opts.disable_env_var_interpolation,
             graceful_shutdown_duration,
+            graceful_data_source_shutdown_duration,
             signal_handler,
         )
         .await?;
@@ -572,6 +578,7 @@ pub async fn load_configs(
     allow_empty_config: bool,
     interpolate_env: bool,
     graceful_shutdown_duration: Option<Duration>,
+    graceful_data_source_shutdown_duration: Option<Duration>,
     signal_handler: &mut SignalHandler,
 ) -> Result<Config, ExitCode> {
     let config_paths = config::process_paths(config_paths).ok_or(exitcode::CONFIG)?;
@@ -659,6 +666,7 @@ pub async fn load_configs(
     }
     config.healthchecks.set_require_healthy(require_healthy);
     config.graceful_shutdown_duration = graceful_shutdown_duration;
+    config.graceful_data_source_shutdown_duration = graceful_data_source_shutdown_duration;
 
     Ok(config)
 }

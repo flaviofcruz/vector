@@ -14,8 +14,8 @@ use self::{
         PanicSinkConfig,
     },
     sources::{
-        BackpressureSourceConfig, BasicSourceConfig, ErrorSourceConfig, PanicSourceConfig,
-        TripwireSourceConfig,
+        BackpressureSourceConfig, BasicSourceConfig, DeferredSourceConfig, ErrorSourceConfig,
+        PanicSourceConfig, TripwireSourceConfig,
     },
     transforms::{BasicTransformConfig, ErrorDefinitionTransformConfig},
 };
@@ -38,6 +38,21 @@ pub fn basic_source() -> (SourceSender, BasicSourceConfig) {
 pub fn basic_source_with_data(data: &str) -> (SourceSender, BasicSourceConfig) {
     let (tx, rx) = SourceSender::new_test_sender_with_options(1, None);
     (tx, BasicSourceConfig::new_with_data(rx, data))
+}
+
+pub fn deferred_source() -> (SourceSender, DeferredSourceConfig) {
+    let (tx, rx) = SourceSender::new_test_sender_with_options(1, None);
+    (tx, DeferredSourceConfig::new(rx))
+}
+
+pub fn deferred_source_with_event_counter(
+    force_shutdown: bool,
+) -> (SourceSender, DeferredSourceConfig, Arc<AtomicUsize>) {
+    let event_counter = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = SourceSender::new_test_sender_with_options(1, None);
+    let mut source = DeferredSourceConfig::new_with_event_counter(rx, Arc::clone(&event_counter));
+    source.set_force_shutdown(force_shutdown);
+    (tx, source, event_counter)
 }
 
 pub fn basic_source_with_event_counter(

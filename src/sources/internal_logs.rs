@@ -136,6 +136,10 @@ impl SourceConfig for InternalLogsConfig {
     fn can_acknowledge(&self) -> bool {
         false
     }
+
+    fn has_deferred_shutdown(&self) -> bool {
+        true
+    }
 }
 
 async fn run(

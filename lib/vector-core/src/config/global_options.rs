@@ -6,7 +6,7 @@ use vector_config::{configurable_component, impl_generate_config_from_default};
 
 use super::{
     super::default_data_dir, AcknowledgementsConfig, LogSchema, Telemetry,
-    metrics_expiration::PerMetricSetExpiration, proxy::ProxyConfig,
+    TwoWaveShutdownConfig, metrics_expiration::PerMetricSetExpiration, proxy::ProxyConfig,
 };
 use crate::serde::bool_or_struct;
 
@@ -115,6 +115,19 @@ pub struct GlobalOptions {
     )]
     #[configurable(metadata(docs::common = true, docs::required = false))]
     pub acknowledgements: AcknowledgementsConfig,
+
+    /// Controls whether two-wave graceful shutdown is enabled.
+    ///
+    /// When enabled, data sources are shut down first (wave 1) and their exclusively-downstream
+    /// components are allowed to drain, then internal (deferred) sources are shut down (wave 2).
+    /// This keeps internal telemetry pipelines running during the first wave of shutdown.
+    #[serde(
+        default,
+        deserialize_with = "bool_or_struct",
+        skip_serializing_if = "crate::serde::is_default"
+    )]
+    #[configurable(metadata(docs::common = false, docs::required = false))]
+    pub two_wave_shutdown: TwoWaveShutdownConfig,
 
     /// The amount of time, in seconds, that internal metrics will persist after having not been
     /// updated before they expire and are removed.
@@ -254,6 +267,13 @@ impl GlobalOptions {
             errors.push("conflicting values for 'acknowledgements' found".to_owned());
         }
 
+        if conflicts(
+            self.two_wave_shutdown.enabled.as_ref(),
+            with.two_wave_shutdown.enabled.as_ref(),
+        ) {
+            errors.push("conflicting values for 'two_wave_shutdown' found".to_owned());
+        }
+
         if conflicts(self.expire_metrics.as_ref(), with.expire_metrics.as_ref()) {
             errors.push("conflicting values for 'expire_metrics' found".to_owned());
         }
@@ -303,6 +323,7 @@ impl GlobalOptions {
                 log_schema,
                 telemetry,
                 acknowledgements: self.acknowledgements.merge_default(&with.acknowledgements),
+                two_wave_shutdown: self.two_wave_shutdown.merge_default(&with.two_wave_shutdown),
                 timezone: self.timezone.or(with.timezone),
                 proxy: self.proxy.merge(&with.proxy),
                 expire_metrics: self.expire_metrics.or(with.expire_metrics),
