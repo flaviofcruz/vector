@@ -179,7 +179,9 @@ impl Service<HttpRequest<PartitionKey>> for HeadlessService {
                         guard.entries.is_empty()
                     };
                     if trigger_refresh {
-                        warn!(message = "All ClickHouse endpoints failed, triggering immediate DNS refresh.");
+                        warn!(
+                            message = "All ClickHouse endpoints failed, triggering immediate DNS refresh."
+                        );
                         notify.notify_one();
                     }
                 }
@@ -264,7 +266,10 @@ fn reconcile_endpoints(
     svc_config: &EndpointServiceConfig,
     new_uris: &[Uri],
 ) {
-    let new_ips: HashSet<IpAddr> = new_uris.iter().filter_map(|u| dns::ip_from_uri(u)).collect();
+    let new_ips: HashSet<IpAddr> = new_uris
+        .iter()
+        .filter_map(|u| dns::ip_from_uri(u))
+        .collect();
 
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
     let current_ips: HashSet<IpAddr> = guard.entries.iter().map(|e| e.ip).collect();

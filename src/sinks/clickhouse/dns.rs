@@ -64,7 +64,10 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
 pub fn ip_from_uri(uri: &Uri) -> Option<IpAddr> {
     uri.host().and_then(|h| {
         // Strip brackets from IPv6 addresses like [::1]
-        let h = h.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(h);
+        let h = h
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(h);
         h.parse().ok()
     })
 }
