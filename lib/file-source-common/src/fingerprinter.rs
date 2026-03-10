@@ -20,6 +20,14 @@ use crate::{
 
 const FINGERPRINT_CRC: Crc<u64> = Crc::<u64>::new(&crc::CRC_64_ECMA_182);
 
+pub static FINGERPRINTER_DYNAMIC_ALLOCATION: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("FINGERPRINTER_DYNAMIC_ALLOCATION")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false)
+    });
+
 #[derive(Debug, Clone)]
 pub struct Fingerprinter {
     strategy: FingerprintStrategy,
@@ -158,7 +166,7 @@ impl Fingerprinter {
         max_line_length: usize,
         ignore_not_found: bool,
     ) -> Fingerprinter {
-        let buffer = vec![0u8; max_line_length];
+        let buffer = vec![0u8; 0]; // No allocation for now, will be resized later once if not using dynamic allocation.
 
         Fingerprinter {
             strategy,
@@ -184,7 +192,13 @@ impl Fingerprinter {
                 ignored_header_bytes,
                 lines,
             } => {
-                let buffer = self.buffer.resize_slice_mut(self.max_line_length);
+                let mut dynamic_buffer;
+                let buffer = if *FINGERPRINTER_DYNAMIC_ALLOCATION {
+                    dynamic_buffer = vec![0u8; self.max_line_length];
+                    dynamic_buffer.as_mut_slice()
+                } else {
+                    self.buffer.resize_slice_mut(self.max_line_length)
+                };
                 let mut fp = File::open(path).await?;
                 let mut reader = UncompressedReaderImpl::reader(&mut fp).await?;
 

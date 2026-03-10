@@ -99,6 +99,15 @@ pub struct GcpAuthConfig {
     /// [gcp_service_account_credentials]: https://cloud.google.com/docs/authentication/production#manually
     pub credentials_path: Option<String>,
 
+    /// A short-lived OAuth2 bearer token to use for authentication.
+    ///
+    /// Intended for use with Vector's file or exec secret backend, where the token is read
+    /// from a file on disk and refreshed automatically via `files_to_watch` and `--watch-config`.
+    /// The token value should be the raw access token string (without the "Bearer " prefix).
+    ///
+    /// When set, takes precedence over `credentials_path` and `api_key`.
+    pub token: Option<SensitiveString>,
+
     /// Skip all authentication handling. For use with integration tests only.
     #[serde(default, skip_serializing)]
     #[configurable(metadata(docs::hidden))]
@@ -109,6 +118,8 @@ impl GcpAuthConfig {
     pub async fn build(&self, scope: Scope) -> crate::Result<GcpAuthenticator> {
         Ok(if self.skip_authentication {
             GcpAuthenticator::None
+        } else if let Some(token) = &self.token {
+            GcpAuthenticator::StaticToken(token.inner().to_string())
         } else {
             let gap = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
             let creds_path = self.credentials_path.as_ref().or(gap.as_ref());
@@ -125,6 +136,9 @@ impl GcpAuthConfig {
 pub enum GcpAuthenticator {
     Credentials(Arc<InnerCreds>),
     ApiKey(Box<str>),
+    /// A static bearer token supplied directly in config (e.g. via a secret backend).
+    /// Token refresh is handled externally via Vector's `--watch-config` + `files_to_watch`.
+    StaticToken(String),
     None,
 }
 
@@ -158,6 +172,7 @@ impl GcpAuthenticator {
     pub fn make_token(&self) -> Option<String> {
         match self {
             Self::Credentials(inner) => Some(inner.make_token()),
+            Self::StaticToken(token) => Some(format!("Bearer {token}")),
             Self::ApiKey(_) | Self::None => None,
         }
     }
@@ -173,7 +188,7 @@ impl GcpAuthenticator {
 
     pub fn apply_uri(&self, uri: &mut Uri) {
         match self {
-            Self::Credentials(_) | Self::None => (),
+            Self::Credentials(_) | Self::StaticToken(_) | Self::None => (),
             Self::ApiKey(api_key) => {
                 let mut parts = uri.clone().into_parts();
                 let path = parts
@@ -233,7 +248,9 @@ impl GcpAuthenticator {
                     }
                 }
             }
-            Self::ApiKey(_) | Self::None => {
+            // Static token and API key don't need internal refresh — token rotation is
+            // handled externally via Vector's --watch-config + files_to_watch mechanism.
+            Self::StaticToken(_) | Self::ApiKey(_) | Self::None => {
                 // This keeps the sender end of the watch open without
                 // actually sending anything, effectively creating an
                 // empty watch stream.
@@ -371,6 +388,41 @@ mod tests {
             .await
             .expect_err("build failed to error");
         assert_downcast_matches!(error, GcpError, GcpError::InvalidApiKey { .. });
+    }
+
+    #[tokio::test]
+    async fn uses_static_token() {
+        let auth = build_auth(r#"token = "ya29.test-token-value""#)
+            .await
+            .expect("build_auth failed");
+        assert!(matches!(auth, GcpAuthenticator::StaticToken(..)));
+
+        // Token is prefixed with "Bearer " in the Authorization header value.
+        assert_eq!(
+            auth.make_token(),
+            Some("Bearer ya29.test-token-value".to_string())
+        );
+
+        // apply_uri must not modify the URI (unlike ApiKey which appends ?key=...).
+        assert_eq!(
+            apply_uri(&auth, "http://example.com/path"),
+            "http://example.com/path"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_token_takes_precedence_over_api_key() {
+        // When both token and api_key are set, token wins.
+        let key = crate::test_util::random_string(16);
+        let auth = build_auth(&format!(
+            r#"
+                token = "ya29.test-token-value"
+                api_key = "{key}"
+            "#
+        ))
+        .await
+        .expect("build_auth failed");
+        assert!(matches!(auth, GcpAuthenticator::StaticToken(..)));
     }
 
     fn apply_uri(auth: &GcpAuthenticator, uri: &str) -> String {

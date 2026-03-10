@@ -265,7 +265,9 @@ fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Fie
 }
 
 /// Serializes a RecordBatch into Arrow IPC streaming format bytes.
-pub fn record_batch_to_arrow_ipc_stream(record_batch: &RecordBatch) -> Result<Bytes, ArrowEncodingError> {
+pub fn record_batch_to_arrow_ipc_stream(
+    record_batch: &RecordBatch,
+) -> Result<Bytes, ArrowEncodingError> {
     let ipc_err = |source| ArrowEncodingError::IpcWrite { source };
 
     let mut buffer = BytesMut::new().writer();

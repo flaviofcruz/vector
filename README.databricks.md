@@ -80,4 +80,6 @@ This lists custom changes merged in Databricks fork of Vector.
 79. Add observability metrics for ClickHouse sink batching and insert latency https://github.com/databricks-eng/vector/pull/401
 80. Add a bricklens ingest sink - https://github.com/databricks-eng/vector/pull/385
 81. Instrument Kafka sink https://github.com/databricks-eng/vector/pull/409
-82. Add support for request-level loadbalancing for Clickhouse sink using a headless ClusterIP svc https://github.com/databricks-eng/vector/pull/418
+81. Use option to use dynamic allocation in fingerprinter https://github.com/databricks-eng/vector/pull/413
+82. Add support for static bearer token authentication in GCP auth config. https://github.com/databricks-eng/vector/pull/415
+83. Add support for request-level loadbalancing for Clickhouse sink using a headless ClusterIP svc https://github.com/databricks-eng/vector/pull/418

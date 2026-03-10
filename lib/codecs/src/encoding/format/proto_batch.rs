@@ -103,10 +103,7 @@ impl ProtoBatchSerializer {
     }
 
     /// Encode a batch of events into individual protobuf byte buffers.
-    pub fn encode_batch(
-        &self,
-        events: &[Event],
-    ) -> Result<Vec<Vec<u8>>, ProtoBatchEncodingError> {
+    pub fn encode_batch(&self, events: &[Event]) -> Result<Vec<Vec<u8>>, ProtoBatchEncodingError> {
         if events.is_empty() {
             return Err(ProtoBatchEncodingError::NoEvents);
         }
@@ -127,7 +124,9 @@ impl ProtoBatchSerializer {
                     return Err(ProtoBatchEncodingError::UnsupportedEventType);
                 }
             }
-            .map_err(|source| ProtoBatchEncodingError::EncodingFailed { source: source.into() })?;
+            .map_err(|source| ProtoBatchEncodingError::EncodingFailed {
+                source: source.into(),
+            })?;
 
             records.push(dynamic_message.encode_to_vec());
         }
