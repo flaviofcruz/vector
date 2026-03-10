@@ -6,8 +6,7 @@
 //!
 //! Failed endpoints (connection errors) are removed from the active set.
 //! A background task periodically re-resolves DNS to discover new pods and
-//! re-add recovered ones. If all endpoints are removed, an immediate DNS
-//! refresh is triggered.
+//! re-add recovered ones.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -17,7 +16,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use http::Uri;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use super::config::QuerySettingsConfig;
 use super::dns;
@@ -32,13 +31,13 @@ const DEFAULT_DNS_REFRESH_SECS: u64 = 30;
 
 /// Configuration parameters needed to construct per-endpoint services.
 #[derive(Clone)]
-struct EndpointServiceConfig {
-    auth: Option<Auth>,
-    skip_unknown_fields: Option<bool>,
-    date_time_best_effort: bool,
-    insert_random_shard: bool,
-    compression: Compression,
-    query_settings: QuerySettingsConfig,
+pub(super) struct EndpointServiceConfig {
+    pub auth: Option<Auth>,
+    pub skip_unknown_fields: Option<bool>,
+    pub date_time_best_effort: bool,
+    pub insert_random_shard: bool,
+    pub compression: Compression,
+    pub query_settings: QuerySettingsConfig,
 }
 
 struct EndpointEntry {
@@ -55,14 +54,20 @@ struct SharedState {
 ///
 /// - Resolves a headless K8s service DNS name to pod IPs at startup
 /// - Dispatches requests round-robin across active endpoints
-/// - Removes endpoints on connection failures
-/// - Triggers immediate DNS re-resolution when all endpoints are exhausted
+/// - Removes endpoints on connection failures (connect/closed errors)
 /// - Periodically re-resolves DNS in the background
+///
+/// The background DNS refresh task shuts down automatically when all clones
+/// of this service are dropped (i.e., when the sink is torn down).
 #[derive(Clone)]
 pub struct HeadlessService {
     state: Arc<Mutex<SharedState>>,
     next: Arc<AtomicUsize>,
     refresh_notify: Arc<Notify>,
+    // Held to keep the background DNS refresh task alive. When all clones of
+    // HeadlessService are dropped, this sender is dropped, signaling the
+    // background task to exit.
+    _shutdown_tx: Arc<watch::Sender<()>>,
 }
 
 impl HeadlessService {
@@ -71,23 +76,9 @@ impl HeadlessService {
     pub async fn new(
         client: HttpClient,
         endpoint: Uri,
-        auth: Option<Auth>,
-        skip_unknown_fields: Option<bool>,
-        date_time_best_effort: bool,
-        insert_random_shard: bool,
-        compression: Compression,
-        query_settings: QuerySettingsConfig,
+        svc_config: EndpointServiceConfig,
         dns_refresh_interval_secs: Option<u64>,
     ) -> crate::Result<Self> {
-        let svc_config = EndpointServiceConfig {
-            auth,
-            skip_unknown_fields,
-            date_time_best_effort,
-            insert_random_shard,
-            compression,
-            query_settings,
-        };
-
         let initial_uris = dns::resolve_endpoints(&endpoint).await?;
 
         let entries: Vec<EndpointEntry> = initial_uris
@@ -112,6 +103,7 @@ impl HeadlessService {
         let state = Arc::new(Mutex::new(SharedState { entries }));
         let refresh_notify = Arc::new(Notify::new());
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
         let refresh_secs = dns_refresh_interval_secs.unwrap_or(DEFAULT_DNS_REFRESH_SECS);
         spawn_dns_refresh_task(
             state.clone(),
@@ -120,12 +112,14 @@ impl HeadlessService {
             endpoint,
             svc_config,
             Duration::from_secs(refresh_secs),
+            shutdown_rx,
         );
 
         Ok(Self {
             state,
             next: Arc::new(AtomicUsize::new(0)),
             refresh_notify,
+            _shutdown_tx: Arc::new(shutdown_tx),
         })
     }
 }
@@ -155,12 +149,15 @@ impl Service<HttpRequest<PartitionKey>> for HeadlessService {
             }
         };
 
-        let Some((mut service, ip)) = pick else {
-            // No endpoints available — the background task should be resolving.
-            notify.notify_one();
-            return Box::pin(async {
-                Err("No available ClickHouse endpoints (DNS refresh pending)".into())
-            });
+        let (mut service, ip) = match pick {
+            Some(pick) => pick,
+            None => {
+                warn!(message = "No resolved ClickHouse endpoints available.");
+                notify.notify_one();
+                return Box::pin(async move {
+                    Err("No resolved ClickHouse endpoints available".into())
+                });
+            }
         };
 
         Box::pin(async move {
@@ -192,12 +189,13 @@ impl Service<HttpRequest<PartitionKey>> for HeadlessService {
     }
 }
 
-/// Returns true if the error is a connection-level failure (as opposed to
-/// an application-level HTTP error).
+/// Returns true if the error is a connection-level failure (connect or closed),
+/// as opposed to an HTTP-level or parse error.
 fn is_connection_error(error: &crate::Error) -> bool {
-    error
-        .downcast_ref::<HttpError>()
-        .is_some_and(|e| matches!(e, HttpError::CallRequest { .. }))
+    error.downcast_ref::<HttpError>().is_some_and(|e| match e {
+        HttpError::CallRequest { source } => source.is_connect() || source.is_closed(),
+        _ => false,
+    })
 }
 
 /// Builds an `HttpService` targeting a single resolved endpoint URI.
@@ -220,6 +218,9 @@ fn build_endpoint_service(
 
 /// Spawns a background task that periodically re-resolves DNS and reconciles
 /// the active endpoint set. Also listens for immediate-refresh notifications.
+///
+/// The task exits when `shutdown_rx` detects that the sender has been dropped
+/// (i.e., when all `HeadlessService` clones are dropped during sink teardown).
 fn spawn_dns_refresh_task(
     state: Arc<Mutex<SharedState>>,
     notify: Arc<Notify>,
@@ -227,6 +228,7 @@ fn spawn_dns_refresh_task(
     endpoint: Uri,
     svc_config: EndpointServiceConfig,
     refresh_interval: Duration,
+    mut shutdown_rx: watch::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(refresh_interval);
@@ -239,6 +241,7 @@ fn spawn_dns_refresh_task(
                 _ = notify.notified() => {
                     interval.reset();
                 },
+                _ = shutdown_rx.changed() => break,
             }
 
             match dns::resolve_endpoints(&endpoint).await {
@@ -253,6 +256,8 @@ fn spawn_dns_refresh_task(
                 }
             }
         }
+
+        info!(message = "ClickHouse headless DNS refresh task shutting down.");
     });
 }
 
@@ -275,9 +280,9 @@ fn reconcile_endpoints(
     let current_ips: HashSet<IpAddr> = guard.entries.iter().map(|e| e.ip).collect();
 
     // Remove endpoints no longer in DNS.
-    let removed_count = guard.entries.len();
+    let before = guard.entries.len();
     guard.entries.retain(|entry| new_ips.contains(&entry.ip));
-    let removed_count = removed_count - guard.entries.len();
+    let removed_count = before - guard.entries.len();
 
     // Add new endpoints.
     let mut added_count = 0;
@@ -293,7 +298,7 @@ fn reconcile_endpoints(
 
     if removed_count > 0 || added_count > 0 {
         info!(
-            message = "ClickHouse headless service DNS refresh completed.",
+            message = "ClickHouse headless service endpoints reconciled.",
             added = added_count,
             removed = removed_count,
             active = guard.entries.len(),
@@ -306,15 +311,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_connection_error_with_hyper_error() {
-        // We can't easily construct a real HttpError::CallRequest in tests,
-        // so we test the negative case — non-connection errors.
+    fn test_is_connection_error_with_string_error() {
         let err: crate::Error = "some application error".into();
         assert!(!is_connection_error(&err));
     }
 
     #[test]
-    fn test_is_connection_error_with_string_error() {
+    fn test_is_connection_error_with_io_error() {
         let err: crate::Error = Box::new(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "connection refused",

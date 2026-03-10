@@ -26,8 +26,7 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let addr_str = format!("{}:{}", host, port);
-    let addrs: Vec<std::net::SocketAddr> = lookup_host(&addr_str)
+    let addrs: Vec<std::net::SocketAddr> = lookup_host((host, port))
         .await
         .map_err(|e| format!("DNS resolution failed for '{}': {}", host, e))?
         .collect();
@@ -37,18 +36,17 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
     }
 
     let mut seen = HashSet::new();
-    let mut uris = Vec::new();
-    for addr in addrs {
-        let ip = addr.ip();
-        if seen.insert(ip) {
-            let host_str = format_ip_for_uri(ip);
+    let uris = addrs
+        .into_iter()
+        .filter(|addr| seen.insert(addr.ip()))
+        .map(|addr| {
+            let host_str = format_ip_for_uri(addr.ip());
             let uri_str = format!("{}://{}:{}{}", scheme, host_str, port, path_and_query);
-            let uri: Uri = uri_str
-                .parse()
-                .map_err(|e| format!("Failed to parse resolved URI '{}': {}", uri_str, e))?;
-            uris.push(uri);
-        }
-    }
+            uri_str
+                .parse::<Uri>()
+                .map_err(|e| format!("Failed to parse resolved URI '{}': {}", uri_str, e).into())
+        })
+        .collect::<crate::Result<Vec<Uri>>>()?;
 
     info!(
         message = "Resolved headless DNS endpoints for ClickHouse.",
@@ -61,9 +59,11 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
 }
 
 /// Extracts the IP address from a resolved URI's host component.
+///
+/// `http::Uri` stores IPv6 hosts with brackets (e.g., `[::1]`), but
+/// `IpAddr::parse` does not accept brackets, so we strip them here.
 pub fn ip_from_uri(uri: &Uri) -> Option<IpAddr> {
     uri.host().and_then(|h| {
-        // Strip brackets from IPv6 addresses like [::1]
         let h = h
             .strip_prefix('[')
             .and_then(|h| h.strip_suffix(']'))
@@ -72,7 +72,9 @@ pub fn ip_from_uri(uri: &Uri) -> Option<IpAddr> {
     })
 }
 
-/// Formats an IP for use in a URI (wraps IPv6 in brackets).
+/// Formats an IP address for embedding in a URI authority component.
+///
+/// IPv6 addresses must be wrapped in brackets per RFC 3986 (e.g., `[::1]`).
 fn format_ip_for_uri(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(v4) => v4.to_string(),
