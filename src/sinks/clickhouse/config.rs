@@ -212,89 +212,29 @@ impl_generate_config_from_default!(ClickhouseConfig);
 #[typetag::serde(name = "clickhouse")]
 impl SinkConfig for ClickhouseConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        info!(
-            message = "ClickHouse sink build() starting.",
-            endpoint = %self.endpoint.uri,
-            table = %self.table,
-            database = ?self.database,
-            format = ?self.format,
-            use_headless_service = %self.use_headless_service,
-            dns_refresh_interval_secs = ?self.dns_refresh_interval_secs,
-            compression = ?self.compression,
-            skip_unknown_fields = ?self.skip_unknown_fields,
-            date_time_best_effort = %self.date_time_best_effort,
-            insert_random_shard = %self.insert_random_shard,
-        );
-
         let endpoint = self.endpoint.with_default_parts().uri;
-        info!(
-            message = "ClickHouse sink: parsed endpoint URI with default parts.",
-            endpoint = %endpoint,
-            scheme = ?endpoint.scheme_str(),
-            host = ?endpoint.host(),
-            port = ?endpoint.port_u16(),
-        );
-
         let auth = self.auth.choose_one(&self.endpoint.auth)?;
-        info!(
-            message = "ClickHouse sink: authentication configured.",
-            has_auth = %auth.is_some(),
-        );
-
         let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
-        info!(
-            message = "ClickHouse sink: TLS settings configured.",
-            tls_enabled = %self.tls.is_some(),
-        );
-
         let client = HttpClient::new(tls_settings, &cx.proxy)?;
-        info!(message = "ClickHouse sink: HTTP client created successfully.");
-
         let request_limits = self.request.into_settings();
-        info!(
-            message = "ClickHouse sink: request limits configured.",
-            concurrency = ?request_limits.concurrency,
-            rate_limit_num = ?request_limits.rate_limit_num,
-        );
-
         let batch_settings = self.batch.into_batcher_settings()?;
-        info!(
-            message = "ClickHouse sink: batch settings configured.",
-            max_bytes = ?batch_settings.size.bytes,
-            max_events = ?batch_settings.size.events,
-        );
 
         let database = self.database.clone().unwrap_or_else(|| {
             "default"
                 .try_into()
                 .expect("'default' should be a valid template")
         });
-        info!(
-            message = "ClickHouse sink: database resolved.",
-            database = %database,
-        );
 
-        info!(message = "ClickHouse sink: resolving encoding strategy...");
         let (format, encoder_kind) = self
             .resolve_strategy(&client, &endpoint, &database, auth.as_ref())
             .await?;
-        info!(
-            message = "ClickHouse sink: encoding strategy resolved.",
-            format = %format,
-        );
 
         let request_builder = ClickhouseRequestBuilder {
             compression: self.compression,
             encoder: (self.encoding.clone(), encoder_kind),
         };
-        info!(message = "ClickHouse sink: request builder created.");
 
         if self.use_headless_service {
-            info!(
-                message = "ClickHouse sink: HEADLESS SERVICE MODE ENABLED - will resolve DNS to individual pod IPs.",
-                endpoint = %endpoint,
-                dns_refresh_interval_secs = ?self.dns_refresh_interval_secs,
-            );
             self.build_headless(
                 client,
                 endpoint,
@@ -307,10 +247,6 @@ impl SinkConfig for ClickhouseConfig {
             )
             .await
         } else {
-            info!(
-                message = "ClickHouse sink: SINGLE ENDPOINT MODE - using direct endpoint connection.",
-                endpoint = %endpoint,
-            );
             self.build_single(
                 client,
                 endpoint,
@@ -346,14 +282,6 @@ impl ClickhouseConfig {
         format: Format,
         request_builder: ClickhouseRequestBuilder,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
-        info!(
-            message = "ClickHouse sink build_single(): constructing single-endpoint sink.",
-            endpoint = %endpoint,
-            database = %database,
-            table = %self.table,
-            format = %format,
-        );
-
         let service_request_builder = ClickhouseServiceRequestBuilder {
             auth: auth.clone(),
             endpoint: endpoint.clone(),
@@ -363,42 +291,24 @@ impl ClickhouseConfig {
             compression: self.compression,
             query_settings: self.query_settings,
         };
-        info!(
-            message = "ClickHouse sink build_single(): service request builder created.",
-            skip_unknown_fields = ?self.skip_unknown_fields,
-            date_time_best_effort = %self.date_time_best_effort,
-            insert_random_shard = %self.insert_random_shard,
-        );
 
         let service: HttpService<ClickhouseServiceRequestBuilder, PartitionKey> =
             HttpService::new(client.clone(), service_request_builder);
-        info!(message = "ClickHouse sink build_single(): HTTP service created.");
 
         let service = ServiceBuilder::new()
             .settings(request_limits, ClickhouseRetryLogic::default())
             .service(service);
-        info!(message = "ClickHouse sink build_single(): service with retry logic configured.");
 
         let sink = ClickhouseSink::new(
             batch_settings,
             service,
-            database.clone(),
+            database,
             self.table.clone(),
             format,
             request_builder,
         );
-        info!(
-            message = "ClickHouse sink build_single(): sink created successfully.",
-            database = %database,
-            table = %self.table,
-        );
 
-        let healthcheck = Box::pin(healthcheck(client, endpoint.clone(), auth));
-        info!(
-            message = "ClickHouse sink build_single(): healthcheck configured.",
-            healthcheck_endpoint = %endpoint,
-        );
-
+        let healthcheck = Box::pin(healthcheck(client, endpoint, auth));
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }
 
@@ -415,20 +325,6 @@ impl ClickhouseConfig {
         format: Format,
         request_builder: ClickhouseRequestBuilder,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
-        info!(
-            message = "ClickHouse sink build_headless(): constructing headless service sink.",
-            endpoint = %endpoint,
-            host = ?endpoint.host(),
-            database = %database,
-            table = %self.table,
-            format = %format,
-            dns_refresh_interval_secs = ?self.dns_refresh_interval_secs,
-        );
-
-        info!(
-            message = "ClickHouse sink build_headless(): initializing HeadlessService with DNS resolution.",
-            endpoint = %endpoint,
-        );
         let headless = HeadlessService::new(
             client.clone(),
             endpoint.clone(),
@@ -441,33 +337,21 @@ impl ClickhouseConfig {
             self.dns_refresh_interval_secs,
         )
         .await?;
-        info!(message = "ClickHouse sink build_headless(): HeadlessService created successfully.");
 
         let service = ServiceBuilder::new()
             .settings(request_limits, ClickhouseRetryLogic::default())
             .service(headless);
-        info!(message = "ClickHouse sink build_headless(): service with retry logic configured.");
 
         let sink = ClickhouseSink::new(
             batch_settings,
             service,
-            database.clone(),
+            database,
             self.table.clone(),
             format,
             request_builder,
         );
-        info!(
-            message = "ClickHouse sink build_headless(): sink created successfully.",
-            database = %database,
-            table = %self.table,
-        );
 
-        let healthcheck = Box::pin(healthcheck(client, endpoint.clone(), auth));
-        info!(
-            message = "ClickHouse sink build_headless(): healthcheck configured.",
-            healthcheck_endpoint = %endpoint,
-        );
-
+        let healthcheck = Box::pin(healthcheck(client, endpoint, auth));
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }
 
@@ -598,42 +482,17 @@ fn get_healthcheck_uri(endpoint: &Uri) -> String {
 
 async fn healthcheck(client: HttpClient, endpoint: Uri, auth: Option<Auth>) -> crate::Result<()> {
     let uri = get_healthcheck_uri(&endpoint);
-    info!(
-        message = "ClickHouse healthcheck: initiating health check.",
-        endpoint = %endpoint,
-        healthcheck_uri = %uri,
-        has_auth = %auth.is_some(),
-    );
-
-    let mut request = Request::get(&uri).body(Body::empty()).unwrap();
+    let mut request = Request::get(uri).body(Body::empty()).unwrap();
 
     if let Some(auth) = auth {
-        info!(message = "ClickHouse healthcheck: applying authentication to request.");
         auth.apply(&mut request);
     }
 
-    info!(message = "ClickHouse healthcheck: sending request...");
     let response = client.send(request).await?;
-    let status = response.status();
 
-    info!(
-        message = "ClickHouse healthcheck: received response.",
-        status_code = %status,
-        status_canonical = ?status.canonical_reason(),
-    );
-
-    match status {
-        StatusCode::OK => {
-            info!(message = "ClickHouse healthcheck: SUCCESS - endpoint is healthy.");
-            Ok(())
-        }
-        status => {
-            info!(
-                message = "ClickHouse healthcheck: FAILED - unexpected status code.",
-                status = %status,
-            );
-            Err(HealthcheckError::UnexpectedStatus { status }.into())
-        }
+    match response.status() {
+        StatusCode::OK => Ok(()),
+        status => Err(HealthcheckError::UnexpectedStatus { status }.into()),
     }
 }
 
