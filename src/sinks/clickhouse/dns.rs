@@ -1,7 +1,7 @@
 //! DNS resolution for headless Kubernetes service discovery.
 //!
 //! Resolves a headless K8s service DNS name to individual pod IPs,
-//! enabling direct round-robin dispatch to ClickHouse shard pods.
+//! enabling direct P2C load-balanced dispatch to ClickHouse shard pods.
 
 use std::collections::HashSet;
 use std::net::IpAddr;

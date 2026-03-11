@@ -2,7 +2,8 @@
 //!
 //! When `use_headless_service` is enabled, the configured endpoint hostname is
 //! resolved via DNS to discover individual pod IPs. Requests are dispatched
-//! round-robin across all resolved endpoints.
+//! using Tower's Power of Two Choices (P2C) load balancer across all resolved
+//! endpoints, routing each request to the endpoint with fewer in-flight requests.
 //!
 //! Failed endpoints (connection errors) are removed from the active set.
 //! A background task periodically re-resolves DNS to discover new pods and
@@ -10,13 +11,20 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use http::Uri;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{mpsc, watch, Notify};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tower::balance::p2c::Balance;
+use tower::buffer::Buffer;
+use tower::discover::Change;
+use tower::load::Load;
 
 use super::config::QuerySettingsConfig;
 use super::dns;
@@ -29,6 +37,14 @@ use crate::sinks::util::http::{HttpRequest, HttpResponse, HttpService};
 /// Default DNS refresh interval.
 const DEFAULT_DNS_REFRESH_SECS: u64 = 30;
 
+// --- Type aliases ---
+
+type DiscoverEvent = Result<Change<IpAddr, TrackedHttpService>, crate::Error>;
+type DiscoverStream = Pin<Box<UnboundedReceiverStream<DiscoverEvent>>>;
+type P2cBalance = Balance<DiscoverStream, HttpRequest<PartitionKey>>;
+type P2cFuture = <P2cBalance as tower::Service<HttpRequest<PartitionKey>>>::Future;
+type BufferedBalance = Buffer<HttpRequest<PartitionKey>, P2cFuture>;
+
 /// Configuration parameters needed to construct per-endpoint services.
 #[derive(Clone)]
 pub(super) struct EndpointServiceConfig {
@@ -40,20 +56,100 @@ pub(super) struct EndpointServiceConfig {
     pub query_settings: QuerySettingsConfig,
 }
 
-struct EndpointEntry {
+/// Shared state between TrackedHttpService error handlers and the DNS refresh task.
+struct SharedDiscoveryState {
+    known_ips: Mutex<HashSet<IpAddr>>,
+    active_count: AtomicUsize,
+    refresh_notify: Notify,
+}
+
+/// Wraps an `HttpService` with load tracking and error-based endpoint removal.
+///
+/// Implements `Load` (returns in-flight request count) so that Tower's P2C
+/// balancer can route to the least-loaded endpoint. On connection errors,
+/// removes this endpoint from the discover channel so Balance stops routing
+/// to it.
+struct TrackedHttpService {
+    inner: HttpService<ClickhouseServiceRequestBuilder, PartitionKey>,
     ip: IpAddr,
-    service: HttpService<ClickhouseServiceRequestBuilder, PartitionKey>,
+    pending: Arc<AtomicUsize>,
+    discover_tx: mpsc::UnboundedSender<DiscoverEvent>,
+    shared: Arc<SharedDiscoveryState>,
 }
 
-struct SharedState {
-    entries: Vec<EndpointEntry>,
+impl Load for TrackedHttpService {
+    type Metric = usize;
+
+    fn load(&self) -> Self::Metric {
+        self.pending.load(Ordering::Relaxed)
+    }
 }
 
-/// A Tower service that round-robins HTTP requests across dynamically
-/// resolved ClickHouse pod IPs.
+impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
+    type Response = HttpResponse;
+    type Error = crate::Error;
+    type Future = BoxFuture<'static, Result<HttpResponse, crate::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+
+        let ip = self.ip;
+        let pending = self.pending.clone();
+        let discover_tx = self.discover_tx.clone();
+        let shared = self.shared.clone();
+        let fut = self.inner.call(request);
+
+        Box::pin(async move {
+            let result = fut.await;
+
+            pending.fetch_sub(1, Ordering::Relaxed);
+
+            if let Err(ref e) = result {
+                if is_connection_error(e) {
+                    warn!(
+                        message = "Removing failed ClickHouse endpoint.",
+                        ip = %ip,
+                        error = %e,
+                    );
+
+                    let trigger_refresh = {
+                        let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
+                        let removed = known.remove(&ip);
+                        if removed {
+                            let prev = shared.active_count.fetch_sub(1, Ordering::Relaxed);
+                            // Send Remove event to Balance.
+                            let _ = discover_tx.send(Ok(Change::Remove(ip)));
+                            prev == 1 // was the last endpoint
+                        } else {
+                            false
+                        }
+                    };
+
+                    if trigger_refresh {
+                        warn!(
+                            message = "All ClickHouse endpoints failed, triggering immediate DNS refresh."
+                        );
+                        shared.refresh_notify.notify_one();
+                    }
+                }
+            }
+
+            result
+        })
+    }
+}
+
+/// A Tower service that load-balances HTTP requests across dynamically
+/// resolved ClickHouse pod IPs using Tower's P2C (Power of Two Choices)
+/// load balancer.
 ///
 /// - Resolves a headless K8s service DNS name to pod IPs at startup
-/// - Dispatches requests round-robin across active endpoints
+/// - Dispatches requests via P2C: picks two random endpoints and routes to
+///   the one with fewer in-flight requests
 /// - Removes endpoints on connection failures (connect/closed errors)
 /// - Periodically re-resolves DNS in the background
 ///
@@ -61,9 +157,7 @@ struct SharedState {
 /// of this service are dropped (i.e., when the sink is torn down).
 #[derive(Clone)]
 pub struct HeadlessService {
-    state: Arc<Mutex<SharedState>>,
-    next: Arc<AtomicUsize>,
-    refresh_notify: Arc<Notify>,
+    inner: BufferedBalance,
     // Held to keep the background DNS refresh task alive. When all clones of
     // HeadlessService are dropped, this sender is dropped, signaling the
     // background task to exit.
@@ -81,33 +175,56 @@ impl HeadlessService {
     ) -> crate::Result<Self> {
         let initial_uris = dns::resolve_endpoints(&endpoint).await?;
 
-        let entries: Vec<EndpointEntry> = initial_uris
+        let (discover_tx, discover_rx) = mpsc::unbounded_channel::<DiscoverEvent>();
+
+        let initial_ips: HashSet<IpAddr> = initial_uris
             .iter()
-            .filter_map(|uri| {
-                let ip = dns::ip_from_uri(uri)?;
-                let service = build_endpoint_service(&client, uri.clone(), &svc_config);
-                Some(EndpointEntry { ip, service })
-            })
+            .filter_map(|uri| dns::ip_from_uri(uri))
             .collect();
 
-        if entries.is_empty() {
+        if initial_ips.is_empty() {
             return Err("DNS resolution returned no usable IP addresses for ClickHouse".into());
+        }
+
+        let shared = Arc::new(SharedDiscoveryState {
+            known_ips: Mutex::new(initial_ips.clone()),
+            active_count: AtomicUsize::new(initial_ips.len()),
+            refresh_notify: Notify::new(),
+        });
+
+        // Build TrackedHttpService for each initial IP and send Insert events.
+        for uri in &initial_uris {
+            if let Some(ip) = dns::ip_from_uri(uri) {
+                if initial_ips.contains(&ip) {
+                    let service = TrackedHttpService {
+                        inner: build_endpoint_service(&client, uri.clone(), &svc_config),
+                        ip,
+                        pending: Arc::new(AtomicUsize::new(0)),
+                        discover_tx: discover_tx.clone(),
+                        shared: shared.clone(),
+                    };
+                    let _ = discover_tx.send(Ok(Change::Insert(ip, service)));
+                }
+            }
         }
 
         info!(
             message = "HeadlessService initialized for ClickHouse.",
             endpoint = %endpoint,
-            active_endpoints = entries.len(),
+            active_endpoints = initial_ips.len(),
         );
 
-        let state = Arc::new(Mutex::new(SharedState { entries }));
-        let refresh_notify = Arc::new(Notify::new());
+        let discover_stream: DiscoverStream =
+            Box::pin(UnboundedReceiverStream::new(discover_rx));
+        let balance = Balance::new(discover_stream);
+        let buffer = Buffer::new(balance, 1);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let refresh_secs = dns_refresh_interval_secs.unwrap_or(DEFAULT_DNS_REFRESH_SECS);
+
         spawn_dns_refresh_task(
-            state.clone(),
-            refresh_notify.clone(),
+            shared,
+            discover_tx,
             client,
             endpoint,
             svc_config,
@@ -116,76 +233,24 @@ impl HeadlessService {
         );
 
         Ok(Self {
-            state,
-            next: Arc::new(AtomicUsize::new(0)),
-            refresh_notify,
+            inner: buffer,
             _shutdown_tx: Arc::new(shutdown_tx),
         })
     }
 }
 
-impl Service<HttpRequest<PartitionKey>> for HeadlessService {
+impl tower::Service<HttpRequest<PartitionKey>> for HeadlessService {
     type Response = HttpResponse;
     type Error = crate::Error;
     type Future = BoxFuture<'static, Result<HttpResponse, crate::Error>>;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
-        let state = self.state.clone();
-        let notify = self.refresh_notify.clone();
-        let idx = self.next.fetch_add(1, Ordering::Relaxed);
-
-        // Pick the next service via round-robin.
-        let pick = {
-            let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.entries.is_empty() {
-                None
-            } else {
-                let entry = &guard.entries[idx % guard.entries.len()];
-                Some((entry.service.clone(), entry.ip))
-            }
-        };
-
-        let (mut service, ip) = match pick {
-            Some(pick) => pick,
-            None => {
-                warn!(message = "No resolved ClickHouse endpoints available.");
-                notify.notify_one();
-                return Box::pin(async move {
-                    Err("No resolved ClickHouse endpoints available".into())
-                });
-            }
-        };
-
-        Box::pin(async move {
-            let result = service.call(request).await;
-
-            if let Err(ref e) = result {
-                if is_connection_error(e) {
-                    warn!(
-                        message = "Removing failed ClickHouse endpoint.",
-                        ip = %ip,
-                        error = %e,
-                    );
-                    let trigger_refresh = {
-                        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.entries.retain(|entry| entry.ip != ip);
-                        guard.entries.is_empty()
-                    };
-                    if trigger_refresh {
-                        warn!(
-                            message = "All ClickHouse endpoints failed, triggering immediate DNS refresh."
-                        );
-                        notify.notify_one();
-                    }
-                }
-            }
-
-            result
-        })
+        let fut = self.inner.call(request);
+        Box::pin(async move { fut.await.map_err(Into::into) })
     }
 }
 
@@ -217,13 +282,13 @@ fn build_endpoint_service(
 }
 
 /// Spawns a background task that periodically re-resolves DNS and reconciles
-/// the active endpoint set. Also listens for immediate-refresh notifications.
+/// the active endpoint set via the discover channel.
 ///
 /// The task exits when `shutdown_rx` detects that the sender has been dropped
 /// (i.e., when all `HeadlessService` clones are dropped during sink teardown).
 fn spawn_dns_refresh_task(
-    state: Arc<Mutex<SharedState>>,
-    notify: Arc<Notify>,
+    shared: Arc<SharedDiscoveryState>,
+    discover_tx: mpsc::UnboundedSender<DiscoverEvent>,
     client: HttpClient,
     endpoint: Uri,
     svc_config: EndpointServiceConfig,
@@ -238,7 +303,7 @@ fn spawn_dns_refresh_task(
         loop {
             tokio::select! {
                 _ = interval.tick() => {},
-                _ = notify.notified() => {
+                _ = shared.refresh_notify.notified() => {
                     interval.reset();
                 },
                 _ = shutdown_rx.changed() => break,
@@ -246,7 +311,13 @@ fn spawn_dns_refresh_task(
 
             match dns::resolve_endpoints(&endpoint).await {
                 Ok(new_uris) => {
-                    reconcile_endpoints(&state, &client, &svc_config, &new_uris);
+                    reconcile_endpoints(
+                        &shared,
+                        &discover_tx,
+                        &client,
+                        &svc_config,
+                        &new_uris,
+                    );
                 }
                 Err(e) => {
                     warn!(
@@ -261,12 +332,11 @@ fn spawn_dns_refresh_task(
     });
 }
 
-/// Reconciles the active endpoint set with freshly resolved URIs.
-/// - Removes entries whose IPs are no longer in DNS
-/// - Adds new entries for IPs that appeared in DNS
-/// - Preserves existing entries (and their connection state) for unchanged IPs
+/// Reconciles the active endpoint set with freshly resolved URIs by sending
+/// `Change::Insert` and `Change::Remove` events to the discover channel.
 fn reconcile_endpoints(
-    state: &Arc<Mutex<SharedState>>,
+    shared: &Arc<SharedDiscoveryState>,
+    discover_tx: &mpsc::UnboundedSender<DiscoverEvent>,
     client: &HttpClient,
     svc_config: &EndpointServiceConfig,
     new_uris: &[Uri],
@@ -276,21 +346,32 @@ fn reconcile_endpoints(
         .filter_map(|u| dns::ip_from_uri(u))
         .collect();
 
-    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    let current_ips: HashSet<IpAddr> = guard.entries.iter().map(|e| e.ip).collect();
+    let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
 
     // Remove endpoints no longer in DNS.
-    let before = guard.entries.len();
-    guard.entries.retain(|entry| new_ips.contains(&entry.ip));
-    let removed_count = before - guard.entries.len();
+    let stale_ips: Vec<IpAddr> = known.difference(&new_ips).copied().collect();
+    let removed_count = stale_ips.len();
+    for ip in &stale_ips {
+        known.remove(ip);
+        shared.active_count.fetch_sub(1, Ordering::Relaxed);
+        let _ = discover_tx.send(Ok(Change::Remove(*ip)));
+    }
 
     // Add new endpoints.
     let mut added_count = 0;
     for uri in new_uris {
         if let Some(ip) = dns::ip_from_uri(uri) {
-            if !current_ips.contains(&ip) {
-                let service = build_endpoint_service(client, uri.clone(), svc_config);
-                guard.entries.push(EndpointEntry { ip, service });
+            if !known.contains(&ip) {
+                let service = TrackedHttpService {
+                    inner: build_endpoint_service(client, uri.clone(), svc_config),
+                    ip,
+                    pending: Arc::new(AtomicUsize::new(0)),
+                    discover_tx: discover_tx.clone(),
+                    shared: shared.clone(),
+                };
+                let _ = discover_tx.send(Ok(Change::Insert(ip, service)));
+                known.insert(ip);
+                shared.active_count.fetch_add(1, Ordering::Relaxed);
                 added_count += 1;
             }
         }
@@ -301,7 +382,7 @@ fn reconcile_endpoints(
             message = "ClickHouse headless service endpoints reconciled.",
             added = added_count,
             removed = removed_count,
-            active = guard.entries.len(),
+            active = known.len(),
         );
     }
 }
@@ -329,45 +410,58 @@ mod tests {
     fn test_reconcile_adds_new_endpoints() {
         let client = make_test_client();
         let config = make_test_config();
-        let state = Arc::new(Mutex::new(SharedState {
-            entries: Vec::new(),
-        }));
+        let (discover_tx, mut discover_rx) = mpsc::unbounded_channel::<DiscoverEvent>();
+
+        let shared = Arc::new(SharedDiscoveryState {
+            known_ips: Mutex::new(HashSet::new()),
+            active_count: AtomicUsize::new(0),
+            refresh_notify: Notify::new(),
+        });
 
         let uris: Vec<Uri> = vec![
             "http://10.0.0.1:8123/".parse().unwrap(),
             "http://10.0.0.2:8123/".parse().unwrap(),
         ];
 
-        reconcile_endpoints(&state, &client, &config, &uris);
+        reconcile_endpoints(&shared, &discover_tx, &client, &config, &uris);
 
-        let guard = state.lock().unwrap();
-        assert_eq!(guard.entries.len(), 2);
-        let ips: HashSet<IpAddr> = guard.entries.iter().map(|e| e.ip).collect();
-        assert!(ips.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(ips.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+        // Verify shared state.
+        let known = shared.known_ips.lock().unwrap();
+        assert_eq!(known.len(), 2);
+        assert!(known.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(known.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+        drop(known);
+        assert_eq!(shared.active_count.load(Ordering::Relaxed), 2);
+
+        // Verify discover channel events.
+        let mut inserted_ips = HashSet::new();
+        while let Ok(event) = discover_rx.try_recv() {
+            if let Ok(Change::Insert(ip, _)) = event {
+                inserted_ips.insert(ip);
+            }
+        }
+        assert_eq!(inserted_ips.len(), 2);
     }
 
     #[test]
     fn test_reconcile_removes_stale_endpoints() {
         let client = make_test_client();
         let config = make_test_config();
+        let (discover_tx, mut discover_rx) = mpsc::unbounded_channel::<DiscoverEvent>();
 
-        let initial_uris: Vec<Uri> = vec![
-            "http://10.0.0.1:8123/".parse().unwrap(),
-            "http://10.0.0.2:8123/".parse().unwrap(),
-            "http://10.0.0.3:8123/".parse().unwrap(),
-        ];
+        let initial_ips: HashSet<IpAddr> = vec![
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            "10.0.0.3".parse().unwrap(),
+        ]
+        .into_iter()
+        .collect();
 
-        let entries: Vec<EndpointEntry> = initial_uris
-            .iter()
-            .filter_map(|uri| {
-                let ip = dns::ip_from_uri(uri)?;
-                let service = build_endpoint_service(&client, uri.clone(), &config);
-                Some(EndpointEntry { ip, service })
-            })
-            .collect();
-
-        let state = Arc::new(Mutex::new(SharedState { entries }));
+        let shared = Arc::new(SharedDiscoveryState {
+            known_ips: Mutex::new(initial_ips),
+            active_count: AtomicUsize::new(3),
+            refresh_notify: Notify::new(),
+        });
 
         // DNS now only returns 2 of the 3 original IPs.
         let new_uris: Vec<Uri> = vec![
@@ -375,36 +469,44 @@ mod tests {
             "http://10.0.0.3:8123/".parse().unwrap(),
         ];
 
-        reconcile_endpoints(&state, &client, &config, &new_uris);
+        reconcile_endpoints(&shared, &discover_tx, &client, &config, &new_uris);
 
-        let guard = state.lock().unwrap();
-        assert_eq!(guard.entries.len(), 2);
-        let ips: HashSet<IpAddr> = guard.entries.iter().map(|e| e.ip).collect();
-        assert!(ips.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(!ips.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
-        assert!(ips.contains(&"10.0.0.3".parse::<IpAddr>().unwrap()));
+        let known = shared.known_ips.lock().unwrap();
+        assert_eq!(known.len(), 2);
+        assert!(known.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!known.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+        assert!(known.contains(&"10.0.0.3".parse::<IpAddr>().unwrap()));
+        drop(known);
+        assert_eq!(shared.active_count.load(Ordering::Relaxed), 2);
+
+        // Verify a Remove event was sent for 10.0.0.2.
+        let mut removed_ips = HashSet::new();
+        while let Ok(event) = discover_rx.try_recv() {
+            if let Ok(Change::Remove(ip)) = event {
+                removed_ips.insert(ip);
+            }
+        }
+        assert!(removed_ips.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
     fn test_reconcile_preserves_existing() {
         let client = make_test_client();
         let config = make_test_config();
+        let (discover_tx, mut discover_rx) = mpsc::unbounded_channel::<DiscoverEvent>();
 
-        let initial_uris: Vec<Uri> = vec![
-            "http://10.0.0.1:8123/".parse().unwrap(),
-            "http://10.0.0.2:8123/".parse().unwrap(),
-        ];
+        let initial_ips: HashSet<IpAddr> = vec![
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+        ]
+        .into_iter()
+        .collect();
 
-        let entries: Vec<EndpointEntry> = initial_uris
-            .iter()
-            .filter_map(|uri| {
-                let ip = dns::ip_from_uri(uri)?;
-                let service = build_endpoint_service(&client, uri.clone(), &config);
-                Some(EndpointEntry { ip, service })
-            })
-            .collect();
-
-        let state = Arc::new(Mutex::new(SharedState { entries }));
+        let shared = Arc::new(SharedDiscoveryState {
+            known_ips: Mutex::new(initial_ips),
+            active_count: AtomicUsize::new(2),
+            refresh_notify: Notify::new(),
+        });
 
         // DNS returns the same IPs plus a new one.
         let new_uris: Vec<Uri> = vec![
@@ -413,10 +515,30 @@ mod tests {
             "http://10.0.0.3:8123/".parse().unwrap(),
         ];
 
-        reconcile_endpoints(&state, &client, &config, &new_uris);
+        reconcile_endpoints(&shared, &discover_tx, &client, &config, &new_uris);
 
-        let guard = state.lock().unwrap();
-        assert_eq!(guard.entries.len(), 3);
+        let known = shared.known_ips.lock().unwrap();
+        assert_eq!(known.len(), 3);
+        drop(known);
+        assert_eq!(shared.active_count.load(Ordering::Relaxed), 3);
+
+        // Only one Insert event (for 10.0.0.3), no Remove events.
+        let mut inserted_ips = HashSet::new();
+        let mut removed_ips = HashSet::new();
+        while let Ok(event) = discover_rx.try_recv() {
+            match event {
+                Ok(Change::Insert(ip, _)) => {
+                    inserted_ips.insert(ip);
+                }
+                Ok(Change::Remove(ip)) => {
+                    removed_ips.insert(ip);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(inserted_ips.len(), 1);
+        assert!(inserted_ips.contains(&"10.0.0.3".parse::<IpAddr>().unwrap()));
+        assert!(removed_ips.is_empty());
     }
 
     fn make_test_client() -> HttpClient {

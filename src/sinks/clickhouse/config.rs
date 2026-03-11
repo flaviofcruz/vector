@@ -142,8 +142,9 @@ pub struct ClickhouseConfig {
     /// When true, treat the endpoint as a headless Kubernetes service DNS name.
     ///
     /// The hostname is resolved to individual pod IPs and requests are
-    /// dispatched round-robin across all resolved endpoints. Failed endpoints
-    /// are automatically removed and re-discovered on the next DNS refresh.
+    /// load-balanced across all resolved endpoints using the Power of Two
+    /// Choices (P2C) algorithm. Failed endpoints are automatically removed
+    /// and re-discovered on the next DNS refresh.
     #[serde(default)]
     pub use_headless_service: bool,
 
@@ -293,7 +294,7 @@ impl ClickhouseConfig {
         self.build_sink_and_healthcheck(params, service)
     }
 
-    /// Builds the headless-service sink with round-robin dispatch across
+    /// Builds the headless-service sink with P2C load-balanced dispatch across
     /// dynamically resolved pod IPs.
     async fn build_headless(
         &self,
