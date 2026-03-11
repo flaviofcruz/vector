@@ -13,7 +13,12 @@ use tokio::net::lookup_host;
 /// a `Vec<Uri>` with each resolved IP substituted into the original URI.
 ///
 /// The scheme, port, and path of the original URI are preserved.
-/// Duplicate IPs are deduplicated. IPv6 addresses are wrapped in brackets.
+/// Duplicate IPs are deduplicated.
+///
+/// Note: `lookup_host` requires a `(host, port)` tuple — `Uri` does not
+/// implement `ToSocketAddrs`, so we extract those components from the URI.
+/// The resolved URIs are built using `Uri::builder()` with `SocketAddr`'s
+/// `Display` impl (which handles IPv6 bracket formatting per RFC 3986).
 pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
     let host = endpoint.host().ok_or("Endpoint URI has no host")?;
     let port = endpoint.port_u16().unwrap_or(match endpoint.scheme_str() {
@@ -40,11 +45,16 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
         .into_iter()
         .filter(|addr| seen.insert(addr.ip()))
         .map(|addr| {
-            let host_str = format_ip_for_uri(addr.ip());
-            let uri_str = format!("{}://{}:{}{}", scheme, host_str, port, path_and_query);
-            uri_str
-                .parse::<Uri>()
-                .map_err(|e| format!("Failed to parse resolved URI '{}': {}", uri_str, e).into())
+            // SocketAddr::to_string() formats as "ip:port" for IPv4 and
+            // "[ip]:port" for IPv6, which is valid URI authority syntax.
+            Uri::builder()
+                .scheme(scheme)
+                .authority(addr.to_string().as_str())
+                .path_and_query(path_and_query)
+                .build()
+                .map_err(|e| {
+                    format!("Failed to build resolved URI for '{}': {}", addr, e).into()
+                })
         })
         .collect::<crate::Result<Vec<Uri>>>()?;
 
@@ -60,10 +70,12 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
 
 /// Extracts the IP address from a resolved URI's host component.
 ///
-/// `http::Uri` stores IPv6 hosts with brackets (e.g., `[::1]`), but
-/// `IpAddr::parse` does not accept brackets, so we strip them here.
+/// `http::Uri::host()` includes brackets for IPv6 (e.g., `[::1]`), but
+/// `IpAddr::parse` does not accept brackets, so we strip them before parsing.
 pub fn ip_from_uri(uri: &Uri) -> Option<IpAddr> {
     uri.host().and_then(|h| {
+        // Strip IPv6 brackets: http::Uri::host() returns "[::1]" for IPv6,
+        // but IpAddr expects "::1".
         let h = h
             .strip_prefix('[')
             .and_then(|h| h.strip_suffix(']'))
@@ -72,31 +84,9 @@ pub fn ip_from_uri(uri: &Uri) -> Option<IpAddr> {
     })
 }
 
-/// Formats an IP address for embedding in a URI authority component.
-///
-/// IPv6 addresses must be wrapped in brackets per RFC 3986 (e.g., `[::1]`).
-fn format_ip_for_uri(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => format!("[{}]", v6),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_format_ip_for_uri_v4() {
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        assert_eq!(format_ip_for_uri(ip), "127.0.0.1");
-    }
-
-    #[test]
-    fn test_format_ip_for_uri_v6() {
-        let ip: IpAddr = "::1".parse().unwrap();
-        assert_eq!(format_ip_for_uri(ip), "[::1]");
-    }
 
     #[test]
     fn test_ip_from_uri_v4() {
