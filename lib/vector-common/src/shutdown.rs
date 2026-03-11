@@ -260,50 +260,18 @@ impl SourceShutdownCoordinator {
     /// force shutdown signal.  The force shutdown signal will be sent to any sources that
     /// don't cleanly shut down before the given `deadline`.
     ///
+    /// Non-deferred (external) sources are shut down first, then deferred (internal) sources.
+    ///
     /// # Panics
     ///
     /// Panics if this coordinator has had its triggers removed (ie
     /// has been taken over with `Self::takeover_source`).
     pub fn shutdown_all(self, deadline: Option<Instant>) -> impl Future<Output = ()> {
-        let mut internal_sources_complete_futures = Vec::new();
-        let mut external_sources_complete_futures = Vec::new();
-
-        let shutdown_begun_triggers = self.begun_triggers;
-        let mut shutdown_complete_tripwires = self.complete_tripwires;
-        let mut shutdown_force_triggers = self.force_triggers;
-
-        for (id, (internal, trigger)) in shutdown_begun_triggers {
-            trigger.cancel();
-
-            let shutdown_complete_tripwire =
-                shutdown_complete_tripwires.remove(&id).unwrap_or_else(|| {
-                    panic!(
-                "shutdown_complete_tripwire for source \"{id}\" not found in the ShutdownCoordinator"
-            )
-                });
-            let shutdown_force_trigger = shutdown_force_triggers.remove(&id).unwrap_or_else(|| {
-                panic!(
-                    "shutdown_force_trigger for source \"{id}\" not found in the ShutdownCoordinator"
-                )
-            });
-
-            let source_complete = SourceShutdownCoordinator::shutdown_source_complete(
-                shutdown_complete_tripwire,
-                shutdown_force_trigger,
-                id.clone(),
-                deadline,
-            );
-
-            if internal {
-                internal_sources_complete_futures.push(source_complete);
-            } else {
-                external_sources_complete_futures.push(source_complete);
-            }
+        let (wave1_future, deferred) = self.shutdown_non_deferred(deadline);
+        async move {
+            wave1_future.await;
+            deferred.shutdown_all(deadline).await;
         }
-
-        futures::future::join_all(external_sources_complete_futures)
-            .then(|_| futures::future::join_all(internal_sources_complete_futures))
-            .map(|_| ())
     }
 
     /// Sends a signal to begin shutting down only non-internal (data) sources, and returns:
