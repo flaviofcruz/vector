@@ -145,6 +145,8 @@ pub struct ClickhouseConfig {
     /// load-balanced across all resolved endpoints using the Power of Two
     /// Choices (P2C) algorithm. Failed endpoints are automatically removed
     /// and re-discovered on the next DNS refresh.
+    /// When headless mode is enabled, the communication to clickhouse Pod IPs
+    /// happens over HTTP
     #[serde(default)]
     pub use_headless_service: bool,
 
@@ -153,6 +155,17 @@ pub struct ClickhouseConfig {
     /// Defaults to 30 seconds.
     #[serde(default)]
     pub dns_refresh_interval_secs: Option<u64>,
+
+    /// Fallback endpoint used when all headless pod IPs are unreachable.
+    ///
+    /// Required when `use_headless_service` is true. This should be a normal
+    /// ClusterIP Kubernetes service (not a headless service) that handles its
+    /// own routing. When all resolved pod IPs have been removed due to
+    /// connection errors, requests are routed to this fallback until the
+    /// headless DNS refresh re-discovers healthy pods.
+    #[configurable(metadata(docs::examples = "http://cluster-service-write.logging-clickhouse.svc.cluster.local:8123"))]
+    #[serde(default)]
+    pub fallback_endpoint: Option<UriSerde>,
 }
 
 /// Query settings for the `clickhouse` sink.
@@ -247,6 +260,33 @@ impl SinkConfig for ClickhouseConfig {
             encoder: (self.encoding.clone(), encoder_kind),
         };
 
+        if self.use_headless_service {
+            if self.fallback_endpoint.is_none() {
+                return Err(
+                    "'fallback_endpoint' is required when 'use_headless_service' is true".into(),
+                );
+            }
+            if endpoint.scheme_str() == Some("https") {
+                return Err(
+                    "HTTPS is not supported with 'use_headless_service'. Headless DNS resolution \
+                     replaces the hostname with pod IPs, which breaks TLS certificate hostname \
+                     verification. Use HTTP for pod-to-pod traffic instead."
+                        .into(),
+                );
+            }
+            if self
+                .fallback_endpoint
+                .as_ref()
+                .is_some_and(|fe| fe.uri.scheme_str() == Some("https"))
+            {
+                return Err(
+                    "HTTPS is not supported for 'fallback_endpoint' when 'use_headless_service' \
+                     is enabled. Use HTTP for pod-to-pod traffic instead."
+                        .into(),
+                );
+            }
+        }
+
         let params = ClickhouseBuildParams {
             client,
             endpoint,
@@ -309,11 +349,19 @@ impl ClickhouseConfig {
             query_settings: self.query_settings,
         };
 
+        let fallback_uri = self
+            .fallback_endpoint
+            .as_ref()
+            .expect("fallback_endpoint validated above")
+            .with_default_parts()
+            .uri;
+
         let headless = HeadlessService::new(
             params.client.clone(),
             params.endpoint.clone(),
             svc_config,
             self.dns_refresh_interval_secs,
+            fallback_uri,
         )
         .await?;
 

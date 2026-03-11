@@ -158,6 +158,11 @@ impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
 #[derive(Clone)]
 pub struct HeadlessService {
     inner: BufferedBalance,
+    fallback: HttpService<ClickhouseServiceRequestBuilder, PartitionKey>,
+    shared: Arc<SharedDiscoveryState>,
+    /// Tracks which service was polled in `poll_ready` so the matching one is
+    /// used in `call`. `true` means the fallback was polled ready.
+    using_fallback: bool,
     // Held to keep the background DNS refresh task alive. When all clones of
     // HeadlessService are dropped, this sender is dropped, signaling the
     // background task to exit.
@@ -172,6 +177,7 @@ impl HeadlessService {
         endpoint: Uri,
         svc_config: EndpointServiceConfig,
         dns_refresh_interval_secs: Option<u64>,
+        fallback_uri: Uri,
     ) -> crate::Result<Self> {
         let initial_uris = dns::resolve_endpoints(&endpoint).await?;
 
@@ -214,6 +220,12 @@ impl HeadlessService {
             active_endpoints = initial_ips.len(),
         );
 
+        let fallback = build_endpoint_service(&client, fallback_uri.clone(), &svc_config);
+        info!(
+            message = "HeadlessService fallback endpoint configured.",
+            fallback_endpoint = %fallback_uri,
+        );
+
         let discover_stream: DiscoverStream =
             Box::pin(UnboundedReceiverStream::new(discover_rx));
         let balance = Balance::new(discover_stream);
@@ -223,7 +235,7 @@ impl HeadlessService {
         let refresh_secs = dns_refresh_interval_secs.unwrap_or(DEFAULT_DNS_REFRESH_SECS);
 
         spawn_dns_refresh_task(
-            shared,
+            shared.clone(),
             discover_tx,
             client,
             endpoint,
@@ -234,6 +246,9 @@ impl HeadlessService {
 
         Ok(Self {
             inner: buffer,
+            fallback,
+            shared,
+            using_fallback: false,
             _shutdown_tx: Arc::new(shutdown_tx),
         })
     }
@@ -245,12 +260,23 @@ impl tower::Service<HttpRequest<PartitionKey>> for HeadlessService {
     type Future = BoxFuture<'static, Result<HttpResponse, crate::Error>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
+        if self.shared.active_count.load(Ordering::Relaxed) == 0 {
+            self.using_fallback = true;
+            self.fallback.poll_ready(cx)
+        } else {
+            self.using_fallback = false;
+            self.inner.poll_ready(cx).map_err(Into::into)
+        }
     }
 
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
-        let fut = self.inner.call(request);
-        Box::pin(async move { fut.await.map_err(Into::into) })
+        if self.using_fallback {
+            warn!(message = "All headless endpoints unavailable, routing to fallback ClusterIP service.");
+            self.fallback.call(request)
+        } else {
+            let fut = self.inner.call(request);
+            Box::pin(async move { fut.await.map_err(Into::into) })
+        }
     }
 }
 
