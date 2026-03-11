@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use http::Uri;
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower::balance::p2c::Balance;
 use tower::buffer::Buffer;
@@ -85,6 +85,80 @@ impl Load for TrackedHttpService {
     }
 }
 
+/// Guard that decrements the pending counter and removes the endpoint from the
+/// active set when the request future is dropped without completing (e.g., when
+/// Tower's timeout layer cancels the request).
+///
+/// When a pod is deleted, the TCP connection hangs until the OS-level SYN retry
+/// timeout (~60-127s on Linux). Tower's request timeout fires first and drops
+/// the future. Without this guard, the endpoint would never be removed and the
+/// pending counter would leak.
+struct RequestGuard {
+    ip: IpAddr,
+    pending: Arc<AtomicUsize>,
+    discover_tx: mpsc::UnboundedSender<DiscoverEvent>,
+    shared: Arc<SharedDiscoveryState>,
+    completed: bool,
+}
+
+impl RequestGuard {
+    /// Marks the request as completed so `Drop` won't remove the endpoint.
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::Relaxed);
+
+        if !self.completed {
+            // Future was cancelled (e.g., by Tower timeout) before HttpService
+            // returned. Treat as endpoint failure — remove it so Balance stops
+            // routing to this pod. DNS refresh will re-add it if it recovers.
+            remove_endpoint(
+                &self.shared,
+                &self.discover_tx,
+                self.ip,
+                "request cancelled (likely timeout)",
+            );
+        }
+    }
+}
+
+/// Removes an endpoint IP from the active set and notifies Balance via the
+/// discover channel. Triggers an immediate DNS refresh if this was the last
+/// active endpoint.
+fn remove_endpoint(
+    shared: &Arc<SharedDiscoveryState>,
+    discover_tx: &mpsc::UnboundedSender<DiscoverEvent>,
+    ip: IpAddr,
+    reason: &str,
+) {
+    warn!(
+        message = "Removing failed ClickHouse endpoint.",
+        ip = %ip,
+        reason = %reason,
+    );
+
+    let trigger_refresh = {
+        let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = known.remove(&ip);
+        if removed {
+            let prev = shared.active_count.fetch_sub(1, Ordering::Relaxed);
+            let _ = discover_tx.send(Ok(Change::Remove(ip)));
+            prev == 1 // was the last endpoint
+        } else {
+            false
+        }
+    };
+
+    if trigger_refresh {
+        warn!(message = "All ClickHouse endpoints failed, triggering immediate DNS refresh.");
+        shared.refresh_notify.notify_one();
+    }
+}
+
 impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
     type Response = HttpResponse;
     type Error = crate::Error;
@@ -97,44 +171,25 @@ impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
         self.pending.fetch_add(1, Ordering::Relaxed);
 
-        let ip = self.ip;
-        let pending = self.pending.clone();
-        let discover_tx = self.discover_tx.clone();
-        let shared = self.shared.clone();
+        let mut guard = RequestGuard {
+            ip: self.ip,
+            pending: self.pending.clone(),
+            discover_tx: self.discover_tx.clone(),
+            shared: self.shared.clone(),
+            completed: false,
+        };
+
         let fut = self.inner.call(request);
 
         Box::pin(async move {
             let result = fut.await;
 
-            pending.fetch_sub(1, Ordering::Relaxed);
+            // Mark as completed so the guard won't remove the endpoint on drop.
+            guard.complete();
 
             if let Err(ref e) = result {
                 if is_connection_error(e) {
-                    warn!(
-                        message = "Removing failed ClickHouse endpoint.",
-                        ip = %ip,
-                        error = %e,
-                    );
-
-                    let trigger_refresh = {
-                        let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
-                        let removed = known.remove(&ip);
-                        if removed {
-                            let prev = shared.active_count.fetch_sub(1, Ordering::Relaxed);
-                            // Send Remove event to Balance.
-                            let _ = discover_tx.send(Ok(Change::Remove(ip)));
-                            prev == 1 // was the last endpoint
-                        } else {
-                            false
-                        }
-                    };
-
-                    if trigger_refresh {
-                        warn!(
-                            message = "All ClickHouse endpoints failed, triggering immediate DNS refresh."
-                        );
-                        shared.refresh_notify.notify_one();
-                    }
+                    remove_endpoint(&guard.shared, &guard.discover_tx, guard.ip, &e.to_string());
                 }
             }
 
@@ -226,8 +281,7 @@ impl HeadlessService {
             fallback_endpoint = %fallback_uri,
         );
 
-        let discover_stream: DiscoverStream =
-            Box::pin(UnboundedReceiverStream::new(discover_rx));
+        let discover_stream: DiscoverStream = Box::pin(UnboundedReceiverStream::new(discover_rx));
         let balance = Balance::new(discover_stream);
         let buffer = Buffer::new(balance, 1);
 
@@ -271,7 +325,10 @@ impl tower::Service<HttpRequest<PartitionKey>> for HeadlessService {
 
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
         if self.using_fallback {
-            warn!(message = "All headless endpoints unavailable, routing to fallback ClusterIP service.");
+            warn!(
+                message =
+                    "All headless endpoints unavailable, routing to fallback ClusterIP service."
+            );
             self.fallback.call(request)
         } else {
             let fut = self.inner.call(request);
@@ -280,13 +337,49 @@ impl tower::Service<HttpRequest<PartitionKey>> for HeadlessService {
     }
 }
 
-/// Returns true if the error is a connection-level failure (connect or closed),
-/// as opposed to an HTTP-level or parse error.
+/// Returns true if the error is a connection-level failure, as opposed to an
+/// HTTP-level or parse error. Covers:
+/// - `is_connect()`: TCP handshake failures
+/// - `is_closed()`: connection pool channel closed
+/// - `is_incomplete_message()`: connection dropped mid-message
+/// - `is_timeout()`: connection timed out
+/// - IO errors with connection-related kinds (ConnectionReset, BrokenPipe, etc.)
+///
+/// Note: hyper 0.14 wraps mid-stream IO errors (like "Connection reset by peer")
+/// as `Kind::Io` which has no public checker method, so we walk the source chain
+/// to find the underlying `std::io::Error`.
 fn is_connection_error(error: &crate::Error) -> bool {
     error.downcast_ref::<HttpError>().is_some_and(|e| match e {
-        HttpError::CallRequest { source } => source.is_connect() || source.is_closed(),
+        HttpError::CallRequest { source } => {
+            source.is_connect()
+                || source.is_closed()
+                || source.is_incomplete_message()
+                || source.is_timeout()
+                || has_io_connection_error(source as &dyn std::error::Error)
+        }
         _ => false,
     })
+}
+
+/// Walks the error and its source chain looking for an `io::Error` with a
+/// connection-related kind. This catches hyper's `Kind::Io` errors that have
+/// no public checker method (e.g., "Connection reset by peer").
+fn has_io_connection_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    // Check the error itself first, then walk the source chain.
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::BrokenPipe
+            );
+        }
+        current = err.source();
+    }
+    false
 }
 
 /// Builds an `HttpService` targeting a single resolved endpoint URI.
@@ -337,13 +430,7 @@ fn spawn_dns_refresh_task(
 
             match dns::resolve_endpoints(&endpoint).await {
                 Ok(new_uris) => {
-                    reconcile_endpoints(
-                        &shared,
-                        &discover_tx,
-                        &client,
-                        &svc_config,
-                        &new_uris,
-                    );
+                    reconcile_endpoints(&shared, &discover_tx, &client, &svc_config, &new_uris);
                 }
                 Err(e) => {
                     warn!(
@@ -425,11 +512,33 @@ mod tests {
 
     #[test]
     fn test_is_connection_error_with_io_error() {
+        // A bare io::Error (not wrapped in HttpError) should NOT match.
         let err: crate::Error = Box::new(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "connection refused",
         ));
         assert!(!is_connection_error(&err));
+    }
+
+    #[test]
+    fn test_has_io_connection_error_connection_reset() {
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "Connection reset by peer (os error 104)",
+        );
+        assert!(has_io_connection_error(&io_err));
+    }
+
+    #[test]
+    fn test_has_io_connection_error_broken_pipe() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        assert!(has_io_connection_error(&io_err));
+    }
+
+    #[test]
+    fn test_has_io_connection_error_other_kind() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        assert!(!has_io_connection_error(&io_err));
     }
 
     #[test]
@@ -521,12 +630,10 @@ mod tests {
         let config = make_test_config();
         let (discover_tx, mut discover_rx) = mpsc::unbounded_channel::<DiscoverEvent>();
 
-        let initial_ips: HashSet<IpAddr> = vec![
-            "10.0.0.1".parse().unwrap(),
-            "10.0.0.2".parse().unwrap(),
-        ]
-        .into_iter()
-        .collect();
+        let initial_ips: HashSet<IpAddr> =
+            vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()]
+                .into_iter()
+                .collect();
 
         let shared = Arc::new(SharedDiscoveryState {
             known_ips: Mutex::new(initial_ips),

@@ -163,7 +163,9 @@ pub struct ClickhouseConfig {
     /// own routing. When all resolved pod IPs have been removed due to
     /// connection errors, requests are routed to this fallback until the
     /// headless DNS refresh re-discovers healthy pods.
-    #[configurable(metadata(docs::examples = "http://cluster-service-write.logging-clickhouse.svc.cluster.local:8123"))]
+    #[configurable(metadata(
+        docs::examples = "http://cluster-service-write.logging-clickhouse.svc.cluster.local:8123"
+    ))]
     #[serde(default)]
     pub fallback_endpoint: Option<UriSerde>,
 }

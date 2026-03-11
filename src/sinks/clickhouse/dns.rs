@@ -52,9 +52,7 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
                 .authority(addr.to_string().as_str())
                 .path_and_query(path_and_query)
                 .build()
-                .map_err(|e| {
-                    format!("Failed to build resolved URI for '{}': {}", addr, e).into()
-                })
+                .map_err(|e| format!("Failed to build resolved URI for '{}': {}", addr, e).into())
         })
         .collect::<crate::Result<Vec<Uri>>>()?;
 
