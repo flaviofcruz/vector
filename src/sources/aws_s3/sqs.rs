@@ -46,7 +46,6 @@ use vector_lib::{
 
 use crate::codecs::Decoder;
 use crate::event::{Event, LogEvent};
-use crate::sources::util::{ClickHouseDeduplicator, DeduplicationClient};
 use crate::{
     SourceSender,
     aws::AwsTimeout,
@@ -308,7 +307,6 @@ pub struct State {
     delete_message: bool,
     delete_failed_message: bool,
     decoder: Decoder,
-    deduplication_client: Option<DeduplicationClient>,
 
     deferred: Option<DeferredConfig>,
     process_custom_message: bool,
@@ -327,15 +325,12 @@ impl Ingestor {
         compression: super::Compression,
         multiline: Option<line_agg::Config>,
         decoder: Decoder,
-        clickhouse_dedupe: Option<ClickHouseDeduplicator>,
     ) -> Result<Ingestor, IngestorNewError> {
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 10 {
             return Err(IngestorNewError::InvalidNumberOfMessages {
                 messages: config.max_number_of_messages,
             });
         }
-
-        let deduplication_client = clickhouse_dedupe.and_then(DeduplicationClient::new);
 
         let state = Arc::new(State {
             region,
@@ -357,7 +352,6 @@ impl Ingestor {
             delete_message: config.delete_message,
             delete_failed_message: config.delete_failed_message,
             decoder,
-            deduplication_client,
 
             deferred: config.deferred,
             process_custom_message: config.process_custom_message,
@@ -729,7 +723,7 @@ impl IngestorProcess {
             key = %msg.key,
             region = %region,
         );
-        self.process_s3_object(&msg.bucket, &msg.key, &region, self.log_namespace, None)
+        self.process_s3_object(&msg.bucket, &msg.key, &region, self.log_namespace)
             .await
     }
 
@@ -794,34 +788,6 @@ impl IngestorProcess {
             });
         }
 
-        // Check for deduplication if configured
-        if let Some(dedup_client) = &self.state.deduplication_client {
-            let file_size = s3_event.s3.object.size;
-
-            // Check if we should ingest this file
-            if !dedup_client
-                .should_ingest(&s3_event.s3.object.key, file_size)
-                .await
-            {
-                debug!(
-                    message = "Skipping S3 object due to deduplication check.",
-                    bucket = %s3_event.s3.bucket.name,
-                    key = %s3_event.s3.object.key,
-                    log_path = %s3_event.s3.object.key,
-                    internal_log_rate_limit = true
-                );
-                return Ok(());
-            }
-
-            debug!(
-                message = "Proceeding to process S3 object after deduplication check.",
-                bucket = %s3_event.s3.bucket.name,
-                key = %s3_event.s3.object.key,
-                log_path = %s3_event.s3.object.key,
-                internal_log_rate_limit = true
-            );
-        }
-
         if let Some(deferred) = &self.state.deferred {
             // Parse event_time string (ISO-8601 format) to DateTime
             if let Ok(event_dt) = chrono::DateTime::parse_from_rfc3339(&s3_event.event_time) {
@@ -841,7 +807,6 @@ impl IngestorProcess {
             &s3_event.s3.object.key,
             &s3_event.aws_region,
             log_namespace,
-            Some(&s3_event.event_time),
         )
         .await
     }
@@ -854,17 +819,12 @@ impl IngestorProcess {
     /// uses `self.state.s3_client`, which is bound to the source's configured region.
     /// It is the caller's responsibility to validate region consistency before calling
     /// this method (e.g., by rejecting cross-region requests with `WrongRegion`).
-    ///
-    /// `event_time` is the S3 event timestamp (ISO-8601), passed to dedup `mark_completion`.
-    /// Pass `None` for direct ingest messages that don't provide one; the current time
-    /// will be used as a fallback for dedup metadata.
     async fn process_s3_object(
         &mut self,
         bucket: &str,
         key: &str,
         region: &str,
         log_namespace: LogNamespace,
-        event_time: Option<&str>,
     ) -> Result<(), ProcessingError> {
         let processing_start_time = Utc::now();
         let download_start = Instant::now();
@@ -897,7 +857,6 @@ impl IngestorProcess {
         );
 
         let metadata = object.metadata.clone();
-        let object_content_length = object.content_length().unwrap_or(0) as u64;
 
         let timestamp = object.last_modified.map(|ts| {
             Utc.timestamp_opt(ts.secs(), ts.subsec_nanos())
@@ -1075,23 +1034,6 @@ impl IngestorProcess {
                 }
             }
         };
-
-        // Mark completion status in ClickHouse if deduplication is configured
-        if let Some(dedup_client) = &self.state.deduplication_client {
-            let success = processing_result.is_ok();
-            let fallback_time = processing_start_time.to_rfc3339();
-            let file_creation_timestamp = event_time.unwrap_or(&fallback_time);
-
-            // Note: Errors are logged internally by the DeduplicationClient
-            dedup_client
-                .mark_completion(
-                    &key,
-                    file_creation_timestamp,
-                    object_content_length,
-                    success,
-                )
-                .await;
-        }
 
         processing_result
     }

@@ -27,7 +27,7 @@ use vector_lib::lookup::owned_value_path;
 use vrl::value::{Kind, kind::Collection};
 
 // Local imports
-use super::util::{MultilineConfig, clickhouse_dedupe::ClickHouseDeduplicator};
+use super::util::MultilineConfig;
 use crate::codecs::DecodingConfig;
 use crate::{
     config::{SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput},
@@ -163,16 +163,6 @@ pub struct AzureBlobConfig {
     #[serde(default = "default_decoding")]
     #[derivative(Default(value = "default_decoding()"))]
     pub decoding: DeserializerConfig,
-
-    /// Optional ClickHouse-based deduplication configuration.
-    ///
-    /// When enabled, the source will check a ClickHouse table to determine
-    /// if a blob has already been processed before downloading and processing it.
-    /// This helps prevent reprocessing of the same data across restarts or
-    /// when multiple Vector instances are processing the same queue.
-    #[configurable(derived)]
-    #[serde(default)]
-    pub clickhouse_dedupe: Option<ClickHouseDeduplicator>,
 }
 
 /// Default framing configuration for backward compatibility.
@@ -351,7 +341,6 @@ impl AzureBlobConfig {
             self.compression,
             multiline,
             decoder,
-            self.clickhouse_dedupe.clone(),
         )
         .await?;
 
@@ -1081,101 +1070,5 @@ mod test {
                 }
             }
         }
-    }
-
-    #[test]
-    /// This test checks ClickHouse deduplication configuration with the same endpoint for read and write.
-    /// It verifies that the configuration is parsed correctly and that both read and write endpoints
-    /// are set to the same value specified in the config.
-    fn test_azure_blob_config_with_clickhouse_dedupe_same_endpoint() {
-        let config_str = r#"
-        {
-            "connection_string": "DefaultEndpointsProtocol=https;AccountName=myaccount;AccountKey=mykey;EndpointSuffix=core.windows.net",
-            "queue": {
-                "queue_name": "test-queue"
-            },
-            "clickhouse_dedupe": {
-                "endpoints": {
-                    "type": "single",
-                    "endpoint": "http://clickhouse:8123/"
-                },
-                "database": "test_db",
-                "table": "file_metadata"
-            }
-        }
-        "#;
-
-        let config: AzureBlobConfig = serde_json::from_str(config_str).unwrap();
-        assert!(config.clickhouse_dedupe.is_some());
-        let dedupe_config = config.clickhouse_dedupe.unwrap();
-        assert_eq!(dedupe_config.database, "test_db");
-        assert_eq!(dedupe_config.table, "file_metadata");
-        assert_eq!(
-            dedupe_config.endpoints.read_endpoint().to_string(),
-            "http://clickhouse:8123/"
-        );
-        assert_eq!(
-            dedupe_config.endpoints.write_endpoint().to_string(),
-            "http://clickhouse:8123/"
-        );
-    }
-
-    #[test]
-    /// This test checks ClickHouse deduplication configuration with separate read and write endpoints.
-    /// It verifies that the configuration is parsed correctly and that the read and write endpoints
-    /// are set as expected.
-    fn test_azure_blob_config_with_clickhouse_dedupe_separate_endpoints() {
-        let config_str = r#"
-        {
-            "connection_string": "DefaultEndpointsProtocol=https;AccountName=myaccount;AccountKey=mykey;EndpointSuffix=core.windows.net",
-            "queue": {
-                "queue_name": "production-queue",
-                "poll_secs": 30,
-                "visibility_timeout_secs": 600,
-                "max_number_of_messages": 5
-            },
-            "clickhouse_dedupe": {
-                "endpoints": {
-                    "type": "separate",
-                    "read_endpoint": "http://clickhouse-read:8123/",
-                    "write_endpoint": "http://clickhouse-write:8123/"
-                },
-                "database": "prod_db",
-                "table": "azure_blob_metadata"
-            }
-        }
-        "#;
-
-        let config: AzureBlobConfig = serde_json::from_str(config_str).unwrap();
-        assert!(config.clickhouse_dedupe.is_some());
-        let dedupe_config = config.clickhouse_dedupe.unwrap();
-        assert_eq!(dedupe_config.database, "prod_db");
-        assert_eq!(dedupe_config.table, "azure_blob_metadata");
-        assert_eq!(
-            dedupe_config.endpoints.read_endpoint().to_string(),
-            "http://clickhouse-read:8123/"
-        );
-        assert_eq!(
-            dedupe_config.endpoints.write_endpoint().to_string(),
-            "http://clickhouse-write:8123/"
-        );
-    }
-
-    #[test]
-    /// This test verifies that the configuration is correctly parsed if the
-    /// ClickHouse deduplication section is omitted. It checks that the `clickhouse_dedupe`
-    /// field is `None` when not provided in the configuration.
-    fn test_azure_blob_config_without_clickhouse_dedupe() {
-        let config_str = r#"
-        {
-            "connection_string": "DefaultEndpointsProtocol=https;AccountName=myaccount;AccountKey=mykey;EndpointSuffix=core.windows.net",
-            "queue": {
-                "queue_name": "test-queue"
-            }
-        }
-        "#;
-
-        let config: AzureBlobConfig = serde_json::from_str(config_str).unwrap();
-        assert!(config.clickhouse_dedupe.is_none());
     }
 }

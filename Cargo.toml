@@ -216,7 +216,6 @@ serial_test = { version = "3.2" }
 
 [dependencies]
 cfg-if.workspace = true
-clickhouse = { version = "0.13.3", features = ["chrono", "native-tls"] }
 clap.workspace = true
 clap_complete.workspace = true
 indoc.workspace = true
@@ -461,7 +460,6 @@ heim = { git = "https://github.com/vectordotdev/heim.git", branch = "update-nix"
 mlua = { version = "0.10.5", default-features = false, features = ["lua54", "send", "vendored", "macros"], optional = true }
 sysinfo = "0.37.2"
 byteorder = "1.5.0"
-serde_repr = "0.1.20"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.0"

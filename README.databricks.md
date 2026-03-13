@@ -83,4 +83,5 @@ This lists custom changes merged in Databricks fork of Vector.
 82. Use option to use dynamic allocation in fingerprinter https://github.com/databricks-eng/vector/pull/413
 83. Add support for static bearer token authentication in GCP auth config. https://github.com/databricks-eng/vector/pull/415
 84. Add support for direct ingest messages in aws_s3 source via SQS https://github.com/databricks-eng/vector/pull/416
-85. Add support for direct ingest messages in azure_blob source via Azure Queue https://github.com/databricks-eng/vector/pull/TBD
+85. Add support for direct ingest messages in azure_blob source via Azure Queue https://github.com/databricks-eng/vector/pull/423
+86. Delete the unused clickhouse deduplication client from the aws_s3 and azure_blob sources https://github.com/databricks-eng/vector/pull/424

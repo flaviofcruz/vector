@@ -37,7 +37,6 @@ use crate::internal_events::{
     EventsReceived, QueueNotificationProcessLag, StreamClosedError,
     emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
 };
-use crate::sources::util::{ClickHouseDeduplicator, DeduplicationClient};
 use crate::{
     SourceSender,
     config::{SourceAcknowledgementsConfig, SourceContext},
@@ -256,8 +255,6 @@ pub struct State {
 
     /// Name of the storage account being monitored
     storage_account_name: String,
-    /// Optional ClickHouse deduplication client
-    deduplication_client: Option<DeduplicationClient>,
     /// Whether to process custom direct ingest messages
     process_custom_message: bool,
 }
@@ -277,7 +274,6 @@ impl Ingestor {
         compression: super::Compression,
         multiline: Option<line_agg::Config>,
         decoder: Decoder,
-        clickhouse_dedupe: Option<ClickHouseDeduplicator>,
     ) -> Result<Ingestor, IngestorNewError> {
         // Validate message batch size
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 32 {
@@ -297,9 +293,6 @@ impl Ingestor {
             })
             .unwrap_or_else(|_| "unknown".to_string());
 
-        // Create DeduplicationClient if deduplication is configured
-        let deduplication_client = clickhouse_dedupe.and_then(DeduplicationClient::new);
-
         // Create shared state
         let state = Arc::new(State {
             blob_client,
@@ -318,7 +311,6 @@ impl Ingestor {
             delete_failed_message: config.delete_failed_message,
             decoder,
             storage_account_name,
-            deduplication_client,
             process_custom_message: config.process_custom_message,
         });
 
@@ -621,8 +613,7 @@ impl IngestorProcess {
             account = %self.state.storage_account_name,
             message_id = %message_id,
         );
-        self.process_blob_object(&msg.container, &msg.blob, None)
-            .await
+        self.process_blob_object(&msg.container, &msg.blob).await
     }
 
     /// Processes a single Event Grid event
@@ -683,52 +674,22 @@ impl IngestorProcess {
             });
         }
 
-        // Check for deduplication if configured
-        if let Some(dedup_client) = &self.state.deduplication_client {
-            let file_size = event.data.content_length.unwrap_or(0) as u64;
-
-            // Check if we should ingest this file
-            if !dedup_client.should_ingest(&blob, file_size).await {
-                debug!(
-                    message = "Skipping blob due to deduplication check.",
-                    container = %container,
-                    blob = %blob,
-                    log_path = %blob,
-                    internal_log_rate_limit = true
-                );
-                return Ok(());
-            }
-
-            debug!(
-                message = "Proceeding to process blob after deduplication check.",
-                container = %container,
-                blob = %blob,
-                log_path = %blob,
-                internal_log_rate_limit = true
-            );
-        }
-
-        self.process_blob_object(container, blob, Some(&event.event_time))
-            .await
+        self.process_blob_object(container, blob).await
     }
 
     /// Downloads a blob, decompresses, frames, deserializes, enriches, and sends
     /// events downstream. This is the shared processing core used by both Event Grid
     /// notifications and direct ingest messages.
     ///
-    /// `event_time` is the Event Grid event timestamp (ISO-8601), passed to dedup
-    /// `mark_completion`. Pass `None` for direct ingest messages that don't provide one;
-    /// the current time will be used as a fallback for dedup metadata.
     async fn process_blob_object(
         &mut self,
         container: &str,
         blob: &str,
-        event_time: Option<&str>,
     ) -> Result<(), ProcessingError> {
         let processing_start_time = Utc::now();
 
         // Own these once up front — they're needed by the blob SDK, error paths,
-        // log enrichment, and dedup, so we avoid repeated to_owned() calls.
+        // and log enrichment, so we avoid repeated to_owned() calls.
         let container = container.to_owned();
         let blob = blob.to_owned();
 
@@ -769,7 +730,6 @@ impl IngestorProcess {
         let content_type = Some(properties.content_type.as_str());
         let content_encoding = properties.content_encoding.as_deref();
         let last_modified = properties.last_modified;
-        let object_content_length = properties.content_length;
 
         let timestamp = last_modified;
 
@@ -948,23 +908,6 @@ impl IngestorProcess {
                 }
             }
         };
-
-        // Mark completion status in ClickHouse if deduplication is configured
-        if let Some(dedup_client) = &self.state.deduplication_client {
-            let success = processing_result.is_ok();
-            let fallback_time = processing_start_time.to_rfc3339();
-            let file_creation_timestamp = event_time.unwrap_or(&fallback_time);
-
-            // Note: Errors are logged internally by the DeduplicationClient
-            dedup_client
-                .mark_completion(
-                    &blob,
-                    file_creation_timestamp,
-                    object_content_length,
-                    success,
-                )
-                .await;
-        }
 
         processing_result
     }

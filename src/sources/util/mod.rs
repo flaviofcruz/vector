@@ -1,8 +1,6 @@
 #![allow(missing_docs)]
 #[cfg(feature = "sources-http_server")]
 mod body_decoding;
-#[cfg(any(feature = "sources-aws_s3", feature = "sources-azure_blob"))]
-pub mod clickhouse_dedupe;
 #[cfg(feature = "sources-file")]
 mod encoding_config;
 #[cfg(all(unix, feature = "sources-dnstap"))]
@@ -43,8 +41,6 @@ mod unix_datagram;
 mod unix_stream;
 mod wrappers;
 
-#[cfg(any(feature = "sources-aws_s3", feature = "sources-azure_blob"))]
-pub use clickhouse_dedupe::*;
 #[cfg(feature = "sources-file")]
 pub use encoding_config::EncodingConfig;
 pub use multiline_config::MultilineConfig;
