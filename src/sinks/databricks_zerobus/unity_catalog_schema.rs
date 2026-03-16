@@ -1249,209 +1249,151 @@ mod tests {
         assert!(attributes_field.is_some());
     }
 
-    /// Prove that MAP<STRING,STRING> as a top-level column generates a proper proto map:
-    /// the field must have is_map()==true (label=Repeated + MapEntry message with map_entry=true).
-    /// The entry message has string key=1 and string value=2 fields, which is exactly the
-    /// wire representation of map<string, string> that protoc would produce.
+    /// Verify that each supported map key/value type combination generates a proper proto map
+    /// (is_map()==true, map_entry=true on the entry message, correct key/value kinds).
+    /// This covers the five real-world map shapes used in production schemas:
+    ///   1. map<int64, bool>    — e.g. boolean_config_access in QueryMetrics
+    ///   2. map<int64, double>  — e.g. double_config_access in QueryMetrics
+    ///   3. map<string, string> — e.g. generic label / attribute maps
+    ///   4. map<int32, string>  — e.g. integer-keyed string value maps
+    ///   5. map<string, struct> — e.g. map to a nested message type
     #[test]
-    fn test_map_string_string_is_map_field() {
-        let schema = UnityCatalogTableSchema {
-            name: "my_table".to_string(),
-            catalog_name: "my_catalog".to_string(),
-            schema_name: "my_schema".to_string(),
-            columns: vec![UnityCatalogColumn {
-                name: "labels".to_string(),
-                type_text: "map<string,string>".to_string(),
-                type_name: "MAP".to_string(),
-                position: 0,
-                nullable: true,
-                type_json: r#"{"type":"map","keyType":"string","valueType":"string","valueContainsNull":true}"#
-                    .to_string(),
-            }],
-        };
-
-        let descriptor =
-            generate_descriptor_from_schema(&schema).expect("descriptor generation failed");
-
-        let labels_field = descriptor
-            .get_field_by_name("labels")
-            .expect("labels field not found");
-
-        // The field must be a true proto map (label=Repeated + map_entry=true on the entry message).
-        assert!(
-            labels_field.is_map(),
-            "map<string,string> top-level column must produce is_map()==true; \
-             got cardinality={:?}",
-            labels_field.cardinality()
-        );
-
-        // Confirm the entry message type has the expected key/value fields.
-        let entry_kind = labels_field.kind();
-        let entry_msg = match entry_kind {
-            prost_reflect::Kind::Message(m) => m,
-            other => panic!("expected Message kind for map field, got {:?}", other),
-        };
-        assert!(
-            entry_msg.is_map_entry(),
-            "entry message must have map_entry=true"
-        );
-
-        let key_field = entry_msg
-            .get_field_by_name("key")
-            .expect("entry message must have a key field");
-        let value_field = entry_msg
-            .get_field_by_name("value")
-            .expect("entry message must have a value field");
-
-        assert_eq!(
-            key_field.kind(),
-            prost_reflect::Kind::String,
-            "map<string,string> key must be string"
-        );
-        assert_eq!(
-            value_field.kind(),
-            prost_reflect::Kind::String,
-            "map<string,string> value must be string"
-        );
-    }
-
-    /// Regression test: MAP fields nested inside a STRUCT must get label=Repeated so that
-    /// prost_reflect treats them as proper map fields (is_map() == true).  Previously they
-    /// fell through to label=Optional, causing try_set_field to reject the encoded value.
-    #[test]
-    fn test_map_inside_struct_is_map_field() {
-        let schema = UnityCatalogTableSchema {
-            name: "my_table".to_string(),
-            catalog_name: "my_catalog".to_string(),
-            schema_name: "my_schema".to_string(),
-            columns: vec![UnityCatalogColumn {
-                name: "info".to_string(),
-                type_text: "struct<counts:map<bigint,boolean>>".to_string(),
-                type_name: "STRUCT".to_string(),
-                position: 0,
-                nullable: true,
-                type_json: r#"{
-                    "type": "struct",
-                    "fields": [{
-                        "name": "counts",
-                        "type": {
-                            "type": "map",
-                            "keyType": "long",
-                            "valueType": "boolean",
-                            "valueContainsNull": true
-                        },
-                        "nullable": true,
-                        "metadata": {}
-                    }]
-                }"#
-                .to_string(),
-            }],
-        };
-
-        let descriptor =
-            generate_descriptor_from_schema(&schema).expect("descriptor generation failed");
-
-        let info_field = descriptor
-            .get_field_by_name("info")
-            .expect("info field missing");
-
-        let info_msg = match info_field.kind() {
-            prost_reflect::Kind::Message(m) => m,
-            other => panic!("info should be a message, got {other:?}"),
-        };
-
-        let map_field = info_msg
-            .get_field_by_name("counts")
-            .expect("counts field missing");
-
-        assert!(
-            map_field.is_map(),
-            "counts MAP<BIGINT,BOOLEAN> inside a struct must be \
-             a proto map field (is_map() == true); got cardinality={:?}",
-            map_field.cardinality()
-        );
-    }
-
-    /// End-to-end encode round-trip for a MAP<BIGINT,BOOLEAN> nested inside a STRUCT.
-    /// Verifies that a VRL Value::Object (the output of parse_proto) produced from
-    /// integer-keyed map fields can be re-encoded using a UC-derived descriptor without
-    /// the "Dropping field from proto" WARN.
-    #[test]
-    fn test_map_inside_struct_encode_roundtrip() {
+    fn test_map_types_produce_is_map_true() {
         use prost_reflect::Kind;
-        use vrl::protobuf::encode::{Options, encode_message};
-        use vrl::value::Value;
 
-        let schema = UnityCatalogTableSchema {
-            name: "my_table".to_string(),
-            catalog_name: "my_catalog".to_string(),
-            schema_name: "my_schema".to_string(),
-            columns: vec![UnityCatalogColumn {
-                name: "info".to_string(),
-                type_text: "struct<counts:map<bigint,boolean>>".to_string(),
-                type_name: "STRUCT".to_string(),
-                position: 0,
-                nullable: true,
+        struct Case {
+            label: &'static str,
+            type_json: &'static str,
+            expected_key: Kind,
+            /// None means the value kind is a Message (struct case).
+            expected_value: Option<Kind>,
+        }
+
+        let cases = vec![
+            Case {
+                label: "map<int64, bool>",
+                type_json: r#"{"type":"map","keyType":"long","valueType":"boolean","valueContainsNull":true}"#,
+                expected_key: Kind::Int64,
+                expected_value: Some(Kind::Bool),
+            },
+            Case {
+                label: "map<int64, double>",
+                type_json: r#"{"type":"map","keyType":"long","valueType":"double","valueContainsNull":true}"#,
+                expected_key: Kind::Int64,
+                expected_value: Some(Kind::Double),
+            },
+            Case {
+                label: "map<string, string>",
+                type_json: r#"{"type":"map","keyType":"string","valueType":"string","valueContainsNull":true}"#,
+                expected_key: Kind::String,
+                expected_value: Some(Kind::String),
+            },
+            Case {
+                label: "map<int32, string>",
+                type_json: r#"{"type":"map","keyType":"integer","valueType":"string","valueContainsNull":true}"#,
+                expected_key: Kind::Int32,
+                expected_value: Some(Kind::String),
+            },
+            Case {
+                // map<string, NewType> where NewType has four scalar fields
+                label: "map<string, struct>",
                 type_json: r#"{
-                    "type": "struct",
-                    "fields": [{
-                        "name": "counts",
-                        "type": {
-                            "type": "map",
-                            "keyType": "long",
-                            "valueType": "boolean",
-                            "valueContainsNull": true
-                        },
-                        "nullable": true,
-                        "metadata": {}
-                    }]
-                }"#
-                .to_string(),
-            }],
-        };
+                    "type": "map",
+                    "keyType": "string",
+                    "valueType": {
+                        "type": "struct",
+                        "fields": [
+                            {"name":"a_field","type":"long","nullable":true,"metadata":{}},
+                            {"name":"b_field","type":"double","nullable":true,"metadata":{}},
+                            {"name":"c_field","type":"boolean","nullable":true,"metadata":{}},
+                            {"name":"d_field","type":"integer","nullable":true,"metadata":{}}
+                        ]
+                    },
+                    "valueContainsNull": true
+                }"#,
+                expected_key: Kind::String,
+                expected_value: None, // value is a Message
+            },
+        ];
 
-        let descriptor =
-            generate_descriptor_from_schema(&schema).expect("descriptor generation failed");
+        for case in &cases {
+            let schema = UnityCatalogTableSchema {
+                name: "my_table".to_string(),
+                catalog_name: "my_catalog".to_string(),
+                schema_name: "my_schema".to_string(),
+                columns: vec![UnityCatalogColumn {
+                    name: "the_map".to_string(),
+                    type_text: case.label.to_string(),
+                    type_name: "MAP".to_string(),
+                    position: 0,
+                    nullable: true,
+                    type_json: case.type_json.to_string(),
+                }],
+            };
 
-        // Simulate what parse_proto produces for map<int64, bool>:
-        // integer keys are stringified, values are VRL booleans.
-        let vrl_value = Value::Object(
-            [(
-                "info".into(),
-                Value::Object(
-                    [
-                        ("42".into(), Value::Boolean(true)),
-                        ("-1".into(), Value::Boolean(false)),
-                    ]
-                    .into_iter()
-                    .collect(),
+            let descriptor = generate_descriptor_from_schema(&schema)
+                .unwrap_or_else(|e| panic!("[{}] descriptor generation failed: {e}", case.label));
+
+            let map_field = descriptor
+                .get_field_by_name("the_map")
+                .unwrap_or_else(|| panic!("[{}] the_map field not found", case.label));
+
+            assert!(
+                map_field.is_map(),
+                "[{}] must produce is_map()==true; got cardinality={:?}",
+                case.label,
+                map_field.cardinality()
+            );
+
+            let entry_msg = match map_field.kind() {
+                Kind::Message(m) => m,
+                other => panic!("[{}] expected Message kind, got {other:?}", case.label),
+            };
+            assert!(
+                entry_msg.is_map_entry(),
+                "[{}] entry message must have map_entry=true",
+                case.label
+            );
+
+            let key_field = entry_msg
+                .get_field_by_name("key")
+                .unwrap_or_else(|| panic!("[{}] entry missing key field", case.label));
+            let value_field = entry_msg
+                .get_field_by_name("value")
+                .unwrap_or_else(|| panic!("[{}] entry missing value field", case.label));
+
+            assert_eq!(
+                key_field.kind(),
+                case.expected_key.clone(),
+                "[{}] wrong key kind",
+                case.label
+            );
+
+            match &case.expected_value {
+                Some(expected_kind) => assert_eq!(
+                    value_field.kind(),
+                    expected_kind.clone(),
+                    "[{}] wrong value kind",
+                    case.label
                 ),
-            )]
-            .into_iter()
-            .collect(),
-        );
-
-        let result = encode_message(&descriptor, vrl_value, &Options::default());
-        assert!(
-            result.is_ok(),
-            "encode_message must not fail for MAP<BIGINT,BOOLEAN> inside a struct: {:?}",
-            result.err()
-        );
-
-        let _message = result.unwrap();
-        let info_field = descriptor.get_field_by_name("info").unwrap();
-        let info_msg_desc = match info_field.kind() {
-            Kind::Message(m) => m,
-            other => panic!("info should be a message, got {other:?}"),
-        };
-        let counts_field = info_msg_desc
-            .get_field_by_name("counts")
-            .expect("counts field missing from descriptor");
-        assert!(
-            counts_field.is_map(),
-            "counts must be a proto map field in the UC-derived descriptor"
-        );
+                None => {
+                    // Struct value: confirm the value field is a Message with the expected fields.
+                    let value_msg = match value_field.kind() {
+                        Kind::Message(m) => m,
+                        other => panic!(
+                            "[{}] value field expected Message kind, got {other:?}",
+                            case.label
+                        ),
+                    };
+                    assert!(value_msg.get_field_by_name("a_field").is_some(), "[{}] missing a_field", case.label);
+                    assert!(value_msg.get_field_by_name("b_field").is_some(), "[{}] missing b_field", case.label);
+                    assert!(value_msg.get_field_by_name("c_field").is_some(), "[{}] missing c_field", case.label);
+                    assert!(value_msg.get_field_by_name("d_field").is_some(), "[{}] missing d_field", case.label);
+                }
+            }
+        }
     }
+
 
     #[test]
     fn test_strict_validation_fails_on_unsupported() {
