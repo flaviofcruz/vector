@@ -866,8 +866,12 @@ fn generate_struct_message(
         let (field_type, type_name) =
             map_complex_type_to_protobuf(&field.field_type, &path, collector)?;
 
-        // Determine if this is a repeated field (for arrays)
-        let (label, is_repeated) = if matches!(field.field_type, ComplexType::Array(_)) {
+        // Both ARRAY and MAP fields must be label=Repeated so that prost_reflect
+        // recognises them as list/map fields (is_list()/is_map() == true).
+        // Previously only Array was handled here, causing MAP fields nested inside a
+        // struct to get label=Optional.  That made try_set_field reject the encoded
+        // value with "expected <MapEntry>, found [...]" and silently drop the field.
+        let (label, is_repeated) = if matches!(field.field_type, ComplexType::Array(_) | ComplexType::Map { .. }) {
             (
                 prost_types::field_descriptor_proto::Label::Repeated as i32,
                 true,
@@ -1243,6 +1247,144 @@ mod tests {
 
         let attributes_field = descriptor.get_field_by_name("attributes");
         assert!(attributes_field.is_some());
+    }
+
+    /// Regression test: MAP fields nested inside a STRUCT must get label=Repeated so that
+    /// prost_reflect treats them as proper map fields (is_map() == true).  Previously they
+    /// fell through to label=Optional, causing try_set_field to reject the encoded value.
+    #[test]
+    fn test_map_inside_struct_is_map_field() {
+        let schema = UnityCatalogTableSchema {
+            name: "my_table".to_string(),
+            catalog_name: "my_catalog".to_string(),
+            schema_name: "my_schema".to_string(),
+            columns: vec![UnityCatalogColumn {
+                name: "info".to_string(),
+                type_text: "struct<counts:map<bigint,boolean>>".to_string(),
+                type_name: "STRUCT".to_string(),
+                position: 0,
+                nullable: true,
+                type_json: r#"{
+                    "type": "struct",
+                    "fields": [{
+                        "name": "counts",
+                        "type": {
+                            "type": "map",
+                            "keyType": "long",
+                            "valueType": "boolean",
+                            "valueContainsNull": true
+                        },
+                        "nullable": true,
+                        "metadata": {}
+                    }]
+                }"#
+                .to_string(),
+            }],
+        };
+
+        let descriptor =
+            generate_descriptor_from_schema(&schema).expect("descriptor generation failed");
+
+        let info_field = descriptor
+            .get_field_by_name("info")
+            .expect("info field missing");
+
+        let info_msg = match info_field.kind() {
+            prost_reflect::Kind::Message(m) => m,
+            other => panic!("info should be a message, got {other:?}"),
+        };
+
+        let map_field = info_msg
+            .get_field_by_name("counts")
+            .expect("counts field missing");
+
+        assert!(
+            map_field.is_map(),
+            "counts MAP<BIGINT,BOOLEAN> inside a struct must be \
+             a proto map field (is_map() == true); got cardinality={:?}",
+            map_field.cardinality()
+        );
+    }
+
+    /// End-to-end encode round-trip for a MAP<BIGINT,BOOLEAN> nested inside a STRUCT.
+    /// Verifies that a VRL Value::Object (the output of parse_proto) produced from
+    /// integer-keyed map fields can be re-encoded using a UC-derived descriptor without
+    /// the "Dropping field from proto" WARN.
+    #[test]
+    fn test_map_inside_struct_encode_roundtrip() {
+        use prost_reflect::Kind;
+        use vrl::protobuf::encode::{Options, encode_message};
+        use vrl::value::Value;
+
+        let schema = UnityCatalogTableSchema {
+            name: "my_table".to_string(),
+            catalog_name: "my_catalog".to_string(),
+            schema_name: "my_schema".to_string(),
+            columns: vec![UnityCatalogColumn {
+                name: "info".to_string(),
+                type_text: "struct<counts:map<bigint,boolean>>".to_string(),
+                type_name: "STRUCT".to_string(),
+                position: 0,
+                nullable: true,
+                type_json: r#"{
+                    "type": "struct",
+                    "fields": [{
+                        "name": "counts",
+                        "type": {
+                            "type": "map",
+                            "keyType": "long",
+                            "valueType": "boolean",
+                            "valueContainsNull": true
+                        },
+                        "nullable": true,
+                        "metadata": {}
+                    }]
+                }"#
+                .to_string(),
+            }],
+        };
+
+        let descriptor =
+            generate_descriptor_from_schema(&schema).expect("descriptor generation failed");
+
+        // Simulate what parse_proto produces for map<int64, bool>:
+        // integer keys are stringified, values are VRL booleans.
+        let vrl_value = Value::Object(
+            [(
+                "info".into(),
+                Value::Object(
+                    [
+                        ("42".into(), Value::Boolean(true)),
+                        ("-1".into(), Value::Boolean(false)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let result = encode_message(&descriptor, vrl_value, &Options::default());
+        assert!(
+            result.is_ok(),
+            "encode_message must not fail for MAP<BIGINT,BOOLEAN> inside a struct: {:?}",
+            result.err()
+        );
+
+        let _message = result.unwrap();
+        let info_field = descriptor.get_field_by_name("info").unwrap();
+        let info_msg_desc = match info_field.kind() {
+            Kind::Message(m) => m,
+            other => panic!("info should be a message, got {other:?}"),
+        };
+        let counts_field = info_msg_desc
+            .get_field_by_name("counts")
+            .expect("counts field missing from descriptor");
+        assert!(
+            counts_field.is_map(),
+            "counts must be a proto map field in the UC-derived descriptor"
+        );
     }
 
     #[test]
