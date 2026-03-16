@@ -1249,6 +1249,72 @@ mod tests {
         assert!(attributes_field.is_some());
     }
 
+    /// Prove that MAP<STRING,STRING> as a top-level column generates a proper proto map:
+    /// the field must have is_map()==true (label=Repeated + MapEntry message with map_entry=true).
+    /// The entry message has string key=1 and string value=2 fields, which is exactly the
+    /// wire representation of map<string, string> that protoc would produce.
+    #[test]
+    fn test_map_string_string_is_map_field() {
+        let schema = UnityCatalogTableSchema {
+            name: "my_table".to_string(),
+            catalog_name: "my_catalog".to_string(),
+            schema_name: "my_schema".to_string(),
+            columns: vec![UnityCatalogColumn {
+                name: "labels".to_string(),
+                type_text: "map<string,string>".to_string(),
+                type_name: "MAP".to_string(),
+                position: 0,
+                nullable: true,
+                type_json: r#"{"type":"map","keyType":"string","valueType":"string","valueContainsNull":true}"#
+                    .to_string(),
+            }],
+        };
+
+        let descriptor =
+            generate_descriptor_from_schema(&schema).expect("descriptor generation failed");
+
+        let labels_field = descriptor
+            .get_field_by_name("labels")
+            .expect("labels field not found");
+
+        // The field must be a true proto map (label=Repeated + map_entry=true on the entry message).
+        assert!(
+            labels_field.is_map(),
+            "map<string,string> top-level column must produce is_map()==true; \
+             got cardinality={:?}",
+            labels_field.cardinality()
+        );
+
+        // Confirm the entry message type has the expected key/value fields.
+        let entry_kind = labels_field.kind();
+        let entry_msg = match entry_kind {
+            prost_reflect::Kind::Message(m) => m,
+            other => panic!("expected Message kind for map field, got {:?}", other),
+        };
+        assert!(
+            entry_msg.is_map_entry(),
+            "entry message must have map_entry=true"
+        );
+
+        let key_field = entry_msg
+            .get_field_by_name("key")
+            .expect("entry message must have a key field");
+        let value_field = entry_msg
+            .get_field_by_name("value")
+            .expect("entry message must have a value field");
+
+        assert_eq!(
+            key_field.kind(),
+            prost_reflect::Kind::String,
+            "map<string,string> key must be string"
+        );
+        assert_eq!(
+            value_field.kind(),
+            prost_reflect::Kind::String,
+            "map<string,string> value must be string"
+        );
+    }
+
     /// Regression test: MAP fields nested inside a STRUCT must get label=Repeated so that
     /// prost_reflect treats them as proper map fields (is_map() == true).  Previously they
     /// fell through to label=Optional, causing try_set_field to reject the encoded value.
