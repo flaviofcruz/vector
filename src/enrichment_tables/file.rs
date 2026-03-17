@@ -36,6 +36,12 @@ pub enum Encoding {
         #[serde(default = "default_delimiter")]
         delimiter: char,
     },
+
+    /// Decodes the file as a JSON file.
+    ///
+    /// A top-level JSON object is treated as a single-row table where each key becomes a column.
+    /// A top-level JSON array of objects is treated as a multi-row table.
+    Json,
 }
 
 impl Default for Encoding {
@@ -53,7 +59,7 @@ impl Default for Encoding {
 pub struct FileSettings {
     /// The path of the enrichment table file.
     ///
-    /// Currently, only [CSV][csv] files are supported.
+    /// Supported formats: [CSV][csv] and JSON.
     ///
     /// [csv]: https://en.wikipedia.org/wiki/Comma-separated_values
     pub path: PathBuf,
@@ -125,6 +131,29 @@ const fn default_delimiter() -> char {
     ','
 }
 
+fn json_to_vrl_value(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(
+                    ordered_float::NotNan::new(f)
+                        .unwrap_or(ordered_float::NotNan::new(0.0_f64).unwrap()),
+                )
+            } else {
+                n.to_string().as_str().into()
+            }
+        }
+        serde_json::Value::String(s) => s.as_str().into(),
+        // Nested arrays and objects are serialized back to their JSON string representation
+        // so that the column value is human-readable and no data is silently lost.
+        _ => serde_json::to_string(v).unwrap_or_default().as_str().into(),
+    }
+}
+
 impl FileConfig {
     fn parse_column(
         &self,
@@ -181,57 +210,130 @@ impl FileConfig {
 
     /// Load the configured file into memory. Required to create a new file enrichment table.
     pub fn load_file(&self, timezone: TimeZone) -> crate::Result<FileData> {
-        let Encoding::Csv {
-            include_headers,
-            delimiter,
-        } = self.file.encoding;
+        match self.file.encoding {
+            Encoding::Csv {
+                include_headers,
+                delimiter,
+            } => {
+                let mut reader = csv::ReaderBuilder::new()
+                    .has_headers(include_headers)
+                    .delimiter(delimiter as u8)
+                    .from_path(&self.file.path)?;
 
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(include_headers)
-            .delimiter(delimiter as u8)
-            .from_path(&self.file.path)?;
+                let first_row = reader.records().next();
+                let headers = if include_headers {
+                    reader
+                        .headers()?
+                        .iter()
+                        .map(|col| col.to_string())
+                        .collect::<Vec<_>>()
+                } else {
+                    // If there are no headers in the datafile we make headers as the numerical index of
+                    // the column.
+                    match first_row {
+                        Some(Ok(ref row)) => (0..row.len()).map(|idx| idx.to_string()).collect(),
+                        _ => Vec::new(),
+                    }
+                };
 
-        let first_row = reader.records().next();
-        let headers = if include_headers {
-            reader
-                .headers()?
-                .iter()
-                .map(|col| col.to_string())
-                .collect::<Vec<_>>()
-        } else {
-            // If there are no headers in the datafile we make headers as the numerical index of
-            // the column.
-            match first_row {
-                Some(Ok(ref row)) => (0..row.len()).map(|idx| idx.to_string()).collect(),
-                _ => Vec::new(),
+                let data = first_row
+                    .into_iter()
+                    .chain(reader.records())
+                    .map(|row| {
+                        Ok(row?
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, col)| self.parse_column(timezone, &headers[idx], idx, col))
+                            .collect::<Result<Vec<_>, String>>()?)
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+
+                trace!(
+                    "Loaded enrichment file {} with headers {:?}.",
+                    self.file.path.to_str().unwrap_or("path with invalid utf"),
+                    headers
+                );
+
+                let file = reader.into_inner();
+
+                Ok(FileData {
+                    headers,
+                    data,
+                    modified: file.metadata()?.modified()?,
+                })
             }
-        };
 
-        let data = first_row
-            .into_iter()
-            .chain(reader.records())
-            .map(|row| {
-                Ok(row?
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, col)| self.parse_column(timezone, &headers[idx], idx, col))
-                    .collect::<Result<Vec<_>, String>>()?)
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
+            Encoding::Json => {
+                let contents = fs::read_to_string(&self.file.path)?;
+                let modified = fs::metadata(&self.file.path)?.modified()?;
+                let json: serde_json::Value = serde_json::from_str(&contents)?;
 
-        trace!(
-            "Loaded enrichment file {} with headers {:?}.",
-            self.file.path.to_str().unwrap_or("path with invalid utf"),
-            headers
-        );
+                // Headers are the top-level JSON object keys; values in each row
+                // map positionally to their corresponding header.
+                let (headers, data) = match json {
+                    serde_json::Value::Object(map) => {
+                        let headers: Vec<String> = map.keys().cloned().collect();
+                        if headers.is_empty() {
+                            return Ok(FileData {
+                                headers: vec![],
+                                data: vec![],
+                                modified,
+                            });
+                        }
+                        let row: Vec<Value> =
+                            headers.iter().map(|k| json_to_vrl_value(&map[k])).collect();
+                        (headers, vec![row])
+                    }
+                    serde_json::Value::Array(arr) => {
+                        if arr.is_empty() {
+                            return Ok(FileData {
+                                headers: vec![],
+                                data: vec![],
+                                modified,
+                            });
+                        }
+                        let first = arr[0]
+                            .as_object()
+                            .ok_or("JSON array elements must be objects")?;
+                        let headers: Vec<String> = first.keys().cloned().collect();
+                        let data = arr
+                            .iter()
+                            .map(|item| {
+                                let obj = item
+                                    .as_object()
+                                    .ok_or("JSON array elements must be objects")?;
+                                Ok(headers
+                                    .iter()
+                                    .map(|k| {
+                                        json_to_vrl_value(
+                                            obj.get(k).unwrap_or(&serde_json::Value::Null),
+                                        )
+                                    })
+                                    .collect())
+                            })
+                            .collect::<Result<Vec<Vec<Value>>, &str>>()
+                            .map_err(|e| e.to_string())?;
+                        (headers, data)
+                    }
+                    _ => return Err(
+                        "JSON enrichment table must contain a top-level object or array of objects"
+                            .into(),
+                    ),
+                };
 
-        let file = reader.into_inner();
+                trace!(
+                    "Loaded JSON enrichment file {} with headers {:?}.",
+                    self.file.path.to_str().unwrap_or("path with invalid utf"),
+                    headers
+                );
 
-        Ok(FileData {
-            headers,
-            data,
-            modified: file.metadata()?.modified()?,
-        })
+                Ok(FileData {
+                    headers,
+                    data,
+                    modified,
+                })
+            }
+        }
     }
 }
 
@@ -1530,5 +1632,155 @@ mod tests {
                 Some(handle)
             )
         );
+    }
+
+    // JSON tests
+
+    #[test]
+    fn parse_json_object() {
+        let dir = tempfile::tempdir().expect("Unable to create tempdir for enrichment table");
+        let path = dir.path().join("table.json");
+        fs::write(
+            path.clone(),
+            r#"{"a_string":"hello","an_int":42,"a_float":3.14,"a_bool":true,"a_null":null,"an_array":[1,2],"an_object":{"k":"v"}}"#,
+        )
+        .expect("Failed to write enrichment table");
+
+        let config = FileConfig {
+            file: FileSettings {
+                path,
+                encoding: Encoding::Json,
+            },
+            schema: HashMap::new(),
+        };
+        let data = config
+            .load_file(Default::default())
+            .expect("Failed to parse json");
+
+        assert_eq!(
+            vec![
+                "a_string".to_string(),
+                "an_int".to_string(),
+                "a_float".to_string(),
+                "a_bool".to_string(),
+                "a_null".to_string(),
+                "an_array".to_string(),
+                "an_object".to_string(),
+            ],
+            data.headers
+        );
+        assert_eq!(
+            vec![
+                Value::from("hello"),
+                Value::Integer(42),
+                Value::Float(ordered_float::NotNan::new(3.14).unwrap()),
+                Value::Boolean(true),
+                Value::Null,
+                Value::from("[1,2]"),         // arrays serialized to JSON string
+                Value::from("{\"k\":\"v\"}"), // objects serialized to JSON string
+            ],
+            data.data[0]
+        );
+    }
+
+    #[test]
+    fn parse_json_empty_object() {
+        let dir = tempfile::tempdir().expect("Unable to create tempdir for enrichment table");
+        let path = dir.path().join("table.json");
+        fs::write(path.clone(), "{}").expect("Failed to write enrichment table");
+
+        let config = FileConfig {
+            file: FileSettings {
+                path,
+                encoding: Encoding::Json,
+            },
+            schema: HashMap::new(),
+        };
+        let data = config
+            .load_file(Default::default())
+            .expect("Failed to parse json");
+
+        assert!(data.headers.is_empty());
+        assert!(data.data.is_empty());
+    }
+
+    #[test]
+    fn parse_json_array_of_objects() {
+        let dir = tempfile::tempdir().expect("Unable to create tempdir for enrichment table");
+        let path = dir.path().join("table.json");
+        fs::write(
+            path.clone(),
+            r#"[{"id":"a","value":"1"},{"id":"b","value":"2"}]"#,
+        )
+        .expect("Failed to write enrichment table");
+
+        let config = FileConfig {
+            file: FileSettings {
+                path,
+                encoding: Encoding::Json,
+            },
+            schema: HashMap::new(),
+        };
+        let data = config
+            .load_file(Default::default())
+            .expect("Failed to parse json");
+
+        assert_eq!(vec!["id".to_string(), "value".to_string()], data.headers);
+        assert_eq!(
+            vec![
+                vec![Value::from("a"), Value::from("1")],
+                vec![Value::from("b"), Value::from("2")],
+            ],
+            data.data
+        );
+    }
+
+    #[test]
+    fn parse_json_array_missing_keys_default_to_null() {
+        // Keys present in the first object but missing in subsequent objects default to null.
+        let dir = tempfile::tempdir().expect("Unable to create tempdir for enrichment table");
+        let path = dir.path().join("table.json");
+        fs::write(path.clone(), r#"[{"a":"1","b":"2"},{"a":"3"}]"#)
+            .expect("Failed to write enrichment table");
+
+        let config = FileConfig {
+            file: FileSettings {
+                path,
+                encoding: Encoding::Json,
+            },
+            schema: HashMap::new(),
+        };
+        let data = config
+            .load_file(Default::default())
+            .expect("Failed to parse json");
+
+        assert_eq!(vec!["a".to_string(), "b".to_string()], data.headers);
+        assert_eq!(
+            vec![
+                vec![Value::from("1"), Value::from("2")],
+                vec![Value::from("3"), Value::Null],
+            ],
+            data.data
+        );
+    }
+
+    #[test]
+    fn parse_json_invalid_top_level_type() {
+        let dir = tempfile::tempdir().expect("Unable to create tempdir for enrichment table");
+
+        for invalid in [r#""just a string""#, "42"] {
+            let path = dir.path().join("table.json");
+            fs::write(path.clone(), invalid).expect("Failed to write enrichment table");
+
+            let config = FileConfig {
+                file: FileSettings {
+                    path,
+                    encoding: Encoding::Json,
+                },
+                schema: HashMap::new(),
+            };
+
+            assert!(config.load_file(Default::default()).is_err());
+        }
     }
 }
