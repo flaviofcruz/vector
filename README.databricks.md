@@ -86,3 +86,4 @@ This lists custom changes merged in Databricks fork of Vector.
 85. Add support for direct ingest messages in azure_blob source via Azure Queue https://github.com/databricks-eng/vector/pull/423
 86. Delete the unused clickhouse deduplication client from the aws_s3 and azure_blob sources https://github.com/databricks-eng/vector/pull/424
 87. Fix MAP fields nested inside structs to use label=Repeated so they are correctly encoded instead of being silently dropped https://github.com/databricks-eng/vector/pull/428
+88. Add `last_config_reload_success` gauge metric to reflect the current state of the most recent config reload attempt https://github.com/databricks-eng/vector/pull/426
