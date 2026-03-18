@@ -243,11 +243,24 @@ impl RunningTopology {
             Box::pin(future::pending()) as future::BoxFuture<'static, ()>
         };
 
+        // Flag to suppress the shutdown reporter before wave 2. This breaks the feedback
+        // loop where the reporter generates log events → internal_logs captures them →
+        // internal_logs never shuts down.
+        let suppress_reporter = Arc::new(AtomicBool::new(false));
+        let suppress_reporter_check = Arc::clone(&suppress_reporter);
+
         // Reports in intervals which components are still running.
         let mut interval = interval(Duration::from_secs(5));
         let reporter = async move {
             loop {
                 interval.tick().await;
+
+                // Stop reporting if wave 2 is about to begin. Continued reporting
+                // would feed events into internal_logs, preventing it from shutting
+                // down cleanly.
+                if suppress_reporter_check.load(Ordering::Relaxed) {
+                    break;
+                }
 
                 // Remove all tasks that have shutdown.
                 check_handles.retain(|_key, handles| {
@@ -321,6 +334,12 @@ impl RunningTopology {
                     internal_log_rate_limit = false,
                 );
                 futures::future::join_all(wave1_wait_handles).await;
+
+                // Suppress the shutdown reporter before wave 2. The reporter generates
+                // log events that feed into internal_logs, creating a feedback loop that
+                // prevents internal_logs from shutting down. Stopping the reporter breaks
+                // this cycle and allows a clean wave 2 shutdown.
+                suppress_reporter.store(true, Ordering::Relaxed);
 
                 // Wave 2: Shut down deferred (internal) sources with remaining main deadline.
                 info!(
