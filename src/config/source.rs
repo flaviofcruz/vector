@@ -127,6 +127,16 @@ pub trait SourceConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sy
     fn send_timeout(&self) -> Option<Duration> {
         None
     }
+
+    /// Whether this source has deferred shutdown behavior.
+    ///
+    /// Sources with deferred shutdown (e.g., `internal_logs`, `internal_metrics`) are kept
+    /// running during the first wave of graceful shutdown so they can continue capturing
+    /// logs and metrics about the shutdown process itself. They are shut down in a second
+    /// wave after transforms and sinks have drained.
+    fn has_deferred_shutdown(&self) -> bool {
+        false
+    }
 }
 
 dyn_clone::clone_trait_object!(SourceConfig);

@@ -70,6 +70,12 @@ pub struct ConfigBuilder {
     #[doc(hidden)]
     pub graceful_shutdown_duration: Option<Duration>,
 
+    /// The duration in seconds to wait for non-internal (data) sources to shut down during
+    /// the first wave of graceful shutdown. Must be strictly less than `graceful_shutdown_duration`.
+    #[serde(default, skip)]
+    #[doc(hidden)]
+    pub graceful_data_source_shutdown_duration: Option<Duration>,
+
     /// Allow the configuration to be empty, resulting in a topology with no components.
     #[serde(default, skip)]
     #[doc(hidden)]
@@ -91,6 +97,7 @@ impl From<Config> for ConfigBuilder {
             tests,
             secret,
             graceful_shutdown_duration,
+            graceful_data_source_shutdown_duration,
         } = config;
 
         let transforms = transforms
@@ -124,6 +131,7 @@ impl From<Config> for ConfigBuilder {
             tests,
             secret,
             graceful_shutdown_duration,
+            graceful_data_source_shutdown_duration,
             allow_empty: false,
         }
     }

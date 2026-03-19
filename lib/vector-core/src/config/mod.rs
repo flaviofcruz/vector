@@ -344,6 +344,48 @@ impl From<SourceAcknowledgementsConfig> for AcknowledgementsConfig {
     }
 }
 
+/// Two-wave shutdown configuration.
+///
+/// When enabled, Vector performs a two-wave graceful shutdown: first shutting down
+/// data (non-deferred) sources and waiting for their exclusively-downstream components
+/// to drain, then shutting down deferred (internal) sources and their downstream components.
+#[configurable_component]
+#[configurable(title = "Controls whether two-wave graceful shutdown is enabled.")]
+#[configurable(
+    description = "When enabled, sources marked with `has_deferred_shutdown` (such as `internal_logs` and `internal_metrics`) are shut down in a second wave, after all non-deferred sources and their exclusive downstream components have drained."
+)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TwoWaveShutdownConfig {
+    /// Whether or not two-wave shutdown is enabled.
+    enabled: Option<bool>,
+}
+
+impl TwoWaveShutdownConfig {
+    pub const DEFAULT: Self = Self { enabled: None };
+
+    #[must_use]
+    pub fn merge_default(&self, other: &Self) -> Self {
+        let enabled = self.enabled.or(other.enabled);
+        Self { enabled }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+}
+
+impl From<Option<bool>> for TwoWaveShutdownConfig {
+    fn from(enabled: Option<bool>) -> Self {
+        Self { enabled }
+    }
+}
+
+impl From<bool> for TwoWaveShutdownConfig {
+    fn from(enabled: bool) -> Self {
+        Some(enabled).into()
+    }
+}
+
 /// End-to-end acknowledgements configuration.
 #[configurable_component]
 #[configurable(title = "Controls how acknowledgements are handled for this sink.")]
