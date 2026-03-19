@@ -8,6 +8,7 @@ use std::{
 };
 
 use futures::FutureExt;
+use metrics::{counter, histogram};
 use tokio::time::{Sleep, sleep};
 use tower::{retry::Policy, timeout::error::Elapsed};
 use vector_lib::configurable::configurable_component;
@@ -71,6 +72,7 @@ pub enum JitterMode {
 #[derive(Debug, Clone)]
 pub struct FibonacciRetryPolicy<L> {
     remaining_attempts: usize,
+    attempts_made: usize,
     previous_duration: Duration,
     current_duration: Duration,
     jitter_mode: JitterMode,
@@ -93,6 +95,7 @@ impl<L: RetryLogic> FibonacciRetryPolicy<L> {
     ) -> Self {
         FibonacciRetryPolicy {
             remaining_attempts,
+            attempts_made: 0,
             previous_duration: Duration::from_secs(0),
             current_duration: initial_backoff,
             jitter_mode,
@@ -126,11 +129,24 @@ impl<L: RetryLogic> FibonacciRetryPolicy<L> {
         self.current_jitter_duration = Self::add_full_jitter(next_duration);
     }
 
+    fn emit_attempts_histogram(&self) {
+        histogram!("sink_attempts_per_request", "buckets" => "integer")
+            .record(self.attempts_made as f64);
+    }
+
+    fn emit_request_completed(&self, status: &'static str) {
+        counter!("sink_requests_completed_total", "status" => status).increment(1);
+    }
+
     fn build_retry(&mut self) -> RetryPolicyFuture {
         self.advance();
         let delay = Box::pin(sleep(self.backoff()));
 
-        debug!(message = "Retrying request.", delay_ms = %self.backoff().as_millis());
+        debug!(
+            message = "Retrying request.",
+            attempt_number = self.attempts_made,
+            delay_ms = %self.backoff().as_millis(),
+        );
         RetryPolicyFuture { delay }
     }
 }
@@ -145,7 +161,16 @@ where
     // NOTE: in the error cases- `Error` and `EventsDropped` internal events are emitted by the
     // driver, so only need to log here.
     fn retry(&mut self, req: &mut Req, result: &mut Result<Res, Error>) -> Option<Self::Future> {
-        match result {
+        self.attempts_made += 1;
+
+        // Emit success/failure on every attempt
+        let status = match result {
+            Ok(response) if self.logic.should_retry_response(response).is_successful() => "success",
+            _ => "failed",
+        };
+        self.emit_request_completed(status);
+
+        let result = match result {
             Ok(response) => match self.logic.should_retry_response(response) {
                 RetryAction::Retry(reason) => {
                     if self.remaining_attempts == 0 {
@@ -153,6 +178,7 @@ where
                             message = "OK/retry response but retries exhausted; dropping the request.",
                             reason = ?reason,
                         );
+                        self.emit_attempts_histogram();
                         return None;
                     }
 
@@ -165,6 +191,7 @@ where
                             message =
                                 "OK/retry response but retries exhausted; dropping the request.",
                         );
+                        self.emit_attempts_histogram();
                         return None;
                     }
                     *req = modify_request(req.clone());
@@ -181,6 +208,7 @@ where
             Err(error) => {
                 if self.remaining_attempts == 0 {
                     error!(message = "Retries exhausted; dropping the request.", %error);
+                    self.emit_attempts_histogram();
                     return None;
                 }
                 // First attempt to cast the error into something of type L::Error
@@ -219,7 +247,14 @@ where
                     Some(self.build_retry())
                 }
             }
+        };
+
+        // Emit attempts histogram when request is done (not retrying)
+        if result.is_none() {
+            self.emit_attempts_histogram();
         }
+
+        result
     }
 
     fn clone_request(&mut self, request: &Req) -> Option<Req> {

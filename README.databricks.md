@@ -91,3 +91,4 @@ This lists custom changes merged in Databricks fork of Vector.
 90. Implement two-wave shutdown for vector-daemon, gated by a flag. https://github.com/databricks-eng/vector/pull/419
 91. expose file fingerprint and offset on each event https://github.com/databricks-eng/vector/pull/436
 92. Removing default exclusion label for prometheus scrape. https://github.com/databricks-eng/vector/pull/435
+93. Add sink request retry and failure rate metrics https://github.com/databricks-eng/vector/pull/425

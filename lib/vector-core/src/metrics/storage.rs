@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
-use metrics::{HistogramFn, atomics::AtomicU64};
+use metrics::{HistogramFn, Key, atomics::AtomicU64};
 use metrics_util::registry::Storage;
 use vector_common::atomic::AtomicF64;
 
@@ -11,27 +11,35 @@ use crate::event::{MetricValue, metric::Bucket};
 
 pub(super) struct VectorStorage;
 
-impl<K> Storage<K> for VectorStorage {
+impl Storage<Key> for VectorStorage {
     type Counter = Arc<AtomicU64>;
     type Gauge = Arc<AtomicF64>;
     type Histogram = Arc<Histogram>;
 
-    fn counter(&self, _: &K) -> Self::Counter {
+    fn counter(&self, _: &Key) -> Self::Counter {
         Arc::new(AtomicU64::new(0))
     }
 
-    fn gauge(&self, _: &K) -> Self::Gauge {
+    fn gauge(&self, _: &Key) -> Self::Gauge {
         Arc::new(AtomicF64::new(0.0))
     }
 
-    fn histogram(&self, _: &K) -> Self::Histogram {
-        Arc::new(Histogram::new())
+    fn histogram(&self, key: &Key) -> Self::Histogram {
+        let use_integer = key
+            .labels()
+            .any(|l| l.key() == "buckets" && l.value() == "integer");
+        if use_integer {
+            Arc::new(Histogram::new_integer())
+        } else {
+            Arc::new(Histogram::new())
+        }
     }
 }
 
 #[derive(Debug)]
 pub(super) struct Histogram {
     buckets: Box<[(f64, AtomicU32); 26]>,
+    power_of_two: bool,
     count: AtomicU64,
     sum: AtomicF64,
 }
@@ -40,7 +48,6 @@ impl Histogram {
     const MIN_BUCKET: f64 = 1.0 / (1 << 12) as f64; // f64::powi() is not const yet
     const MIN_BUCKET_EXP: f64 = -12.0;
     const BUCKETS: usize = 26;
-
     pub(crate) fn new() -> Self {
         // Box to avoid having this large array inline to the structure, blowing
         // out cache coherence.
@@ -49,8 +56,7 @@ impl Histogram {
         // suitable for different distributions but since our present use case
         // is mostly non-negative and measures smallish latencies we cluster
         // around but never quite get to zero with an increasingly coarse
-        // long-tail. This also lets us find the right bucket to record into using simple
-        // constant-time math operations instead of a loop-and-compare construct.
+        // long-tail.
         let buckets = Box::new([
             (2.0f64.powi(-12), AtomicU32::new(0)),
             (2.0f64.powi(-11), AtomicU32::new(0)),
@@ -81,21 +87,70 @@ impl Histogram {
         ]);
         Self {
             buckets,
+            power_of_two: true,
             count: AtomicU64::new(0),
             sum: AtomicF64::new(0.0),
         }
     }
 
-    pub(self) fn bucket_index(value: f64) -> usize {
-        // The buckets are all powers of two, so compute the ceiling of the log_2 of the
-        // value. Apply a lower bound to prevent zero or negative values from blowing up the log.
-        let log = value.max(Self::MIN_BUCKET).log2().ceil();
-        // Offset it based on the minimum bucket's exponent. The result will be non-negative thanks
-        // to the `.max` above, so we can coerce it directly to `usize`.
-        #[allow(clippy::cast_possible_truncation)] // The log will always be smaller than `usize`.
-        let index = (log - Self::MIN_BUCKET_EXP) as usize;
-        // Now bound the value for values larger than the largest bucket.
-        index.min(Self::BUCKETS - 1)
+    /// Integer buckets [1, 2, 3, ..., 25, +∞] for discrete count distributions
+    /// like retry attempts per request.
+    pub(crate) fn new_integer() -> Self {
+        let buckets = Box::new([
+            (1.0, AtomicU32::new(0)),
+            (2.0, AtomicU32::new(0)),
+            (3.0, AtomicU32::new(0)),
+            (4.0, AtomicU32::new(0)),
+            (5.0, AtomicU32::new(0)),
+            (6.0, AtomicU32::new(0)),
+            (7.0, AtomicU32::new(0)),
+            (8.0, AtomicU32::new(0)),
+            (9.0, AtomicU32::new(0)),
+            (10.0, AtomicU32::new(0)),
+            (11.0, AtomicU32::new(0)),
+            (12.0, AtomicU32::new(0)),
+            (13.0, AtomicU32::new(0)),
+            (14.0, AtomicU32::new(0)),
+            (15.0, AtomicU32::new(0)),
+            (16.0, AtomicU32::new(0)),
+            (17.0, AtomicU32::new(0)),
+            (18.0, AtomicU32::new(0)),
+            (19.0, AtomicU32::new(0)),
+            (20.0, AtomicU32::new(0)),
+            (21.0, AtomicU32::new(0)),
+            (22.0, AtomicU32::new(0)),
+            (23.0, AtomicU32::new(0)),
+            (24.0, AtomicU32::new(0)),
+            (25.0, AtomicU32::new(0)),
+            (f64::INFINITY, AtomicU32::new(0)),
+        ]);
+        Self {
+            buckets,
+            power_of_two: false,
+            count: AtomicU64::new(0),
+            sum: AtomicF64::new(0.0),
+        }
+    }
+
+    fn bucket_index(&self, value: f64) -> usize {
+        if self.power_of_two {
+            // The buckets are all powers of two, so compute the ceiling of the log_2 of the
+            // value. Apply a lower bound to prevent zero or negative values from blowing up the log.
+            let log = value.max(Self::MIN_BUCKET).log2().ceil();
+            // Offset it based on the minimum bucket's exponent. The result will be non-negative
+            // thanks to the `.max` above, so we can coerce it directly to `usize`.
+            #[allow(clippy::cast_possible_truncation)]
+            let index = (log - Self::MIN_BUCKET_EXP) as usize;
+            index.min(Self::BUCKETS - 1)
+        } else {
+            // Integer buckets [1, 2, ..., 25, +∞]: linear scan for the first bucket that fits.
+            for (i, (upper, _)) in self.buckets.iter().enumerate() {
+                if value <= *upper {
+                    return i;
+                }
+            }
+            Self::BUCKETS - 1
+        }
     }
 
     pub(super) fn count(&self) -> u64 {
@@ -127,7 +182,7 @@ impl Histogram {
 
 impl HistogramFn for Histogram {
     fn record(&self, value: f64) {
-        let index = Self::bucket_index(value);
+        let index = self.bucket_index(value);
         self.buckets[index].1.fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum
@@ -173,7 +228,7 @@ mod test {
                     continue;
                 }
 
-                let index = Histogram::bucket_index(value);
+                let index = sut.bucket_index(value);
                 assert!(
                     value <= sut.buckets[index].0,
                     "Value {} is not less than the upper limit {}.",
@@ -203,5 +258,27 @@ mod test {
             .tests(1_000)
             .max_tests(2_000)
             .quickcheck(inner as fn(Vec<f64>) -> TestResult);
+    }
+
+    #[test]
+    fn histogram_integer_boundaries() {
+        let h = Histogram::new_integer();
+
+        // Exact integer values map to their expected index
+        assert_eq!(h.bucket_index(1.0), 0);
+        assert_eq!(h.bucket_index(2.0), 1);
+        assert_eq!(h.bucket_index(25.0), 24);
+
+        // Fractional values land in the next bucket up
+        assert_eq!(h.bucket_index(1.5), 1); // > 1.0, so bucket 2.0
+        assert_eq!(h.bucket_index(0.5), 0); // <= 1.0, so bucket 1.0
+
+        // Values <= 0 land in the first bucket
+        assert_eq!(h.bucket_index(0.0), 0);
+        assert_eq!(h.bucket_index(-5.0), 0);
+
+        // Values > 25 land in the +inf bucket
+        assert_eq!(h.bucket_index(26.0), 25);
+        assert_eq!(h.bucket_index(1000.0), 25);
     }
 }

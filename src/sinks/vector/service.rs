@@ -5,6 +5,7 @@ use http::Uri;
 use hyper::client::HttpConnector;
 use hyper_openssl::HttpsConnector;
 use hyper_proxy::ProxyConnector;
+use metrics::counter;
 use prost::Message;
 use tonic::{IntoRequest, body::BoxBody};
 use tower::Service;
@@ -106,6 +107,7 @@ impl Service<VectorRequest> for VectorService {
 
     // Emission of internal events for errors and dropped events is handled upstream by the caller.
     fn call(&mut self, mut list: VectorRequest) -> Self::Future {
+        counter!("sink_request_attempts_total").increment(1);
         let mut service = self.clone();
         let byte_size = list.request.encoded_len();
         let metadata = std::mem::take(list.metadata_mut());
