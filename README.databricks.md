@@ -89,3 +89,4 @@ This lists custom changes merged in Databricks fork of Vector.
 88. Add `last_config_reload_success` gauge metric to reflect the current state of the most recent config reload attempt https://github.com/databricks-eng/vector/pull/426
 89. Add JSON encoding support for file enrichment tables, enabling hot-reload of JSON files as enrichment sources without requiring CSV conversion. https://github.com/databricks-eng/vector/pull/434
 90. expose file fingerprint and offset on each event https://github.com/databricks-eng/vector/pull/436
+91. Removing default exclusion label for prometheus scrape. https://github.com/databricks-eng/vector/pull/435
