@@ -69,7 +69,8 @@ impl ApplicationConfig {
             .then(|| Duration::from_secs(u64::from(opts.graceful_shutdown_limit_secs)));
 
         let graceful_data_source_shutdown_duration = graceful_shutdown_duration.and_then(|main| {
-            let data = Duration::from_secs(u64::from(opts.graceful_data_source_shutdown_limit_secs));
+            let data =
+                Duration::from_secs(u64::from(opts.graceful_data_source_shutdown_limit_secs));
             if data < main { Some(data) } else { None }
         });
 

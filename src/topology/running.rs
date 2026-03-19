@@ -173,13 +173,14 @@ impl RunningTopology {
         // Split the shutdown into two waves if there are deferred sources and a data source
         // deadline is configured. Otherwise, use the existing single-pass shutdown to maintain
         // backward compatibility.
-        let (wave1_complete, deferred_shutdowns) =
-            self.shutdown_coordinator.shutdown_non_deferred(
-                data_source_deadline.or(deadline),
-            );
+        let (wave1_complete, deferred_shutdowns) = self
+            .shutdown_coordinator
+            .shutdown_non_deferred(data_source_deadline.or(deadline));
 
         let two_wave_enabled = self.config.global.two_wave_shutdown.enabled();
-        let use_two_wave = two_wave_enabled && deferred_shutdowns.has_deferred_sources() && data_source_deadline.is_some();
+        let use_two_wave = two_wave_enabled
+            && deferred_shutdowns.has_deferred_sources()
+            && data_source_deadline.is_some();
 
         // In two-wave mode, compute which components are exclusively downstream of
         // non-deferred sources. Only those components should be waited on in wave 1.
@@ -349,7 +350,8 @@ impl RunningTopology {
                 deferred_shutdowns.shutdown_all(deadline).await;
             };
 
-            futures::future::join(source_shutdown_complete, shutdown_complete_future).map(|_| ())
+            futures::future::join(source_shutdown_complete, shutdown_complete_future)
+                .map(|_| ())
                 .boxed()
         } else {
             // No deferred sources or no data source deadline: use original single-pass behavior.
@@ -358,7 +360,8 @@ impl RunningTopology {
                 deferred_shutdowns.shutdown_all(deadline).await;
             };
 
-            futures::future::join(source_shutdown_complete, shutdown_complete_future).map(|_| ())
+            futures::future::join(source_shutdown_complete, shutdown_complete_future)
+                .map(|_| ())
                 .boxed()
         }
     }
@@ -376,7 +379,8 @@ impl RunningTopology {
         deferred_source_keys: &HashSet<ComponentKey>,
     ) -> HashSet<ComponentKey> {
         // Start with all non-deferred sources.
-        let mut non_deferred: HashSet<ComponentKey> = config.sources()
+        let mut non_deferred: HashSet<ComponentKey> = config
+            .sources()
             .map(|(k, _)| k.clone())
             .filter(|k| !deferred_source_keys.contains(k))
             .collect();
@@ -390,7 +394,10 @@ impl RunningTopology {
                     continue;
                 }
                 if !transform.inputs.is_empty()
-                    && transform.inputs.iter().all(|input| non_deferred.contains(&input.component))
+                    && transform
+                        .inputs
+                        .iter()
+                        .all(|input| non_deferred.contains(&input.component))
                 {
                     non_deferred.insert(key.clone());
                     changed = true;
@@ -402,7 +409,10 @@ impl RunningTopology {
                     continue;
                 }
                 if !sink.inputs.is_empty()
-                    && sink.inputs.iter().all(|input| non_deferred.contains(&input.component))
+                    && sink
+                        .inputs
+                        .iter()
+                        .all(|input| non_deferred.contains(&input.component))
                 {
                     non_deferred.insert(key.clone());
                     changed = true;

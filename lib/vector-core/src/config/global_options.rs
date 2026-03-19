@@ -5,8 +5,8 @@ use vector_common::TimeZone;
 use vector_config::{configurable_component, impl_generate_config_from_default};
 
 use super::{
-    super::default_data_dir, AcknowledgementsConfig, LogSchema, Telemetry,
-    TwoWaveShutdownConfig, metrics_expiration::PerMetricSetExpiration, proxy::ProxyConfig,
+    super::default_data_dir, AcknowledgementsConfig, LogSchema, Telemetry, TwoWaveShutdownConfig,
+    metrics_expiration::PerMetricSetExpiration, proxy::ProxyConfig,
 };
 use crate::serde::bool_or_struct;
 
@@ -323,7 +323,9 @@ impl GlobalOptions {
                 log_schema,
                 telemetry,
                 acknowledgements: self.acknowledgements.merge_default(&with.acknowledgements),
-                two_wave_shutdown: self.two_wave_shutdown.merge_default(&with.two_wave_shutdown),
+                two_wave_shutdown: self
+                    .two_wave_shutdown
+                    .merge_default(&with.two_wave_shutdown),
                 timezone: self.timezone.or(with.timezone),
                 proxy: self.proxy.merge(&with.proxy),
                 expire_metrics: self.expire_metrics.or(with.expire_metrics),

@@ -230,7 +230,7 @@ pub struct RootOpts {
     #[arg(
         long,
         default_value = "20",
-        env = "VECTOR_GRACEFUL_DATA_SOURCE_SHUTDOWN_LIMIT_SECS",
+        env = "VECTOR_GRACEFUL_DATA_SOURCE_SHUTDOWN_LIMIT_SECS"
     )]
     pub graceful_data_source_shutdown_limit_secs: NonZeroU64,
 

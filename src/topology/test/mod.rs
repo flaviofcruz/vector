@@ -1030,7 +1030,11 @@ async fn topology_two_wave_graceful_shutdown() {
         mixed_transform,
     );
 
-    config.add_sink("non_deferred_sink", &["non_deferred_transform"], non_deferred_sink);
+    config.add_sink(
+        "non_deferred_sink",
+        &["non_deferred_transform"],
+        non_deferred_sink,
+    );
     config.add_sink("mixed_sink", &["mixed_transform"], mixed_sink);
 
     let (topology, _) = start_topology(config.build().unwrap(), false).await;
@@ -1046,22 +1050,30 @@ async fn topology_two_wave_graceful_shutdown() {
     internal_logs_tx.send_event(event3).await.unwrap();
 
     // Collect events from non_deferred_sink (should get 1 event from ext1)
-    let nd_event: EventArray = non_deferred_out.take(1).collect::<Vec<_>>().await
-        .into_iter().next().unwrap().into();
-    let nd_messages: Vec<String> = nd_event.into_events()
-        .map(into_message)
-        .collect();
+    let nd_event: EventArray = non_deferred_out
+        .take(1)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .into();
+    let nd_messages: Vec<String> = nd_event.into_events().map(into_message).collect();
     assert_eq!(nd_messages, vec!["from_ext1 nd_transformed"]);
 
     // Collect events from mixed_sink (should get 2 events: from ext2 and internal)
     let mixed_events: Vec<EventArray> = mixed_out.take(2).map(|item| item.into()).collect().await;
-    let mut mixed_messages: Vec<String> = mixed_events.into_iter()
+    let mut mixed_messages: Vec<String> = mixed_events
+        .into_iter()
         .flat_map(|arr| arr.into_events().map(into_message).collect::<Vec<_>>())
         .collect();
     mixed_messages.sort();
     assert_eq!(
         mixed_messages,
-        vec!["from_ext2 mixed_transformed", "from_internal mixed_transformed"]
+        vec![
+            "from_ext2 mixed_transformed",
+            "from_internal mixed_transformed"
+        ]
     );
 
     // Drop senders so sources can finish when they receive shutdown signals

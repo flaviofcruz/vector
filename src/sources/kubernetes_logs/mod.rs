@@ -34,7 +34,7 @@ use vector_lib::{
         parse_start_reading_at,
     },
     file_source_common::{
-        Checkpointer, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
+        Checkpointer, FileFingerprint, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
     },
     internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
     lookup::{OwnedTargetPath, lookup_v2::OptionalTargetPath, owned_value_path, path},
@@ -1042,6 +1042,8 @@ impl Source {
             let mut event = create_event(
                 line.text,
                 &line.filename,
+                line.start_offset,
+                line.file_id,
                 ingestion_timestamp_field.as_ref(),
                 log_namespace,
                 &self.source_context,
@@ -1161,9 +1163,18 @@ fn get_page_size(use_apiserver_cache: bool) -> Option<u32> {
     }
 }
 
+fn fingerprint_to_string(fp: FileFingerprint) -> String {
+    match fp {
+        FileFingerprint::FirstLinesChecksum(checksum) => format!("checksum:{}", checksum),
+        FileFingerprint::DevInode(dev, inode) => format!("dev_inode:{}:{}", dev, inode),
+    }
+}
+
 fn create_event(
     line: Bytes,
     file: &str,
+    start_offset: u64,
+    file_id: FileFingerprint,
     ingestion_timestamp_field: Option<&OwnedTargetPath>,
     log_namespace: LogNamespace,
     source_context: &Option<HashMap<String, String>>,
@@ -1199,6 +1210,9 @@ fn create_event(
         // The CRI/Docker parsers handle inserting the `log_schema().timestamp_key()` value.
         (LogNamespace::Legacy, None) => (),
     };
+
+    log.insert("file_id", fingerprint_to_string(file_id));
+    log.insert("offset", start_offset);
 
     // Apply additional fields as specified by the source context if needed
     if let Some(source_context) = source_context {

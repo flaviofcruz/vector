@@ -140,16 +140,11 @@ impl DeferredSourceShutdowns {
         for (id, trigger) in self.begun_triggers {
             trigger.cancel();
 
-            let shutdown_complete_tripwire =
-                complete_tripwires.remove(&id).unwrap_or_else(|| {
-                    panic!(
-                        "shutdown_complete_tripwire for deferred source \"{id}\" not found"
-                    )
-                });
+            let shutdown_complete_tripwire = complete_tripwires.remove(&id).unwrap_or_else(|| {
+                panic!("shutdown_complete_tripwire for deferred source \"{id}\" not found")
+            });
             let shutdown_force_trigger = force_triggers.remove(&id).unwrap_or_else(|| {
-                panic!(
-                    "shutdown_force_trigger for deferred source \"{id}\" not found"
-                )
+                panic!("shutdown_force_trigger for deferred source \"{id}\" not found")
             });
 
             complete_futures.push(SourceShutdownCoordinator::shutdown_source_complete(
@@ -517,7 +512,9 @@ mod test {
 
         wave1_future.await;
         // Deferred shutdown with no sources should complete immediately.
-        deferred.shutdown_all(Some(Instant::now() + Duration::from_secs(1))).await;
+        deferred
+            .shutdown_all(Some(Instant::now() + Duration::from_secs(1)))
+            .await;
     }
 
     #[tokio::test]
