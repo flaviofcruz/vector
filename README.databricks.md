@@ -88,5 +88,6 @@ This lists custom changes merged in Databricks fork of Vector.
 87. Fix MAP fields nested inside structs to use label=Repeated so they are correctly encoded instead of being silently dropped https://github.com/databricks-eng/vector/pull/428
 88. Add `last_config_reload_success` gauge metric to reflect the current state of the most recent config reload attempt https://github.com/databricks-eng/vector/pull/426
 89. Add JSON encoding support for file enrichment tables, enabling hot-reload of JSON files as enrichment sources without requiring CSV conversion. https://github.com/databricks-eng/vector/pull/434
-90. expose file fingerprint and offset on each event https://github.com/databricks-eng/vector/pull/436
-91. Removing default exclusion label for prometheus scrape. https://github.com/databricks-eng/vector/pull/435
+90. Implement two-wave shutdown for vector-daemon, gated by a flag. https://github.com/databricks-eng/vector/pull/419
+91. expose file fingerprint and offset on each event https://github.com/databricks-eng/vector/pull/436
+92. Removing default exclusion label for prometheus scrape. https://github.com/databricks-eng/vector/pull/435
