@@ -91,6 +91,17 @@ pub struct S3SinkConfig {
     #[configurable(metadata(docs::human_name = "Append UUID to Filename"))]
     pub filename_append_uuid: bool,
 
+    /// Whether or not to prepend a random cryptographic nonce to the beginning of the object key's filename.
+    ///
+    /// The nonce is a truncated 8-character random hexadecimal string, prepended to the filename
+    /// with a `-` delimiter. For example, if the filename would normally be `1658176486`, setting
+    /// this field to `true` results in a filename like `a3b1f29c-1658176486`.
+    ///
+    /// This can be useful for S3 performance optimization by increasing key randomness.
+    #[serde(default)]
+    #[configurable(metadata(docs::human_name = "Prepend Crypto Nonce to Filename"))]
+    pub filename_prepend_crypto_nonce: bool,
+
     /// The filename extension to use in the object key.
     ///
     /// This overrides setting the extension based on the configured `compression`.
@@ -173,6 +184,7 @@ impl GenerateConfig for S3SinkConfig {
             key_prefix: default_key_prefix(),
             filename_time_format: default_filename_time_format(),
             filename_append_uuid: true,
+            filename_prepend_crypto_nonce: false,
             filename_extension: None,
             options: S3Options::default(),
             region: RegionOrEndpoint::default(),
@@ -265,6 +277,7 @@ impl S3SinkConfig {
             filename_extension: self.filename_extension.clone(),
             filename_time_format: self.filename_time_format.clone(),
             filename_append_uuid: self.filename_append_uuid,
+            filename_prepend_crypto_nonce: self.filename_prepend_crypto_nonce,
             encoder: (transformer, encoder),
             compression: self.compression,
             filename_tz_offset: offset,

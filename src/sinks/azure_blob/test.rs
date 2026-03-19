@@ -27,6 +27,7 @@ fn default_config(encoding: EncodingConfigWithFraming) -> AzureBlobSinkConfig {
         blob_prefix: Default::default(),
         blob_time_format: Default::default(),
         blob_append_uuid: Default::default(),
+        blob_prepend_crypto_nonce: false,
         encoding,
         compression: Compression::gzip_default(),
         batch: Default::default(),
@@ -63,6 +64,7 @@ fn azure_blob_build_request_without_compression() {
         container_name,
         blob_time_format,
         blob_append_uuid,
+        blob_prepend_crypto_nonce: false,
         encoder: (
             Default::default(),
             Encoder::<Framer>::new(
@@ -111,6 +113,7 @@ fn azure_blob_build_request_with_compression() {
         container_name,
         blob_time_format,
         blob_append_uuid,
+        blob_prepend_crypto_nonce: false,
         encoder: (
             Default::default(),
             Encoder::<Framer>::new(
@@ -159,6 +162,7 @@ fn azure_blob_build_request_with_time_format() {
         container_name,
         blob_time_format,
         blob_append_uuid,
+        blob_prepend_crypto_nonce: false,
         encoder: (
             Default::default(),
             Encoder::<Framer>::new(
@@ -210,6 +214,7 @@ fn azure_blob_build_request_with_uuid() {
         container_name,
         blob_time_format,
         blob_append_uuid,
+        blob_prepend_crypto_nonce: false,
         encoder: (
             Default::default(),
             Encoder::<Framer>::new(
@@ -233,4 +238,57 @@ fn azure_blob_build_request_with_uuid() {
     assert_ne!(request.metadata.partition_key, "blob.log".to_string());
     assert_eq!(request.content_encoding, None);
     assert_eq!(request.content_type, "text/plain");
+}
+
+#[test]
+fn azure_blob_build_request_with_crypto_nonce() {
+    let log = Event::Log(LogEvent::from("test message"));
+    let container_name = String::from("logs");
+    let sink_config = AzureBlobSinkConfig {
+        blob_prefix: "blob/".try_into().unwrap(),
+        container_name: container_name.clone(),
+        ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+    };
+    let key = sink_config
+        .key_partitioner()
+        .unwrap()
+        .partition(&log)
+        .expect("key wasn't provided");
+
+    let request_options = AzureBlobRequestOptions {
+        container_name,
+        blob_time_format: String::new(),
+        blob_append_uuid: false,
+        blob_prepend_crypto_nonce: true,
+        encoder: (
+            Default::default(),
+            Encoder::<Framer>::new(
+                NewlineDelimitedEncoder::default().into(),
+                TextSerializerConfig::default().build().into(),
+            ),
+        ),
+        compression: Compression::None,
+    };
+
+    let mut byte_size = GroupedCountByteSize::new_untagged();
+    byte_size.add_event(&log, log.estimated_json_encoded_size_of());
+
+    let (metadata, request_metadata_builder, _events) =
+        request_options.split_input((key, vec![log]));
+    let payload = EncodeResult::uncompressed(Bytes::new(), byte_size);
+    let request_metadata = request_metadata_builder.build(&payload);
+    let request = request_options.build_request(metadata, request_metadata, payload);
+
+    // Should be "blob/<8-hex-chars>-.log"
+    let filename = request
+        .metadata
+        .partition_key
+        .strip_prefix("blob/")
+        .unwrap()
+        .strip_suffix(".log")
+        .unwrap();
+    let (nonce, rest) = filename.split_at(9);
+    assert!(nonce[..8].chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(&nonce[8..], "-");
+    assert!(rest.is_empty());
 }

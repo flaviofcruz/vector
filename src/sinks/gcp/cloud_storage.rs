@@ -7,6 +7,7 @@ use http::{
     header::{HeaderName, HeaderValue},
 };
 use indoc::indoc;
+use rand::Rng;
 use snafu::{ResultExt, Snafu};
 use tower::ServiceBuilder;
 use uuid::Uuid;
@@ -141,6 +142,18 @@ pub struct GcsSinkConfig {
     #[configurable(metadata(docs::advanced))]
     filename_append_uuid: bool,
 
+    /// Whether or not to prepend a random cryptographic nonce to the beginning of the object key's filename.
+    ///
+    /// The nonce is a truncated 8-character random hexadecimal string, prepended to the filename
+    /// with a `-` delimiter. For example, if the filename would normally be `1658176486`, setting
+    /// this field to `true` results in a filename like `a3b1f29c-1658176486`.
+    ///
+    /// This can be useful for GCS performance optimization by increasing key randomness.
+    #[serde(default)]
+    #[configurable(metadata(docs::advanced))]
+    #[configurable(metadata(docs::human_name = "Prepend Crypto Nonce to Filename"))]
+    filename_prepend_crypto_nonce: bool,
+
     /// The filename extension to use in the object key.
     ///
     /// If not specified, the extension is determined by the compression scheme used.
@@ -226,6 +239,7 @@ fn default_config(encoding: EncodingConfigWithFraming) -> GcsSinkConfig {
         key_prefix: Default::default(),
         filename_time_format: default_time_format(),
         filename_append_uuid: true,
+        filename_prepend_crypto_nonce: false,
         filename_extension: Default::default(),
         content_type: Default::default(),
         encoding,
@@ -339,6 +353,7 @@ struct RequestSettings {
     extension: String,
     time_format: String,
     append_uuid: bool,
+    prepend_crypto_nonce: bool,
     encoder: (Transformer, Encoder<Framer>),
     compression: Compression,
     tz_offset: Option<FixedOffset>,
@@ -409,11 +424,18 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
                     .format(&self.time_format),
             };
 
-            if self.append_uuid {
+            let base = if self.append_uuid {
                 let uuid = Uuid::new_v4();
                 format!("{}-{}", seconds, uuid.hyphenated())
             } else {
                 seconds.to_string()
+            };
+
+            if self.prepend_crypto_nonce {
+                let nonce = rand::rng().random::<u32>();
+                format!("{:08x}-{}", nonce, base)
+            } else {
+                base
             }
         };
 
@@ -478,6 +500,7 @@ impl RequestSettings {
             .unwrap_or_else(|| config.compression.extension().into());
         let time_format = config.filename_time_format.clone();
         let append_uuid = config.filename_append_uuid;
+        let prepend_crypto_nonce = config.filename_prepend_crypto_nonce;
         let offset = config
             .timezone
             .or(cx.globals.timezone)
@@ -492,6 +515,7 @@ impl RequestSettings {
             extension,
             time_format,
             append_uuid,
+            prepend_crypto_nonce,
             compression: config.compression,
             encoder: (transformer, encoder),
             tz_offset: offset,
@@ -591,12 +615,23 @@ mod tests {
         compression: Compression,
         content_encoding: Option<String>,
     ) -> GcsRequest {
+        build_request_opts(extension, uuid, false, compression, content_encoding)
+    }
+
+    fn build_request_opts(
+        extension: Option<&str>,
+        uuid: bool,
+        prepend_crypto_nonce: bool,
+        compression: Compression,
+        content_encoding: Option<String>,
+    ) -> GcsRequest {
         let context = SinkContext::default();
         let sink_config = GcsSinkConfig {
             key_prefix: Some("key/".into()),
             filename_time_format: "date".into(),
             filename_extension: extension.map(Into::into),
             filename_append_uuid: uuid,
+            filename_prepend_crypto_nonce: prepend_crypto_nonce,
             content_encoding,
             compression,
             ..default_config(
@@ -685,6 +720,22 @@ mod tests {
         let result = RequestSettings::new(&sink_config, context);
         // Should return an error, not panic
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn gcs_build_request_with_crypto_nonce() {
+        let req = build_request_opts(None, false, true, Compression::None, None);
+        let filename = req
+            .key
+            .strip_prefix("key/")
+            .unwrap()
+            .strip_suffix(".log")
+            .unwrap();
+        // Should be "<8-hex-chars>-date"
+        let (nonce, rest) = filename.split_at(9);
+        assert!(nonce[..8].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(&nonce[8..], "-");
+        assert_eq!(rest, "date");
     }
 
     #[test]

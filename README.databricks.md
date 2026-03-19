@@ -93,3 +93,4 @@ This lists custom changes merged in Databricks fork of Vector.
 92. Removing default exclusion label for prometheus scrape. https://github.com/databricks-eng/vector/pull/435
 93. Add sink request retry and failure rate metrics https://github.com/databricks-eng/vector/pull/425
 94. Handle object/blob not found (404) in `aws_s3` and `azure_blob` sources by deleting the queue message instead of retrying indefinitely https://github.com/databricks-eng/vector/pull/433
+95. Add cryptographic nonce file prefix functionality to cloud blob sinks - https://github.com/databricks-eng/vector/pull/414

@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use chrono::Utc;
+use rand::Rng;
 use uuid::Uuid;
 use vector_lib::event::event_log::generate_count_map;
 use vector_lib::{
@@ -24,6 +25,7 @@ pub struct AzureBlobRequestOptions {
     pub container_name: String,
     pub blob_time_format: String,
     pub blob_append_uuid: bool,
+    pub blob_prepend_crypto_nonce: bool,
     pub encoder: (Transformer, Encoder<Framer>),
     pub compression: Compression,
 }
@@ -85,10 +87,16 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
         payload: EncodeResult<Self::Payload>,
     ) -> Self::Request {
         let formatted_ts = Utc::now().format(self.blob_time_format.as_str());
-        let blob_name = if self.blob_append_uuid {
+        let base = if self.blob_append_uuid {
             format!("{formatted_ts}-{}", Uuid::new_v4().hyphenated())
         } else {
             formatted_ts.to_string()
+        };
+        let blob_name = if self.blob_prepend_crypto_nonce {
+            let nonce = rand::rng().random::<u32>();
+            format!("{:08x}-{}", nonce, base)
+        } else {
+            base
         };
 
         let extension = self.compression.extension();
