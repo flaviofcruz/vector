@@ -69,6 +69,7 @@ copilot-instructions.md
 # AI rule files (go/ai/rules) 
 .cursorrules
 .cursor
+.claude
 .goosehints
 CLAUDE.md
 AGENTS.md

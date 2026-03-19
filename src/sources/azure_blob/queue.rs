@@ -222,6 +222,14 @@ pub enum ProcessingError {
         blob
     ))]
     ErrorAcknowledgement { container: String, blob: String },
+
+    /// Blob was not found in Azure Storage (404)
+    #[snafu(display("Blob not found {}/{}: {}", container, blob, source))]
+    BlobNotFound {
+        source: azure_core_for_storage::Error,
+        container: String,
+        blob: String,
+    },
 }
 
 /// Internal state maintained by the ingestor
@@ -456,11 +464,33 @@ impl IngestorProcess {
                     }
                 }
                 Err(err) => {
-                    error!(
-                        message = "Failed to process queue message.",
-                        message_id = &message_id,
-                        error = ?err,
-                    );
+                    match err {
+                        ProcessingError::BlobNotFound {
+                            ref source,
+                            ref container,
+                            ref blob,
+                        } => {
+                            warn!(
+                                message = "Blob not found.",
+                                message_id = &message_id,
+                                container = %container,
+                                blob = %blob,
+                                error = %source,
+                            );
+                            // Blob no longer exists — retrying won't help.
+                            // Delete the queue message to prevent infinite retries.
+                            if self.state.delete_message {
+                                delete_messages.push(message.clone());
+                            }
+                        }
+                        _ => {
+                            error!(
+                                message = "Failed to process queue message.",
+                                message_id = &message_id,
+                                error = ?err,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -702,10 +732,28 @@ impl IngestorProcess {
 
         let mut blob_stream = blob_client.get().into_stream();
 
-        let response_opt = blob_stream.next().await.transpose().context(GetBlobSnafu {
-            container: container.clone(),
-            blob: blob.clone(),
-        })?;
+        let response_result = blob_stream.next().await.transpose();
+        let response_opt = match response_result {
+            Ok(opt) => opt,
+            Err(err) => {
+                // Check if the error is a 404 (Blob not found)
+                let is_not_found = matches!(
+                    err.kind(),
+                    ErrorKind::HttpResponse { status, .. } if *status == azure_core_for_storage::StatusCode::NotFound
+                );
+                if is_not_found {
+                    return Err(ProcessingError::BlobNotFound {
+                        source: err,
+                        container: container.clone(),
+                        blob: blob.clone(),
+                    });
+                }
+                Err(err).context(GetBlobSnafu {
+                    container: container.clone(),
+                    blob: blob.clone(),
+                })?
+            }
+        };
 
         let blob_response = response_opt.ok_or_else(|| ProcessingError::GetBlob {
             source: azure_core_for_storage::Error::message(

@@ -288,6 +288,12 @@ pub enum ProcessingError {
         key: String,
         deferred_queue: String,
     },
+    #[snafu(display("Object not found s3://{}/{}: {}", bucket, key, source))]
+    ObjectNotFound {
+        source: SdkError<GetObjectError, HttpResponse>,
+        bucket: String,
+        key: String,
+    },
 }
 
 pub struct State {
@@ -534,6 +540,33 @@ impl IngestorProcess {
                                     id = message_id,
                                     receipt_handle = receipt_handle,
                                 );
+                                delete_entries.push(
+                                    DeleteMessageBatchRequestEntry::builder()
+                                        .id(message_id)
+                                        .receipt_handle(receipt_handle)
+                                        .build()
+                                        .expect("all required builder params specified"),
+                                );
+                            }
+                        }
+                        ProcessingError::ObjectNotFound {
+                            ref source,
+                            ref bucket,
+                            ref key,
+                        } => {
+                            warn!(
+                                message = "S3 object not found.",
+                                message_id = &message_id,
+                                bucket = %bucket,
+                                key = %key,
+                                error = %source,
+                            );
+                            emit!(SqsMessageProcessingSucceeded {
+                                message_id: &message_id
+                            });
+                            // Object no longer exists — retrying won't help.
+                            // Delete the SQS message to prevent infinite retries.
+                            if self.state.delete_message {
                                 delete_entries.push(
                                     DeleteMessageBatchRequestEntry::builder()
                                         .id(message_id)
@@ -842,13 +875,31 @@ impl IngestorProcess {
             .bucket(bucket.clone())
             .key(key.clone())
             .send()
-            .await
-            .with_context(|_| GetObjectSnafu {
-                bucket: bucket.clone(),
-                key: key.clone(),
-            });
+            .await;
 
-        let object = object_result?;
+        let object = match object_result {
+            Ok(obj) => obj,
+            Err(err) => {
+                // Check if the error is a NoSuchKey (object not found / 404)
+                let is_not_found = match &err {
+                    SdkError::ServiceError(service_err) => {
+                        matches!(service_err.err(), GetObjectError::NoSuchKey(_))
+                    }
+                    _ => false,
+                };
+                if is_not_found {
+                    return Err(ProcessingError::ObjectNotFound {
+                        source: err,
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                    });
+                }
+                Err(err).context(GetObjectSnafu {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                })?
+            }
+        };
 
         debug!(
             message = "Got S3 object.",
