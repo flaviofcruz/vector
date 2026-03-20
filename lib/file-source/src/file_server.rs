@@ -68,6 +68,7 @@ where
     // map that can be normally used until we have to emit the event
     pub source_context: Option<HashMap<String, String>>,
     pub file_to_pod_map: Option<Arc<Mutex<HashMap<PathBuf, LogFileInfo>>>>,
+    pub drain_on_shutdown: bool,
 }
 
 /// `FileServer` as Source
@@ -170,6 +171,15 @@ where
         self.emitter.emit_files_open(fp_map.len());
 
         let mut stats = TimingStats::default();
+
+        // Wrap the checkpointer in Arc so the drain path can write
+        // checkpoints while the checkpoint_writer task is still running.
+        let checkpointer = Arc::new(checkpointer);
+        let drain_checkpointer = if self.drain_on_shutdown {
+            Some(Arc::clone(&checkpointer))
+        } else {
+            None
+        };
 
         // Spawn the checkpoint writer task
         let checkpoint_task_handle = tokio::spawn(checkpoint_writer(
@@ -452,6 +462,119 @@ where
             futures::pin_mut!(sleep);
             match select(shutdown_data, sleep).await {
                 Either::Left((_, _)) => {
+                    if self.drain_on_shutdown {
+                        let drain_checkpointer = drain_checkpointer.as_ref().expect(
+                            "drain_checkpointer must be set when drain_on_shutdown is true",
+                        );
+                        info!(message = "Shutdown signal received, draining files before exit.");
+
+                        // Snapshot current EOF of each watched file as the drain target.
+                        let mut drain_targets: IndexMap<FileFingerprint, u64> = IndexMap::new();
+                        for (&file_id, watcher) in &fp_map {
+                            match fs::metadata(&watcher.path).await {
+                                Ok(meta) => {
+                                    drain_targets.insert(file_id, meta.len());
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        message = "Could not stat file for drain target, skipping.",
+                                        path = ?watcher.path,
+                                        ?error,
+                                    );
+                                }
+                            }
+                        }
+
+                        // Round-robin drain loop.
+                        while !drain_targets.is_empty() {
+                            let mut progress = false;
+
+                            for file_id in drain_targets.keys().copied().collect::<Vec<_>>() {
+                                let Some(&target) = drain_targets.get(&file_id) else {
+                                    continue;
+                                };
+                                let Some(watcher) = fp_map.get_mut(&file_id) else {
+                                    drain_targets.swap_remove(&file_id);
+                                    progress = true;
+                                    continue;
+                                };
+
+                                let mut bytes_read: usize = 0;
+                                while watcher.get_file_position() < target {
+                                    match watcher.read_line().await {
+                                        Ok(RawLineResult {
+                                            raw_line: Some(line),
+                                            discarded_for_size_and_truncated,
+                                        }) => {
+                                            for buf in &discarded_for_size_and_truncated {
+                                                self.emitter.emit_file_line_too_long(
+                                                    &buf.clone(),
+                                                    self.max_line_bytes,
+                                                    buf.len(),
+                                                );
+                                            }
+                                            bytes_read += line.bytes.len();
+                                            lines.push(Line {
+                                                text: line.bytes,
+                                                filename: watcher
+                                                    .path
+                                                    .to_str()
+                                                    .expect("not a valid path")
+                                                    .to_owned(),
+                                                file_id,
+                                                start_offset: line.offset,
+                                                end_offset: watcher.get_file_position(),
+                                            });
+                                            if bytes_read > self.max_read_bytes {
+                                                break;
+                                            }
+                                        }
+                                        Ok(_) => break,
+                                        Err(_) => {
+                                            drain_targets.swap_remove(&file_id);
+                                            progress = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                progress |= bytes_read > 0;
+
+                                // Persist checkpoint once a file reaches its drain target.
+                                if drain_targets.contains_key(&file_id)
+                                    && watcher.get_file_position() >= target
+                                {
+                                    drain_targets.swap_remove(&file_id);
+                                    checkpoints.update(file_id, watcher.get_file_position());
+                                    if let Err(error) = drain_checkpointer.write_checkpoints().await
+                                    {
+                                        error!(?error, "Error writing checkpoints during drain");
+                                    }
+                                    progress = true;
+                                }
+                            }
+
+                            let to_send = std::mem::take(&mut lines);
+                            if !to_send.is_empty() {
+                                if let Err(error) = chans.send(to_send).await {
+                                    error!(message = "Output channel closed during drain.", %error);
+                                    break;
+                                }
+                            }
+
+                            if !progress {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+
+                        info!(message = "Drain complete, shutting down file server.");
+                    }
+
+                    // Close the output channel FIRST. This allows downstream
+                    // processing to complete and acknowledgements to flow back,
+                    // which in turn lets shutdown_checkpointer resolve so the
+                    // checkpoint writer task can finish. Awaiting the checkpoint
+                    // task before closing the channel would deadlock when
+                    // end-to-end acknowledgements are enabled.
                     chans
                         .close()
                         .await
@@ -555,12 +678,11 @@ where
 }
 
 async fn checkpoint_writer(
-    checkpointer: Checkpointer,
+    checkpointer: Arc<Checkpointer>,
     sleep_duration: Duration,
     mut shutdown: impl Future + Unpin,
     emitter: impl FileSourceInternalEvents,
 ) -> Arc<Checkpointer> {
-    let checkpointer = Arc::new(checkpointer);
     loop {
         let sleep = sleep(sleep_duration);
         tokio::select! {
@@ -694,4 +816,426 @@ pub struct Line {
     pub file_id: FileFingerprint,
     pub start_offset: u64,
     pub end_offset: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        io::Error,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+
+    use bytes::{Bytes, BytesMut};
+    use file_source_common::{
+        Checkpointer, FileSourceInternalEvents, FingerprintStrategy, Fingerprinter, ReadFrom,
+    };
+    use futures::{StreamExt, channel::mpsc};
+    use tempfile::tempdir;
+    use tokio::fs;
+
+    use crate::{
+        file_server::{FileServer, Line},
+        paths_provider::PathsProvider,
+    };
+
+    // No-op FileSourceInternalEvents implementation for testing.
+    // Error events panic so tests fail fast on unexpected errors.
+    #[derive(Clone)]
+    struct NoErrors;
+
+    impl FileSourceInternalEvents for NoErrors {
+        fn emit_file_added(&self, _: &Path) {}
+        fn emit_file_resumed(&self, _: &Path, _: u64) {}
+        fn emit_file_watch_error(&self, _: &Path, _: Error) {
+            panic!("unexpected file watch error");
+        }
+        fn emit_file_unwatched(&self, _: &Path, _: bool) {}
+        fn emit_file_deleted(&self, _: &Path) {}
+        fn emit_file_delete_error(&self, _: &Path, _: Error) {
+            panic!("unexpected file delete error");
+        }
+        fn emit_file_fingerprint_read_error(&self, _: &Path, _: Error) {
+            panic!("unexpected fingerprint read error");
+        }
+        fn emit_file_checkpointed(&self, _: usize, _: Duration) {}
+        fn emit_file_checksum_failed(&self, _: &Path) {
+            panic!("unexpected file checksum failure");
+        }
+        fn emit_file_checkpoint_write_error(&self, _: Error) {
+            panic!("unexpected checkpoint write error");
+        }
+        fn emit_files_open(&self, _: usize) {}
+        fn emit_path_globbing_failed(&self, _: &Path, _: &Error) {
+            panic!("unexpected path globbing failure");
+        }
+        fn emit_file_line_too_long(&self, _: &BytesMut, _: usize, _: usize) {
+            panic!("unexpected line too long");
+        }
+    }
+
+    // Simple PathsProvider that returns a fixed set of paths.
+    struct TestPathsProvider {
+        paths: Vec<PathBuf>,
+    }
+
+    impl PathsProvider for TestPathsProvider {
+        type IntoIter = Vec<(Option<crate::paths_provider::LogFileInfo>, PathBuf)>;
+
+        fn paths(&self) -> Self::IntoIter {
+            self.paths.iter().map(|p| (None, p.clone())).collect()
+        }
+    }
+
+    fn make_file_server(
+        paths: Vec<PathBuf>,
+        data_dir: PathBuf,
+        drain_on_shutdown: bool,
+    ) -> FileServer<TestPathsProvider, NoErrors> {
+        FileServer {
+            paths_provider: TestPathsProvider { paths },
+            max_read_bytes: 2048,
+            ignore_checkpoints: false,
+            read_from: ReadFrom::Beginning,
+            ignore_before: None,
+            start_reading_at: None,
+            max_line_bytes: 1024,
+            line_delimiter: Bytes::from("\n"),
+            data_dir,
+            glob_minimum_cooldown: Duration::from_millis(100),
+            fingerprinter: Fingerprinter::new(
+                FingerprintStrategy::FirstLinesChecksum {
+                    ignored_header_bytes: 0,
+                    lines: 1,
+                },
+                1024,
+                true,
+            ),
+            oldest_first: false,
+            remove_after: None,
+            emitter: NoErrors,
+            rotate_wait: Duration::from_secs(u64::MAX / 2),
+            ttl_removal_config: None,
+            source_context: None,
+            file_to_pod_map: None,
+            drain_on_shutdown,
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_on_shutdown_false_preserves_existing_behavior() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let log_path = tmp.path().join("test.log");
+        // Write 200 lines, each ~50 bytes, total ~10KB which exceeds max_read_bytes of 2048.
+        let content: String = (0..200)
+            .map(|i| format!("line {:04} -- padding to make this longer\n", i))
+            .collect();
+        fs::write(&log_path, &content).await.unwrap();
+
+        let file_server = make_file_server(vec![log_path], data_dir, false);
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+
+        // Both shutdown signals resolve immediately.
+        let shutdown_data = futures::future::ready(());
+        let shutdown_checkpointer = futures::future::ready(());
+        let checkpointer = Checkpointer::new(tmp.path().join("data").as_path());
+
+        let result = file_server
+            .run(tx, shutdown_data, shutdown_checkpointer, checkpointer)
+            .await;
+        assert!(result.is_ok());
+
+        // Collect lines non-blocking since the channel is already closed.
+        let mut received = Vec::new();
+        while let Ok(Some(batch)) = rx.try_next() {
+            received.extend(batch);
+        }
+
+        // With immediate shutdown signal and drain_on_shutdown=false, only a partial
+        // read should occur (first iteration reads up to max_read_bytes).
+        assert!(
+            received.len() < 200,
+            "expected partial read, got {} lines",
+            received.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_on_shutdown_reads_all_data() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let log_path = tmp.path().join("test.log");
+        let content: String = (0..200)
+            .map(|i| format!("line {:04} -- padding to make this longer\n", i))
+            .collect();
+        fs::write(&log_path, &content).await.unwrap();
+
+        let file_server = make_file_server(vec![log_path], data_dir, true);
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+
+        let shutdown_data = futures::future::ready(());
+        let shutdown_checkpointer = futures::future::ready(());
+        let checkpointer = Checkpointer::new(tmp.path().join("data").as_path());
+
+        // Spawn a collector to drain the bounded channel concurrently.
+        let collector = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Some(batch) = rx.next().await {
+                lines.extend(batch);
+            }
+            lines
+        });
+
+        let result = file_server
+            .run(tx, shutdown_data, shutdown_checkpointer, checkpointer)
+            .await;
+        assert!(result.is_ok());
+
+        let received = collector.await.unwrap();
+        assert_eq!(
+            received.len(),
+            200,
+            "expected all 200 lines, got {}",
+            received.len()
+        );
+
+        // Verify first and last line content.
+        assert_eq!(
+            received[0].text,
+            Bytes::from("line 0000 -- padding to make this longer")
+        );
+        assert_eq!(
+            received[199].text,
+            Bytes::from("line 0199 -- padding to make this longer")
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_on_shutdown_multiple_files() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let log_a = tmp.path().join("a.log");
+        let log_b = tmp.path().join("b.log");
+
+        let content_a: String = (0..100)
+            .map(|i| format!("file_a line {:04} padding here\n", i))
+            .collect();
+        let content_b: String = (0..100)
+            .map(|i| format!("file_b line {:04} padding here\n", i))
+            .collect();
+
+        fs::write(&log_a, &content_a).await.unwrap();
+        fs::write(&log_b, &content_b).await.unwrap();
+
+        let file_server = make_file_server(vec![log_a, log_b], data_dir, true);
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+
+        let shutdown_data = futures::future::ready(());
+        let shutdown_checkpointer = futures::future::ready(());
+        let checkpointer = Checkpointer::new(tmp.path().join("data").as_path());
+
+        let collector = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Some(batch) = rx.next().await {
+                lines.extend(batch);
+            }
+            lines
+        });
+
+        let result = file_server
+            .run(tx, shutdown_data, shutdown_checkpointer, checkpointer)
+            .await;
+        assert!(result.is_ok());
+
+        let received = collector.await.unwrap();
+        let from_a = received
+            .iter()
+            .filter(|l| l.filename.contains("a.log"))
+            .count();
+        let from_b = received
+            .iter()
+            .filter(|l| l.filename.contains("b.log"))
+            .count();
+
+        assert_eq!(from_a, 100, "expected 100 lines from a.log, got {}", from_a);
+        assert_eq!(from_b, 100, "expected 100 lines from b.log, got {}", from_b);
+        assert_eq!(received.len(), 200);
+    }
+
+    #[tokio::test]
+    async fn drain_on_shutdown_writes_checkpoints() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let log_path = tmp.path().join("test.log");
+        let content = "line one\nline two\nline three\n";
+        fs::write(&log_path, content).await.unwrap();
+
+        let file_server = make_file_server(vec![log_path.clone()], data_dir.clone(), true);
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+
+        let shutdown_data = futures::future::ready(());
+        let shutdown_checkpointer = futures::future::ready(());
+        let checkpointer = Checkpointer::new(data_dir.as_path());
+
+        let collector = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Some(batch) = rx.next().await {
+                lines.extend(batch);
+            }
+            lines
+        });
+
+        let result = file_server
+            .run(tx, shutdown_data, shutdown_checkpointer, checkpointer)
+            .await;
+        assert!(result.is_ok());
+
+        let received = collector.await.unwrap();
+        assert_eq!(received.len(), 3);
+
+        // Verify checkpoints were persisted by loading them in a fresh Checkpointer.
+        let mut checkpointer = Checkpointer::new(data_dir.as_path());
+        checkpointer.read_checkpoints(None).await;
+
+        // Compute the file's fingerprint.
+        let mut fingerprinter = Fingerprinter::new(
+            FingerprintStrategy::FirstLinesChecksum {
+                ignored_header_bytes: 0,
+                lines: 1,
+            },
+            1024,
+            true,
+        );
+        let mut known_small_files = HashMap::new();
+        let fingerprint = fingerprinter
+            .fingerprint_or_emit(&log_path, &mut known_small_files, &NoErrors)
+            .await
+            .expect("should be able to fingerprint the file");
+
+        let position = checkpointer.view().get(fingerprint);
+        let file_size = fs::metadata(&log_path).await.unwrap().len();
+        assert_eq!(
+            position,
+            Some(file_size),
+            "checkpoint position should equal file size after drain"
+        );
+    }
+
+    /// Integration test for the drain-on-shutdown contract.
+    ///
+    /// Two independent FileServer runs execute the same steps 1–3 but
+    /// diverge at step 4 based on the `drain_on_shutdown` flag.
+    ///
+    /// Run A (drain_on_shutdown = false):
+    ///   1. Write X lines to a file whose total size exceeds `max_read_bytes`.
+    ///   2. Start FileServer with an *immediate* shutdown signal (`ready(())`).
+    ///      The main loop runs one iteration — reads up to `max_read_bytes`
+    ///      (Y lines, where Y < X), sends them to the output channel.
+    ///   3. Shutdown signal fires. The main loop's `select(shutdown, sleep)`
+    ///      resolves to `Either::Left` and enters the shutdown path.
+    ///   4. Only Y lines are delivered. The remaining X − Y lines on disk
+    ///      are lost.
+    ///
+    /// Run B (drain_on_shutdown = true):
+    ///   1–3. Same as Run A (fresh file, fresh FileServer, same immediate
+    ///      shutdown signal).
+    ///   4. The drain loop reads the remaining X − Y lines before closing
+    ///      the channel. All X lines are delivered and the checkpoint is
+    ///      set to EOF.
+    #[tokio::test]
+    async fn drain_on_shutdown_integration() {
+        // Build a throwaway server just to read max_read_bytes, so the
+        // test stays correct even if make_file_server's value changes.
+        let max_read_bytes = {
+            let tmp = tempdir().unwrap();
+            make_file_server(vec![], tmp.path().to_path_buf(), false).max_read_bytes
+        };
+
+        // Each line is ~40 bytes.  We need total file size to comfortably
+        // exceed max_read_bytes so that one main-loop iteration only reads
+        // a fraction of the file (Y lines, where Y < X).
+        const LINE_LEN: usize = 40;
+        let x = max_read_bytes / LINE_LEN * 4; // ~4× what fits in one iteration
+        let file_content: String = (0..x)
+            .map(|i| format!("line {:04} -- padding to make this longer\n", i))
+            .collect();
+
+        // Steps 1–3 for each run: write X lines to a fresh file in a
+        // fresh tempdir, start a new FileServer with an immediate shutdown
+        // signal, let it run one read iteration, then enter the shutdown
+        // path.  Each call gets its own isolated state (tempdir, file,
+        // FileServer, channel, checkpointer) — the two runs share nothing.
+        async fn run_file_server(content: &str, drain: bool) -> Vec<Line> {
+            let tmp = tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            fs::create_dir_all(&data_dir).await.unwrap();
+
+            let log_path = tmp.path().join("test.log");
+            fs::write(&log_path, content).await.unwrap();
+
+            let file_server = make_file_server(vec![log_path], data_dir.clone(), drain);
+            let (tx, rx) = mpsc::channel::<Vec<Line>>(2);
+
+            // Immediate shutdown: the main loop gets exactly one read
+            // iteration before the shutdown signal wins the select.
+            let shutdown_data = futures::future::ready(());
+            let shutdown_checkpointer = futures::future::ready(());
+            let checkpointer = Checkpointer::new(data_dir.as_path());
+
+            let collector = tokio::spawn(async move {
+                let mut lines = Vec::new();
+                let mut rx = rx;
+                while let Some(batch) = rx.next().await {
+                    lines.extend(batch);
+                }
+                lines
+            });
+
+            file_server
+                .run(tx, shutdown_data, shutdown_checkpointer, checkpointer)
+                .await
+                .expect("FileServer::run should succeed");
+
+            collector.await.expect("collector task panicked")
+        }
+
+        // ── Run A (drain_on_shutdown = false) ───────────────────────────
+        // Step 4: no drain — only Y lines from the first read iteration
+        // are delivered; the remaining X − Y lines on disk are lost.
+        let received_a = run_file_server(&file_content, false).await;
+        let y = received_a.len();
+        assert!(
+            y > 0 && y < x,
+            "Run A: expected a partial read (0 < Y < {x}), got Y = {y}",
+        );
+
+        // ── Run B (drain_on_shutdown = true) ────────────────────────────
+        // Step 4: the drain loop reads the remaining X − Y lines before
+        // closing the channel.  All X lines are delivered.
+        let received_b = run_file_server(&file_content, true).await;
+        assert_eq!(
+            received_b.len(),
+            x,
+            "Run B: expected all {x} lines with drain, got {}",
+            received_b.len(),
+        );
+        assert_eq!(
+            received_b[0].text,
+            Bytes::from("line 0000 -- padding to make this longer"),
+        );
+        assert_eq!(
+            received_b[x - 1].text,
+            Bytes::from(format!("line {:04} -- padding to make this longer", x - 1)),
+        );
+    }
 }

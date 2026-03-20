@@ -608,6 +608,7 @@ pub fn file_source(
         source_context: config.source_context.clone(),
         // The file source has no way of retrieving pod information, so we don't need to track it.
         file_to_pod_map: None,
+        drain_on_shutdown: false,
     };
 
     let event_metadata = EventMetadata {
