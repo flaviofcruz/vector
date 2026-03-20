@@ -116,6 +116,10 @@ impl Drop for RequestGuard {
             // Future was cancelled (e.g., by Tower timeout) before HttpService
             // returned. Treat as endpoint failure — remove it so Balance stops
             // routing to this pod. DNS refresh will re-add it if it recovers.
+            debug!(
+                message = "Request future cancelled before completion, removing ClickHouse pod.",
+                pod_ip = %self.ip,
+            );
             remove_endpoint(
                 &self.shared,
                 &self.discover_tx,
@@ -169,10 +173,17 @@ impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
     }
 
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
-        self.pending.fetch_add(1, Ordering::Relaxed);
+        let in_flight = self.pending.fetch_add(1, Ordering::Relaxed) + 1;
+        let ip = self.ip;
+
+        debug!(
+            message = "Dispatching request to ClickHouse pod.",
+            pod_ip = %ip,
+            in_flight_on_pod = in_flight,
+        );
 
         let mut guard = RequestGuard {
-            ip: self.ip,
+            ip,
             pending: self.pending.clone(),
             discover_tx: self.discover_tx.clone(),
             shared: self.shared.clone(),
@@ -187,9 +198,23 @@ impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
             // Mark as completed so the guard won't remove the endpoint on drop.
             guard.complete();
 
-            if let Err(ref e) = result {
-                if is_connection_error(e) {
-                    remove_endpoint(&guard.shared, &guard.discover_tx, guard.ip, &e.to_string());
+            match &result {
+                Ok(_) => {}
+                Err(e) => {
+                    if is_connection_error(e) {
+                        debug!(
+                            message = "Connection error on ClickHouse pod, removing endpoint.",
+                            pod_ip = %ip,
+                            error = %e,
+                        );
+                        remove_endpoint(&guard.shared, &guard.discover_tx, ip, &e.to_string());
+                    } else {
+                        debug!(
+                            message = "Non-connection error on ClickHouse pod (endpoint kept).",
+                            pod_ip = %ip,
+                            error = %e,
+                        );
+                    }
                 }
             }
 
@@ -314,7 +339,9 @@ impl tower::Service<HttpRequest<PartitionKey>> for HeadlessService {
     type Future = BoxFuture<'static, Result<HttpResponse, crate::Error>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.shared.active_count.load(Ordering::Relaxed) == 0 {
+        let active = self.shared.active_count.load(Ordering::Relaxed);
+        if active == 0 {
+            debug!(message = "No active headless endpoints, will use fallback on next call.");
             self.using_fallback = true;
             self.fallback.poll_ready(cx)
         } else {
@@ -326,11 +353,15 @@ impl tower::Service<HttpRequest<PartitionKey>> for HeadlessService {
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
         if self.using_fallback {
             warn!(
-                message =
-                    "All headless endpoints unavailable, routing to fallback ClusterIP service."
+                message = "All headless endpoints unavailable, routing to fallback ClusterIP service.",
+                active_endpoints = self.shared.active_count.load(Ordering::Relaxed),
             );
             self.fallback.call(request)
         } else {
+            debug!(
+                message = "Routing request via P2C balance.",
+                active_endpoints = self.shared.active_count.load(Ordering::Relaxed),
+            );
             let fut = self.inner.call(request);
             Box::pin(async move { fut.await.map_err(Into::into) })
         }
@@ -420,22 +451,35 @@ fn spawn_dns_refresh_task(
         interval.tick().await;
 
         loop {
-            tokio::select! {
-                _ = interval.tick() => {},
+            let reason = tokio::select! {
+                _ = interval.tick() => "scheduled interval",
                 _ = shared.refresh_notify.notified() => {
                     interval.reset();
+                    "all endpoints failed (immediate trigger)"
                 },
                 _ = shutdown_rx.changed() => break,
-            }
+            };
+
+            debug!(
+                message = "ClickHouse headless DNS refresh triggered.",
+                reason = reason,
+                active_endpoints = shared.active_count.load(Ordering::Relaxed),
+            );
 
             match dns::resolve_endpoints(&endpoint).await {
                 Ok(new_uris) => {
+                    debug!(
+                        message = "DNS refresh resolved endpoints.",
+                        resolved_count = new_uris.len(),
+                        endpoints = ?new_uris.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+                    );
                     reconcile_endpoints(&shared, &discover_tx, &client, &svc_config, &new_uris);
                 }
                 Err(e) => {
                     warn!(
                         message = "DNS refresh failed for ClickHouse headless service.",
                         error = %e,
+                        active_endpoints = shared.active_count.load(Ordering::Relaxed),
                     );
                 }
             }
@@ -468,6 +512,10 @@ fn reconcile_endpoints(
         known.remove(ip);
         shared.active_count.fetch_sub(1, Ordering::Relaxed);
         let _ = discover_tx.send(Ok(Change::Remove(*ip)));
+        debug!(
+            message = "ClickHouse headless endpoint removed (no longer in DNS).",
+            pod_ip = %ip,
+        );
     }
 
     // Add new endpoints.
@@ -475,6 +523,11 @@ fn reconcile_endpoints(
     for uri in new_uris {
         if let Some(ip) = dns::ip_from_uri(uri) {
             if !known.contains(&ip) {
+                debug!(
+                    message = "ClickHouse headless endpoint added (new in DNS).",
+                    pod_ip = %ip,
+                    uri = %uri,
+                );
                 let service = TrackedHttpService {
                     inner: build_endpoint_service(client, uri.clone(), svc_config),
                     ip,
@@ -486,6 +539,11 @@ fn reconcile_endpoints(
                 known.insert(ip);
                 shared.active_count.fetch_add(1, Ordering::Relaxed);
                 added_count += 1;
+            } else {
+                trace!(
+                    message = "ClickHouse headless endpoint unchanged (already active).",
+                    pod_ip = %ip,
+                );
             }
         }
     }

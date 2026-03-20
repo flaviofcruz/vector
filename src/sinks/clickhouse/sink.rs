@@ -61,6 +61,14 @@ where
                 let event_count = batch.len();
                 let in_memory_byte_size: usize = batch.iter().map(|e| e.size_of()).sum();
 
+                debug!(
+                    message = "ClickHouse batch assembled, sending to request builder.",
+                    database = %key.database,
+                    table = %key.table,
+                    event_count = event_count,
+                    in_memory_byte_size = in_memory_byte_size,
+                );
+
                 emit!(ClickhouseBatchFlushed {
                     event_count,
                     in_memory_byte_size,
@@ -70,9 +78,14 @@ where
                 {
                     let mut map = last_flush_times.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(last_time) = map.get(&key) {
-                        emit!(ClickhouseBatchInterval {
-                            interval: now.duration_since(*last_time),
-                        });
+                        let interval = now.duration_since(*last_time);
+                        debug!(
+                            message = "Time since last flush for this partition.",
+                            database = %key.database,
+                            table = %key.table,
+                            interval_ms = interval.as_millis(),
+                        );
+                        emit!(ClickhouseBatchInterval { interval });
                     }
                     map.insert(key.clone(), now);
                 }
@@ -193,6 +206,7 @@ where
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
         let compressed_byte_size = request.get_metadata().request_encoded_size();
         let start = Instant::now();
+
         let future = self.inner.call(request);
 
         Box::pin(async move {
@@ -207,6 +221,14 @@ where
                 },
                 Err(_) => "error",
             };
+
+            debug!(
+                message = "ClickHouse insert request completed.",
+                status = status,
+                latency_ms = latency.as_millis(),
+                compressed_byte_size = compressed_byte_size,
+            );
+
             emit!(ClickhouseInsertCompleted {
                 latency,
                 compressed_byte_size,
