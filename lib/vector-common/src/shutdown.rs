@@ -109,6 +109,56 @@ impl ShutdownSignal {
 
 type IsInternal = bool;
 
+/// Holds the shutdown handles for deferred (internal) sources, allowing them to be shut down
+/// in a second wave after non-deferred sources have completed.
+#[derive(Debug)]
+pub struct DeferredSourceShutdowns {
+    begun_triggers: HashMap<ComponentKey, Trigger>,
+    force_triggers: HashMap<ComponentKey, Trigger>,
+    complete_tripwires: HashMap<ComponentKey, Tripwire>,
+}
+
+impl DeferredSourceShutdowns {
+    /// Returns true if there are any deferred sources to shut down.
+    pub fn has_deferred_sources(&self) -> bool {
+        !self.begun_triggers.is_empty()
+    }
+
+    /// Returns the set of deferred source component keys.
+    pub fn deferred_keys(&self) -> std::collections::HashSet<ComponentKey> {
+        self.begun_triggers.keys().cloned().collect()
+    }
+
+    /// Triggers shutdown of all deferred sources and returns a future that resolves once
+    /// all have completed or been force-shutdown at the given deadline.
+    pub fn shutdown_all(self, deadline: Option<Instant>) -> impl Future<Output = ()> {
+        let mut complete_futures = Vec::new();
+
+        let mut complete_tripwires = self.complete_tripwires;
+        let mut force_triggers = self.force_triggers;
+
+        for (id, trigger) in self.begun_triggers {
+            trigger.cancel();
+
+            let shutdown_complete_tripwire = complete_tripwires.remove(&id).unwrap_or_else(|| {
+                panic!("shutdown_complete_tripwire for deferred source \"{id}\" not found")
+            });
+            let shutdown_force_trigger = force_triggers.remove(&id).unwrap_or_else(|| {
+                panic!("shutdown_force_trigger for deferred source \"{id}\" not found")
+            });
+
+            complete_futures.push(SourceShutdownCoordinator::shutdown_source_complete(
+                shutdown_complete_tripwire,
+                shutdown_force_trigger,
+                id,
+                deadline,
+            ));
+        }
+
+        futures::future::join_all(complete_futures).map(|_| ())
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SourceShutdownCoordinator {
     begun_triggers: HashMap<ComponentKey, (IsInternal, Trigger)>,
@@ -205,26 +255,48 @@ impl SourceShutdownCoordinator {
     /// force shutdown signal.  The force shutdown signal will be sent to any sources that
     /// don't cleanly shut down before the given `deadline`.
     ///
+    /// Non-deferred (external) sources are shut down first, then deferred (internal) sources.
+    ///
     /// # Panics
     ///
     /// Panics if this coordinator has had its triggers removed (ie
     /// has been taken over with `Self::takeover_source`).
     pub fn shutdown_all(self, deadline: Option<Instant>) -> impl Future<Output = ()> {
-        let mut internal_sources_complete_futures = Vec::new();
-        let mut external_sources_complete_futures = Vec::new();
+        let (wave1_future, deferred) = self.shutdown_non_deferred(deadline);
+        async move {
+            wave1_future.await;
+            deferred.shutdown_all(deadline).await;
+        }
+    }
 
-        let shutdown_begun_triggers = self.begun_triggers;
+    /// Sends a signal to begin shutting down only non-internal (data) sources, and returns:
+    /// 1. A future that resolves once all non-internal sources have completed or been force-shutdown
+    /// 2. A `DeferredSourceShutdowns` handle for shutting down internal sources later
+    ///
+    /// This enables a two-wave shutdown: first shut down data sources, then (after transforms/sinks
+    /// have drained) shut down internal sources.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this coordinator has had its triggers removed.
+    pub fn shutdown_non_deferred(
+        self,
+        deadline: Option<Instant>,
+    ) -> (impl Future<Output = ()>, DeferredSourceShutdowns) {
+        let mut external_sources_complete_futures = Vec::new();
+        let mut deferred_begun_triggers = HashMap::new();
+        let mut deferred_force_triggers = HashMap::new();
+        let mut deferred_complete_tripwires = HashMap::new();
+
         let mut shutdown_complete_tripwires = self.complete_tripwires;
         let mut shutdown_force_triggers = self.force_triggers;
 
-        for (id, (internal, trigger)) in shutdown_begun_triggers {
-            trigger.cancel();
-
+        for (id, (internal, trigger)) in self.begun_triggers {
             let shutdown_complete_tripwire =
                 shutdown_complete_tripwires.remove(&id).unwrap_or_else(|| {
                     panic!(
-                "shutdown_complete_tripwire for source \"{id}\" not found in the ShutdownCoordinator"
-            )
+                        "shutdown_complete_tripwire for source \"{id}\" not found in the ShutdownCoordinator"
+                    )
                 });
             let shutdown_force_trigger = shutdown_force_triggers.remove(&id).unwrap_or_else(|| {
                 panic!(
@@ -232,23 +304,32 @@ impl SourceShutdownCoordinator {
                 )
             });
 
-            let source_complete = SourceShutdownCoordinator::shutdown_source_complete(
-                shutdown_complete_tripwire,
-                shutdown_force_trigger,
-                id.clone(),
-                deadline,
-            );
-
             if internal {
-                internal_sources_complete_futures.push(source_complete);
+                deferred_begun_triggers.insert(id.clone(), trigger);
+                deferred_force_triggers.insert(id.clone(), shutdown_force_trigger);
+                deferred_complete_tripwires.insert(id, shutdown_complete_tripwire);
             } else {
-                external_sources_complete_futures.push(source_complete);
+                trigger.cancel();
+                external_sources_complete_futures.push(
+                    SourceShutdownCoordinator::shutdown_source_complete(
+                        shutdown_complete_tripwire,
+                        shutdown_force_trigger,
+                        id,
+                        deadline,
+                    ),
+                );
             }
         }
 
-        futures::future::join_all(external_sources_complete_futures)
-            .then(|_| futures::future::join_all(internal_sources_complete_futures))
-            .map(|_| ())
+        let wave1_future = futures::future::join_all(external_sources_complete_futures).map(|_| ());
+
+        let deferred = DeferredSourceShutdowns {
+            begun_triggers: deferred_begun_triggers,
+            force_triggers: deferred_force_triggers,
+            complete_tripwires: deferred_complete_tripwires,
+        };
+
+        (wave1_future, deferred)
     }
 
     /// Sends the signal to the given source to begin shutting down. Returns a future that resolves
@@ -380,5 +461,114 @@ mod test {
 
         let finished = futures::poll!(force_shutdown_tripwire.boxed());
         assert_eq!(finished, Poll::Ready(()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_non_deferred_only_shuts_down_external_sources() {
+        let mut shutdown = SourceShutdownCoordinator::default();
+        let external_id = ComponentKey::from("external");
+        let internal_id = ComponentKey::from("internal");
+
+        let (external_signal, _) = shutdown.register_source(&external_id, false);
+        let (_internal_signal, _internal_force) = shutdown.register_source(&internal_id, true);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (wave1_future, deferred) = shutdown.shutdown_non_deferred(Some(deadline));
+
+        // The deferred handle should contain the internal source.
+        assert!(deferred.has_deferred_sources());
+        assert!(deferred.deferred_keys().contains(&internal_id));
+        assert!(!deferred.deferred_keys().contains(&external_id));
+
+        // Drop the external signal to simulate clean shutdown.
+        drop(external_signal);
+
+        // Wave 1 should complete since the external source shut down.
+        wave1_future.await;
+
+        // Deferred sources can be shut down in a second wave.
+        let wave2_deadline = Instant::now() + Duration::from_secs(1);
+        deferred.shutdown_all(Some(wave2_deadline)).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_non_deferred_no_internal_sources() {
+        let mut shutdown = SourceShutdownCoordinator::default();
+        let ext1 = ComponentKey::from("ext1");
+        let ext2 = ComponentKey::from("ext2");
+
+        let (signal1, _) = shutdown.register_source(&ext1, false);
+        let (signal2, _) = shutdown.register_source(&ext2, false);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (wave1_future, deferred) = shutdown.shutdown_non_deferred(Some(deadline));
+
+        // No deferred sources.
+        assert!(!deferred.has_deferred_sources());
+
+        // Drop signals to simulate clean shutdown.
+        drop(signal1);
+        drop(signal2);
+
+        wave1_future.await;
+        // Deferred shutdown with no sources should complete immediately.
+        deferred
+            .shutdown_all(Some(Instant::now() + Duration::from_secs(1)))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_non_deferred_external_force_shutdown() {
+        let mut shutdown = SourceShutdownCoordinator::default();
+        let external_id = ComponentKey::from("external");
+        let internal_id = ComponentKey::from("internal");
+
+        // Keep external signal alive to trigger force shutdown.
+        let (_external_signal, external_force) = shutdown.register_source(&external_id, false);
+        let (_internal_signal, _internal_force) = shutdown.register_source(&internal_id, true);
+
+        // Very short deadline to trigger force shutdown quickly.
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let (wave1_future, deferred) = shutdown.shutdown_non_deferred(Some(deadline));
+
+        // Wave 1 should complete after force-shutting down the external source.
+        wave1_future.await;
+
+        // External source should have been force-shutdown (tripwire resolved).
+        let finished = futures::poll!(external_force.boxed());
+        assert_eq!(finished, Poll::Ready(()));
+
+        // Deferred sources still need their own shutdown.
+        assert!(deferred.has_deferred_sources());
+        let wave2_deadline = Instant::now() + Duration::from_millis(100);
+        deferred.shutdown_all(Some(wave2_deadline)).await;
+    }
+
+    #[tokio::test]
+    async fn two_wave_shutdown_timing() {
+        // Verify that wave 1 completes before wave 2 starts.
+        let mut shutdown = SourceShutdownCoordinator::default();
+        let external_id = ComponentKey::from("data_source");
+        let internal_id = ComponentKey::from("internal_logs");
+
+        let (external_signal, _) = shutdown.register_source(&external_id, false);
+        let (_internal_signal, _internal_force) = shutdown.register_source(&internal_id, true);
+
+        let data_deadline = Instant::now() + Duration::from_secs(2);
+        let (wave1_future, deferred) = shutdown.shutdown_non_deferred(Some(data_deadline));
+
+        let start = Instant::now();
+
+        // Drop external signal immediately (clean shutdown).
+        drop(external_signal);
+        wave1_future.await;
+
+        let wave1_elapsed = start.elapsed();
+        // Wave 1 should complete almost immediately (well under 1 second).
+        assert!(wave1_elapsed < Duration::from_secs(1));
+
+        // Wave 2 uses remaining main deadline.
+        let main_deadline = Instant::now() + Duration::from_millis(100);
+        deferred.shutdown_all(Some(main_deadline)).await;
     }
 }

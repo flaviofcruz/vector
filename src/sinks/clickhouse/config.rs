@@ -253,15 +253,6 @@ impl SinkConfig for ClickhouseConfig {
                 .expect("'default' should be a valid template")
         });
 
-        let (format, encoder_kind) = self
-            .resolve_strategy(&client, &endpoint, &database, auth.as_ref())
-            .await?;
-
-        let request_builder = ClickhouseRequestBuilder {
-            compression: self.compression,
-            encoder: (self.encoding.clone(), encoder_kind),
-        };
-
         if self.use_headless_service {
             if self.fallback_endpoint.is_none() {
                 return Err(
@@ -287,7 +278,21 @@ impl SinkConfig for ClickhouseConfig {
                         .into(),
                 );
             }
+            if self.dns_refresh_interval_secs == Some(0) {
+                return Err(
+                    "'dns_refresh_interval_secs' must be greater than 0".into(),
+                );
+            }
         }
+
+        let (format, encoder_kind) = self
+            .resolve_strategy(&client, &endpoint, &database, auth.as_ref())
+            .await?;
+
+        let request_builder = ClickhouseRequestBuilder {
+            compression: self.compression,
+            encoder: (self.encoding.clone(), encoder_kind),
+        };
 
         let params = ClickhouseBuildParams {
             client,

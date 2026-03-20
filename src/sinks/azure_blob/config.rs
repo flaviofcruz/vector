@@ -114,6 +114,16 @@ pub struct AzureBlobSinkConfig {
     /// blob keys must be unique.
     pub blob_append_uuid: Option<bool>,
 
+    /// Whether or not to prepend a random cryptographic nonce to the beginning of the blob key's filename.
+    ///
+    /// The nonce is a truncated 8-character random hexadecimal string, prepended to the filename
+    /// with a `-` delimiter. For example, if the filename would normally be `1658176486`, setting
+    /// this field to `true` results in a filename like `a3b1f29c-1658176486`.
+    ///
+    /// This can be useful for Azure Blob Storage performance optimization by increasing key randomness.
+    #[serde(default)]
+    pub blob_prepend_crypto_nonce: bool,
+
     #[serde(flatten)]
     pub encoding: EncodingConfigWithFraming,
 
@@ -156,6 +166,7 @@ impl GenerateConfig for AzureBlobSinkConfig {
             blob_prefix: default_blob_prefix(),
             blob_time_format: Some(String::from("%s")),
             blob_append_uuid: Some(true),
+            blob_prepend_crypto_nonce: false,
             encoding: (Some(NewlineDelimitedEncoderConfig::new()), JsonSerializerConfig::default()).into(),
             compression: Compression::gzip_default(),
             batch: BatchConfig::default(),
@@ -231,6 +242,7 @@ impl AzureBlobSinkConfig {
             container_name: self.container_name.clone(),
             blob_time_format,
             blob_append_uuid,
+            blob_prepend_crypto_nonce: self.blob_prepend_crypto_nonce,
             encoder: (transformer, encoder),
             compression: self.compression,
         };

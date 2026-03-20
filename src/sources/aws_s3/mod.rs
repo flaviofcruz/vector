@@ -16,7 +16,7 @@ use vector_lib::{
 };
 use vrl::value::{Kind, kind::Collection};
 
-use super::util::{MultilineConfig, clickhouse_dedupe::ClickHouseDeduplicator};
+use super::util::MultilineConfig;
 use crate::{
     aws::{RegionOrEndpoint, auth::AwsAuthentication, create_client, create_client_and_region},
     codecs::DecodingConfig,
@@ -132,16 +132,6 @@ pub struct AwsS3Config {
     #[serde(default = "default_decoding")]
     #[derivative(Default(value = "default_decoding()"))]
     pub decoding: DeserializerConfig,
-
-    /// Optional ClickHouse-based deduplication configuration.
-    ///
-    /// When enabled, the source will check a ClickHouse table to determine
-    /// if an S3 object has already been processed before downloading and processing it.
-    /// This helps prevent reprocessing of the same data across restarts or
-    /// when multiple Vector instances are processing the same queue.
-    #[configurable(derived)]
-    #[serde(default)]
-    pub clickhouse_dedupe: Option<ClickHouseDeduplicator>,
 
     /// Specifies which addressing style to use.
     ///
@@ -292,7 +282,6 @@ impl AwsS3Config {
                     self.compression,
                     multiline,
                     decoder,
-                    self.clickhouse_dedupe.clone(),
                 )
                 .await?;
 
@@ -451,99 +440,6 @@ mod test {
         .unwrap();
 
         assert!(data.is_empty());
-    }
-
-    #[test]
-    /// This test verifies the AWS S3 configuration with ClickHouse deduplication using separate endpoints.
-    /// It checks that the configuration is correctly parsed and that the read and write endpoints
-    /// are set differently as specified in the configuration.
-    fn test_aws_s3_config_with_clickhouse_dedupe_separate_endpoints() {
-        let config_str = r#"
-        {
-            "region": "us-west-2",
-            "sqs": {
-                "queue_url": "https://sqs.us-west-2.amazonaws.com/123456789012/test-queue"
-            },
-            "clickhouse_dedupe": {
-                "endpoints": {
-                    "type": "separate",
-                    "read_endpoint": "http://clickhouse-read:8123/",
-                    "write_endpoint": "http://clickhouse-write:8123/"
-                },
-                "database": "test_db",
-                "table": "file_metadata"
-            }
-        }
-        "#;
-
-        let config: AwsS3Config = serde_json::from_str(config_str).unwrap();
-        assert!(config.clickhouse_dedupe.is_some());
-        let dedupe_config = config.clickhouse_dedupe.unwrap();
-        assert_eq!(dedupe_config.database, "test_db");
-        assert_eq!(dedupe_config.table, "file_metadata");
-        assert_eq!(
-            dedupe_config.endpoints.read_endpoint().to_string(),
-            "http://clickhouse-read:8123/"
-        );
-        assert_eq!(
-            dedupe_config.endpoints.write_endpoint().to_string(),
-            "http://clickhouse-write:8123/"
-        );
-    }
-
-    #[test]
-    /// This test verifies the AWS S3 configuration with ClickHouse deduplication using the same endpoint
-    /// for both reading and writing. It checks that the configuration is correctly parsed and that
-    /// both the read and write endpoints are set to the same value as specified in the configuration.
-    fn test_aws_s3_config_with_clickhouse_dedupe_same_endpoint() {
-        let config_str = r#"
-        {
-            "region": "us-east-1",
-            "sqs": {
-                "queue_url": "https://sqs.us-east-1.amazonaws.com/123456789012/test-queue"
-            },
-            "clickhouse_dedupe": {
-                "endpoints": {
-                    "type": "single",
-                    "endpoint": "http://clickhouse:8123/"
-                },
-                "database": "test_db",
-                "table": "file_metadata"
-            }
-        }
-        "#;
-
-        let config: AwsS3Config = serde_json::from_str(config_str).unwrap();
-        assert!(config.clickhouse_dedupe.is_some());
-        let dedupe_config = config.clickhouse_dedupe.unwrap();
-        assert_eq!(dedupe_config.database, "test_db");
-        assert_eq!(dedupe_config.table, "file_metadata");
-        assert_eq!(
-            dedupe_config.endpoints.read_endpoint().to_string(),
-            "http://clickhouse:8123/"
-        );
-        assert_eq!(
-            dedupe_config.endpoints.write_endpoint().to_string(),
-            "http://clickhouse:8123/"
-        );
-    }
-
-    #[test]
-    /// This test checks that the configuration is correctly parsed if the
-    /// ClickHouse deduplication section is omitted. It verifies that the `clickhouse_dedupe`
-    /// field is `None` when not provided in the configuration.
-    fn test_aws_s3_config_without_clickhouse_dedupe() {
-        let config_str = r#"
-        {
-            "region": "us-east-1",
-            "sqs": {
-                "queue_url": "https://sqs.us-east-1.amazonaws.com/123456789012/test-queue"
-            }
-        }
-        "#;
-
-        let config: AwsS3Config = serde_json::from_str(config_str).unwrap();
-        assert!(config.clickhouse_dedupe.is_none());
     }
 }
 

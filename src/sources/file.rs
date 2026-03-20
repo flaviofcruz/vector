@@ -707,6 +707,7 @@ pub fn file_source(
                 line.text,
                 line.start_offset,
                 &line.filename,
+                line.file_id,
                 &event_metadata,
                 log_namespace,
                 include_file_metric_tag,
@@ -822,10 +823,18 @@ struct EventMetadata {
     source_context: Option<HashMap<String, String>>,
 }
 
+fn fingerprint_to_string(fp: FileFingerprint) -> String {
+    match fp {
+        FileFingerprint::FirstLinesChecksum(checksum) => format!("checksum:{}", checksum),
+        FileFingerprint::DevInode(dev, inode) => format!("dev_inode:{}:{}", dev, inode),
+    }
+}
+
 fn create_event(
     line: Bytes,
     offset: u64,
     file: &str,
+    file_id: FileFingerprint,
     meta: &EventMetadata,
     log_namespace: LogNamespace,
     include_file_metric_tag: bool,
@@ -874,6 +883,14 @@ fn create_event(
         legacy_file_key,
         path!("path"),
         file,
+    );
+
+    log_namespace.insert_source_metadata(
+        FileConfig::NAME,
+        &mut event,
+        Some(LegacyKey::Overwrite("file_id")),
+        path!("file_id"),
+        fingerprint_to_string(file_id),
     );
 
     // Apply additional fields as specified by the source context if needed
@@ -1152,11 +1169,21 @@ mod tests {
             offset_key: Some(owned_value_path!("offset")),
             source_context: None,
         };
-        let log = create_event(line, offset, file, &meta, LogNamespace::Legacy, false);
+        let file_id = FileFingerprint::FirstLinesChecksum(12345);
+        let log = create_event(
+            line,
+            offset,
+            file,
+            file_id,
+            &meta,
+            LogNamespace::Legacy,
+            false,
+        );
 
         assert_eq!(log["file"], "some_file.rs".into());
         assert_eq!(log["host"], "Some.Machine".into());
         assert_eq!(log["offset"], 0.into());
+        assert_eq!(log["file_id"], "checksum:12345".into());
         assert_eq!(*log.get_message().unwrap(), "hello world".into());
         assert_eq!(*log.get_source_type().unwrap(), "file".into());
         assert!(log[log_schema().timestamp_key().unwrap().to_string()].is_timestamp());
@@ -1175,7 +1202,16 @@ mod tests {
             offset_key: Some(owned_value_path!("off")),
             source_context: None,
         };
-        let log = create_event(line, offset, file, &meta, LogNamespace::Legacy, false);
+        let file_id = FileFingerprint::FirstLinesChecksum(12345);
+        let log = create_event(
+            line,
+            offset,
+            file,
+            file_id,
+            &meta,
+            LogNamespace::Legacy,
+            false,
+        );
 
         assert_eq!(log["file_path"], "some_file.rs".into());
         assert_eq!(log["hostname"], "Some.Machine".into());
@@ -1198,7 +1234,16 @@ mod tests {
             offset_key: Some(owned_value_path!("ignored")),
             source_context: None,
         };
-        let log = create_event(line, offset, file, &meta, LogNamespace::Vector, false);
+        let file_id = FileFingerprint::FirstLinesChecksum(12345);
+        let log = create_event(
+            line,
+            offset,
+            file,
+            file_id,
+            &meta,
+            LogNamespace::Vector,
+            false,
+        );
 
         assert_eq!(log.value(), &value!("hello world"));
 
@@ -1254,7 +1299,16 @@ mod tests {
             offset_key: Some(owned_value_path!("off")),
             source_context: Some(source_context),
         };
-        let log = create_event(line, offset, file, &meta, LogNamespace::Legacy, false);
+        let file_id = FileFingerprint::FirstLinesChecksum(12345);
+        let log = create_event(
+            line,
+            offset,
+            file,
+            file_id,
+            &meta,
+            LogNamespace::Legacy,
+            false,
+        );
 
         assert_eq!(log["file_path"], "some_file.rs".into());
         assert_eq!(log["hostname"], "Some.Machine".into());
@@ -1657,6 +1711,7 @@ mod tests {
             assert_eq!(
                 received[0].as_log().keys().unwrap().collect::<HashSet<_>>(),
                 vec![
+                    "file_id".into(),
                     default_file_key()
                         .path
                         .expect("file key to exist")

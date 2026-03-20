@@ -39,6 +39,9 @@ pub struct BasicSourceConfig {
     #[serde(skip)]
     force_shutdown: bool,
 
+    #[serde(skip)]
+    deferred_shutdown: bool,
+
     /// Meaningless field that only exists for triggering config diffs during topology reloading.
     data: Option<String>,
 }
@@ -52,6 +55,7 @@ impl Default for BasicSourceConfig {
             event_counter: None,
             data_type: Some(DataType::all_bits()),
             force_shutdown: false,
+            deferred_shutdown: false,
             data: None,
         }
     }
@@ -66,6 +70,7 @@ impl BasicSourceConfig {
             event_counter: None,
             data_type: Some(DataType::all_bits()),
             force_shutdown: false,
+            deferred_shutdown: false,
             data: None,
         }
     }
@@ -76,6 +81,7 @@ impl BasicSourceConfig {
             event_counter: None,
             data_type: Some(DataType::all_bits()),
             force_shutdown: false,
+            deferred_shutdown: false,
             data: Some(data.into()),
         }
     }
@@ -89,12 +95,17 @@ impl BasicSourceConfig {
             event_counter: Some(event_counter),
             data_type: Some(DataType::all_bits()),
             force_shutdown: false,
+            deferred_shutdown: false,
             data: None,
         }
     }
 
     pub fn set_force_shutdown(&mut self, force_shutdown: bool) {
         self.force_shutdown = force_shutdown;
+    }
+
+    pub fn set_deferred_shutdown(&mut self, deferred: bool) {
+        self.deferred_shutdown = deferred;
     }
 }
 
@@ -120,15 +131,18 @@ impl SourceConfig for BasicSourceConfig {
 
                     _ = &mut shutdown1, if force_shutdown => break,
 
-                    Some(array) = recv.next() => {
-                        if let Some(counter) = &event_counter {
-                            counter.fetch_add(array.len(), Ordering::Relaxed);
-                        }
+                    result = recv.next() => match result {
+                        Some(array) => {
+                            if let Some(counter) = &event_counter {
+                                counter.fetch_add(array.len(), Ordering::Relaxed);
+                            }
 
-                        if let Err(e) = out.send_event(array).await {
-                            error!(message = "Error sending in sink..", %e);
-                            return Err(())
+                            if let Err(e) = out.send_event(array).await {
+                                error!(message = "Error sending in sink..", %e);
+                                return Err(())
+                            }
                         }
+                        None => break,
                     },
 
                     _ = &mut shutdown2, if !force_shutdown => break,
@@ -149,5 +163,9 @@ impl SourceConfig for BasicSourceConfig {
 
     fn can_acknowledge(&self) -> bool {
         false
+    }
+
+    fn has_deferred_shutdown(&self) -> bool {
+        self.deferred_shutdown
     }
 }

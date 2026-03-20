@@ -1,4 +1,4 @@
-use metrics::counter;
+use metrics::{counter, gauge};
 use vector_lib::NamedInternalEvent;
 use vector_lib::internal_event::{InternalEvent, error_stage, error_type};
 
@@ -35,6 +35,7 @@ impl InternalEvent for VectorReloaded<'_> {
             internal_log_rate_limit = false,
         );
         counter!("reloaded_total").increment(1);
+        gauge!("last_config_reload_success").set(1.0);
     }
 }
 
@@ -87,6 +88,7 @@ impl InternalEvent for VectorReloadError {
             "reason" => self.reason,
         )
         .increment(1);
+        gauge!("last_config_reload_success").set(0.0);
     }
 }
 
@@ -109,6 +111,7 @@ impl InternalEvent for VectorConfigLoadError {
             "stage" => error_stage::PROCESSING,
         )
         .increment(1);
+        gauge!("last_config_reload_success").set(0.0);
     }
 }
 

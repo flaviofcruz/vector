@@ -221,6 +221,19 @@ pub struct RootOpts {
     )]
     pub graceful_shutdown_limit_secs: NonZeroU64,
 
+    /// Set the duration in seconds to wait for non-internal (data) sources to shut down during
+    /// the first wave of graceful shutdown. This must be strictly less than
+    /// `--graceful-shutdown-limit-secs` to take effect. If greater than or equal to the main
+    /// limit, it is ignored. After this duration, data sources are force-closed, transforms
+    /// and sinks drain, and then internal sources (e.g. internal_logs, internal_metrics) are
+    /// shut down in a second wave within the remaining time of the main limit.
+    #[arg(
+        long,
+        default_value = "20",
+        env = "VECTOR_GRACEFUL_DATA_SOURCE_SHUTDOWN_LIMIT_SECS"
+    )]
+    pub graceful_data_source_shutdown_limit_secs: NonZeroU64,
+
     /// Never time out while waiting for graceful shutdown after SIGINT or SIGTERM received.
     /// This is useful when you would like for Vector to attempt to send data until terminated
     /// by a SIGKILL. Overrides/cannot be set with `--graceful-shutdown-limit-secs`.

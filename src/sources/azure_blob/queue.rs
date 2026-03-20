@@ -34,10 +34,9 @@ use vector_lib::source_sender::SendError;
 use crate::codecs::Decoder;
 use crate::event::{Event, LogEvent};
 use crate::internal_events::{
-    EventsReceived, StreamClosedError, emit_object_storage_ack_metrics,
-    emit_object_storage_non_ack_metrics,
+    EventsReceived, QueueNotificationProcessLag, StreamClosedError,
+    emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
 };
-use crate::sources::util::{ClickHouseDeduplicator, DeduplicationClient};
 use crate::{
     SourceSender,
     config::{SourceAcknowledgementsConfig, SourceContext},
@@ -127,6 +126,15 @@ pub(super) struct Config {
     #[serde(default)]
     #[derivative(Default)]
     pub(super) tls_options: Option<TlsConfig>,
+
+    /// Whether to process custom direct ingest messages from the queue.
+    ///
+    /// When enabled, the source will also handle messages with `{"kind": "INGEST", "container": "...", "blob": "..."}` format
+    /// in addition to standard Event Grid notifications. This allows you to manually enqueue
+    /// blobs for ingestion without relying on Event Grid notifications.
+    #[serde(default)]
+    #[derivative(Default)]
+    pub(super) process_custom_message: bool,
 }
 
 // Default configuration values
@@ -214,6 +222,14 @@ pub enum ProcessingError {
         blob
     ))]
     ErrorAcknowledgement { container: String, blob: String },
+
+    /// Blob was not found in Azure Storage (404)
+    #[snafu(display("Blob not found {}/{}: {}", container, blob, source))]
+    BlobNotFound {
+        source: azure_core_for_storage::Error,
+        container: String,
+        blob: String,
+    },
 }
 
 /// Internal state maintained by the ingestor
@@ -247,8 +263,8 @@ pub struct State {
 
     /// Name of the storage account being monitored
     storage_account_name: String,
-    /// Optional ClickHouse deduplication client
-    deduplication_client: Option<DeduplicationClient>,
+    /// Whether to process custom direct ingest messages
+    process_custom_message: bool,
 }
 
 /// Main ingestor implementation that handles Azure Queue message processing
@@ -266,7 +282,6 @@ impl Ingestor {
         compression: super::Compression,
         multiline: Option<line_agg::Config>,
         decoder: Decoder,
-        clickhouse_dedupe: Option<ClickHouseDeduplicator>,
     ) -> Result<Ingestor, IngestorNewError> {
         // Validate message batch size
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 32 {
@@ -286,9 +301,6 @@ impl Ingestor {
             })
             .unwrap_or_else(|_| "unknown".to_string());
 
-        // Create DeduplicationClient if deduplication is configured
-        let deduplication_client = clickhouse_dedupe.and_then(DeduplicationClient::new);
-
         // Create shared state
         let state = Arc::new(State {
             blob_client,
@@ -307,7 +319,7 @@ impl Ingestor {
             delete_failed_message: config.delete_failed_message,
             decoder,
             storage_account_name,
-            deduplication_client,
+            process_custom_message: config.process_custom_message,
         });
 
         Ok(Ingestor { state })
@@ -452,11 +464,33 @@ impl IngestorProcess {
                     }
                 }
                 Err(err) => {
-                    error!(
-                        message = "Failed to process queue message.",
-                        message_id = &message_id,
-                        error = ?err,
-                    );
+                    match err {
+                        ProcessingError::BlobNotFound {
+                            ref source,
+                            ref container,
+                            ref blob,
+                        } => {
+                            warn!(
+                                message = "Blob not found.",
+                                message_id = &message_id,
+                                container = %container,
+                                blob = %blob,
+                                error = %source,
+                            );
+                            // Blob no longer exists — retrying won't help.
+                            // Delete the queue message to prevent infinite retries.
+                            if self.state.delete_message {
+                                delete_messages.push(message.clone());
+                            }
+                        }
+                        _ => {
+                            error!(
+                                message = "Failed to process queue message.",
+                                message_id = &message_id,
+                                error = ?err,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -477,18 +511,12 @@ impl IngestorProcess {
         tokio::time::sleep(Duration::from_secs(self.state.poll_secs)).await;
     }
 
-    /// Processes a single queue message
+    /// Dispatches a single queue message to the appropriate handler based on its content.
     ///
-    /// This function:
-    /// 1. Base64 decodes the message content
-    /// 2. Parses the decoded content as an Event Grid event
-    /// 3. Processes each event in the message
-    ///
-    /// # Arguments
-    /// * `message` - The queue message to process
-    ///
-    /// # Returns
-    /// Ok(()) if processing succeeds, or a ProcessingError if any step fails
+    /// The message body is base64-decoded, then deserialized as one of:
+    /// - `EventGridEvent` — standard Event Grid blob notification
+    /// - `DirectIngestMessage` — custom message requesting ingestion of a specific blob
+    ///   (only processed when `process_custom_message` is enabled in the queue config)
     async fn handle_queue_message(&mut self, message: &Message) -> Result<(), ProcessingError> {
         let message_text = &message.message_text;
 
@@ -518,24 +546,7 @@ impl IngestorProcess {
             }
         })?;
 
-        // Parse as Event Grid event
-        let event_grid_events: Vec<EventGridEvent> = {
-            let single: EventGridEvent = serde_json::from_str(&decoded_str).map_err(|e| {
-                error!(
-                    message = "Failed to parse decoded message as JSON object",
-                    error = ?e,
-                    message_id = &message.message_id,
-                    decoded_message = %decoded_str
-                );
-                ProcessingError::InvalidQueueMessage {
-                    source: e,
-                    message_id: message.message_id.clone(),
-                }
-            })?;
-            vec![single]
-        };
-
-        // Represents the time at which Azure EventGrid had created the notification
+        // Represents the time at which the message was inserted into the queue
         let queue_notification_create_timestamp = Utc
             .timestamp_opt(
                 message.insertion_time.unix_timestamp(),
@@ -543,13 +554,96 @@ impl IngestorProcess {
             )
             .single();
 
-        // Process each event
-        for event in event_grid_events.iter() {
-            self.handle_event_grid_event(event.clone(), queue_notification_create_timestamp)
-                .await?;
+        let message_id = &message.message_id;
+
+        // Try to parse as a QueueEvent (DirectIngest is tried first due to deny_unknown_fields)
+        let queue_event: QueueEvent = serde_json::from_str(&decoded_str).map_err(|e| {
+            error!(
+                message = "Failed to parse decoded message as JSON object",
+                error = ?e,
+                message_id = message_id,
+                decoded_message = %decoded_str
+            );
+            ProcessingError::InvalidQueueMessage {
+                source: e,
+                message_id: message_id.clone(),
+            }
+        })?;
+
+        match queue_event {
+            QueueEvent::DirectIngest(msg) => {
+                self.handle_direct_ingest(msg, message_id, queue_notification_create_timestamp)
+                    .await
+            }
+            QueueEvent::EventGrid(event) => {
+                self.handle_event_grid_event(event, queue_notification_create_timestamp)
+                    .await
+            }
+        }
+    }
+
+    /// Handles a direct ingest message — a custom queue message that explicitly
+    /// names a blob container and blob path to ingest, bypassing Event Grid notifications.
+    ///
+    /// Gated behind the `process_custom_message` config flag. When disabled,
+    /// direct ingest messages are silently ignored. Also validates that the
+    /// `kind` field equals [`DIRECT_INGEST_KIND`] and emits queue processing
+    /// lag metrics from the queue insertion time.
+    async fn handle_direct_ingest(
+        &mut self,
+        msg: DirectIngestMessage,
+        message_id: &str,
+        queue_notification_create_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), ProcessingError> {
+        if !self.state.process_custom_message {
+            debug!(
+                message = "Ignoring direct ingest message because process_custom_message is not enabled.",
+                message_id = %message_id,
+            );
+            return Ok(());
+        }
+        if msg.kind != DIRECT_INGEST_KIND {
+            warn!(
+                message = "Unknown direct ingest kind, ignoring.",
+                kind = %msg.kind,
+                expected = DIRECT_INGEST_KIND,
+                message_id = %message_id,
+            );
+            return Ok(());
+        }
+        // The blob client is bound to the source's configured storage account, so we
+        // reject cross-account requests — consistent with the Event Grid notification path.
+        if let Some(ref account) = msg.account {
+            if self.state.storage_account_name != *account {
+                return Err(ProcessingError::WrongStorageAccount {
+                    account: account.clone(),
+                    container: msg.container,
+                    blob: msg.blob,
+                });
+            }
         }
 
-        Ok(())
+        // Emit queue processing lag metric (insertion time → now).
+        // This measures how long the message sat in the queue before being picked up.
+        if let Some(notification_ts) = queue_notification_create_timestamp {
+            let lag_duration = Utc::now().signed_duration_since(notification_ts);
+            let lag_seconds = lag_duration.num_milliseconds() as f64 / 1000.0;
+            // The shared metric struct uses `bucket` (S3 terminology); for Azure this is the container.
+            emit!(QueueNotificationProcessLag {
+                lag_seconds,
+                cloud: CLOUD_PROVIDER,
+                bucket: &msg.container,
+            });
+        }
+
+        debug!(
+            message = "Processing direct ingest message.",
+            container = %msg.container,
+            blob = %msg.blob,
+            account = %self.state.storage_account_name,
+            message_id = %message_id,
+        );
+        self.process_blob_object(&msg.container, &msg.blob).await
     }
 
     /// Processes a single Event Grid event
@@ -610,56 +704,68 @@ impl IngestorProcess {
             });
         }
 
-        // Check for deduplication if configured
-        if let Some(dedup_client) = &self.state.deduplication_client {
-            let file_size = event.data.content_length.unwrap_or(0) as u64;
+        self.process_blob_object(container, blob).await
+    }
 
-            // Check if we should ingest this file
-            if !dedup_client.should_ingest(&blob, file_size).await {
-                debug!(
-                    message = "Skipping blob due to deduplication check.",
-                    container = %container,
-                    blob = %blob,
-                    log_path = %blob,
-                    internal_log_rate_limit = true
-                );
-                return Ok(());
-            }
+    /// Downloads a blob, decompresses, frames, deserializes, enriches, and sends
+    /// events downstream. This is the shared processing core used by both Event Grid
+    /// notifications and direct ingest messages.
+    ///
+    async fn process_blob_object(
+        &mut self,
+        container: &str,
+        blob: &str,
+    ) -> Result<(), ProcessingError> {
+        let processing_start_time = Utc::now();
 
-            debug!(
-                message = "Proceeding to process blob after deduplication check.",
-                container = %container,
-                blob = %blob,
-                log_path = %blob,
-                internal_log_rate_limit = true
-            );
-        }
+        // Own these once up front — they're needed by the blob SDK, error paths,
+        // and log enrichment, so we avoid repeated to_owned() calls.
+        let container = container.to_owned();
+        let blob = blob.to_owned();
 
         // Get blob client and download content
         let blob_client = self
             .state
             .blob_client
-            .container_client(container)
-            .blob_client(blob);
+            .container_client(&container)
+            .blob_client(&blob);
 
         let mut blob_stream = blob_client.get().into_stream();
 
-        let response_opt = blob_stream.next().await.transpose().context(GetBlobSnafu {
-            container: container.to_string(),
-            blob: blob.to_string(),
-        })?;
+        let response_result = blob_stream.next().await.transpose();
+        let response_opt = match response_result {
+            Ok(opt) => opt,
+            Err(err) => {
+                // Check if the error is a 404 (Blob not found)
+                let is_not_found = matches!(
+                    err.kind(),
+                    ErrorKind::HttpResponse { status, .. } if *status == azure_core_for_storage::StatusCode::NotFound
+                );
+                if is_not_found {
+                    return Err(ProcessingError::BlobNotFound {
+                        source: err,
+                        container: container.clone(),
+                        blob: blob.clone(),
+                    });
+                }
+                Err(err).context(GetBlobSnafu {
+                    container: container.clone(),
+                    blob: blob.clone(),
+                })?
+            }
+        };
 
         let blob_response = response_opt.ok_or_else(|| ProcessingError::GetBlob {
             source: azure_core_for_storage::Error::message(
                 ErrorKind::Other,
                 "no blob response received",
             ),
-            container: container.to_string(),
-            blob: blob.to_string(),
+            container: container.clone(),
+            blob: blob.clone(),
         })?;
 
         debug!(
-            message = "Got blob from Event Grid notification.",
+            message = "Got blob.",
             container = %container,
             blob = %blob,
             internal_log_rate_limit = true
@@ -686,7 +792,7 @@ impl IngestorProcess {
         // Decode blob content based on compression settings
         let blob_reader = super::blob_object_decoder(
             self.state.compression,
-            blob,
+            &blob,
             content_encoding,
             content_type,
             Box::new(body_stream),
@@ -727,8 +833,6 @@ impl IngestorProcess {
         };
 
         // Prepare metadata for event processing
-        let container_name = container.to_string();
-        let blob_name = blob.to_string();
         let account_name = self.state.storage_account_name.clone();
 
         // Process each line into events
@@ -754,8 +858,8 @@ impl IngestorProcess {
                         handle_single_log(
                             log_event,
                             self.log_namespace,
-                            &container_name,
-                            &blob_name,
+                            &container,
+                            &blob,
                             &account_name,
                             &metadata_map,
                             timestamp_chrono,
@@ -785,14 +889,14 @@ impl IngestorProcess {
         let processing_result = if let Some(error) = read_error {
             Err(ProcessingError::ReadBlob {
                 source: error,
-                container: container.to_string(),
-                blob: blob.to_string(),
+                container: container.clone(),
+                blob: blob.clone(),
             })
         } else if let Some(error) = send_error {
             Err(ProcessingError::PipelineSend {
                 source: error,
-                container: container.to_string(),
-                blob: blob.to_string(),
+                container: container.clone(),
+                blob: blob.clone(),
             })
         } else {
             // Handle batch acknowledgement
@@ -804,13 +908,13 @@ impl IngestorProcess {
                     emit_object_storage_ack_metrics(
                         processing_start_time,
                         CLOUD_PROVIDER,
-                        container,
+                        &container,
                     );
 
                     match result {
                         BatchStatus::Delivered => {
                             debug!(
-                                message = "Blob from queue delivered.",
+                                message = "Blob delivered.",
                                 container = %container,
                                 blob = %blob,
                                 internal_log_rate_limit = true
@@ -820,31 +924,31 @@ impl IngestorProcess {
                         }
                         BatchStatus::Errored => {
                             warn!(
-                                message = "Blob from queue processing errored.",
-                                container = container,
-                                blob = blob,
+                                message = "Blob processing errored.",
+                                container = %container,
+                                blob = %blob,
                             );
                             if self.state.delete_failed_message {
                                 Ok(())
                             } else {
                                 Err(ProcessingError::ErrorAcknowledgement {
-                                    container: container.to_string(),
-                                    blob: blob.to_string(),
+                                    container: container.clone(),
+                                    blob: blob.clone(),
                                 })
                             }
                         }
                         BatchStatus::Rejected => {
                             warn!(
-                                message = "Blob from queue was rejected.",
-                                container = container,
-                                blob = blob,
+                                message = "Blob was rejected.",
+                                container = %container,
+                                blob = %blob,
                             );
                             if self.state.delete_failed_message {
                                 Ok(())
                             } else {
                                 Err(ProcessingError::ErrorAcknowledgement {
-                                    container: container.to_string(),
-                                    blob: blob.to_string(),
+                                    container: container.clone(),
+                                    blob: blob.clone(),
                                 })
                             }
                         }
@@ -852,18 +956,6 @@ impl IngestorProcess {
                 }
             }
         };
-
-        // Mark completion status in ClickHouse if deduplication is configured
-        if let Some(dedup_client) = &self.state.deduplication_client {
-            let file_size = event.data.content_length.unwrap_or(0) as u64;
-            let file_creation_timestamp = event.event_time.as_str();
-            let success = processing_result.is_ok();
-
-            // Note: Errors are logged internally by the DeduplicationClient
-            dedup_client
-                .mark_completion(blob, file_creation_timestamp, file_size, success)
-                .await;
-        }
 
         processing_result
     }
@@ -992,6 +1084,41 @@ fn parse_blob_subject(subject: &str) -> Option<(&str, &str)> {
     } else {
         None
     }
+}
+
+/// The expected value of the `kind` field in a direct ingest message.
+const DIRECT_INGEST_KIND: &str = "INGEST";
+
+/// A direct ingest message that can be placed on the Azure Queue to trigger
+/// ingestion of a specific blob without relying on Event Grid notifications.
+///
+/// Example message:
+/// ```json
+/// {"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log"}
+/// ```
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectIngestMessage {
+    /// Must be "INGEST".
+    pub kind: String,
+    /// The blob container name.
+    pub container: String,
+    /// The blob path/key.
+    pub blob: String,
+    /// Optional storage account override. Falls back to the source's configured account.
+    pub account: Option<String>,
+}
+
+/// Represents the possible message types that can arrive on the Azure Queue.
+///
+/// `DirectIngest` is listed first with `#[serde(deny_unknown_fields)]` on the struct,
+/// so it is tried first during deserialization but will not false-match Event Grid
+/// notifications (which carry additional fields that `deny_unknown_fields` rejects).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum QueueEvent {
+    DirectIngest(DirectIngestMessage),
+    EventGrid(EventGridEvent),
 }
 
 /// Event Grid event structure for blob notifications.
@@ -1227,5 +1354,171 @@ mod tests {
             config.queue_name, "my-storage-queue",
             "Queue name should be correctly parsed from TOML"
         );
+    }
+
+    #[test]
+    fn test_direct_ingest_message() {
+        // Basic direct ingest message
+        let value: QueueEvent = serde_json::from_str(
+            r#"{"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log"}"#,
+        )
+        .unwrap();
+        match value {
+            QueueEvent::DirectIngest(msg) => {
+                assert_eq!(msg.kind, DIRECT_INGEST_KIND);
+                assert_eq!(msg.container, "my-container");
+                assert_eq!(msg.blob, "path/to/file.log");
+                assert!(msg.account.is_none());
+            }
+            _ => panic!("Expected DirectIngest variant"),
+        }
+
+        // With optional account
+        let value: QueueEvent = serde_json::from_str(
+            r#"{"kind": "INGEST", "container": "my-container", "blob": "data.csv", "account": "mystorageaccount"}"#,
+        )
+        .unwrap();
+        match value {
+            QueueEvent::DirectIngest(msg) => {
+                assert_eq!(msg.account.as_deref(), Some("mystorageaccount"));
+            }
+            _ => panic!("Expected DirectIngest variant"),
+        }
+
+        // Event Grid notification still parses as EventGrid, not DirectIngest
+        let event_grid_json = r#"{
+            "topic": "/subscriptions/00000000/resourceGroups/test/providers/Microsoft.Storage/storageAccounts/testaccount",
+            "subject": "/blobServices/default/containers/testcontainer/blobs/testfile.txt",
+            "eventType": "Microsoft.Storage.BlobCreated",
+            "id": "00000000-0000-0000-0000-000000000000",
+            "data": {
+                "contentType": "text/plain",
+                "url": "https://testaccount.blob.core.windows.net/testcontainer/testfile.txt"
+            },
+            "dataVersion": "",
+            "metadataVersion": "1",
+            "eventTime": "2024-12-06T03:32:15.7238874Z"
+        }"#;
+        let value: QueueEvent = serde_json::from_str(event_grid_json).unwrap();
+        assert!(matches!(value, QueueEvent::EventGrid(_)));
+    }
+
+    #[test]
+    fn test_direct_ingest_unknown_kind_still_parses() {
+        // A message with unknown kind still deserializes into DirectIngest —
+        // the runtime check in handle_direct_ingest rejects it, not serde.
+        let value: QueueEvent =
+            serde_json::from_str(r#"{"kind": "UNKNOWN", "container": "c", "blob": "b"}"#).unwrap();
+        match value {
+            QueueEvent::DirectIngest(msg) => {
+                assert_eq!(msg.kind, "UNKNOWN");
+            }
+            _ => panic!("Expected DirectIngest variant"),
+        }
+    }
+
+    #[test]
+    fn test_direct_ingest_extra_fields_rejected() {
+        // deny_unknown_fields on DirectIngestMessage means a message with extra
+        // fields won't match DirectIngest. It should fall through to another
+        // variant or fail to parse entirely.
+        let msg_with_extra =
+            r#"{"kind": "INGEST", "container": "c", "blob": "b", "unexpected_field": true}"#;
+        let result: Result<QueueEvent, _> = serde_json::from_str(msg_with_extra);
+        // Should not parse as DirectIngest (deny_unknown_fields), and won't match
+        // EventGridEvent either, so parsing fails.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_custom_message_config_parsing() {
+        // Default: process_custom_message is false
+        let config: Config = toml::from_str(
+            r#"
+            queue_name = "my-storage-queue"
+            "#,
+        )
+        .unwrap();
+        assert!(!config.process_custom_message);
+
+        // Explicitly enabled
+        let config: Config = toml::from_str(
+            r#"
+            queue_name = "my-storage-queue"
+            process_custom_message = true
+            "#,
+        )
+        .unwrap();
+        assert!(config.process_custom_message);
+
+        // Explicitly disabled
+        let config: Config = toml::from_str(
+            r#"
+            queue_name = "my-storage-queue"
+            process_custom_message = false
+            "#,
+        )
+        .unwrap();
+        assert!(!config.process_custom_message);
+    }
+
+    #[test]
+    fn test_direct_ingest_missing_required_fields() {
+        // Missing "blob" field
+        let result: Result<QueueEvent, _> =
+            serde_json::from_str(r#"{"kind": "INGEST", "container": "c"}"#);
+        assert!(result.is_err());
+
+        // Missing "container" field
+        let result: Result<QueueEvent, _> =
+            serde_json::from_str(r#"{"kind": "INGEST", "blob": "b"}"#);
+        assert!(result.is_err());
+
+        // Missing "kind" field
+        let result: Result<QueueEvent, _> =
+            serde_json::from_str(r#"{"container": "c", "blob": "b"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_direct_ingest_base64_round_trip() {
+        // Simulate the actual message path: base64 encode then decode
+        let raw_json =
+            r#"{"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log"}"#;
+        let encoded = STANDARD.encode(raw_json);
+        let decoded_bytes = STANDARD.decode(&encoded).unwrap();
+        let decoded_str = String::from_utf8(decoded_bytes).unwrap();
+        let value: QueueEvent = serde_json::from_str(&decoded_str).unwrap();
+        match value {
+            QueueEvent::DirectIngest(msg) => {
+                assert_eq!(msg.kind, DIRECT_INGEST_KIND);
+                assert_eq!(msg.container, "my-container");
+                assert_eq!(msg.blob, "path/to/file.log");
+            }
+            _ => panic!("Expected DirectIngest variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_grid_base64_round_trip() {
+        // Ensure Event Grid messages still work through the base64 round-trip
+        let raw_json = r#"{
+            "topic": "/subscriptions/00000000/resourceGroups/test/providers/Microsoft.Storage/storageAccounts/testaccount",
+            "subject": "/blobServices/default/containers/testcontainer/blobs/testfile.txt",
+            "eventType": "Microsoft.Storage.BlobCreated",
+            "id": "00000000-0000-0000-0000-000000000000",
+            "data": {
+                "contentType": "text/plain",
+                "url": "https://testaccount.blob.core.windows.net/testcontainer/testfile.txt"
+            },
+            "dataVersion": "",
+            "metadataVersion": "1",
+            "eventTime": "2024-12-06T03:32:15.7238874Z"
+        }"#;
+        let encoded = STANDARD.encode(raw_json);
+        let decoded_bytes = STANDARD.decode(&encoded).unwrap();
+        let decoded_str = String::from_utf8(decoded_bytes).unwrap();
+        let value: QueueEvent = serde_json::from_str(&decoded_str).unwrap();
+        assert!(matches!(value, QueueEvent::EventGrid(_)));
     }
 }

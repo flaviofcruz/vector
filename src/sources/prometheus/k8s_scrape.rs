@@ -550,9 +550,11 @@ fn prepare_field_selector(extra: &str, self_node_name: &str) -> Result<String> {
 }
 
 fn prepare_label_selector(extra: &str) -> String {
-    const BUILT_IN: &str = "vector.dev/exclude!=true";
+    const BUILT_IN: &str = "";
 
-    if extra.is_empty() {
+    if BUILT_IN.is_empty() {
+        extra.to_string()
+    } else if extra.is_empty() {
         BUILT_IN.to_string()
     } else {
         format!("{BUILT_IN},{extra}")
@@ -628,11 +630,8 @@ mod tests {
 
     #[test]
     fn test_prepare_label_selector() {
-        assert_eq!(prepare_label_selector(""), "vector.dev/exclude!=true");
-        assert_eq!(
-            prepare_label_selector("app=myapp"),
-            "vector.dev/exclude!=true,app=myapp"
-        );
+        assert_eq!(prepare_label_selector(""), "");
+        assert_eq!(prepare_label_selector("app=myapp"), "app=myapp");
     }
 
     #[tokio::test]

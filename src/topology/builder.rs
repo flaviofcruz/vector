@@ -79,8 +79,6 @@ static TRANSFORM_CONCURRENCY_LIMIT: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or_else(crate::num_threads)
 });
 
-const INTERNAL_SOURCES: [&str; 2] = ["internal_logs", "internal_metrics"];
-
 struct Builder<'a> {
     config: &'a super::Config,
     diff: &'a ConfigDiff,
@@ -359,7 +357,7 @@ impl<'a> Builder<'a> {
 
             let (shutdown_signal, force_shutdown_tripwire) = self
                 .shutdown_coordinator
-                .register_source(key, INTERNAL_SOURCES.contains(&typetag));
+                .register_source(key, source.inner.has_deferred_shutdown());
 
             let context = SourceContext {
                 key: key.clone(),

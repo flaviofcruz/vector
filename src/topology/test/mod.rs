@@ -9,7 +9,7 @@ use std::{
 use futures::{StreamExt, future, stream};
 use tokio::{
     task::yield_now,
-    time::{Duration, sleep},
+    time::{Duration, Instant, sleep},
 };
 use vector_lib::{
     buffers::{BufferConfig, BufferType, WhenFull},
@@ -25,7 +25,7 @@ use crate::{
         mock::{
             basic_sink, basic_sink_failing_healthcheck, basic_sink_with_data, basic_source,
             basic_source_with_data, basic_source_with_event_counter, basic_transform,
-            error_definition_transform,
+            deferred_source, error_definition_transform,
         },
         start_topology, trace_init,
     },
@@ -972,5 +972,139 @@ async fn source_metadata_reaches_sink() {
     assert_eq!(
         **out_event2.into_log().metadata().source_id().unwrap(),
         ComponentKey::from("in2")
+    );
+}
+
+/// Tests the two-wave graceful shutdown with the following topology:
+///
+/// Pipeline 1: external_data_1 (non-deferred) → non_deferred_transform → non_deferred_sink
+/// Pipeline 2: external_data_2 (non-deferred) → mixed_transform → mixed_sink
+/// Pipeline 3: internal_logs (deferred) → mixed_transform → mixed_sink
+///
+/// Wave 1 shuts down external_data_1 and external_data_2, then waits for
+/// non_deferred_transform and non_deferred_sink to drain. mixed_transform and mixed_sink
+/// stay alive because they have a deferred source (internal_logs) in their ancestry.
+///
+/// Wave 2 shuts down internal_logs, after which mixed_transform and mixed_sink drain and exit.
+///
+/// The test asserts that the total shutdown time is well under the 30s graceful shutdown limit,
+/// which would be violated if the two-wave logic is broken (e.g., force-shutdown timeout hit).
+#[tokio::test]
+async fn topology_two_wave_graceful_shutdown() {
+    trace_init();
+
+    // Pipeline 1: external_data_1 → non_deferred_transform → non_deferred_sink
+    let (mut ext_data_1_tx, ext_data_1_source) = basic_source();
+    let non_deferred_transform = basic_transform(" nd_transformed", 0.0);
+    let (non_deferred_out, non_deferred_sink) = basic_sink(10);
+
+    // Pipeline 2: external_data_2 → mixed_transform → mixed_sink
+    let (mut ext_data_2_tx, ext_data_2_source) = basic_source();
+
+    // Pipeline 3: internal_logs (deferred) → mixed_transform → mixed_sink
+    let (mut internal_logs_tx, internal_logs_source) = deferred_source();
+
+    let mixed_transform = basic_transform(" mixed_transformed", 0.0);
+    let (mixed_out, mixed_sink) = basic_sink(10);
+
+    let mut config = Config::builder();
+    // Enable two-wave shutdown via the global option.
+    config.global.two_wave_shutdown = true.into();
+    // Set shutdown durations: wave 1 = 5s, overall = 30s.
+    // The test must complete well under 30s — hitting the deadline means something is broken.
+    config.graceful_shutdown_duration = Some(Duration::from_secs(30));
+    config.graceful_data_source_shutdown_duration = Some(Duration::from_secs(5));
+
+    config.add_source("external_data_1", ext_data_1_source);
+    config.add_source("external_data_2", ext_data_2_source);
+    config.add_source("internal_logs", internal_logs_source);
+
+    config.add_transform(
+        "non_deferred_transform",
+        &["external_data_1"],
+        non_deferred_transform,
+    );
+    config.add_transform(
+        "mixed_transform",
+        &["external_data_2", "internal_logs"],
+        mixed_transform,
+    );
+
+    config.add_sink(
+        "non_deferred_sink",
+        &["non_deferred_transform"],
+        non_deferred_sink,
+    );
+    config.add_sink("mixed_sink", &["mixed_transform"], mixed_sink);
+
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
+
+    // Send events through all three pipelines
+    let event1 = Event::Log(LogEvent::from("from_ext1"));
+    ext_data_1_tx.send_event(event1).await.unwrap();
+
+    let event2 = Event::Log(LogEvent::from("from_ext2"));
+    ext_data_2_tx.send_event(event2).await.unwrap();
+
+    let event3 = Event::Log(LogEvent::from("from_internal"));
+    internal_logs_tx.send_event(event3).await.unwrap();
+
+    // Collect events from non_deferred_sink (should get 1 event from ext1)
+    let nd_event: EventArray = non_deferred_out
+        .take(1)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+        .into();
+    let nd_messages: Vec<String> = nd_event.into_events().map(into_message).collect();
+    assert_eq!(nd_messages, vec!["from_ext1 nd_transformed"]);
+
+    // Collect events from mixed_sink (should get 2 events: from ext2 and internal)
+    let mixed_events: Vec<EventArray> = mixed_out.take(2).map(|item| item.into()).collect().await;
+    let mut mixed_messages: Vec<String> = mixed_events
+        .into_iter()
+        .flat_map(|arr| arr.into_events().map(into_message).collect::<Vec<_>>())
+        .collect();
+    mixed_messages.sort();
+    assert_eq!(
+        mixed_messages,
+        vec![
+            "from_ext2 mixed_transformed",
+            "from_internal mixed_transformed"
+        ]
+    );
+
+    // Drop senders so sources can finish when they receive shutdown signals
+    drop(ext_data_1_tx);
+    drop(ext_data_2_tx);
+    drop(internal_logs_tx);
+
+    // Stop the topology — this triggers the two-wave shutdown.
+    // Wave 1: external_data_1 and external_data_2 shut down,
+    //         non_deferred_transform and non_deferred_sink drain.
+    // Wave 2: internal_logs shuts down,
+    //         mixed_transform and mixed_sink drain.
+    //
+    // If the two-wave logic is broken (e.g., mixed components are included in
+    // wave 1), this would hang or fail because the mixed pipeline would be
+    // waited on before the deferred source is shut down.
+    let start = Instant::now();
+    topology.stop().await;
+    let elapsed = start.elapsed();
+
+    // The test must complete well under the 30s graceful shutdown limit.
+    // If shutdown takes anywhere near that long, it means the force-shutdown
+    // deadline was hit rather than a clean two-wave shutdown.
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "Shutdown took {elapsed:?}, which exceeds the 30s graceful shutdown limit. \
+         This indicates the two-wave shutdown did not complete cleanly."
+    );
+    // In practice, a clean shutdown should be near-instant (< 5s).
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "Shutdown took {elapsed:?}, expected < 5s for a clean two-wave shutdown."
     );
 }

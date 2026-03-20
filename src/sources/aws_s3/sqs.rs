@@ -46,7 +46,6 @@ use vector_lib::{
 
 use crate::codecs::Decoder;
 use crate::event::{Event, LogEvent};
-use crate::sources::util::{ClickHouseDeduplicator, DeduplicationClient};
 use crate::{
     SourceSender,
     aws::AwsTimeout,
@@ -54,12 +53,12 @@ use crate::{
     config::{SourceAcknowledgementsConfig, SourceContext},
     event::{BatchNotifier, BatchStatus, EstimatedJsonEncodedSizeOf},
     internal_events::{
-        EventsReceived, S3ObjectProcessingFailed, S3ObjectProcessingSucceeded,
-        SqsMessageDeleteBatchError, SqsMessageDeletePartialError, SqsMessageDeleteSucceeded,
-        SqsMessageProcessingError, SqsMessageProcessingSucceeded, SqsMessageReceiveError,
-        SqsMessageReceiveSucceeded, SqsMessageSendBatchError, SqsMessageSentPartialError,
-        SqsMessageSentSucceeded, SqsS3EventRecordInvalidEventIgnored, StreamClosedError,
-        emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
+        EventsReceived, QueueNotificationProcessLag, S3ObjectProcessingFailed,
+        S3ObjectProcessingSucceeded, SqsMessageDeleteBatchError, SqsMessageDeletePartialError,
+        SqsMessageDeleteSucceeded, SqsMessageProcessingError, SqsMessageProcessingSucceeded,
+        SqsMessageReceiveError, SqsMessageReceiveSucceeded, SqsMessageSendBatchError,
+        SqsMessageSentPartialError, SqsMessageSentSucceeded, SqsS3EventRecordInvalidEventIgnored,
+        StreamClosedError, emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
     },
     line_agg::{self, LineAgg},
     shutdown::ShutdownSignal,
@@ -191,6 +190,15 @@ pub(super) struct Config {
     /// Configuration for deferring events to another queue based on their age.
     #[configurable(derived)]
     pub(super) deferred: Option<DeferredConfig>,
+
+    /// Whether to process custom direct ingest messages from the queue.
+    ///
+    /// When enabled, the source will also handle messages with `{"kind": "INGEST", "bucket": "...", "key": "..."}` format
+    /// in addition to standard S3 event notifications. This allows you to manually enqueue
+    /// S3 objects for ingestion without relying on S3 bucket notifications.
+    #[serde(default)]
+    #[derivative(Default)]
+    pub(super) process_custom_message: bool,
 }
 
 const fn default_poll_secs() -> u32 {
@@ -280,6 +288,12 @@ pub enum ProcessingError {
         key: String,
         deferred_queue: String,
     },
+    #[snafu(display("Object not found s3://{}/{}: {}", bucket, key, source))]
+    ObjectNotFound {
+        source: SdkError<GetObjectError, HttpResponse>,
+        bucket: String,
+        key: String,
+    },
 }
 
 pub struct State {
@@ -299,9 +313,9 @@ pub struct State {
     delete_message: bool,
     delete_failed_message: bool,
     decoder: Decoder,
-    deduplication_client: Option<DeduplicationClient>,
 
     deferred: Option<DeferredConfig>,
+    process_custom_message: bool,
 }
 
 pub(super) struct Ingestor {
@@ -317,15 +331,12 @@ impl Ingestor {
         compression: super::Compression,
         multiline: Option<line_agg::Config>,
         decoder: Decoder,
-        clickhouse_dedupe: Option<ClickHouseDeduplicator>,
     ) -> Result<Ingestor, IngestorNewError> {
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 10 {
             return Err(IngestorNewError::InvalidNumberOfMessages {
                 messages: config.max_number_of_messages,
             });
         }
-
-        let deduplication_client = clickhouse_dedupe.and_then(DeduplicationClient::new);
 
         let state = Arc::new(State {
             region,
@@ -347,9 +358,9 @@ impl Ingestor {
             delete_message: config.delete_message,
             delete_failed_message: config.delete_failed_message,
             decoder,
-            deduplication_client,
 
             deferred: config.deferred,
+            process_custom_message: config.process_custom_message,
         });
 
         Ok(Ingestor { state })
@@ -538,6 +549,33 @@ impl IngestorProcess {
                                 );
                             }
                         }
+                        ProcessingError::ObjectNotFound {
+                            ref source,
+                            ref bucket,
+                            ref key,
+                        } => {
+                            warn!(
+                                message = "S3 object not found.",
+                                message_id = &message_id,
+                                bucket = %bucket,
+                                key = %key,
+                                error = %source,
+                            );
+                            emit!(SqsMessageProcessingSucceeded {
+                                message_id: &message_id
+                            });
+                            // Object no longer exists — retrying won't help.
+                            // Delete the SQS message to prevent infinite retries.
+                            if self.state.delete_message {
+                                delete_entries.push(
+                                    DeleteMessageBatchRequestEntry::builder()
+                                        .id(message_id)
+                                        .receipt_handle(receipt_handle)
+                                        .build()
+                                        .expect("all required builder params specified"),
+                                );
+                            }
+                        }
                         _ => {
                             emit!(SqsMessageProcessingError {
                                 message_id: &message_id,
@@ -611,34 +649,115 @@ impl IngestorProcess {
         Ok(())
     }
 
+    /// Dispatches a single SQS message to the appropriate handler based on its content.
+    ///
+    /// The message body is first unwrapped from an SNS envelope if present, then
+    /// deserialized as one of:
+    /// - `S3Event` — standard S3 bucket notification (ObjectCreated, etc.)
+    /// - `S3TestEvent` — S3 test connectivity event (silently acknowledged)
+    /// - `DirectIngestMessage` — custom message requesting ingestion of a specific S3 object
+    ///   (only processed when `process_custom_message` is enabled in the SQS config)
     async fn handle_sqs_message(&mut self, message: Message) -> Result<(), ProcessingError> {
-        // queue_notification_create_timestamp is extracted from the SQS message
-        // and represents the time the notification was sent by the SNS service.
+        // queue_notification_create_timestamp is derived from the SQS `SentTimestamp`
+        // system attribute and represents when the producer sent the message to SQS,
+        // for both SNS-wrapped and direct-ingest messages.
         let queue_notification_create_timestamp =
             extract_queue_notification_create_timestamp(&message);
+
+        let message_id = message
+            .message_id
+            .clone()
+            .unwrap_or_else(|| "<empty>".to_owned());
 
         let sqs_body = message.body.unwrap_or_default();
         let sqs_body = serde_json::from_str::<SnsNotification>(sqs_body.as_ref())
             .map(|notification| notification.message)
             .unwrap_or(sqs_body);
         let s3_event: SqsEvent =
-            serde_json::from_str(sqs_body.as_ref()).context(InvalidSqsMessageSnafu {
-                message_id: message
-                    .message_id
-                    .clone()
-                    .unwrap_or_else(|| "<empty>".to_owned()),
+            serde_json::from_str(sqs_body.as_ref()).with_context(|_| InvalidSqsMessageSnafu {
+                message_id: message_id.clone(),
             })?;
 
         match s3_event {
             SqsEvent::TestEvent(_s3_test_event) => {
-                debug!(?message.message_id, message = "Found S3 Test Event.");
+                debug!(message_id = %message_id, message = "Found S3 Test Event.");
                 Ok(())
             }
             SqsEvent::Event(s3_event) => {
                 self.handle_s3_event(s3_event, queue_notification_create_timestamp)
                     .await
             }
+            SqsEvent::DirectIngest(msg) => {
+                self.handle_direct_ingest(msg, &message_id, queue_notification_create_timestamp)
+                    .await
+            }
         }
+    }
+
+    /// Handles a direct ingest message — a custom SQS message that explicitly
+    /// names an S3 bucket and key to ingest, bypassing S3 bucket notifications.
+    ///
+    /// Gated behind the `process_custom_message` config flag. When disabled,
+    /// direct ingest messages are silently ignored. Also validates that the
+    /// `kind` field equals [`DIRECT_INGEST_KIND`] and emits queue processing
+    /// lag metrics from the SQS `SentTimestamp`.
+    async fn handle_direct_ingest(
+        &mut self,
+        msg: DirectIngestMessage,
+        message_id: &str,
+        queue_notification_create_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), ProcessingError> {
+        if !self.state.process_custom_message {
+            debug!(
+                message = "Ignoring direct ingest message because process_custom_message is not enabled.",
+                message_id = %message_id,
+            );
+            return Ok(());
+        }
+        if msg.kind != DIRECT_INGEST_KIND {
+            warn!(
+                message = "Unknown direct ingest kind, ignoring.",
+                kind = %msg.kind,
+                expected = DIRECT_INGEST_KIND,
+                message_id = %message_id,
+            );
+            return Ok(());
+        }
+        let region = msg
+            .region
+            .unwrap_or_else(|| self.state.region.as_ref().to_owned());
+
+        // The S3 client is bound to the source's configured region, so we reject
+        // cross-region requests — consistent with the S3 notification path.
+        if self.state.region.as_ref() != region.as_str() {
+            return Err(ProcessingError::WrongRegion {
+                bucket: msg.bucket,
+                key: msg.key,
+                region,
+            });
+        }
+
+        // Emit queue processing lag metric (SQS SentTimestamp → now).
+        // This measures how long the message sat in the queue before being picked up.
+        if let Some(notification_ts) = queue_notification_create_timestamp {
+            let processing_start_time = Utc::now();
+            let lag_duration = processing_start_time.signed_duration_since(notification_ts);
+            let lag_seconds = lag_duration.num_milliseconds() as f64 / 1000.0;
+            emit!(QueueNotificationProcessLag {
+                lag_seconds,
+                cloud: CLOUD_PROVIDER,
+                bucket: &msg.bucket,
+            });
+        }
+
+        debug!(
+            message = "Processing direct ingest message.",
+            bucket = %msg.bucket,
+            key = %msg.key,
+            region = %region,
+        );
+        self.process_s3_object(&msg.bucket, &msg.key, &region, self.log_namespace)
+            .await
     }
 
     async fn handle_s3_event(
@@ -702,34 +821,6 @@ impl IngestorProcess {
             });
         }
 
-        // Check for deduplication if configured
-        if let Some(dedup_client) = &self.state.deduplication_client {
-            let file_size = s3_event.s3.object.size;
-
-            // Check if we should ingest this file
-            if !dedup_client
-                .should_ingest(&s3_event.s3.object.key, file_size)
-                .await
-            {
-                debug!(
-                    message = "Skipping S3 object due to deduplication check.",
-                    bucket = %s3_event.s3.bucket.name,
-                    key = %s3_event.s3.object.key,
-                    log_path = %s3_event.s3.object.key,
-                    internal_log_rate_limit = true
-                );
-                return Ok(());
-            }
-
-            debug!(
-                message = "Proceeding to process S3 object after deduplication check.",
-                bucket = %s3_event.s3.bucket.name,
-                key = %s3_event.s3.object.key,
-                log_path = %s3_event.s3.object.key,
-                internal_log_rate_limit = true
-            );
-        }
-
         if let Some(deferred) = &self.state.deferred {
             // Parse event_time string (ISO-8601 format) to DateTime
             if let Ok(event_dt) = chrono::DateTime::parse_from_rfc3339(&s3_event.event_time) {
@@ -744,32 +835,79 @@ impl IngestorProcess {
             }
         }
 
+        self.process_s3_object(
+            &s3_event.s3.bucket.name,
+            &s3_event.s3.object.key,
+            &s3_event.aws_region,
+            log_namespace,
+        )
+        .await
+    }
+
+    /// Downloads an S3 object, decompresses, frames, deserializes, enriches, and sends
+    /// events downstream. This is the shared processing core used by both S3 event
+    /// notifications and direct ingest messages.
+    ///
+    /// `region` is used only for log enrichment metadata — the actual S3 `GetObject` call
+    /// uses `self.state.s3_client`, which is bound to the source's configured region.
+    /// It is the caller's responsibility to validate region consistency before calling
+    /// this method (e.g., by rejecting cross-region requests with `WrongRegion`).
+    async fn process_s3_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        region: &str,
+        log_namespace: LogNamespace,
+    ) -> Result<(), ProcessingError> {
+        let processing_start_time = Utc::now();
         let download_start = Instant::now();
+
+        // Own these once up front — they're needed by the S3 SDK, error paths,
+        // log enrichment, and dedup, so we avoid repeated to_owned() calls.
+        let bucket = bucket.to_owned();
+        let key = key.to_owned();
+        let region = region.to_owned();
 
         let object_result = self
             .state
             .s3_client
             .get_object()
-            .bucket(s3_event.s3.bucket.name.clone())
-            .key(s3_event.s3.object.key.clone())
+            .bucket(bucket.clone())
+            .key(key.clone())
             .send()
-            .await
-            .context(GetObjectSnafu {
-                bucket: s3_event.s3.bucket.name.clone(),
-                key: s3_event.s3.object.key.clone(),
-            });
+            .await;
 
-        let object = object_result?;
+        let object = match object_result {
+            Ok(obj) => obj,
+            Err(err) => {
+                // Check if the error is a NoSuchKey (object not found / 404)
+                let is_not_found = match &err {
+                    SdkError::ServiceError(service_err) => {
+                        matches!(service_err.err(), GetObjectError::NoSuchKey(_))
+                    }
+                    _ => false,
+                };
+                if is_not_found {
+                    return Err(ProcessingError::ObjectNotFound {
+                        source: err,
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                    });
+                }
+                Err(err).context(GetObjectSnafu {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                })?
+            }
+        };
 
         debug!(
-            message = "Got S3 object from SQS notification.",
-            bucket = s3_event.s3.bucket.name,
-            key = s3_event.s3.object.key,
+            message = "Got S3 object.",
+            bucket = %bucket,
+            key = %key,
         );
 
         let metadata = object.metadata.clone();
-        let object_content_length = object.content_length().unwrap_or(0) as u64;
-        let object_key = s3_event.s3.object.key.clone();
 
         let timestamp = object.last_modified.map(|ts| {
             Utc.timestamp_opt(ts.secs(), ts.subsec_nanos())
@@ -780,7 +918,7 @@ impl IngestorProcess {
         let (batch, receiver) = BatchNotifier::maybe_new_with_receiver(self.acknowledgements);
         let object_reader = super::s3_object_decoder(
             self.state.compression,
-            &s3_event.s3.object.key,
+            &key,
             object.content_encoding.as_deref(),
             object.content_type.as_deref(),
             object.body,
@@ -802,6 +940,7 @@ impl IngestorProcess {
         let mut read_error = None;
         let bytes_received = self.bytes_received.clone();
         let events_received = self.events_received.clone();
+
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = Box::new(
             FramedRead::new(object_reader, self.state.decoder.framer.clone())
                 .map(|res| {
@@ -846,7 +985,9 @@ impl IngestorProcess {
                         handle_single_log(
                             log_event,
                             log_namespace,
-                            &s3_event,
+                            &bucket,
+                            &key,
+                            &region,
                             &metadata,
                             timestamp,
                         );
@@ -872,13 +1013,18 @@ impl IngestorProcess {
         // so we explicitly drop it so that we can again utilize `read_error` below.
         drop(stream);
 
-        let bucket = &s3_event.s3.bucket.name;
         let duration = download_start.elapsed();
 
         if read_error.is_some() {
-            emit!(S3ObjectProcessingFailed { bucket, duration });
+            emit!(S3ObjectProcessingFailed {
+                bucket: &bucket,
+                duration,
+            });
         } else {
-            emit!(S3ObjectProcessingSucceeded { bucket, duration });
+            emit!(S3ObjectProcessingSucceeded {
+                bucket: &bucket,
+                duration,
+            });
         }
 
         // The BatchNotifier is cloned for each LogEvent in the batch stream, but the last
@@ -888,54 +1034,50 @@ impl IngestorProcess {
         let processing_result = if let Some(error) = read_error {
             Err(ProcessingError::ReadObject {
                 source: error,
-                bucket: s3_event.s3.bucket.name.clone(),
-                key: s3_event.s3.object.key.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
             })
         } else if let Some(error) = send_error {
             Err(ProcessingError::PipelineSend {
                 source: error,
-                bucket: s3_event.s3.bucket.name.clone(),
-                key: s3_event.s3.object.key.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
             })
         } else {
             match receiver {
                 None => Ok(()),
                 Some(receiver) => {
                     let result = receiver.await;
-                    emit_object_storage_ack_metrics(
-                        processing_start_time,
-                        CLOUD_PROVIDER,
-                        &s3_event.s3.bucket.name,
-                    );
+                    emit_object_storage_ack_metrics(processing_start_time, CLOUD_PROVIDER, &bucket);
 
                     match result {
                         BatchStatus::Delivered => {
                             debug!(
-                                message = "S3 object from SQS delivered.",
-                                bucket = s3_event.s3.bucket.name,
-                                key = s3_event.s3.object.key,
+                                message = "S3 object delivered.",
+                                bucket = %bucket,
+                                key = %key,
                             );
                             Ok(())
                         }
                         BatchStatus::Errored => Err(ProcessingError::ErrorAcknowledgement {
-                            bucket: s3_event.s3.bucket.name,
-                            key: s3_event.s3.object.key,
-                            region: s3_event.aws_region,
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            region: region.clone(),
                         }),
                         BatchStatus::Rejected => {
                             if self.state.delete_failed_message {
                                 warn!(
                                     message =
-                                        "S3 object from SQS was rejected. Deleting failed message.",
-                                    bucket = s3_event.s3.bucket.name,
-                                    key = s3_event.s3.object.key,
+                                        "S3 object was rejected. Deleting failed message.",
+                                    bucket = %bucket,
+                                    key = %key,
                                 );
                                 Ok(())
                             } else {
                                 Err(ProcessingError::ErrorAcknowledgement {
-                                    bucket: s3_event.s3.bucket.name,
-                                    key: s3_event.s3.object.key,
-                                    region: s3_event.aws_region,
+                                    bucket: bucket.clone(),
+                                    key: key.clone(),
+                                    region: region.clone(),
                                 })
                             }
                         }
@@ -943,22 +1085,6 @@ impl IngestorProcess {
                 }
             }
         };
-
-        // Mark completion status in ClickHouse if deduplication is configured
-        if let Some(dedup_client) = &self.state.deduplication_client {
-            let file_creation_timestamp = s3_event.event_time.as_str();
-            let success = processing_result.is_ok();
-
-            // Note: Errors are logged internally by the DeduplicationClient
-            dedup_client
-                .mark_completion(
-                    &object_key,
-                    file_creation_timestamp,
-                    object_content_length,
-                    success,
-                )
-                .await;
-        }
 
         processing_result
     }
@@ -1014,7 +1140,9 @@ impl IngestorProcess {
 fn handle_single_log(
     log: &mut LogEvent,
     log_namespace: LogNamespace,
-    s3_event: &S3EventRecord,
+    bucket: &str,
+    key: &str,
+    region: &str,
     metadata: &Option<HashMap<String, String>>,
     timestamp: Option<DateTime<Utc>>,
 ) {
@@ -1023,7 +1151,7 @@ fn handle_single_log(
         log,
         Some(LegacyKey::Overwrite(path!("bucket"))),
         path!("bucket"),
-        Bytes::from(s3_event.s3.bucket.name.as_bytes().to_vec()),
+        Bytes::copy_from_slice(bucket.as_bytes()),
     );
 
     log_namespace.insert_source_metadata(
@@ -1031,14 +1159,14 @@ fn handle_single_log(
         log,
         Some(LegacyKey::Overwrite(path!("object"))),
         path!("object"),
-        Bytes::from(s3_event.s3.object.key.as_bytes().to_vec()),
+        Bytes::copy_from_slice(key.as_bytes()),
     );
     log_namespace.insert_source_metadata(
         AwsS3Config::NAME,
         log,
         Some(LegacyKey::Overwrite(path!("region"))),
         path!("region"),
-        Bytes::from(s3_event.aws_region.as_bytes().to_vec()),
+        Bytes::copy_from_slice(region.as_bytes()),
     );
 
     if let Some(metadata) = metadata {
@@ -1114,10 +1242,34 @@ pub struct SnsNotification {
     pub timestamp: DateTime<Utc>,
 }
 
+/// The expected value of the `kind` field in a direct ingest message.
+const DIRECT_INGEST_KIND: &str = "INGEST";
+
+/// A direct ingest message that can be placed on the SQS queue to trigger
+/// ingestion of a specific S3 object without relying on S3 bucket notifications.
+///
+/// Example message:
+/// ```json
+/// {"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log"}
+/// ```
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectIngestMessage {
+    /// Must be "INGEST".
+    pub kind: String,
+    /// The S3 bucket name.
+    pub bucket: String,
+    /// The S3 object key.
+    pub key: String,
+    /// Optional AWS region override. Falls back to the source's configured region.
+    pub region: Option<String>,
+}
+
 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/how-to-enable-disable-notification-intro.html
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 enum SqsEvent {
+    DirectIngest(DirectIngestMessage),
     Event(S3Event),
     TestEvent(S3TestEvent),
 }
@@ -1380,6 +1532,112 @@ fn test_s3_sns_testevent() {
     assert_eq!(value.bucket, "bucketname".to_string());
     assert_eq!(value.event.kind, "s3".to_string());
     assert_eq!(value.event.name, "TestEvent".to_string());
+}
+
+#[test]
+fn test_direct_ingest_message() {
+    // Basic direct ingest message
+    let value: SqsEvent = serde_json::from_str(
+        r#"{"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log"}"#,
+    )
+    .unwrap();
+    match value {
+        SqsEvent::DirectIngest(msg) => {
+            assert_eq!(msg.kind, DIRECT_INGEST_KIND);
+            assert_eq!(msg.bucket, "my-bucket");
+            assert_eq!(msg.key, "path/to/file.log");
+            assert!(msg.region.is_none());
+        }
+        _ => panic!("Expected DirectIngest variant"),
+    }
+
+    // With optional region
+    let value: SqsEvent = serde_json::from_str(
+        r#"{"kind": "INGEST", "bucket": "my-bucket", "key": "data.csv", "region": "eu-west-1"}"#,
+    )
+    .unwrap();
+    match value {
+        SqsEvent::DirectIngest(msg) => {
+            assert_eq!(msg.region.as_deref(), Some("eu-west-1"));
+        }
+        _ => panic!("Expected DirectIngest variant"),
+    }
+
+    // S3 notification still parses as Event, not DirectIngest
+    let s3_notification = r#"{
+        "Records": [{
+            "eventVersion": "2.1",
+            "eventSource": "aws:s3",
+            "awsRegion": "us-east-1",
+            "eventName": "ObjectCreated:Put",
+            "eventTime": "2022-03-24T19:43:00.548Z",
+            "s3": {
+                "bucket": {"name": "test-bucket"},
+                "object": {"key": "test.log", "size": 100}
+            }
+        }]
+    }"#;
+    let value: SqsEvent = serde_json::from_str(s3_notification).unwrap();
+    assert!(matches!(value, SqsEvent::Event(_)));
+}
+
+#[test]
+fn test_direct_ingest_unknown_kind_still_parses() {
+    // A message with unknown kind still deserializes into DirectIngest —
+    // the runtime check in handle_direct_ingest rejects it, not serde.
+    let value: SqsEvent =
+        serde_json::from_str(r#"{"kind": "UNKNOWN", "bucket": "b", "key": "k"}"#).unwrap();
+    match value {
+        SqsEvent::DirectIngest(msg) => {
+            assert_eq!(msg.kind, "UNKNOWN");
+        }
+        _ => panic!("Expected DirectIngest variant"),
+    }
+}
+
+#[test]
+fn test_direct_ingest_extra_fields_rejected() {
+    // deny_unknown_fields on DirectIngestMessage means a message with extra
+    // fields won't match DirectIngest. It should fall through to another
+    // variant or fail to parse entirely.
+    let msg_with_extra =
+        r#"{"kind": "INGEST", "bucket": "b", "key": "k", "unexpected_field": true}"#;
+    let result: Result<SqsEvent, _> = serde_json::from_str(msg_with_extra);
+    // Should not parse as DirectIngest (deny_unknown_fields), and won't match
+    // S3Event or S3TestEvent either, so parsing fails.
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_process_custom_message_config_parsing() {
+    // Default: process_custom_message is false
+    let config: Config = toml::from_str(
+        r#"
+            queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+        "#,
+    )
+    .unwrap();
+    assert!(!config.process_custom_message);
+
+    // Explicitly enabled
+    let config: Config = toml::from_str(
+        r#"
+            queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+            process_custom_message = true
+        "#,
+    )
+    .unwrap();
+    assert!(config.process_custom_message);
+
+    // Explicitly disabled
+    let config: Config = toml::from_str(
+        r#"
+            queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+            process_custom_message = false
+        "#,
+    )
+    .unwrap();
+    assert!(!config.process_custom_message);
 }
 
 #[test]

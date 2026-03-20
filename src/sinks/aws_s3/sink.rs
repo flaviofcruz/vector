@@ -2,6 +2,7 @@ use std::io;
 
 use bytes::Bytes;
 use chrono::{FixedOffset, Utc};
+use rand::Rng;
 use uuid::Uuid;
 use vector_common::internal_event::vector_event::file_send_event::FileEventMetadata;
 use vector_lib::event::event_log::generate_count_map;
@@ -29,6 +30,7 @@ pub struct S3RequestOptions {
     pub bucket: String,
     pub filename_time_format: String,
     pub filename_append_uuid: bool,
+    pub filename_prepend_crypto_nonce: bool,
     pub filename_extension: Option<String>,
     pub api_options: S3Options,
     pub encoder: (Transformer, Encoder<Framer>),
@@ -110,10 +112,17 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
                     .format(self.filename_time_format.as_str()),
             };
 
-            if self.filename_append_uuid {
+            let base = if self.filename_append_uuid {
                 format!("{formatted_ts}-{}", Uuid::new_v4().hyphenated())
             } else {
                 formatted_ts.to_string()
+            };
+
+            if self.filename_prepend_crypto_nonce {
+                let nonce = rand::rng().random::<u32>();
+                format!("{:08x}-{}", nonce, base)
+            } else {
+                base
             }
         };
 
@@ -165,6 +174,10 @@ fn format_s3_key(s3_key: &str, filename: &str, extension: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codecs::Encoder;
+    use crate::sinks::s3_common::partitioner::S3PartitionKey;
+    use vector_lib::codecs::{NewlineDelimitedEncoder, TextSerializerConfig, encoding::Framer};
+    use vector_lib::request_metadata::GroupedCountByteSize;
 
     #[test]
     fn test_format_s3_key() {
@@ -173,5 +186,60 @@ mod tests {
             format_s3_key("s3_key_", "filename", "txt")
         );
         assert_eq!("s3_key_filename", format_s3_key("s3_key_", "filename", ""));
+    }
+
+    fn make_request_options(prepend_crypto_nonce: bool, append_uuid: bool) -> S3RequestOptions {
+        let encoder = Encoder::<Framer>::new(
+            NewlineDelimitedEncoder::default().into(),
+            TextSerializerConfig::default().build().into(),
+        );
+
+        S3RequestOptions {
+            bucket: "test-bucket".to_string(),
+            filename_time_format: "%s".to_string(),
+            filename_append_uuid: append_uuid,
+            filename_prepend_crypto_nonce: prepend_crypto_nonce,
+            filename_extension: Some("log".to_string()),
+            api_options: S3Options::default(),
+            encoder: (Transformer::default(), encoder),
+            compression: Compression::None,
+            filename_tz_offset: None,
+        }
+    }
+
+    fn build_request_with_options(options: &S3RequestOptions) -> S3Request {
+        let partition_key = S3PartitionKey {
+            key_prefix: "test-prefix/".to_string(),
+            ssekms_key_id: None,
+        };
+        let events: Vec<Event> = vec![];
+        let (metadata, metadata_builder, _events) =
+            <S3RequestOptions as RequestBuilder<(S3PartitionKey, Vec<Event>)>>::split_input(
+                options,
+                (partition_key, events),
+            );
+        let byte_size = GroupedCountByteSize::new_untagged();
+        let payload = EncodeResult::uncompressed(Bytes::new(), byte_size);
+        let request_metadata = metadata_builder.build(&payload);
+        options.build_request(metadata, request_metadata, payload)
+    }
+
+    #[test]
+    fn s3_build_request_with_crypto_nonce() {
+        let options = make_request_options(true, false);
+        let request = build_request_with_options(&options);
+        let filename = request
+            .metadata
+            .s3_key
+            .strip_prefix("test-prefix/")
+            .unwrap()
+            .strip_suffix(".log")
+            .unwrap();
+        // Should be "<8-hex-chars>-<timestamp>"
+        let (nonce, rest) = filename.split_at(9);
+        assert_eq!(nonce.len(), 9);
+        assert!(nonce[..8].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(&nonce[8..], "-");
+        assert!(rest.chars().all(|c| c.is_ascii_digit()));
     }
 }
