@@ -363,6 +363,16 @@ pub struct Config {
     #[configurable(metadata(docs::examples = 60))]
     #[configurable(metadata(docs::human_name = "Wait Time Before Removing File"))]
     pub remove_after_secs: Option<u64>,
+
+    /// Whether to drain all watched files up to their current EOF on shutdown
+    /// before closing the output channel.
+    ///
+    /// When enabled, the file server will snapshot each file's size at shutdown
+    /// time and continue reading until every file has been read up to that point,
+    /// persisting checkpoints per-file so progress is not lost even if the process
+    /// is killed mid-drain.
+    #[serde(default = "default_drain_on_shutdown")]
+    drain_on_shutdown: bool,
 }
 
 const fn default_read_from() -> ReadFromConfig {
@@ -419,6 +429,7 @@ impl Default for Config {
             source_context: None,
             multiline: None,
             remove_after_secs: None,
+            drain_on_shutdown: default_drain_on_shutdown(),
         }
     }
 }
@@ -694,6 +705,7 @@ struct Source {
     source_context: Option<HashMap<String, String>>,
     multiline: Option<MultilineConfig>,
     remove_after_secs: Option<u64>,
+    drain_on_shutdown: bool,
 }
 
 impl Source {
@@ -795,6 +807,7 @@ impl Source {
             source_context: config.source_context.clone(),
             multiline: config.multiline.clone(),
             remove_after_secs: config.remove_after_secs,
+            drain_on_shutdown: config.drain_on_shutdown,
         })
     }
 
@@ -841,6 +854,7 @@ impl Source {
             ref source_context,
             multiline,
             remove_after_secs,
+            drain_on_shutdown,
         } = self;
 
         let mut reflectors = Vec::new();
@@ -1018,6 +1032,7 @@ impl Source {
             ttl_removal_config: file_ttl_removal_config,
             source_context: source_context.clone(),
             file_to_pod_map: Some(file_to_pod_map_ref),
+            drain_on_shutdown,
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
@@ -1305,6 +1320,10 @@ const fn default_delay_deletion_ms() -> Duration {
 
 const fn default_rotate_wait() -> Duration {
     Duration::from_secs(u64::MAX / 2)
+}
+
+const fn default_drain_on_shutdown() -> bool {
+    false
 }
 
 // This function constructs the patterns we include for file watching, created
@@ -1800,5 +1819,33 @@ mod tests {
                 )
             )
         )
+    }
+
+    #[test]
+    fn test_default_config_drain_on_shutdown() {
+        let config = Config::default();
+        assert_eq!(config.drain_on_shutdown, false);
+    }
+
+    #[test]
+    fn test_config_drain_on_shutdown_enabled() {
+        let config = Config {
+            drain_on_shutdown: true,
+            ..Default::default()
+        };
+        assert_eq!(config.drain_on_shutdown, true);
+    }
+
+    #[test]
+    fn test_config_serialization_drain_on_shutdown() {
+        let toml_config = r#"
+            drain_on_shutdown = true
+        "#;
+        let config: Config = toml::from_str(toml_config).unwrap();
+        assert_eq!(config.drain_on_shutdown, true);
+
+        let default_toml = "";
+        let default_config: Config = toml::from_str(default_toml).unwrap();
+        assert_eq!(default_config.drain_on_shutdown, false);
     }
 }
