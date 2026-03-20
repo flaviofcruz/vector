@@ -94,3 +94,4 @@ This lists custom changes merged in Databricks fork of Vector.
 93. Add sink request retry and failure rate metrics https://github.com/databricks-eng/vector/pull/425
 94. Handle object/blob not found (404) in `aws_s3` and `azure_blob` sources by deleting the queue message instead of retrying indefinitely https://github.com/databricks-eng/vector/pull/433
 95. Add cryptographic nonce file prefix functionality to cloud blob sinks - https://github.com/databricks-eng/vector/pull/414
+96. Add config-driven ingestion callback component for object storage sources (aws_s3, azure_blob) to notify upstream services on file processing completion https://github.com/databricks-eng/vector/pull/429
