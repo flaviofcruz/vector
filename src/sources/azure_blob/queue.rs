@@ -230,6 +230,12 @@ pub enum ProcessingError {
         container: String,
         blob: String,
     },
+    #[snafu(display(
+        "Direct ingest message for blob {}/{} has an empty file_id, ignoring.",
+        container,
+        blob
+    ))]
+    EmptyFileId { container: String, blob: String },
 }
 
 /// Internal state maintained by the ingestor
@@ -483,6 +489,22 @@ impl IngestorProcess {
                                 delete_messages.push(message.clone());
                             }
                         }
+                        ProcessingError::EmptyFileId {
+                            ref container,
+                            ref blob,
+                        } => {
+                            warn!(
+                                message = "Direct ingest message has empty file_id, discarding.",
+                                message_id = &message_id,
+                                container = %container,
+                                blob = %blob,
+                            );
+                            // Empty file_id is a permanent invalid state — retrying won't help.
+                            // Delete the queue message to prevent infinite retries.
+                            if self.state.delete_message {
+                                delete_messages.push(message.clone());
+                            }
+                        }
                         _ => {
                             error!(
                                 message = "Failed to process queue message.",
@@ -610,6 +632,12 @@ impl IngestorProcess {
                 message_id = %message_id,
             );
             return Ok(());
+        }
+        if msg.file_id.is_empty() {
+            return Err(ProcessingError::EmptyFileId {
+                container: msg.container,
+                blob: msg.blob,
+            });
         }
         // The blob client is bound to the source's configured storage account, so we
         // reject cross-account requests — consistent with the Event Grid notification path.
@@ -1094,11 +1122,16 @@ const DIRECT_INGEST_KIND: &str = "INGEST";
 ///
 /// Example message:
 /// ```json
-/// {"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log"}
+/// {"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log", "file_id": "f-abc-123"}
 /// ```
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DirectIngestMessage {
+    /// File identifier assigned by the upstream service.
+    /// Used by the ingestion callback component to notify the upstream
+    /// service of processing completion.
+    #[allow(dead_code)]
+    pub file_id: String,
     /// Must be "INGEST".
     pub kind: String,
     /// The blob container name.
@@ -1360,7 +1393,7 @@ mod tests {
     fn test_direct_ingest_message() {
         // Basic direct ingest message
         let value: QueueEvent = serde_json::from_str(
-            r#"{"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log"}"#,
+            r#"{"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log", "file_id": "f-123"}"#,
         )
         .unwrap();
         match value {
@@ -1369,18 +1402,20 @@ mod tests {
                 assert_eq!(msg.container, "my-container");
                 assert_eq!(msg.blob, "path/to/file.log");
                 assert!(msg.account.is_none());
+                assert_eq!(msg.file_id, "f-123");
             }
             _ => panic!("Expected DirectIngest variant"),
         }
 
         // With optional account
         let value: QueueEvent = serde_json::from_str(
-            r#"{"kind": "INGEST", "container": "my-container", "blob": "data.csv", "account": "mystorageaccount"}"#,
+            r#"{"kind": "INGEST", "container": "my-container", "blob": "data.csv", "account": "mystorageaccount", "file_id": "f-456"}"#,
         )
         .unwrap();
         match value {
             QueueEvent::DirectIngest(msg) => {
                 assert_eq!(msg.account.as_deref(), Some("mystorageaccount"));
+                assert_eq!(msg.file_id, "f-456");
             }
             _ => panic!("Expected DirectIngest variant"),
         }
@@ -1407,8 +1442,10 @@ mod tests {
     fn test_direct_ingest_unknown_kind_still_parses() {
         // A message with unknown kind still deserializes into DirectIngest —
         // the runtime check in handle_direct_ingest rejects it, not serde.
-        let value: QueueEvent =
-            serde_json::from_str(r#"{"kind": "UNKNOWN", "container": "c", "blob": "b"}"#).unwrap();
+        let value: QueueEvent = serde_json::from_str(
+            r#"{"kind": "UNKNOWN", "container": "c", "blob": "b", "file_id": "f-1"}"#,
+        )
+        .unwrap();
         match value {
             QueueEvent::DirectIngest(msg) => {
                 assert_eq!(msg.kind, "UNKNOWN");
@@ -1422,8 +1459,7 @@ mod tests {
         // deny_unknown_fields on DirectIngestMessage means a message with extra
         // fields won't match DirectIngest. It should fall through to another
         // variant or fail to parse entirely.
-        let msg_with_extra =
-            r#"{"kind": "INGEST", "container": "c", "blob": "b", "unexpected_field": true}"#;
+        let msg_with_extra = r#"{"kind": "INGEST", "container": "c", "blob": "b", "file_id": "f-1", "unexpected_field": true}"#;
         let result: Result<QueueEvent, _> = serde_json::from_str(msg_with_extra);
         // Should not parse as DirectIngest (deny_unknown_fields), and won't match
         // EventGridEvent either, so parsing fails.
@@ -1464,27 +1500,34 @@ mod tests {
 
     #[test]
     fn test_direct_ingest_missing_required_fields() {
-        // Missing "blob" field
-        let result: Result<QueueEvent, _> =
-            serde_json::from_str(r#"{"kind": "INGEST", "container": "c"}"#);
-        assert!(result.is_err());
-
-        // Missing "container" field
-        let result: Result<QueueEvent, _> =
-            serde_json::from_str(r#"{"kind": "INGEST", "blob": "b"}"#);
-        assert!(result.is_err());
-
-        // Missing "kind" field
-        let result: Result<QueueEvent, _> =
-            serde_json::from_str(r#"{"container": "c", "blob": "b"}"#);
-        assert!(result.is_err());
+        let cases = [
+            (
+                "missing blob",
+                r#"{"kind": "INGEST", "container": "c", "file_id": "f-1"}"#,
+            ),
+            (
+                "missing container",
+                r#"{"kind": "INGEST", "blob": "b", "file_id": "f-1"}"#,
+            ),
+            (
+                "missing kind",
+                r#"{"container": "c", "blob": "b", "file_id": "f-1"}"#,
+            ),
+            (
+                "missing file_id",
+                r#"{"kind": "INGEST", "container": "c", "blob": "b"}"#,
+            ),
+        ];
+        for (name, json) in cases {
+            let result: Result<QueueEvent, _> = serde_json::from_str(json);
+            assert!(result.is_err(), "expected error for case: {name}");
+        }
     }
 
     #[test]
     fn test_direct_ingest_base64_round_trip() {
         // Simulate the actual message path: base64 encode then decode
-        let raw_json =
-            r#"{"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log"}"#;
+        let raw_json = r#"{"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log", "file_id": "f-b64"}"#;
         let encoded = STANDARD.encode(raw_json);
         let decoded_bytes = STANDARD.decode(&encoded).unwrap();
         let decoded_str = String::from_utf8(decoded_bytes).unwrap();
