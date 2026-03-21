@@ -468,6 +468,41 @@ impl IngestionCallbackClient {
         })
     }
 
+    /// Convenience method: builds a [`CallbackContext`] from a processing result
+    /// and spawns [`notify`](Self::notify) as a detached tokio task.
+    ///
+    /// This is the primary integration point for sources. Call it after
+    /// `process_s3_object` / `process_blob_object` returns with the
+    /// processing result and the original message fields.
+    ///
+    /// `processing_error` should be `None` on success, or `Some(error_string)`
+    /// on failure. The `message_fields` are the fields from the original
+    /// direct-ingest queue message (e.g., file_id, bucket, key, etc.).
+    pub fn spawn_notify(
+        &self,
+        result: &Result<(), impl std::fmt::Display>,
+        processing_duration: Duration,
+        message_fields: HashMap<String, String>,
+    ) -> tokio::task::JoinHandle<()> {
+        let status = match result {
+            Ok(()) => BatchStatus::Delivered,
+            Err(_) => BatchStatus::Errored,
+        };
+        let error_message = match result {
+            Ok(()) => String::new(),
+            Err(err) => format!("{err}"),
+        };
+        let ctx = CallbackContext {
+            status,
+            error_message,
+            duration: processing_duration,
+            timestamp: Utc::now(),
+            message_fields,
+        };
+        let cb = self.clone();
+        tokio::spawn(async move { cb.notify(&ctx).await })
+    }
+
     /// Fire the appropriate callback (success or failure) based on the context.
     ///
     /// This method is designed to be called from `tokio::spawn` — it never
@@ -1359,6 +1394,8 @@ mod tests {
         ])
         .await;
 
+        // start_paused = true: Tokio auto-advances paused time when the only pending
+        // work is timer-based (the retry sleep), making retries instant without wall-clock waits.
         let client = make_test_client(&format!("http://{addr}"), Some("/ok"), None, vec![], 3);
 
         let ctx = make_context(BatchStatus::Delivered, "", vec![]);
@@ -1544,6 +1581,68 @@ mod tests {
         // Both must resolve to the same path without double-slash.
         assert_eq!(requests[0].uri, "/v1/callback");
         assert_eq!(requests[1].uri, "/v1/callback");
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn integration_spawn_notify_success_fires_callback() {
+        let (addr, log, shutdown) = start_test_server(vec![StatusCode::OK]).await;
+
+        let client = make_test_client(
+            &format!("http://{addr}"),
+            Some("/mark-ok"),
+            Some("/mark-fail"),
+            vec![("error_message", "{{error_message}}")],
+            1,
+        );
+
+        // Simulate a successful processing result
+        let result: Result<(), String> = Ok(());
+        let message_fields = HashMap::from([("file_id".to_string(), "f-spawn-1".to_string())]);
+        client
+            .spawn_notify(&result, Duration::ZERO, message_fields)
+            .await
+            .unwrap();
+
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].uri, "/mark-ok");
+        assert!(requests[0].body.is_empty());
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn integration_spawn_notify_failure_fires_callback_with_error() {
+        let (addr, log, shutdown) = start_test_server(vec![StatusCode::OK]).await;
+
+        let client = make_test_client(
+            &format!("http://{addr}"),
+            Some("/mark-ok"),
+            Some("/mark-fail"),
+            vec![
+                ("file_id", "{{message.file_id}}"),
+                ("error_message", "{{error_message}}"),
+            ],
+            1,
+        );
+
+        // Simulate a failed processing result
+        let result: Result<(), String> = Err("S3 read timeout".to_string());
+        let message_fields = HashMap::from([("file_id".to_string(), "f-spawn-2".to_string())]);
+        client
+            .spawn_notify(&result, Duration::ZERO, message_fields)
+            .await
+            .unwrap();
+
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].uri, "/mark-fail");
+
+        let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(body["file_id"], "f-spawn-2");
+        assert_eq!(body["error_message"], "S3 read timeout");
 
         let _ = shutdown.send(());
     }

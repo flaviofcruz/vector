@@ -44,6 +44,7 @@ use crate::{
     line_agg::{self, LineAgg},
     shutdown::ShutdownSignal,
     sources::azure_blob::AzureBlobConfig,
+    sources::ingestion_callback::IngestionCallbackClient,
     tls::TlsConfig,
 };
 use vector_lib::config::{LegacyKey, LogNamespace, log_schema};
@@ -271,6 +272,8 @@ pub struct State {
     storage_account_name: String,
     /// Whether to process custom direct ingest messages
     process_custom_message: bool,
+    /// Optional callback client for notifying upstream on processing completion
+    callback_client: Option<IngestionCallbackClient>,
 }
 
 /// Main ingestor implementation that handles Azure Queue message processing
@@ -288,6 +291,7 @@ impl Ingestor {
         compression: super::Compression,
         multiline: Option<line_agg::Config>,
         decoder: Decoder,
+        callback_client: Option<IngestionCallbackClient>,
     ) -> Result<Ingestor, IngestorNewError> {
         // Validate message batch size
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 32 {
@@ -326,6 +330,7 @@ impl Ingestor {
             decoder,
             storage_account_name,
             process_custom_message: config.process_custom_message,
+            callback_client,
         });
 
         Ok(Ingestor { state })
@@ -669,9 +674,28 @@ impl IngestorProcess {
             container = %msg.container,
             blob = %msg.blob,
             account = %self.state.storage_account_name,
+            file_id = %msg.file_id,
             message_id = %message_id,
         );
-        self.process_blob_object(&msg.container, &msg.blob).await
+
+        let processing_start = std::time::Instant::now();
+        let result = self.process_blob_object(&msg.container, &msg.blob).await;
+
+        // Fire ingestion callback if configured (non-blocking).
+        if let Some(ref cb_client) = self.state.callback_client {
+            let message_fields = std::collections::HashMap::from([
+                ("file_id".to_string(), msg.file_id.clone()),
+                ("container".to_string(), msg.container.clone()),
+                ("blob".to_string(), msg.blob.clone()),
+                (
+                    "account".to_string(),
+                    self.state.storage_account_name.clone(),
+                ),
+            ]);
+            let _ = cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
+        }
+
+        result
     }
 
     /// Processes a single Event Grid event
@@ -1130,7 +1154,6 @@ pub(crate) struct DirectIngestMessage {
     /// File identifier assigned by the upstream service.
     /// Used by the ingestion callback component to notify the upstream
     /// service of processing completion.
-    #[allow(dead_code)]
     pub file_id: String,
     /// Must be "INGEST".
     pub kind: String,
@@ -1563,5 +1586,50 @@ mod tests {
         let decoded_str = String::from_utf8(decoded_bytes).unwrap();
         let value: QueueEvent = serde_json::from_str(&decoded_str).unwrap();
         assert!(matches!(value, QueueEvent::EventGrid(_)));
+    }
+
+    #[test]
+    fn test_azure_blob_config_with_ingestion_callback() {
+        let config: super::AzureBlobConfig = toml::from_str(
+            r#"
+                connection_string = "DefaultEndpointsProtocol=https;AccountName=test;AccountKey=dGVzdA==;EndpointSuffix=core.windows.net"
+
+                [queue]
+                queue_name = "my-queue"
+                process_custom_message = true
+
+                [ingestion_callback]
+
+                [ingestion_callback.on_success]
+                uri = "/v2/files/{{message.file_id}}/mark-successful"
+
+                [ingestion_callback.on_failure]
+                uri = "/v2/files/{{message.file_id}}/mark-failed"
+
+                [ingestion_callback.on_failure.body]
+                file_id = "{{message.file_id}}"
+                error_message = "{{error_message}}"
+
+                [ingestion_callback.request]
+                base_url = "https://log-access.example.com"
+
+                [ingestion_callback.auth]
+                strategy = "bearer"
+                token = "my-token"
+            "#,
+        )
+        .unwrap();
+
+        let cb = config
+            .ingestion_callback
+            .expect("ingestion_callback should be present");
+        assert!(cb.on_success.is_some());
+        assert!(cb.on_failure.is_some());
+        assert_eq!(cb.request.base_url, "https://log-access.example.com");
+        assert!(cb.auth.is_some());
+
+        let on_failure = cb.on_failure.unwrap();
+        assert_eq!(on_failure.body.len(), 2);
+        assert_eq!(on_failure.body["file_id"], "{{message.file_id}}");
     }
 }

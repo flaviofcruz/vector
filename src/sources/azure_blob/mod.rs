@@ -30,7 +30,9 @@ use vrl::value::{Kind, kind::Collection};
 use super::util::MultilineConfig;
 use crate::codecs::DecodingConfig;
 use crate::{
-    config::{SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput},
+    config::{
+        ProxyConfig, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput,
+    },
     line_agg,
     serde::{bool_or_struct, default_decoding},
     tls::TlsConfig,
@@ -163,6 +165,14 @@ pub struct AzureBlobConfig {
     #[serde(default = "default_decoding")]
     #[derivative(Default(value = "default_decoding()"))]
     pub decoding: DeserializerConfig,
+
+    /// Optional ingestion callback configuration.
+    ///
+    /// When present, the source fires HTTP callbacks to notify an upstream
+    /// service after a custom direct-ingest file finishes processing.
+    /// Only triggered for messages with `process_custom_message = true`.
+    #[configurable(derived)]
+    pub ingestion_callback: Option<super::ingestion_callback::IngestionCallbackConfig>,
 }
 
 /// Default framing configuration for backward compatibility.
@@ -204,7 +214,7 @@ impl SourceConfig for AzureBlobConfig {
 
         // Create and run the queue ingestor
         Ok(Box::pin(
-            self.create_queue_ingestor(multiline_config, log_namespace)
+            self.create_queue_ingestor(multiline_config, log_namespace, &cx.proxy)
                 .await?
                 .run(cx, self.acknowledgements, log_namespace),
         ))
@@ -309,6 +319,7 @@ impl AzureBlobConfig {
         &self,
         multiline: Option<line_agg::Config>,
         log_namespace: LogNamespace,
+        proxy: &ProxyConfig,
     ) -> crate::Result<queue::Ingestor> {
         let (blob_client, queue_client) = match (&self.connection_string, &self.client_certificate)
         {
@@ -333,6 +344,16 @@ impl AzureBlobConfig {
             DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
                 .build()?;
 
+        // Build callback client if configured
+        let callback_client = self
+            .ingestion_callback
+            .as_ref()
+            .map(|cb_config| {
+                super::ingestion_callback::IngestionCallbackClient::new(cb_config, proxy)
+            })
+            .transpose()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
         // Create and return ingestor
         let ingestor = queue::Ingestor::new(
             blob_client,
@@ -341,6 +362,7 @@ impl AzureBlobConfig {
             self.compression,
             multiline,
             decoder,
+            callback_client,
         )
         .await?;
 
@@ -1023,7 +1045,7 @@ mod test {
         for (i, test_case) in test_cases.iter().enumerate() {
             let result = test_case
                 .config
-                .create_queue_ingestor(None, LogNamespace::Legacy)
+                .create_queue_ingestor(None, LogNamespace::Legacy, &ProxyConfig::default())
                 .await;
 
             assert!(

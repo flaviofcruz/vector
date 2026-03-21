@@ -97,3 +97,4 @@ This lists custom changes merged in Databricks fork of Vector.
 96. Add config-driven ingestion callback component for object storage sources (aws_s3, azure_blob) to notify upstream services on file processing completion https://github.com/databricks-eng/vector/pull/429
 97. Add required file_id field to direct ingest messages in aws_s3 and azure_blob sources for ingestion callback integration https://github.com/databricks-eng/vector/pull/430
 98. Modifies termination behavior for kubernetes_logs to deliver logs up until the termination time - https://github.com/databricks-eng/vector/pull/402
+99. Integrate ingestion callback component with aws_s3 and azure_blob sources to notify upstream services on direct-ingest file processing completion https://github.com/databricks-eng/vector/pull/431

@@ -63,6 +63,7 @@ use crate::{
     line_agg::{self, LineAgg},
     shutdown::ShutdownSignal,
     sources::aws_s3::AwsS3Config,
+    sources::ingestion_callback::IngestionCallbackClient,
     tls::TlsConfig,
 };
 
@@ -322,6 +323,7 @@ pub struct State {
 
     deferred: Option<DeferredConfig>,
     process_custom_message: bool,
+    callback_client: Option<IngestionCallbackClient>,
 }
 
 pub(super) struct Ingestor {
@@ -337,6 +339,7 @@ impl Ingestor {
         compression: super::Compression,
         multiline: Option<line_agg::Config>,
         decoder: Decoder,
+        callback_client: Option<IngestionCallbackClient>,
     ) -> Result<Ingestor, IngestorNewError> {
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 10 {
             return Err(IngestorNewError::InvalidNumberOfMessages {
@@ -367,6 +370,7 @@ impl Ingestor {
 
             deferred: config.deferred,
             process_custom_message: config.process_custom_message,
+            callback_client,
         });
 
         Ok(Ingestor { state })
@@ -792,9 +796,26 @@ impl IngestorProcess {
             bucket = %msg.bucket,
             key = %msg.key,
             region = %region,
+            file_id = %msg.file_id,
         );
-        self.process_s3_object(&msg.bucket, &msg.key, &region, self.log_namespace)
-            .await
+
+        let processing_start = Instant::now();
+        let result = self
+            .process_s3_object(&msg.bucket, &msg.key, &region, self.log_namespace)
+            .await;
+
+        // Fire ingestion callback if configured (non-blocking).
+        if let Some(ref cb_client) = self.state.callback_client {
+            let message_fields = HashMap::from([
+                ("file_id".to_string(), msg.file_id.clone()),
+                ("bucket".to_string(), msg.bucket.clone()),
+                ("key".to_string(), msg.key.clone()),
+                ("region".to_string(), region.clone()),
+            ]);
+            let _ = cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
+        }
+
+        result
     }
 
     async fn handle_s3_event(
@@ -1295,7 +1316,6 @@ pub struct DirectIngestMessage {
     /// File identifier assigned by the upstream service.
     /// Used by the ingestion callback component to notify the upstream
     /// service of processing completion.
-    #[allow(dead_code)]
     pub file_id: String,
     /// Must be "INGEST".
     pub kind: String,
@@ -1763,4 +1783,52 @@ fn parse_sqs_config() {
         "#,
     );
     assert!(test.is_err());
+}
+
+#[test]
+fn test_aws_s3_config_with_ingestion_callback() {
+    // Config parses with ingestion_callback present
+    let config: super::AwsS3Config = toml::from_str(
+        r#"
+            [sqs]
+            queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+            process_custom_message = true
+
+            [ingestion_callback]
+
+            [ingestion_callback.on_success]
+            uri = "/v2/files/{{message.file_id}}/mark-successful"
+
+            [ingestion_callback.on_failure]
+            uri = "/v2/files/{{message.file_id}}/mark-failed"
+
+            [ingestion_callback.on_failure.body]
+            file_id = "{{message.file_id}}"
+            error_message = "{{error_message}}"
+
+            [ingestion_callback.request]
+            base_url = "https://log-access.example.com"
+            timeout_secs = 5
+            retry_max_attempts = 2
+
+            [ingestion_callback.auth]
+            strategy = "bearer"
+            token = "my-token"
+        "#,
+    )
+    .unwrap();
+
+    let cb = config
+        .ingestion_callback
+        .expect("ingestion_callback should be present");
+    assert!(cb.on_success.is_some());
+    assert!(cb.on_failure.is_some());
+    assert_eq!(cb.request.base_url, "https://log-access.example.com");
+    assert_eq!(cb.request.timeout_secs, 5);
+    assert_eq!(cb.request.retry_max_attempts, 2);
+    assert!(cb.auth.is_some());
+
+    let on_failure = cb.on_failure.unwrap();
+    assert_eq!(on_failure.body.len(), 2);
+    assert_eq!(on_failure.body["file_id"], "{{message.file_id}}");
 }

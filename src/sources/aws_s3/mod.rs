@@ -139,6 +139,14 @@ pub struct AwsS3Config {
     #[serde(default = "default_true")]
     #[derivative(Default(value = "default_true()"))]
     pub force_path_style: bool,
+
+    /// Optional ingestion callback configuration.
+    ///
+    /// When present, the source fires HTTP callbacks to notify an upstream
+    /// service after a custom direct-ingest file finishes processing.
+    /// Only triggered for messages with `process_custom_message = true`.
+    #[configurable(derived)]
+    pub ingestion_callback: Option<super::ingestion_callback::IngestionCallbackConfig>,
 }
 
 const fn default_framing() -> FramingConfig {
@@ -274,6 +282,15 @@ impl AwsS3Config {
                 )
                 .await?;
 
+                let callback_client = self
+                    .ingestion_callback
+                    .as_ref()
+                    .map(|cb_config| {
+                        super::ingestion_callback::IngestionCallbackClient::new(cb_config, proxy)
+                    })
+                    .transpose()
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
                 let ingestor = sqs::Ingestor::new(
                     region,
                     sqs_client,
@@ -282,6 +299,7 @@ impl AwsS3Config {
                     self.compression,
                     multiline,
                     decoder,
+                    callback_client,
                 )
                 .await?;
 
