@@ -2622,6 +2622,47 @@ mod tests {
         }
     }
 
+    // Verify that if a file is deleted externally before remove_after kicks in,
+    // Vector treats NotFound as a successful deletion and does not retry in a loop.
+    #[tokio::test]
+    async fn remove_file_already_deleted() {
+        let n = 5;
+        let remove_after_secs = 2;
+
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            remove_after_secs: Some(remove_after_secs),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("file");
+        let received = run_file_source(&config, false, Acks, LogNamespace::Legacy, async {
+            let mut file = File::create(&path).unwrap();
+
+            for i in 0..n {
+                writeln!(&mut file, "{i}").unwrap();
+            }
+            file.flush().unwrap();
+            drop(file);
+
+            // Wait for Vector to read the file, then delete it externally
+            // (simulating kubelet cleaning up an emptyDir volume).
+            sleep(Duration::from_secs(1)).await;
+            std::fs::remove_file(&path).unwrap();
+
+            // Wait for remove_after grace period to elapse. Vector should
+            // handle the NotFound gracefully rather than retrying forever.
+            sleep(Duration::from_secs(remove_after_secs + 2)).await;
+        })
+        .await;
+
+        assert_eq!(received.len(), n);
+
+        // File should already be gone (we deleted it).
+        assert!(File::open(&path).is_err());
+    }
+
     // Validation for active v. rotated file (active file should be TTL'd after read)
     async fn validate_files_after_ttl(
         config: &file::FileConfig,

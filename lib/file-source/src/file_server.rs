@@ -300,7 +300,15 @@ where
                             }
                         }
                         Ok((path, Err(err))) => {
-                            self.emitter.emit_file_delete_error(&path, err);
+                            if err.kind() == std::io::ErrorKind::NotFound {
+                                // File already gone (e.g. kubelet cleaned up the pod volume).
+                                // Treat as successful deletion.
+                                info!(message = "File not found during deletion, assuming it was already removed externally.", path = ?path);
+                                known_small_files.remove(&path);
+                                self.emitter.emit_file_deleted(&path);
+                            } else {
+                                self.emitter.emit_file_delete_error(&path, err);
+                            }
                         }
                         Err(join_err) => {
                             self.emitter.emit_file_delete_error(
@@ -390,8 +398,16 @@ where
                                     watcher.set_dead();
                                 }
                                 Err(error) => {
-                                    // We will try again after some time.
-                                    self.emitter.emit_file_delete_error(&watcher.path, error);
+                                    if error.kind() == std::io::ErrorKind::NotFound {
+                                        // File already gone (e.g. kubelet cleaned up the pod volume).
+                                        // Treat as successful deletion.
+                                        info!(message = "File not found during deletion, assuming it was already removed externally.", path = ?watcher.path);
+                                        self.emitter.emit_file_deleted(&watcher.path);
+                                        watcher.set_dead();
+                                    } else {
+                                        // We will try again after some time.
+                                        self.emitter.emit_file_delete_error(&watcher.path, error);
+                                    }
                                 }
                             }
                         }
