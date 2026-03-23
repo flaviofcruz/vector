@@ -40,10 +40,12 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
         return Err(format!("DNS resolution for '{}' returned no addresses", host).into());
     }
 
-    let mut seen = HashSet::new();
+    // Deduplicate by IP using a HashMap, then build per-IP URIs.
     let uris = addrs
         .into_iter()
-        .filter(|addr| seen.insert(addr.ip()))
+        .map(|addr| (addr.ip(), addr))
+        .collect::<std::collections::HashMap<_, _>>()
+        .into_values()
         .map(|addr| {
             // SocketAddr::to_string() formats as "ip:port" for IPv4 and
             // "[ip]:port" for IPv6, which is valid URI authority syntax.
@@ -60,6 +62,10 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
         message = "Resolved headless DNS endpoints for ClickHouse.",
         host = %host,
         count = uris.len(),
+    );
+    debug!(
+        message = "Resolved headless DNS endpoints for ClickHouse (detailed).",
+        host = %host,
         endpoints = ?uris.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
     );
 
@@ -68,18 +74,11 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
 
 /// Extracts the IP address from a resolved URI's host component.
 ///
-/// `http::Uri::host()` includes brackets for IPv6 (e.g., `[::1]`), but
-/// `IpAddr::parse` does not accept brackets, so we strip them before parsing.
+/// `http::Uri::host()` delegates to `Authority::host()`, which already strips
+/// IPv6 brackets (e.g., returns `"::1"` for a `[::1]` authority), so the host
+/// string can be parsed directly into an `IpAddr`.
 pub fn ip_from_uri(uri: &Uri) -> Option<IpAddr> {
-    uri.host().and_then(|h| {
-        // Strip IPv6 brackets: http::Uri::host() returns "[::1]" for IPv6,
-        // but IpAddr expects "::1".
-        let h = h
-            .strip_prefix('[')
-            .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(h);
-        h.parse().ok()
-    })
+    uri.host().and_then(|h| h.parse().ok())
 }
 
 #[cfg(test)]

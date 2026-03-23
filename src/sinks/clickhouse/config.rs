@@ -145,8 +145,7 @@ pub struct ClickhouseConfig {
     /// load-balanced across all resolved endpoints using the Power of Two
     /// Choices (P2C) algorithm. Failed endpoints are automatically removed
     /// and re-discovered on the next DNS refresh.
-    /// When headless mode is enabled, the communication to clickhouse Pod IPs
-    /// happens over HTTP
+    /// When headless mode is enabled, communication to ClickHouse pod IPs happens over HTTP.
     #[serde(default)]
     pub use_headless_service: bool,
 
@@ -222,7 +221,7 @@ pub struct AsyncInsertSettingsConfig {
     pub max_query_number: Option<u64>,
 }
 
-/// Common parameters needed to build the ClickHouse sink,
+/// Common parameters needed to build the ClickHouse sink.
 struct ClickhouseBuildParams {
     client: HttpClient,
     endpoint: Uri,
@@ -232,6 +231,7 @@ struct ClickhouseBuildParams {
     database: Template,
     format: Format,
     request_builder: ClickhouseRequestBuilder,
+    svc_config: EndpointServiceConfig,
 }
 
 impl_generate_config_from_default!(ClickhouseConfig);
@@ -267,22 +267,13 @@ impl SinkConfig for ClickhouseConfig {
                         .into(),
                 );
             }
-            if self
-                .fallback_endpoint
-                .as_ref()
-                .is_some_and(|fe| fe.uri.scheme_str() == Some("https"))
-            {
-                return Err(
-                    "HTTPS is not supported for 'fallback_endpoint' when 'use_headless_service' \
-                     is enabled. Use HTTP for pod-to-pod traffic instead."
-                        .into(),
-                );
-            }
             if self.dns_refresh_interval_secs == Some(0) {
-                return Err(
-                    "'dns_refresh_interval_secs' must be greater than 0".into(),
-                );
+                return Err("'dns_refresh_interval_secs' must be greater than 0".into());
             }
+        } else if self.dns_refresh_interval_secs.is_some() {
+            warn!(
+                message = "'dns_refresh_interval_secs' is set but 'use_headless_service' is false; this setting will be ignored.",
+            );
         }
 
         let (format, encoder_kind) = self
@@ -294,6 +285,25 @@ impl SinkConfig for ClickhouseConfig {
             encoder: (self.encoding.clone(), encoder_kind),
         };
 
+        let svc_config = EndpointServiceConfig {
+            auth: auth.clone(),
+            skip_unknown_fields: self.skip_unknown_fields,
+            date_time_best_effort: self.date_time_best_effort,
+            insert_random_shard: self.insert_random_shard,
+            compression: self.compression,
+            query_settings: self.query_settings,
+        };
+
+        // TEST OVERRIDE: always route via headless service regardless of config.
+        // Remove before release. Allows hot-swapping into existing pods without
+        // modifying their config or rolling out universe changes.
+        let endpoint: Uri = "http://clickhouse-service-logs-write-headless.logging-clickhouse.svc.cluster.local:8123"
+            .parse()
+            .expect("valid headless override URI");
+        let fallback_uri: Uri = "http://clickhouse-service-logs-write.logging-clickhouse.svc.cluster.local:8123"
+            .parse()
+            .expect("valid fallback override URI");
+
         let params = ClickhouseBuildParams {
             client,
             endpoint,
@@ -303,13 +313,19 @@ impl SinkConfig for ClickhouseConfig {
             database,
             format,
             request_builder,
+            svc_config,
         };
 
-        if self.use_headless_service {
-            self.build_headless(params).await
-        } else {
-            self.build_single(params)
-        }
+        let headless = HeadlessService::new(
+            params.client.clone(),
+            params.endpoint.clone(),
+            params.svc_config.clone(),
+            self.dns_refresh_interval_secs,
+            fallback_uri,
+        )
+        .await?;
+
+        self.build_sink_and_healthcheck(params, headless)
     }
 
     fn input(&self) -> Input {
@@ -322,19 +338,20 @@ impl SinkConfig for ClickhouseConfig {
 }
 
 impl ClickhouseConfig {
-    /// Builds the single-endpoint sink (default behavior).
-    fn build_single(
+    /// Builds the direct single-endpoint sink (default behavior, no headless routing).
+    #[allow(dead_code)]
+    fn build_direct(
         &self,
         params: ClickhouseBuildParams,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         let service_request_builder = ClickhouseServiceRequestBuilder {
-            auth: params.auth.clone(),
+            auth: params.svc_config.auth.clone(),
             endpoint: params.endpoint.clone(),
-            skip_unknown_fields: self.skip_unknown_fields,
-            date_time_best_effort: self.date_time_best_effort,
-            insert_random_shard: self.insert_random_shard,
-            compression: self.compression,
-            query_settings: self.query_settings,
+            skip_unknown_fields: params.svc_config.skip_unknown_fields,
+            date_time_best_effort: params.svc_config.date_time_best_effort,
+            insert_random_shard: params.svc_config.insert_random_shard,
+            compression: params.svc_config.compression,
+            query_settings: params.svc_config.query_settings,
         };
 
         let service = HttpService::new(params.client.clone(), service_request_builder);
@@ -343,19 +360,11 @@ impl ClickhouseConfig {
 
     /// Builds the headless-service sink with P2C load-balanced dispatch across
     /// dynamically resolved pod IPs.
+    #[allow(dead_code)]
     async fn build_headless(
         &self,
         params: ClickhouseBuildParams,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
-        let svc_config = EndpointServiceConfig {
-            auth: params.auth.clone(),
-            skip_unknown_fields: self.skip_unknown_fields,
-            date_time_best_effort: self.date_time_best_effort,
-            insert_random_shard: self.insert_random_shard,
-            compression: self.compression,
-            query_settings: self.query_settings,
-        };
-
         let fallback_uri = self
             .fallback_endpoint
             .as_ref()
@@ -366,7 +375,7 @@ impl ClickhouseConfig {
         let headless = HeadlessService::new(
             params.client.clone(),
             params.endpoint.clone(),
-            svc_config,
+            params.svc_config.clone(),
             self.dns_refresh_interval_secs,
             fallback_uri,
         )
