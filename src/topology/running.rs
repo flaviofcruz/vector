@@ -336,6 +336,16 @@ impl RunningTopology {
                 );
                 futures::future::join_all(wave1_wait_handles).await;
 
+                // Emit a VEL event indicating all data components have been closed.
+                // This must happen before wave 2 shuts down internal sources (including
+                // internal_logs), so the event can still be delivered through the pipeline.
+                info!(
+                    message = "All Vector data components have been closed.",
+                    vector_event_type = "VECTOR_SERVICE_EVENT",
+                    service_event = "VECTOR_PROCESS_COMPONENTS_CLOSED",
+                    internal_log_rate_limit = false,
+                );
+
                 // Suppress the shutdown reporter before wave 2. The reporter generates
                 // log events that feed into internal_logs, creating a feedback loop that
                 // prevents internal_logs from shutting down. Stopping the reporter breaks
@@ -357,6 +367,17 @@ impl RunningTopology {
             // No deferred sources or no data source deadline: use original single-pass behavior.
             let source_shutdown_complete = async move {
                 wave1_complete.await;
+
+                // Emit a VEL event indicating data components have been closed.
+                // Emitted before deferred source shutdown so that internal_logs
+                // (if present as a deferred source) can still deliver the event.
+                info!(
+                    message = "All Vector data components have been closed.",
+                    vector_event_type = "VECTOR_SERVICE_EVENT",
+                    service_event = "VECTOR_PROCESS_COMPONENTS_CLOSED",
+                    internal_log_rate_limit = false,
+                );
+
                 deferred_shutdowns.shutdown_all(deadline).await;
             };
 
