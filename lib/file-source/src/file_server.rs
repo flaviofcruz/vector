@@ -326,7 +326,7 @@ where
             let mut global_bytes_read: usize = 0;
             let mut maxed_out_reading_single_file = false;
             for (&file_id, watcher) in &mut fp_map {
-                if !watcher.should_read() {
+                if !watcher.should_read() && !checkpoints.get_done(file_id) {
                     continue;
                 }
 
@@ -379,6 +379,13 @@ where
                         source_context: self.source_context.clone(),
                         emitted_after_multiline_agg: false,
                     });
+                }
+                if watcher.reached_eof()
+                    && watcher.path.extension().map_or(false, |ext| ext == "gz")
+                {
+                    //TODO: a vector event for done. important for debugging
+                    info!(message = "File reached eof. Marking it done.", path = ?watcher.path);
+                    checkpoints.set_done(file_id);
                 }
 
                 if bytes_read > 0 {
