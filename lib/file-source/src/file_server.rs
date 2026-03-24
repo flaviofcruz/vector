@@ -326,14 +326,18 @@ where
             let mut global_bytes_read: usize = 0;
             let mut maxed_out_reading_single_file = false;
             for (&file_id, watcher) in &mut fp_map {
-                if !watcher.should_read() && !checkpoints.get_done(file_id) {
+                if !watcher.should_read() {
                     continue;
                 }
+
+                // Skip reading gzip files already fully read, but still fall through
+                // to the removal logic below so TTL cleanup can proceed.
+                let is_done = !self.ignore_checkpoints && checkpoints.get_done(file_id);
 
                 let start = time::Instant::now();
                 let mut bytes_read: usize = 0;
                 let mut lines_read: usize = 0;
-                while let Ok(RawLineResult {
+                while !is_done && let Ok(RawLineResult {
                     raw_line: Some(line),
                     discarded_for_size_and_truncated,
                 }) = watcher.read_line().await
@@ -649,6 +653,15 @@ where
         } else {
             fallback
         };
+
+        // Skip opening gzip files that have already been fully read.
+        if !self.ignore_checkpoints
+            && checkpoints.get_done(file_id)
+            && path.extension().map_or(false, |ext| ext == "gz")
+        {
+            debug!(message = "Skipping already-done gzipped file.", ?path,);
+            return;
+        }
 
         match FileWatcher::new(
             path.clone(),

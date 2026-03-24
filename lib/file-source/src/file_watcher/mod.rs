@@ -11,7 +11,7 @@ use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncSeekExt, BufReader},
     time::Instant,
 };
-use tracing::debug;
+use tracing::{debug, info};
 use vector_common::constants::GZIP_MAGIC;
 
 use file_source_common::{
@@ -130,12 +130,15 @@ impl FileWatcher {
                         (Box::new(null_reader()), 0)
                     }
                     (true, _, ReadFrom::Checkpoint(file_position)) => {
-                        debug!(
-                            message = "Not re-reading gzipped file with existing stored offset.",
+                        info!(
+                            message = "Resuming gzipped file from offset.",
                             ?path,
-                            %file_position
+                            %file_position,
                         );
-                        (Box::new(null_reader()), file_position)
+                        (
+                            gzip_reader_at_offset(reader, file_position).await?,
+                            file_position,
+                        )
                     }
                     // TODO: This may become the default, leading us to stop reading gzipped files that
                     // we were reading before. Should we merge this and the next branch to read
@@ -204,11 +207,7 @@ impl FileWatcher {
             let mut reader = BufReader::new(File::open(&path).await?);
             let gzipped = is_gzipped(&mut reader).await?;
             let new_reader: Box<dyn AsyncBufRead + Send + Unpin> = if gzipped {
-                if self.file_position != 0 {
-                    Box::new(null_reader())
-                } else {
-                    Box::new(BufReader::new(GzipDecoder::new(reader)))
-                }
+                gzip_reader_at_offset(reader, self.file_position).await?
             } else {
                 reader.seek(io::SeekFrom::Start(self.file_position)).await?;
                 Box::new(reader)
@@ -363,4 +362,32 @@ async fn is_gzipped(r: &mut BufReader<File>) -> io::Result<bool> {
 
 fn null_reader() -> impl AsyncBufRead {
     io::Cursor::new(Vec::new())
+}
+
+/// Build a boxed gzip reader that decompresses and skips to the given offset.
+async fn gzip_reader_at_offset(
+    reader: BufReader<File>,
+    offset: u64,
+) -> io::Result<Box<dyn AsyncBufRead + Send + Unpin>> {
+    let mut gzip_reader = BufReader::new(GzipDecoder::new(reader));
+    if offset > 0 {
+        skip_first_n_bytes(&mut gzip_reader, offset as usize).await?;
+    }
+    Ok(Box::new(gzip_reader))
+}
+
+/// Skip the first `n` bytes from an async buffered reader by consuming
+/// chunks until `n` bytes have been discarded.
+async fn skip_first_n_bytes<R: AsyncBufRead + Unpin>(reader: &mut R, n: usize) -> io::Result<()> {
+    let mut skipped = 0;
+    while skipped < n {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            break;
+        }
+        let to_skip = std::cmp::min(chunk.len(), n - skipped);
+        reader.consume(to_skip);
+        skipped += to_skip;
+    }
+    Ok(())
 }

@@ -101,3 +101,4 @@ This lists custom changes merged in Databricks fork of Vector.
 100. Fix file source infinite retry loop when `remove_after_secs` is configured and the file is already deleted externally (e.g. kubelet cleaning up emptyDir volumes on pod termination) https://github.com/databricks-eng/vector/pull/443
 101. Emit `VECTOR_PROCESS_COMPONENTS_CLOSED` VEL event during shutdown to signal that graceful shutdown completed successfully https://github.com/databricks-eng/vector/pull/438
 102. add is_done in file checkpoints to represent archieved file has reached eof https://github.com/databricks-eng/vector/pull/448
+103. Support reading from in-progress gzipped files https://github.com/databricks-eng/vector/pull/447

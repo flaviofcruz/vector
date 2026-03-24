@@ -3183,4 +3183,71 @@ start_reading_at: "not-a-timestamp"
             error_msg
         );
     }
+
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_gzipped_file_checkpoint_fully_read() {
+        // First run: read the entire gzipped file.
+        // Second run: the file is marked done, so nothing new is read
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*.gz")],
+            max_line_bytes: 100,
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("test.gz");
+        let data = b"first line\nsecond line\n";
+        fs::write(&path, gzip_bytes(data)).unwrap();
+
+        // First run: read all lines
+        {
+            let received = run_file_source(
+                &config,
+                true,
+                Acks,
+                LogNamespace::Legacy,
+                sleep_500_millis(),
+            )
+            .await;
+            let lines = extract_messages_string(received);
+            assert_eq!(lines, vec!["first line", "second line"]);
+        }
+
+        // Second run: nothing new should be read (since the file is marked done)
+        // We skip the compliance wrapper since no events are expected.
+        {
+            let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+            let (trigger_shutdown, shutdown, shutdown_done) = ShutdownSignal::new_wired();
+            let data_dir = config.data_dir.clone().unwrap();
+
+            tokio::spawn(file::file_source(
+                &config,
+                data_dir,
+                shutdown,
+                tx,
+                true,
+                LogNamespace::Legacy,
+            ));
+
+            sleep_500_millis().await;
+            drop(trigger_shutdown);
+
+            let received = timeout(Duration::from_secs(5), rx.collect::<Vec<_>>())
+                .await
+                .expect(
+                    "Unclosed channel: may indicate file-server could not shutdown gracefully.",
+                );
+            shutdown_done.await;
+
+            let lines = extract_messages_string(received);
+            assert!(lines.is_empty(), "Expected no new lines, got: {:?}", lines);
+        }
+    }
 }
