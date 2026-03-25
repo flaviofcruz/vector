@@ -2389,4 +2389,383 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 1);
     }
+
+    // -------------------------------------------------------------------------
+    // Realistic proto-schema tests
+    // -------------------------------------------------------------------------
+
+    /// Schema mirroring proto/logs/sla/service_health_event.proto.
+    ///
+    /// Covers:
+    ///   - top-level scalar fields (LargeUtf8, Int32, Int64, Boolean)
+    ///   - deprecated `rpc_info` Struct with two string sub-fields
+    ///   - `request_info` Struct with string and Int32 sub-fields
+    ///   - null handling: rows where optional struct fields are absent
+    #[test]
+    fn test_encode_service_health_event_schema() {
+        use arrow::array::{BooleanArray, Int32Array, Int64Array, LargeStringArray, StructArray};
+
+        let rpc_info_fields = Fields::from(vec![
+            Field::new("rpc_handler", DataType::LargeUtf8, true),
+            Field::new("exception_class", DataType::LargeUtf8, true),
+        ]);
+        let request_info_fields = Fields::from(vec![
+            Field::new("request_type", DataType::Int32, true),
+            Field::new("handler", DataType::LargeUtf8, true),
+            Field::new("exception_class", DataType::LargeUtf8, true),
+            Field::new("http_method", DataType::LargeUtf8, true),
+            Field::new("source_type", DataType::Int32, true),
+            Field::new("retry_count", DataType::Int32, true),
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_name", DataType::LargeUtf8, true),
+            Field::new("outcome", DataType::LargeUtf8, true),
+            Field::new("outcome_type", DataType::Int32, true),
+            Field::new("duration_ms", DataType::Int64, true),
+            Field::new("workspace_id", DataType::Int64, true),
+            Field::new("rpc_info", DataType::Struct(rpc_info_fields.clone()), true),
+            Field::new(
+                "request_info",
+                DataType::Struct(request_info_fields.clone()),
+                true,
+            ),
+            Field::new("classification_low_confidence", DataType::Boolean, true),
+            Field::new("dbr_version", DataType::LargeUtf8, true),
+            Field::new("is_suppressed", DataType::Boolean, true),
+            Field::new("engine_request_id", DataType::LargeUtf8, true),
+        ]));
+
+        // Row 0: all fields populated (nullable sub-fields simply omitted → null in Arrow).
+        let mut log0 = LogEvent::default();
+        log0.insert("event_name", "JobRunTermination");
+        log0.insert("outcome", "Success");
+        log0.insert("outcome_type", 1i64); // SUCCESS enum → Int32
+        log0.insert("duration_ms", 42_000i64);
+        log0.insert("workspace_id", 123_456_789i64);
+        log0.insert("rpc_info.rpc_handler", "com.databricks.api.Jobs");
+        // rpc_info.exception_class absent → null
+        log0.insert("request_info.request_type", 1i64); // RPC
+        log0.insert("request_info.handler", "com.databricks.api.Jobs");
+        // request_info.exception_class absent → null
+        // request_info.http_method absent → null
+        log0.insert("request_info.source_type", 2i64); // SERVER_SIDE
+        log0.insert("request_info.retry_count", 0i64);
+        log0.insert("classification_low_confidence", false);
+        log0.insert("dbr_version", "16.4.7");
+        log0.insert("is_suppressed", false);
+        log0.insert("engine_request_id", "abc-def-123");
+
+        // Row 1: rpc_info and request_info absent → null structs; engine_request_id absent → null.
+        let mut log1 = LogEvent::default();
+        log1.insert("event_name", "ClusterTermination");
+        log1.insert("outcome", "CloudFailure");
+        log1.insert("outcome_type", 2i64);
+        log1.insert("duration_ms", 5_000i64);
+        log1.insert("workspace_id", 987_654_321i64);
+        log1.insert("classification_low_confidence", true);
+        log1.insert("dbr_version", "14.3.0");
+        log1.insert("is_suppressed", true);
+        // engine_request_id absent → null
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 11);
+
+        // Top-level scalar checks.
+        let event_name_col = batch
+            .column_by_name("event_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert_eq!(event_name_col.value(0), "JobRunTermination");
+        assert_eq!(event_name_col.value(1), "ClusterTermination");
+
+        let outcome_type_col = batch
+            .column_by_name("outcome_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(outcome_type_col.value(0), 1);
+        assert_eq!(outcome_type_col.value(1), 2);
+
+        let workspace_id_col = batch
+            .column_by_name("workspace_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(workspace_id_col.value(0), 123_456_789);
+        assert_eq!(workspace_id_col.value(1), 987_654_321);
+
+        // rpc_info: row 0 non-null, row 1 null.
+        let rpc_info_col = batch
+            .column_by_name("rpc_info")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(!rpc_info_col.is_null(0), "row 0 rpc_info should be non-null");
+        assert!(rpc_info_col.is_null(1), "row 1 rpc_info should be null");
+
+        let rpc_handler = rpc_info_col
+            .column_by_name("rpc_handler")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert_eq!(rpc_handler.value(0), "com.databricks.api.Jobs");
+
+        // request_info: row 0 non-null, row 1 null.
+        let request_info_col = batch
+            .column_by_name("request_info")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(
+            !request_info_col.is_null(0),
+            "row 0 request_info should be non-null"
+        );
+        assert!(
+            request_info_col.is_null(1),
+            "row 1 request_info should be null"
+        );
+
+        let retry_count = request_info_col
+            .column_by_name("retry_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(retry_count.value(0), 0);
+
+        // Boolean fields.
+        let is_suppressed_col = batch
+            .column_by_name("is_suppressed")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(!is_suppressed_col.value(0));
+        assert!(is_suppressed_col.value(1));
+    }
+
+    /// Schema mirroring the core fields of proto/logs/qpl/query_profile.proto.
+    ///
+    /// Covers:
+    ///   - top-level scalar and enum (Int32/Int64/Boolean/LargeUtf8) fields
+    ///   - `failure` Struct (QueryFailure: error_class, sub_error_class, sql_state,
+    ///     redacted_exception)
+    ///   - `query_metrics` Struct (parsing_time_ns, analysis_time_ns,
+    ///     optimization_time_ns, physical_planning_time_ns — all Int64)
+    ///   - `query_profile_debug` Struct (logging_overhead_ns Int64, error_class
+    ///     LargeUtf8, sequence_number Int64)
+    ///   - null handling: row with no failure struct
+    #[test]
+    fn test_encode_query_profile_schema() {
+        use arrow::array::{BooleanArray, Int32Array, Int64Array, LargeStringArray, StructArray};
+
+        let failure_fields = Fields::from(vec![
+            Field::new("error_class", DataType::LargeUtf8, true),
+            Field::new("sub_error_class", DataType::LargeUtf8, true),
+            Field::new("sql_state", DataType::LargeUtf8, true),
+            Field::new("redacted_exception", DataType::LargeUtf8, true),
+        ]);
+        let query_metrics_fields = Fields::from(vec![
+            Field::new("parsing_time_ns", DataType::Int64, true),
+            Field::new("analysis_time_ns", DataType::Int64, true),
+            Field::new("optimization_time_ns", DataType::Int64, true),
+            Field::new("physical_planning_time_ns", DataType::Int64, true),
+        ]);
+        let debug_fields = Fields::from(vec![
+            Field::new("logging_overhead_ns", DataType::Int64, true),
+            Field::new("error_class", DataType::LargeUtf8, true),
+            Field::new("sequence_number", DataType::Int64, true),
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::LargeUtf8, true),
+            Field::new("app_id", DataType::LargeUtf8, true),
+            Field::new("execution_id", DataType::LargeUtf8, true),
+            Field::new("time_submitted_unix_ms", DataType::Int64, true),
+            Field::new("time_completed_unix_ms", DataType::Int64, true),
+            Field::new("is_streaming", DataType::Boolean, true),
+            Field::new("is_success", DataType::Boolean, true),
+            Field::new("entry_point", DataType::Int32, true),
+            Field::new("exception", DataType::LargeUtf8, true),
+            Field::new("failure", DataType::Struct(failure_fields.clone()), true),
+            Field::new(
+                "query_metrics",
+                DataType::Struct(query_metrics_fields.clone()),
+                true,
+            ),
+            Field::new(
+                "query_profile_debug",
+                DataType::Struct(debug_fields.clone()),
+                true,
+            ),
+        ]));
+
+        // Row 0: successful query — no failure struct.
+        // Row 0: successful query — exception and failure absent → null.
+        let mut log0 = LogEvent::default();
+        log0.insert("id", "qpl-2024-01-15-00-00-abc123");
+        log0.insert("app_id", "application_1234_0001");
+        log0.insert("execution_id", "exec-42");
+        log0.insert("time_submitted_unix_ms", 1_705_276_800_000i64);
+        log0.insert("time_completed_unix_ms", 1_705_276_802_500i64);
+        log0.insert("is_streaming", false);
+        log0.insert("is_success", true);
+        log0.insert("entry_point", 2i64); // THRIFT_SERVER
+        // exception absent → null
+        // failure fields absent → null struct
+        log0.insert("query_metrics.parsing_time_ns", 50_000i64);
+        log0.insert("query_metrics.analysis_time_ns", 120_000i64);
+        log0.insert("query_metrics.optimization_time_ns", 80_000i64);
+        log0.insert("query_metrics.physical_planning_time_ns", 30_000i64);
+        log0.insert("query_profile_debug.logging_overhead_ns", 1_500i64);
+        // query_profile_debug.error_class absent → null
+        log0.insert("query_profile_debug.sequence_number", 7i64);
+
+        // Row 1: failed query — failure struct present; some optional fields absent → null.
+        let mut log1 = LogEvent::default();
+        log1.insert("id", "qpl-2024-01-15-00-01-xyz789");
+        log1.insert("app_id", "application_1234_0002");
+        log1.insert("execution_id", "exec-43");
+        log1.insert("time_submitted_unix_ms", 1_705_276_810_000i64);
+        log1.insert("time_completed_unix_ms", 1_705_276_810_200i64);
+        log1.insert("is_streaming", false);
+        log1.insert("is_success", false);
+        log1.insert("entry_point", 2i64); // THRIFT_SERVER
+        log1.insert("exception", "AnalysisException");
+        log1.insert("failure.error_class", "TABLE_OR_VIEW_NOT_FOUND");
+        // failure.sub_error_class absent → null
+        log1.insert("failure.sql_state", "42P01");
+        log1.insert("failure.redacted_exception", "Table or view not found: foo");
+        log1.insert("query_metrics.parsing_time_ns", 10_000i64);
+        log1.insert("query_metrics.analysis_time_ns", 5_000i64);
+        // query_metrics.optimization_time_ns absent → null
+        // query_metrics.physical_planning_time_ns absent → null
+        log1.insert("query_profile_debug.logging_overhead_ns", 900i64);
+        log1.insert("query_profile_debug.error_class", "SerializationError");
+        log1.insert("query_profile_debug.sequence_number", 8i64);
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 12);
+
+        // Top-level scalar checks.
+        let id_col = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "qpl-2024-01-15-00-00-abc123");
+        assert_eq!(id_col.value(1), "qpl-2024-01-15-00-01-xyz789");
+
+        let is_success_col = batch
+            .column_by_name("is_success")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(is_success_col.value(0));
+        assert!(!is_success_col.value(1));
+
+        let entry_point_col = batch
+            .column_by_name("entry_point")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(entry_point_col.value(0), 2);
+        assert_eq!(entry_point_col.value(1), 2);
+
+        // failure struct: row 0 null, row 1 non-null.
+        let failure_col = batch
+            .column_by_name("failure")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(failure_col.is_null(0), "row 0 failure should be null");
+        assert!(!failure_col.is_null(1), "row 1 failure should be non-null");
+
+        let error_class = failure_col
+            .column_by_name("error_class")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert_eq!(error_class.value(1), "TABLE_OR_VIEW_NOT_FOUND");
+
+        let sql_state = failure_col
+            .column_by_name("sql_state")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert_eq!(sql_state.value(1), "42P01");
+
+        // query_metrics struct: both rows non-null.
+        let metrics_col = batch
+            .column_by_name("query_metrics")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(!metrics_col.is_null(0));
+        assert!(!metrics_col.is_null(1));
+
+        let parsing_ns = metrics_col
+            .column_by_name("parsing_time_ns")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(parsing_ns.value(0), 50_000);
+        assert_eq!(parsing_ns.value(1), 10_000);
+
+        // query_profile_debug struct: both rows non-null.
+        let debug_col = batch
+            .column_by_name("query_profile_debug")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(!debug_col.is_null(0));
+        assert!(!debug_col.is_null(1));
+
+        let seq_num = debug_col
+            .column_by_name("sequence_number")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(seq_num.value(0), 7);
+        assert_eq!(seq_num.value(1), 8);
+
+        let debug_error_class = debug_col
+            .column_by_name("error_class")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert!(debug_error_class.is_null(0));
+        assert_eq!(debug_error_class.value(1), "SerializationError");
+    }
 }
