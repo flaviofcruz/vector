@@ -384,10 +384,19 @@ pub struct Config {
     #[configurable(metadata(docs::examples = "host"))]
     #[serde(default)]
     pub host_key: Option<OptionalValuePath>,
+
+    /// String sequence used to separate one log line from another.
+    #[serde(default = "default_line_delimiter")]
+    #[configurable(metadata(docs::examples = "\r\n"))]
+    pub line_delimiter: String,
 }
 
 const fn default_read_from() -> ReadFromConfig {
     ReadFromConfig::Beginning
+}
+
+fn default_line_delimiter() -> String {
+    "\n".to_string()
 }
 
 impl GenerateConfig for Config {
@@ -442,6 +451,7 @@ impl Default for Config {
             remove_after_secs: None,
             drain_on_shutdown: default_drain_on_shutdown(),
             host_key: None,
+            line_delimiter: default_line_delimiter(),
         }
     }
 }
@@ -729,6 +739,7 @@ struct Source {
     remove_after_secs: Option<u64>,
     drain_on_shutdown: bool,
     host_key: Option<OwnedValuePath>,
+    line_delimiter: String,
 }
 
 impl Source {
@@ -832,6 +843,7 @@ impl Source {
             remove_after_secs: config.remove_after_secs,
             drain_on_shutdown: config.drain_on_shutdown,
             host_key: config.host_key.clone().and_then(|v| v.path),
+            line_delimiter: config.line_delimiter.clone(),
         })
     }
 
@@ -880,6 +892,7 @@ impl Source {
             remove_after_secs,
             drain_on_shutdown,
             host_key,
+            line_delimiter,
         } = self;
 
         let hostname = host_key.as_ref().and_then(|_| {
@@ -1036,7 +1049,7 @@ impl Source {
             // protects against malformed lines or tailing incorrect files.
             max_line_bytes: resolved_max_line_bytes,
             // Delimiter bytes that is used to read the file line-by-line
-            line_delimiter: Bytes::from("\n"),
+            line_delimiter: Bytes::from(line_delimiter),
             // The directory where to keep the checkpoints.
             data_dir,
             // This value specifies not exactly the globbing, but interval
