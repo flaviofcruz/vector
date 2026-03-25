@@ -53,7 +53,7 @@ impl FunctionTransform for DatabricksParser {
                 return;
             }
             // Always parse the message as unstructured. Don't attempt to perform any formatting
-            // on the log message; just insert the read timestamp and priority.
+            // on the log message; just insert the priority (and timestamp, if one was parsed).
             Some(s) => {
                 let parsed_log = parse_log_as_unstructured(&s);
 
@@ -279,7 +279,10 @@ pub mod tests {
         let ts = log.get(event_path!("timestamp")).expect("timestamp should exist");
         match ts {
             Value::Timestamp(t) => {
-                assert_eq!(*t, original_timestamp, "parser should not overwrite the event timestamp");
+                assert_eq!(
+                    *t, original_timestamp,
+                    "parser should not overwrite the event timestamp"
+                );
             }
             other => panic!("expected Timestamp value, got {:?}", other),
         }
