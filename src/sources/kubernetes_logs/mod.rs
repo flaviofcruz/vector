@@ -872,11 +872,11 @@ impl Source {
             host_key,
         } = self;
 
-        let hostname = if host_key.is_some() {
-            crate::get_hostname().ok()
-        } else {
-            None
-        };
+        let hostname = host_key.as_ref().and_then(|_| {
+            crate::get_hostname()
+                .ok()
+                .map(|h| bytes::Bytes::from(h))
+        });
 
         let mut reflectors = Vec::new();
 
@@ -1128,7 +1128,7 @@ impl Source {
                     event.as_mut_log(),
                     Some(LegacyKey::Overwrite(hk)),
                     path!("host"),
-                    hn.clone(),
+                    hn.clone(), // Bytes::clone is O(1) ref-count bump
                 );
             }
 
