@@ -1931,4 +1931,32 @@ mod tests {
         let opt = config.host_key.expect("host_key should be Some");
         assert!(opt.path.is_none(), "empty string should parse to path = None");
     }
+
+    #[test]
+    fn test_default_config_line_delimiter() {
+        let config = Config::default();
+        assert_eq!(config.line_delimiter, "\n");
+    }
+
+    #[test]
+    fn test_config_line_delimiter_custom() {
+        let config = Config {
+            line_delimiter: "\r\n".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.line_delimiter, "\r\n");
+    }
+
+    #[test]
+    fn test_config_serialization_line_delimiter() {
+        let toml_config = r#"
+            line_delimiter = "\r\n"
+        "#;
+        let config: Config = toml::from_str(toml_config).unwrap();
+        assert_eq!(config.line_delimiter, "\r\n");
+
+        let default_toml = "";
+        let default_config: Config = toml::from_str(default_toml).unwrap();
+        assert_eq!(default_config.line_delimiter, "\n");
+    }
 }
