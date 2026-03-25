@@ -8,7 +8,7 @@ use arrow::{
     array::{
         ArrayRef, BinaryBuilder, BooleanBuilder, Decimal128Builder, Decimal256Builder,
         Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder,
-        LargeBinaryBuilder, LargeStringBuilder, MapArray, StringBuilder, StructArray,
+        LargeBinaryBuilder, LargeStringBuilder, ListArray, MapArray, StringBuilder, StructArray,
         TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
         TimestampSecondBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
     },
@@ -319,6 +319,9 @@ pub fn build_record_batch(
             DataType::Struct(fields) => build_struct_array(events, field_name, fields, nullable)?,
             DataType::Map(entries_field, _sorted) => {
                 build_map_array(events, field_name, entries_field, nullable)?
+            }
+            DataType::List(item_field) => {
+                build_list_array(events, field_name, item_field, nullable)?
             }
             other_type => {
                 return Err(ArrowEncodingError::UnsupportedType {
@@ -762,6 +765,7 @@ fn build_column_for_path(
         DataType::Map(entries_field, _sorted) => {
             build_map_array(events, path, entries_field, nullable)
         }
+        DataType::List(item_field) => build_list_array(events, path, item_field, nullable),
         DataType::Timestamp(time_unit, _) => {
             build_timestamp_array(events, path, *time_unit, nullable)
         }
@@ -918,6 +922,120 @@ fn build_map_array(
     .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
 
     Ok(Arc::new(map_array))
+}
+
+/// Builds an Arrow `ListArray` for a repeated field at the given path.
+///
+/// The Vector event value at `path` must be a `Value::Array`. Each element
+/// is encoded according to `item_field`, supporting all scalar types, `Struct`,
+/// and nested `List`.  Absent or non-array values produce a null list row when
+/// the field is nullable; non-nullable missing values return `NullConstraint`.
+fn build_list_array(
+    events: &[Event],
+    path: &str,
+    item_field: &Field,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let mut flat_items: Vec<Value> = Vec::new();
+    let mut offsets: Vec<i32> = vec![0];
+    let mut validity: Vec<bool> = Vec::with_capacity(events.len());
+    let mut has_null = false;
+
+    for event in events {
+        let arr_opt = if let Event::Log(log) = event {
+            log.get(path).and_then(|v| {
+                if let Value::Array(a) = v {
+                    Some(a.clone())
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        match arr_opt {
+            Some(arr) => {
+                flat_items.extend(arr.into_iter());
+                offsets.push(flat_items.len() as i32);
+                validity.push(true);
+            }
+            None => {
+                if !nullable {
+                    return Err(ArrowEncodingError::NullConstraint {
+                        field_name: path.into(),
+                    });
+                }
+                offsets.push(*offsets.last().unwrap_or(&0));
+                validity.push(false);
+                has_null = true;
+            }
+        }
+    }
+
+    let child_array = build_list_item_array(&flat_items, item_field)?;
+    let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    let null_buffer = has_null.then(|| NullBuffer::from(validity));
+
+    let list_array = ListArray::try_new(
+        Arc::new(item_field.clone()),
+        offset_buffer,
+        child_array,
+        null_buffer,
+    )
+    .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+
+    Ok(Arc::new(list_array))
+}
+
+/// Builds the flat child array for a `ListArray` from pre-collected item values.
+///
+/// Delegates to `build_map_value_array` for scalar types.  For `Struct`, each
+/// item must be a `Value::Object`; child fields are extracted by name.
+/// For nested `List`, each item must be a `Value::Array`.
+fn build_list_item_array(
+    items: &[Value],
+    field: &Field,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    match field.data_type() {
+        DataType::Struct(fields) => {
+            let child_arrays: Vec<ArrayRef> = fields
+                .iter()
+                .map(|child_field| {
+                    let child_values: Vec<Value> = items
+                        .iter()
+                        .map(|item| match item {
+                            Value::Object(map) => map
+                                .get(child_field.name().as_str())
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            _ => Value::Null,
+                        })
+                        .collect();
+                    build_list_item_array(&child_values, child_field)
+                })
+                .collect::<Result<_, _>>()?;
+
+            // Null buffer: items that were not Value::Object are null struct rows.
+            let mut has_null = false;
+            let validity: Vec<bool> = items
+                .iter()
+                .map(|item| {
+                    let valid = matches!(item, Value::Object(_));
+                    if !valid {
+                        has_null = true;
+                    }
+                    valid
+                })
+                .collect();
+            let null_buffer = has_null.then(|| NullBuffer::from(validity));
+
+            let struct_array = StructArray::try_new(fields.clone(), child_arrays, null_buffer)
+                .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+            Ok(Arc::new(struct_array))
+        }
+        _ => build_map_value_array(items, field),
+    }
 }
 
 /// Builds a flat value array for Map entries from pre-collected Vector values.
@@ -2216,6 +2334,277 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // List encoding tests
+    // -------------------------------------------------------------------------
+
+    /// `repeated int64` — mirrors `flag_evaluation_hashes` in service_health_event.proto
+    /// and `contributing_query_ids` (repeated string) pattern.
+    #[test]
+    fn test_encode_list_int64() {
+        use arrow::array::{Int64Array, ListArray};
+
+        let mut log0 = LogEvent::default();
+        log0.insert(
+            "hashes",
+            Value::Array(vec![
+                Value::Integer(111),
+                Value::Integer(222),
+                Value::Integer(333),
+            ]),
+        );
+
+        let mut log1 = LogEvent::default();
+        log1.insert(
+            "hashes",
+            Value::Array(vec![Value::Integer(999)]),
+        );
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let list_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        // Row 0: [111, 222, 333]
+        assert!(!list_col.is_null(0));
+        let row0 = list_col
+            .value(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(row0, vec![111, 222, 333]);
+
+        // Row 1: [999]
+        assert!(!list_col.is_null(1));
+        let row1 = list_col
+            .value(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(row1, vec![999]);
+    }
+
+    /// `repeated string` — mirrors `contributing_query_ids` / `redacted_task_retryable_errors`.
+    #[test]
+    fn test_encode_list_string() {
+        use arrow::array::{LargeStringArray, ListArray};
+
+        let mut log0 = LogEvent::default();
+        log0.insert(
+            "ids",
+            Value::Array(vec![
+                Value::Bytes("qpl-abc".into()),
+                Value::Bytes("qpl-def".into()),
+            ]),
+        );
+
+        let events = vec![Event::Log(log0)];
+        let item_field = Field::new("item", DataType::LargeUtf8, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ids",
+            DataType::List(Arc::new(item_field)),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let list_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let row0_val = list_col.value(0);
+        let row0 = row0_val.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(row0.value(0), "qpl-abc");
+        assert_eq!(row0.value(1), "qpl-def");
+    }
+
+    /// Null rows: absent list field → null list; non-nullable missing → error.
+    #[test]
+    fn test_encode_list_null_rows() {
+        use arrow::array::ListArray;
+
+        let mut log0 = LogEvent::default();
+        log0.insert(
+            "hashes",
+            Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
+        );
+        let log1 = LogEvent::default(); // absent → null
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            true, // nullable
+        )]));
+
+        let batch = build_record_batch(Arc::clone(&schema), &events).unwrap();
+        let list_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!list_col.is_null(0), "row 0 should be non-null");
+        assert!(list_col.is_null(1), "row 1 should be null");
+        assert_eq!(list_col.value(0).len(), 2);
+    }
+
+    #[test]
+    fn test_encode_list_non_nullable_missing_fails() {
+        let log = LogEvent::default();
+        let events = vec![Event::Log(log)];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            false, // non-nullable
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(matches!(
+            result,
+            Err(ArrowEncodingError::NullConstraint { .. })
+        ));
+    }
+
+    /// `List<Struct>` — mirrors repeated message fields like QPL's `stage_data`.
+    #[test]
+    fn test_encode_list_struct() {
+        use arrow::array::{Int64Array, ListArray, StructArray};
+        use vrl::value::ObjectMap;
+
+        let item_struct_fields = Fields::from(vec![
+            Field::new("rule_id", DataType::Int64, true),
+            Field::new("total_time_ns", DataType::Int64, true),
+            Field::new("phase_id", DataType::Int64, true),
+        ]);
+
+        // Row 0: two rule summaries.
+        let make_rule = |rule_id: i64, total: i64, phase: i64| {
+            let mut m = ObjectMap::new();
+            m.insert("rule_id".into(), Value::Integer(rule_id));
+            m.insert("total_time_ns".into(), Value::Integer(total));
+            m.insert("phase_id".into(), Value::Integer(phase));
+            Value::Object(m)
+        };
+
+        let mut log0 = LogEvent::default();
+        log0.insert(
+            "rule_stats",
+            Value::Array(vec![make_rule(1, 5_000, 3), make_rule(2, 8_000, 4)]),
+        );
+
+        // Row 1: empty list.
+        let mut log1 = LogEvent::default();
+        log1.insert("rule_stats", Value::Array(vec![]));
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+        let item_field = Field::new(
+            "item",
+            DataType::Struct(item_struct_fields.clone()),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "rule_stats",
+            DataType::List(Arc::new(item_field)),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let list_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        // Row 0: 2 struct items.
+        assert!(!list_col.is_null(0));
+        let row0_val = list_col.value(0);
+        let row0_structs = row0_val.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(row0_structs.len(), 2);
+
+        let rule_ids = row0_structs
+            .column_by_name("rule_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(rule_ids.value(0), 1);
+        assert_eq!(rule_ids.value(1), 2);
+
+        let total_ns = row0_structs
+            .column_by_name("total_time_ns")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(total_ns.value(0), 5_000);
+        assert_eq!(total_ns.value(1), 8_000);
+
+        // Row 1: empty list.
+        assert!(!list_col.is_null(1));
+        assert_eq!(list_col.value(1).len(), 0);
+    }
+
+    /// IPC round-trip for List<Int64>.
+    #[test]
+    fn test_encode_list_ipc_roundtrip() {
+        use arrow::ipc::reader::StreamReader;
+        use std::io::Cursor;
+
+        let mut log = LogEvent::default();
+        log.insert(
+            "hashes",
+            Value::Array(vec![
+                Value::Integer(10),
+                Value::Integer(20),
+                Value::Integer(30),
+            ]),
+        );
+
+        let events = vec![Event::Log(log)];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            true,
+        )]));
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)));
+        assert!(bytes.is_ok(), "IPC encoding failed: {:?}", bytes);
+
+        let cursor = Cursor::new(bytes.unwrap());
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
+    }
+
+    // -------------------------------------------------------------------------
     // Map encoding tests
     // -------------------------------------------------------------------------
 
@@ -2432,8 +2821,15 @@ mod tests {
             ),
             Field::new("classification_low_confidence", DataType::Boolean, true),
             Field::new("dbr_version", DataType::LargeUtf8, true),
+            Field::new("outcome_details", DataType::LargeUtf8, true),
             Field::new("is_suppressed", DataType::Boolean, true),
             Field::new("engine_request_id", DataType::LargeUtf8, true),
+            Field::new("service_extra_v2", DataType::LargeBinary, true),
+            Field::new(
+                "flag_evaluation_hashes",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
         ]));
 
         // Row 0: all fields populated (nullable sub-fields simply omitted → null in Arrow).
@@ -2453,10 +2849,22 @@ mod tests {
         log0.insert("request_info.retry_count", 0i64);
         log0.insert("classification_low_confidence", false);
         log0.insert("dbr_version", "16.4.7");
+        log0.insert("outcome_details", "JobRunTermination succeeded after 42s");
         log0.insert("is_suppressed", false);
         log0.insert("engine_request_id", "abc-def-123");
+        log0.insert(
+            "service_extra_v2",
+            Value::Bytes(b"\x0a\x05hello".to_vec().into()),
+        );
+        log0.insert(
+            "flag_evaluation_hashes",
+            Value::Array(vec![
+                Value::Integer(111_222_333),
+                Value::Integer(444_555_666),
+            ]),
+        );
 
-        // Row 1: rpc_info and request_info absent → null structs; engine_request_id absent → null.
+        // Row 1: rpc_info and request_info absent → null structs; several fields absent → null.
         let mut log1 = LogEvent::default();
         log1.insert("event_name", "ClusterTermination");
         log1.insert("outcome", "CloudFailure");
@@ -2465,8 +2873,11 @@ mod tests {
         log1.insert("workspace_id", 987_654_321i64);
         log1.insert("classification_low_confidence", true);
         log1.insert("dbr_version", "14.3.0");
+        // outcome_details absent → null
         log1.insert("is_suppressed", true);
         // engine_request_id absent → null
+        // service_extra_v2 absent → null
+        // flag_evaluation_hashes absent → null
 
         let events = vec![Event::Log(log0), Event::Log(log1)];
 
@@ -2475,7 +2886,7 @@ mod tests {
         let batch = result.unwrap();
 
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 11);
+        assert_eq!(batch.num_columns(), 14);
 
         // Top-level scalar checks.
         let event_name_col = batch
@@ -2556,6 +2967,38 @@ mod tests {
             .unwrap();
         assert!(!is_suppressed_col.value(0));
         assert!(is_suppressed_col.value(1));
+
+        // service_extra_v2 (LargeBinary): row 0 non-null, row 1 null.
+        use arrow::array::LargeBinaryArray;
+        let binary_col = batch
+            .column_by_name("service_extra_v2")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert!(!binary_col.is_null(0));
+        assert!(binary_col.is_null(1));
+        assert_eq!(binary_col.value(0), b"\x0a\x05hello");
+
+        // flag_evaluation_hashes (List<Int64>): row 0 has [111_222_333, 444_555_666], row 1 null.
+        use arrow::array::ListArray;
+        let list_col = batch
+            .column_by_name("flag_evaluation_hashes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!list_col.is_null(0));
+        assert!(list_col.is_null(1));
+        let hashes: Vec<i64> = list_col
+            .value(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+        assert_eq!(hashes, vec![111_222_333, 444_555_666]);
     }
 
     /// Schema mirroring the core fields of proto/logs/qpl/query_profile.proto.
@@ -2593,6 +3036,11 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::LargeUtf8, true),
+            Field::new(
+                "contributing_query_ids",
+                DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                true,
+            ),
             Field::new("app_id", DataType::LargeUtf8, true),
             Field::new("execution_id", DataType::LargeUtf8, true),
             Field::new("time_submitted_unix_ms", DataType::Int64, true),
@@ -2614,10 +3062,16 @@ mod tests {
             ),
         ]));
 
-        // Row 0: successful query — no failure struct.
         // Row 0: successful query — exception and failure absent → null.
         let mut log0 = LogEvent::default();
         log0.insert("id", "qpl-2024-01-15-00-00-abc123");
+        log0.insert(
+            "contributing_query_ids",
+            Value::Array(vec![
+                Value::Bytes("qpl-prev-1".into()),
+                Value::Bytes("qpl-prev-2".into()),
+            ]),
+        );
         log0.insert("app_id", "application_1234_0001");
         log0.insert("execution_id", "exec-42");
         log0.insert("time_submitted_unix_ms", 1_705_276_800_000i64);
@@ -2635,9 +3089,10 @@ mod tests {
         // query_profile_debug.error_class absent → null
         log0.insert("query_profile_debug.sequence_number", 7i64);
 
-        // Row 1: failed query — failure struct present; some optional fields absent → null.
+        // Row 1: failed query — contributing_query_ids absent → null list.
         let mut log1 = LogEvent::default();
         log1.insert("id", "qpl-2024-01-15-00-01-xyz789");
+        // contributing_query_ids absent → null
         log1.insert("app_id", "application_1234_0002");
         log1.insert("execution_id", "exec-43");
         log1.insert("time_submitted_unix_ms", 1_705_276_810_000i64);
@@ -2665,7 +3120,7 @@ mod tests {
         let batch = result.unwrap();
 
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 12);
+        assert_eq!(batch.num_columns(), 13);
 
         // Top-level scalar checks.
         let id_col = batch
@@ -2767,5 +3222,25 @@ mod tests {
             .unwrap();
         assert!(debug_error_class.is_null(0));
         assert_eq!(debug_error_class.value(1), "SerializationError");
+
+        // contributing_query_ids (List<LargeUtf8>): row 0 has 2 ids, row 1 null.
+        use arrow::array::ListArray;
+        let cq_col = batch
+            .column_by_name("contributing_query_ids")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!cq_col.is_null(0), "row 0 contributing_query_ids non-null");
+        assert!(cq_col.is_null(1), "row 1 contributing_query_ids null");
+        let cq_val = cq_col.value(0);
+        let ids: Vec<&str> = cq_val
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
+        assert_eq!(ids, vec!["qpl-prev-1", "qpl-prev-2"]);
     }
 }
