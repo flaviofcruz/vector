@@ -666,6 +666,16 @@ impl SourceConfig for Config {
                 Kind::timestamp(),
                 Some("timestamp"),
             )
+            .with_source_metadata(
+                Self::NAME,
+                self.host_key
+                    .clone()
+                    .and_then(|v| v.path)
+                    .map(LegacyKey::Overwrite),
+                &owned_value_path!("host"),
+                Kind::bytes().or_undefined(),
+                Some("host"),
+            )
             .with_standard_vector_source_metadata();
 
         vec![SourceOutput::new_maybe_logs(
@@ -873,9 +883,13 @@ impl Source {
         } = self;
 
         let hostname = host_key.as_ref().and_then(|_| {
-            crate::get_hostname()
-                .ok()
-                .map(|h| bytes::Bytes::from(h))
+            match crate::get_hostname() {
+                Ok(h) => Some(Bytes::from(h)),
+                Err(error) => {
+                    warn!(message = "Failed to resolve hostname; host_key will not be added to events.", %error);
+                    None
+                }
+            }
         });
 
         let mut reflectors = Vec::new();
@@ -1128,7 +1142,7 @@ impl Source {
                     event.as_mut_log(),
                     Some(LegacyKey::Overwrite(hk)),
                     path!("host"),
-                    hn.clone(), // Bytes::clone is O(1) ref-count bump
+                    hn.clone(),
                 );
             }
 
