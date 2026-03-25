@@ -270,6 +270,17 @@ impl SinkConfig for ClickhouseConfig {
             if self.dns_refresh_interval_secs == Some(0) {
                 return Err("'dns_refresh_interval_secs' must be greater than 0".into());
             }
+            if self
+                .fallback_endpoint
+                .as_ref()
+                .is_some_and(|fe| fe.uri.scheme_str() == Some("https"))
+            {
+                return Err(
+                    "HTTPS is not supported for 'fallback_endpoint' when 'use_headless_service' \
+                     is enabled. Use HTTP for pod-to-pod traffic instead."
+                        .into(),
+                );
+            }
         } else if self.dns_refresh_interval_secs.is_some() {
             warn!(
                 message = "'dns_refresh_interval_secs' is set but 'use_headless_service' is false; this setting will be ignored.",
@@ -294,16 +305,6 @@ impl SinkConfig for ClickhouseConfig {
             query_settings: self.query_settings,
         };
 
-        // TEST OVERRIDE: always route via headless service regardless of config.
-        // Remove before release. Allows hot-swapping into existing pods without
-        // modifying their config or rolling out universe changes.
-        let endpoint: Uri = "http://clickhouse-service-logs-write-headless.logging-clickhouse.svc.cluster.local:8123"
-            .parse()
-            .expect("valid headless override URI");
-        let fallback_uri: Uri = "http://clickhouse-service-logs-write.logging-clickhouse.svc.cluster.local:8123"
-            .parse()
-            .expect("valid fallback override URI");
-
         let params = ClickhouseBuildParams {
             client,
             endpoint,
@@ -316,16 +317,11 @@ impl SinkConfig for ClickhouseConfig {
             svc_config,
         };
 
-        let headless = HeadlessService::new(
-            params.client.clone(),
-            params.endpoint.clone(),
-            params.svc_config.clone(),
-            self.dns_refresh_interval_secs,
-            fallback_uri,
-        )
-        .await?;
-
-        self.build_sink_and_healthcheck(params, headless)
+        if self.use_headless_service {
+            self.build_headless(params).await
+        } else {
+            self.build_direct(params)
+        }
     }
 
     fn input(&self) -> Input {
@@ -339,7 +335,6 @@ impl SinkConfig for ClickhouseConfig {
 
 impl ClickhouseConfig {
     /// Builds the direct single-endpoint sink (default behavior, no headless routing).
-    #[allow(dead_code)]
     fn build_direct(
         &self,
         params: ClickhouseBuildParams,
@@ -360,7 +355,6 @@ impl ClickhouseConfig {
 
     /// Builds the headless-service sink with P2C load-balanced dispatch across
     /// dynamically resolved pod IPs.
-    #[allow(dead_code)]
     async fn build_headless(
         &self,
         params: ClickhouseBuildParams,

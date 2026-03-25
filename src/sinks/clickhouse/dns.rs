@@ -3,7 +3,6 @@
 //! Resolves a headless K8s service DNS name to individual pod IPs,
 //! enabling direct P2C load-balanced dispatch to ClickHouse shard pods.
 
-use std::collections::HashSet;
 use std::net::IpAddr;
 
 use http::Uri;
@@ -83,6 +82,8 @@ pub fn ip_from_uri(uri: &Uri) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
