@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use derivative::Derivative;
 use vector_lib::{
     config::{LegacyKey, LogNamespace, log_schema},
@@ -86,7 +87,7 @@ impl FunctionTransform for DatabricksParser {
 }
 
 struct ParsedLog<'a> {
-    timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    timestamp: Option<DateTime<Utc>>,
     priority: &'a [u8],
     message: &'a [u8],
 }
@@ -252,14 +253,9 @@ pub mod tests {
         test_parsing_invalid_messages(LogNamespace::Legacy);
     }
 
-    /// Verify that DatabricksParser does NOT set a synthetic timestamp on the event.
-    /// The parser should leave the event's timestamp untouched so that it retains
-    /// whatever timestamp was set at event creation time (the ingest timestamp),
-    /// matching the behavior of the file source.
     #[test]
     fn test_parser_does_not_set_timestamp_legacy() {
-        use chrono::{DateTime, Utc};
-        use vector_lib::lookup::{event_path, metadata_path};
+        use vector_lib::lookup::event_path;
 
         let original_timestamp = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
@@ -289,8 +285,6 @@ pub mod tests {
         }
     }
 
-    /// Same test for the Vector namespace: verify the parser does not insert a
-    /// synthetic timestamp into the metadata.
     #[test]
     fn test_parser_does_not_set_timestamp_vector() {
         use vector_lib::lookup::metadata_path;
