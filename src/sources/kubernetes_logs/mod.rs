@@ -37,7 +37,11 @@ use vector_lib::{
         Checkpointer, FileFingerprint, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
     },
     internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
-    lookup::{OwnedTargetPath, lookup_v2::OptionalTargetPath, owned_value_path, path},
+    lookup::{
+        OwnedTargetPath, OwnedValuePath,
+        lookup_v2::{OptionalTargetPath, OptionalValuePath},
+        owned_value_path, path,
+    },
 };
 use vrl::value::{Kind, kind::Collection};
 
@@ -373,6 +377,13 @@ pub struct Config {
     /// is killed mid-drain.
     #[serde(default = "default_drain_on_shutdown")]
     drain_on_shutdown: bool,
+
+    /// Overrides the name of the log field used to add the current hostname to each event.
+    /// Disabled by default. Set to "host" to match the file source behavior.
+    /// Set to "" to explicitly suppress this key.
+    #[configurable(metadata(docs::examples = "host"))]
+    #[serde(default)]
+    pub host_key: Option<OptionalValuePath>,
 }
 
 const fn default_read_from() -> ReadFromConfig {
@@ -430,6 +441,7 @@ impl Default for Config {
             multiline: None,
             remove_after_secs: None,
             drain_on_shutdown: default_drain_on_shutdown(),
+            host_key: None,
         }
     }
 }
@@ -706,6 +718,7 @@ struct Source {
     multiline: Option<MultilineConfig>,
     remove_after_secs: Option<u64>,
     drain_on_shutdown: bool,
+    host_key: Option<OwnedValuePath>,
 }
 
 impl Source {
@@ -808,6 +821,7 @@ impl Source {
             multiline: config.multiline.clone(),
             remove_after_secs: config.remove_after_secs,
             drain_on_shutdown: config.drain_on_shutdown,
+            host_key: config.host_key.clone().and_then(|v| v.path),
         })
     }
 
@@ -855,7 +869,14 @@ impl Source {
             multiline,
             remove_after_secs,
             drain_on_shutdown,
+            host_key,
         } = self;
+
+        let hostname = if host_key.is_some() {
+            crate::get_hostname().ok()
+        } else {
+            None
+        };
 
         let mut reflectors = Vec::new();
 
@@ -1099,6 +1120,16 @@ impl Source {
                     emit!(KubernetesLogsEventNodeAnnotationError { event: &event });
                 }
                 */
+            }
+
+            if let (Some(hk), Some(hn)) = (&host_key, &hostname) {
+                log_namespace.insert_source_metadata(
+                    Config::NAME,
+                    event.as_mut_log(),
+                    Some(LegacyKey::Overwrite(hk)),
+                    path!("host"),
+                    hn.clone(),
+                );
             }
 
             checkpoints.update(line.file_id, line.end_offset);
