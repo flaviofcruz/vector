@@ -1746,6 +1746,11 @@ mod tests {
                         Some("timestamp")
                     )
                     .with_metadata_field(
+                        &owned_value_path!("kubernetes_logs", "host"),
+                        Kind::bytes().or_undefined(),
+                        Some("host")
+                    )
+                    .with_metadata_field(
                         &owned_value_path!("vector", "source_type"),
                         Kind::bytes(),
                         None
@@ -1892,5 +1897,25 @@ mod tests {
         let default_toml = "";
         let default_config: Config = toml::from_str(default_toml).unwrap();
         assert_eq!(default_config.drain_on_shutdown, false);
+    }
+
+    #[test]
+    fn test_default_config_host_key_is_none() {
+        let config = Config::default();
+        assert!(config.host_key.is_none());
+    }
+
+    #[test]
+    fn test_config_host_key_from_toml() {
+        let config: Config = toml::from_str(r#"host_key = "host""#).unwrap();
+        let path = config.host_key.expect("host_key should be Some").path;
+        assert_eq!(path, Some(owned_value_path!("host")));
+    }
+
+    #[test]
+    fn test_config_host_key_empty_string_suppresses() {
+        let config: Config = toml::from_str(r#"host_key = """#).unwrap();
+        let opt = config.host_key.expect("host_key should be Some");
+        assert!(opt.path.is_none(), "empty string should parse to path = None");
     }
 }
