@@ -45,7 +45,7 @@ use vector_lib::{
 };
 use vrl::value::{Kind, kind::Collection};
 
-use crate::sources::util::MultilineConfig;
+use crate::sources::util::{EncodingConfig, MultilineConfig};
 use crate::{
     SourceSender,
     built_info::{PKG_NAME, PKG_VERSION},
@@ -53,6 +53,7 @@ use crate::{
         ComponentKey, DataType, GenerateConfig, GlobalOptions, SourceConfig, SourceContext,
         SourceOutput, log_schema,
     },
+    encoding_transcode::{Decoder, Encoder},
     event::Event,
     internal_events::{
         FileInternalMetricsConfig, FileSourceInternalEventsEmitter, KubernetesLifecycleError,
@@ -389,6 +390,14 @@ pub struct Config {
     #[serde(default = "default_line_delimiter")]
     #[configurable(metadata(docs::examples = "\r\n"))]
     pub line_delimiter: String,
+
+    /// Character set encoding of the source log files.
+    ///
+    /// When set, the log file bytes are transcoded from the specified encoding to UTF-8.
+    /// If not set, UTF-8 is assumed.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub encoding: Option<EncodingConfig>,
 }
 
 const fn default_read_from() -> ReadFromConfig {
@@ -452,6 +461,7 @@ impl Default for Config {
             drain_on_shutdown: default_drain_on_shutdown(),
             host_key: None,
             line_delimiter: default_line_delimiter(),
+            encoding: None,
         }
     }
 }
@@ -740,6 +750,7 @@ struct Source {
     drain_on_shutdown: bool,
     host_key: Option<OwnedValuePath>,
     line_delimiter: String,
+    encoding: Option<EncodingConfig>,
 }
 
 impl Source {
@@ -844,6 +855,7 @@ impl Source {
             drain_on_shutdown: config.drain_on_shutdown,
             host_key: config.host_key.clone().and_then(|v| v.path),
             line_delimiter: config.line_delimiter.clone(),
+            encoding: config.encoding.clone(),
         })
     }
 
@@ -893,6 +905,7 @@ impl Source {
             drain_on_shutdown,
             host_key,
             line_delimiter,
+            encoding,
         } = self;
 
         let hostname = host_key.as_ref().and_then(|_| {
@@ -1002,6 +1015,8 @@ impl Source {
             NamespaceMetadataAnnotator::new(ns_state, namespace_fields_spec, log_namespace);
         let node_annotator = NodeMetadataAnnotator::new(node_state, node_field_spec, log_namespace);
 
+        let encoding_charset = encoding.as_ref().map(|e| e.charset);
+
         let ignore_before = calculate_ignore_before(ignore_older_secs);
 
         let mut resolved_max_line_bytes = max_line_bytes;
@@ -1049,7 +1064,10 @@ impl Source {
             // protects against malformed lines or tailing incorrect files.
             max_line_bytes: resolved_max_line_bytes,
             // Delimiter bytes that is used to read the file line-by-line
-            line_delimiter: Bytes::from(line_delimiter),
+            line_delimiter: match encoding_charset {
+                Some(e) => Encoder::new(e).encode_from_utf8(&line_delimiter),
+                None => Bytes::from(line_delimiter),
+            },
             // The directory where to keep the checkpoints.
             data_dir,
             // This value specifies not exactly the globbing, but interval
@@ -1086,7 +1104,21 @@ impl Source {
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
 
         let checkpoints = checkpointer.view();
-        let events = file_source_rx.flat_map(futures::stream::iter);
+        let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
+        let mut encoding_decoder = encoding_charset.map(Decoder::new);
+        let events = file_source_rx.flat_map(futures::stream::iter).map(move |mut line| {
+            let byte_size = line.text.len();
+            bytes_received.emit(ByteSize(byte_size));
+
+            // Transcode each line from the file's encoding charset to UTF-8.
+            // This must happen before multiline aggregation so that regex
+            // patterns in the multiline config can match UTF-8 text.
+            line.text = match encoding_decoder.as_mut() {
+                Some(d) => d.decode_to_utf8(line.text),
+                None => line.text,
+            };
+            line
+        });
         let multiline_config = multiline.clone();
         let messages: Box<dyn Stream<Item = Line> + Send + std::marker::Unpin> =
             if let Some(ref multiline_config) = multiline_config {
@@ -1097,11 +1129,7 @@ impl Source {
             } else {
                 Box::new(events)
             };
-        let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
         let events = messages.map(move |line| {
-            let byte_size = line.text.len();
-            bytes_received.emit(ByteSize(byte_size));
-
             let mut event = create_event(
                 line.text,
                 &line.filename,
@@ -1459,6 +1487,7 @@ fn prepare_label_selector(selector: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use similar_asserts::assert_eq;
     use vector_lib::{
         config::LogNamespace,
@@ -1469,6 +1498,7 @@ mod tests {
 
     use super::Config;
     use crate::config::SourceConfig;
+    use crate::encoding_transcode::{Decoder, Encoder};
 
     #[test]
     fn generate_config() {
@@ -1958,5 +1988,47 @@ mod tests {
         let default_toml = "";
         let default_config: Config = toml::from_str(default_toml).unwrap();
         assert_eq!(default_config.line_delimiter, "\n");
+    }
+
+    #[test]
+    fn test_default_config_encoding_is_none() {
+        let config = Config::default();
+        assert!(config.encoding.is_none());
+    }
+
+    #[test]
+    fn test_config_serialization_encoding() {
+        let toml_config = r#"
+            [encoding]
+            charset = "utf-16le"
+        "#;
+        let config: Config = toml::from_str(toml_config).unwrap();
+        assert!(config.encoding.is_some());
+        assert_eq!(
+            config.encoding.unwrap().charset,
+            encoding_rs::UTF_16LE
+        );
+
+        let default_toml = "";
+        let default_config: Config = toml::from_str(default_toml).unwrap();
+        assert!(default_config.encoding.is_none());
+    }
+
+    #[test]
+    fn test_encoding_transcode_roundtrip() {
+        // Simulate the transcoding pipeline: encode a UTF-8 line delimiter to
+        // the target charset, then decode a line (in the target charset) back
+        // to UTF-8 — mirroring what the source does at runtime.
+        let charset = encoding_rs::UTF_16LE;
+
+        // Encoder: "\n" -> UTF-16LE bytes (used for line_delimiter)
+        let delimiter = Encoder::new(charset).encode_from_utf8("\n");
+        assert_eq!(delimiter, Bytes::from_static(b"\n\x00"));
+
+        // Decoder: UTF-16LE bytes -> UTF-8 string
+        let mut decoder = Decoder::new(charset);
+        let utf16le_hello = Encoder::new(charset).encode_from_utf8("hello world");
+        let decoded = decoder.decode_to_utf8(utf16le_hello);
+        assert_eq!(decoded, Bytes::from("hello world"));
     }
 }
