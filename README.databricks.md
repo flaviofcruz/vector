@@ -104,3 +104,4 @@ This lists custom changes merged in Databricks fork of Vector.
 103. Support reading from in-progress gzipped files https://github.com/databricks-eng/vector/pull/447
 104. Stop overwriting event timestamps with Utc::now() in DatabricksParser for kubernetes_logs source https://github.com/databricks-eng/vector/pull/451
 105. Add optional `host_key` metadata field to `kubernetes_logs` source to attach hostname to each event https://github.com/databricks-eng/vector/pull/453
+106. Make `line_delimiter` configurable in the `kubernetes_logs` source to match file source behavior https://github.com/databricks-eng/vector/pull/454
