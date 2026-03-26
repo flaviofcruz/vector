@@ -51,11 +51,14 @@ fn proto_field_to_arrow_field(field: &FieldDescriptor) -> Result<Field, ZerobusS
 }
 
 /// Map a protobuf `Kind` to an Arrow `DataType`.
-fn proto_kind_to_arrow_type(kind: &Kind, _field_name: &str) -> Result<DataType, ZerobusSinkError> {
+fn proto_kind_to_arrow_type(kind: &Kind, field_name: &str) -> Result<DataType, ZerobusSinkError> {
     match kind {
         Kind::Double => Ok(DataType::Float64),
         Kind::Float => Ok(DataType::Float32),
         Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => Ok(DataType::Int32),
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 if field_name == "_event_time" => Ok(
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        ),
         Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => Ok(DataType::Int64),
         Kind::Uint32 | Kind::Fixed32 => Ok(DataType::UInt32),
         Kind::Uint64 | Kind::Fixed64 => Ok(DataType::UInt64),

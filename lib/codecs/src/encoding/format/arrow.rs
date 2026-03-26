@@ -292,8 +292,8 @@ pub fn build_record_batch(
         let field_name = field.name();
         let nullable = field.is_nullable();
         let array: ArrayRef = match field.data_type() {
-            DataType::Timestamp(time_unit, _) => {
-                build_timestamp_array(events, field_name, *time_unit, nullable)?
+            DataType::Timestamp(time_unit, tz) => {
+                build_timestamp_array(events, field_name, *time_unit, tz.clone(), nullable)?
             }
             DataType::Utf8 => build_string_array(events, field_name, nullable)?,
             DataType::LargeUtf8 => build_large_string_array(events, field_name, nullable)?,
@@ -396,6 +396,7 @@ fn build_timestamp_array(
     events: &[Event],
     field_name: &str,
     time_unit: TimeUnit,
+    timezone: Option<Arc<str>>,
     nullable: bool,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     macro_rules! build_array {
@@ -427,7 +428,12 @@ fn build_timestamp_array(
                     builder.append_option(value_to_append);
                 }
             }
-            Ok(Arc::new(builder.finish()))
+            let array = builder.finish();
+            if let Some(tz) = timezone {
+                Ok(Arc::new(array.with_timezone(tz)))
+            } else {
+                Ok(Arc::new(array))
+            }
         }};
     }
 
@@ -766,8 +772,8 @@ fn build_column_for_path(
             build_map_array(events, path, entries_field, nullable)
         }
         DataType::List(item_field) => build_list_array(events, path, item_field, nullable),
-        DataType::Timestamp(time_unit, _) => {
-            build_timestamp_array(events, path, *time_unit, nullable)
+        DataType::Timestamp(time_unit, tz) => {
+            build_timestamp_array(events, path, *time_unit, tz.clone(), nullable)
         }
         DataType::Utf8 => build_string_array(events, path, nullable),
         DataType::LargeUtf8 => build_large_string_array(events, path, nullable),
