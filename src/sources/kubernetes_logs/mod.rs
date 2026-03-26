@@ -37,7 +37,11 @@ use vector_lib::{
         Checkpointer, FileFingerprint, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
     },
     internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
-    lookup::{OwnedTargetPath, lookup_v2::OptionalTargetPath, owned_value_path, path},
+    lookup::{
+        OwnedTargetPath, OwnedValuePath,
+        lookup_v2::{OptionalTargetPath, OptionalValuePath},
+        owned_value_path, path,
+    },
 };
 use vrl::value::{Kind, kind::Collection};
 
@@ -373,6 +377,13 @@ pub struct Config {
     /// is killed mid-drain.
     #[serde(default = "default_drain_on_shutdown")]
     drain_on_shutdown: bool,
+
+    /// Overrides the name of the log field used to add the current hostname to each event.
+    /// Disabled by default. Set to "host" to match the file source behavior.
+    /// Set to "" to explicitly suppress this key.
+    #[configurable(metadata(docs::examples = "host"))]
+    #[serde(default)]
+    pub host_key: Option<OptionalValuePath>,
 }
 
 const fn default_read_from() -> ReadFromConfig {
@@ -430,6 +441,7 @@ impl Default for Config {
             multiline: None,
             remove_after_secs: None,
             drain_on_shutdown: default_drain_on_shutdown(),
+            host_key: None,
         }
     }
 }
@@ -654,6 +666,16 @@ impl SourceConfig for Config {
                 Kind::timestamp(),
                 Some("timestamp"),
             )
+            .with_source_metadata(
+                Self::NAME,
+                self.host_key
+                    .clone()
+                    .and_then(|v| v.path)
+                    .map(LegacyKey::Overwrite),
+                &owned_value_path!("host"),
+                Kind::bytes().or_undefined(),
+                Some("host"),
+            )
             .with_standard_vector_source_metadata();
 
         vec![SourceOutput::new_maybe_logs(
@@ -706,6 +728,7 @@ struct Source {
     multiline: Option<MultilineConfig>,
     remove_after_secs: Option<u64>,
     drain_on_shutdown: bool,
+    host_key: Option<OwnedValuePath>,
 }
 
 impl Source {
@@ -808,6 +831,7 @@ impl Source {
             multiline: config.multiline.clone(),
             remove_after_secs: config.remove_after_secs,
             drain_on_shutdown: config.drain_on_shutdown,
+            host_key: config.host_key.clone().and_then(|v| v.path),
         })
     }
 
@@ -855,7 +879,18 @@ impl Source {
             multiline,
             remove_after_secs,
             drain_on_shutdown,
+            host_key,
         } = self;
+
+        let hostname = host_key.as_ref().and_then(|_| {
+            match crate::get_hostname() {
+                Ok(h) => Some(Bytes::from(h)),
+                Err(error) => {
+                    warn!(message = "Failed to resolve hostname; host_key will not be added to events.", %error);
+                    None
+                }
+            }
+        });
 
         let mut reflectors = Vec::new();
 
@@ -1099,6 +1134,16 @@ impl Source {
                     emit!(KubernetesLogsEventNodeAnnotationError { event: &event });
                 }
                 */
+            }
+
+            if let (Some(hk), Some(hn)) = (&host_key, &hostname) {
+                log_namespace.insert_source_metadata(
+                    Config::NAME,
+                    event.as_mut_log(),
+                    Some(LegacyKey::Overwrite(hk)),
+                    path!("host"),
+                    hn.clone(),
+                );
             }
 
             checkpoints.update(line.file_id, line.end_offset);
@@ -1701,6 +1746,11 @@ mod tests {
                         Some("timestamp")
                     )
                     .with_metadata_field(
+                        &owned_value_path!("kubernetes_logs", "host"),
+                        Kind::bytes().or_undefined(),
+                        Some("host")
+                    )
+                    .with_metadata_field(
                         &owned_value_path!("vector", "source_type"),
                         Kind::bytes(),
                         None
@@ -1847,5 +1897,25 @@ mod tests {
         let default_toml = "";
         let default_config: Config = toml::from_str(default_toml).unwrap();
         assert_eq!(default_config.drain_on_shutdown, false);
+    }
+
+    #[test]
+    fn test_default_config_host_key_is_none() {
+        let config = Config::default();
+        assert!(config.host_key.is_none());
+    }
+
+    #[test]
+    fn test_config_host_key_from_toml() {
+        let config: Config = toml::from_str(r#"host_key = "host""#).unwrap();
+        let path = config.host_key.expect("host_key should be Some").path;
+        assert_eq!(path, Some(owned_value_path!("host")));
+    }
+
+    #[test]
+    fn test_config_host_key_empty_string_suppresses() {
+        let config: Config = toml::from_str(r#"host_key = """#).unwrap();
+        let opt = config.host_key.expect("host_key should be Some");
+        assert!(opt.path.is_none(), "empty string should parse to path = None");
     }
 }
