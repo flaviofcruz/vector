@@ -2011,4 +2011,25 @@ mod tests {
         let default_config: Config = toml::from_str(default_toml).unwrap();
         assert!(default_config.encoding.is_none());
     }
+
+    #[test]
+    fn test_encoding_transcode_roundtrip() {
+        use bytes::Bytes;
+        use crate::encoding_transcode::{Decoder, Encoder};
+
+        // Simulate the transcoding pipeline: encode a UTF-8 line delimiter to
+        // the target charset, then decode a line (in the target charset) back
+        // to UTF-8 — mirroring what the source does at runtime.
+        let charset = encoding_rs::UTF_16LE;
+
+        // Encoder: "\n" -> UTF-16LE bytes (used for line_delimiter)
+        let delimiter = Encoder::new(charset).encode_from_utf8("\n");
+        assert_eq!(delimiter, Bytes::from_static(b"\n\x00"));
+
+        // Decoder: UTF-16LE bytes -> UTF-8 string
+        let mut decoder = Decoder::new(charset);
+        let utf16le_hello = Encoder::new(charset).encode_from_utf8("hello world");
+        let decoded = decoder.decode_to_utf8(utf16le_hello);
+        assert_eq!(decoded, Bytes::from("hello world"));
+    }
 }
