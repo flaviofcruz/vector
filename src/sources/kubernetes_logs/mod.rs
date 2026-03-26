@@ -1487,6 +1487,7 @@ fn prepare_label_selector(selector: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use similar_asserts::assert_eq;
     use vector_lib::{
         config::LogNamespace,
@@ -1497,6 +1498,7 @@ mod tests {
 
     use super::Config;
     use crate::config::SourceConfig;
+    use crate::encoding_transcode::{Decoder, Encoder};
 
     #[test]
     fn generate_config() {
@@ -2014,9 +2016,6 @@ mod tests {
 
     #[test]
     fn test_encoding_transcode_roundtrip() {
-        use bytes::Bytes;
-        use crate::encoding_transcode::{Decoder, Encoder};
-
         // Simulate the transcoding pipeline: encode a UTF-8 line delimiter to
         // the target charset, then decode a line (in the target charset) back
         // to UTF-8 — mirroring what the source does at runtime.
