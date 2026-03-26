@@ -262,7 +262,7 @@ pub mod tests {
             .with_timezone(&Utc);
 
         // Create a log event with a known timestamp already set (simulating the ingest timestamp).
-        let mut log = crate::event::LogEvent::default();
+        let mut log = LogEvent::default();
         log.insert(event_path!("message"), "some log line");
         log.insert(event_path!("timestamp"), original_timestamp);
         let input = Event::Log(log);
