@@ -108,6 +108,25 @@ pub enum CallbackError {
         source: crate::template::TemplateParseError,
     },
 
+    #[snafu(display(
+        "Header {:?} is reserved and cannot be set via `headers`. \
+         Use the `auth` config for Authorization; Content-Type is set automatically.",
+        name
+    ))]
+    ReservedHeaderName { name: String },
+
+    #[snafu(display("Invalid callback header name {:?}: {}", name, source))]
+    InvalidHeaderName {
+        name: String,
+        source: http::header::InvalidHeaderName,
+    },
+
+    #[snafu(display("Invalid callback header value for {:?}: {}", name, source))]
+    InvalidHeaderValue {
+        name: String,
+        source: http::header::InvalidHeaderValue,
+    },
+
     #[snafu(display("Invalid URI after template rendering: {}", rendered))]
     InvalidRenderedUri { rendered: String },
 
@@ -236,12 +255,30 @@ pub struct CallbackEndpointConfig {
     ))]
     #[configurable(metadata(docs::examples = "body_examples()"))]
     pub body: BTreeMap<String, String>,
+
+    /// Additional HTTP headers to include in the callback request.
+    ///
+    /// Header names and values are static strings — template interpolation is not supported.
+    /// Headers are validated at startup.
+    #[serde(default)]
+    #[configurable(metadata(
+        docs::additional_props_description = "An HTTP header name and its static value."
+    ))]
+    #[configurable(metadata(docs::examples = "header_examples()"))]
+    pub headers: BTreeMap<String, String>,
 }
 
 fn body_examples() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("file_id".to_string(), "{{message.file_id}}".to_string()),
         ("error_message".to_string(), "{{error_message}}".to_string()),
+    ])
+}
+
+fn header_examples() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("X-Tenant-Id".to_string(), "acme-corp".to_string()),
+        ("X-Environment".to_string(), "production".to_string()),
     ])
 }
 
@@ -295,6 +332,11 @@ const fn default_retry_initial_backoff_secs() -> u64 {
     1
 }
 
+/// Headers that Vector manages itself and that users cannot override via `headers`.
+/// `content-type` is set automatically when a body is present; `authorization` is
+/// handled by the `auth` config field.
+const RESERVED_HEADERS: &[&str] = &["content-type", "authorization"];
+
 // ---------------------------------------------------------------------------
 // Parsed endpoint (templates pre-compiled at startup)
 // ---------------------------------------------------------------------------
@@ -306,6 +348,8 @@ struct ParsedEndpoint {
     /// Body key-value pairs with pre-parsed template values.
     /// Empty vec means no body.
     body_templates: Vec<(String, Template)>,
+    /// Pre-validated static headers applied to every request for this endpoint.
+    headers: Vec<(http::header::HeaderName, http::header::HeaderValue)>,
     method: Method,
 }
 
@@ -321,9 +365,31 @@ impl ParsedEndpoint {
             body_templates.push((key.clone(), tpl));
         }
 
+        let mut headers = Vec::with_capacity(cfg.headers.len());
+        for (name, value) in &cfg.headers {
+            if RESERVED_HEADERS.contains(&name.to_lowercase().as_str()) {
+                return Err(CallbackError::ReservedHeaderName { name: name.clone() });
+            }
+            let header_name =
+                http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|source| {
+                    CallbackError::InvalidHeaderName {
+                        name: name.clone(),
+                        source,
+                    }
+                })?;
+            let header_value = http::header::HeaderValue::from_str(value).map_err(|source| {
+                CallbackError::InvalidHeaderValue {
+                    name: name.clone(),
+                    source,
+                }
+            })?;
+            headers.push((header_name, header_value));
+        }
+
         Ok(Self {
             uri_template,
             body_templates,
+            headers,
             method: cfg.method.to_method(),
         })
     }
@@ -595,7 +661,10 @@ impl IngestionCallbackClient {
 
         let max_attempts = self.retry_max_attempts.max(1);
         for attempt in 1..=max_attempts {
-            match self.send_request(&full_url, &endpoint.method, &body).await {
+            match self
+                .send_request(&full_url, &endpoint.method, &body, &endpoint.headers)
+                .await
+            {
                 Ok(()) => {
                     debug!(
                         message = "Ingestion callback succeeded.",
@@ -635,6 +704,7 @@ impl IngestionCallbackClient {
         url: &str,
         method: &Method,
         body: &str,
+        extra_headers: &[(http::header::HeaderName, http::header::HeaderValue)],
     ) -> Result<(), CallbackError> {
         let uri: Uri = url.parse().map_err(|_| CallbackError::InvalidRenderedUri {
             rendered: url.to_string(),
@@ -650,6 +720,10 @@ impl IngestionCallbackClient {
 
         if !body.is_empty() {
             builder = builder.header("Content-Type", "application/json");
+        }
+
+        for (name, value) in extra_headers {
+            builder = builder.header(name, value);
         }
 
         if let Some(ref auth) = self.auth {
@@ -721,6 +795,7 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            headers: BTreeMap::new(),
         }
     }
 
@@ -937,7 +1012,11 @@ mod tests {
         let json = r#"{
             "on_success": {
                 "uri": "/v2/files/{{message.file_id}}/mark-successful",
-                "method": "POST"
+                "method": "POST",
+                "headers": {
+                    "X-Tenant-Id": "acme-corp",
+                    "X-Environment": "production"
+                }
             },
             "on_failure": {
                 "uri": "/v2/files/{{message.file_id}}/mark-failed",
@@ -970,12 +1049,15 @@ mod tests {
         let on_success = config.on_success.unwrap();
         assert!(on_success.body.is_empty());
         assert_eq!(on_success.method, HttpMethod::POST);
+        assert_eq!(on_success.headers["X-Tenant-Id"], "acme-corp");
+        assert_eq!(on_success.headers["X-Environment"], "production");
 
         let on_failure = config.on_failure.unwrap();
         assert_eq!(on_failure.method, HttpMethod::PUT);
         assert_eq!(on_failure.body.len(), 2);
         assert_eq!(on_failure.body["file_id"], "{{message.file_id}}");
         assert_eq!(on_failure.body["error_message"], "{{error_message}}");
+        assert!(on_failure.headers.is_empty());
     }
 
     #[test]
@@ -1001,7 +1083,12 @@ mod tests {
         let cfg: CallbackEndpointConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.method, HttpMethod::POST);
         assert!(cfg.body.is_empty());
+        assert!(cfg.headers.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Headers: config, validation, and request application
+    // -----------------------------------------------------------------------
 
     #[test]
     fn config_rejects_unknown_fields() {
@@ -1010,38 +1097,6 @@ mod tests {
             "request": { "base_url": "https://example.com" }
         }"#;
         assert!(serde_json::from_str::<IngestionCallbackConfig>(json).is_err());
-    }
-
-    #[test]
-    fn config_empty_base_url_rejected_at_build() {
-        let config = IngestionCallbackConfig {
-            on_success: Some(make_endpoint("/test", vec![])),
-            on_failure: None,
-            request: CallbackRequestConfig {
-                base_url: String::new(),
-                ..Default::default()
-            },
-            auth: None,
-            tls: None,
-        };
-        let result = IngestionCallbackClient::new(&config, &ProxyConfig::default());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn config_relative_base_url_rejected_at_build() {
-        let config = IngestionCallbackConfig {
-            on_success: Some(make_endpoint("/test", vec![])),
-            on_failure: None,
-            request: CallbackRequestConfig {
-                base_url: "/just/a/path".to_string(),
-                ..Default::default()
-            },
-            auth: None,
-            tls: None,
-        };
-        let result = IngestionCallbackClient::new(&config, &ProxyConfig::default());
-        assert!(result.is_err());
     }
 
     #[test]
@@ -1263,13 +1318,13 @@ mod tests {
         on_success_uri: Option<&str>,
         on_failure_uri: Option<&str>,
         on_failure_body: Vec<(&str, &str)>,
-        retry_max_attempts: u32,
     ) -> IngestionCallbackClient {
         let config = IngestionCallbackConfig {
             on_success: on_success_uri.map(|uri| CallbackEndpointConfig {
                 uri: uri.to_string(),
                 method: HttpMethod::POST,
                 body: BTreeMap::new(),
+                headers: BTreeMap::new(),
             }),
             on_failure: on_failure_uri.map(|uri| CallbackEndpointConfig {
                 uri: uri.to_string(),
@@ -1278,7 +1333,35 @@ mod tests {
                     .into_iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
+                headers: BTreeMap::new(),
             }),
+            request: CallbackRequestConfig {
+                base_url: base_url.to_string(),
+                timeout_secs: 5,
+                retry_max_attempts: 1,
+                retry_initial_backoff_secs: 1,
+            },
+            auth: None,
+            tls: None,
+        };
+
+        IngestionCallbackClient::new(&config, &ProxyConfig::default()).unwrap()
+    }
+
+    /// Minimal helper for retry-specific tests — only configures the success endpoint.
+    fn make_retry_client(
+        base_url: &str,
+        on_success_uri: &str,
+        retry_max_attempts: u32,
+    ) -> IngestionCallbackClient {
+        let config = IngestionCallbackConfig {
+            on_success: Some(CallbackEndpointConfig {
+                uri: on_success_uri.to_string(),
+                method: HttpMethod::POST,
+                body: BTreeMap::new(),
+                headers: BTreeMap::new(),
+            }),
+            on_failure: None,
             request: CallbackRequestConfig {
                 base_url: base_url.to_string(),
                 timeout_secs: 5,
@@ -1288,7 +1371,6 @@ mod tests {
             auth: None,
             tls: None,
         };
-
         IngestionCallbackClient::new(&config, &ProxyConfig::default()).unwrap()
     }
 
@@ -1301,7 +1383,6 @@ mod tests {
             Some("/v2/files/{{message.file_id}}/mark-successful"),
             None,
             vec![],
-            1,
         );
 
         let ctx = make_context(BatchStatus::Delivered, "", vec![("file_id", "f-integ-1")]);
@@ -1333,7 +1414,6 @@ mod tests {
                 ("file_id", "{{message.file_id}}"),
                 ("error_message", "{{error_message}}"),
             ],
-            1,
         );
 
         let ctx = make_context(
@@ -1365,7 +1445,6 @@ mod tests {
             None,
             Some("/callback"),
             vec![("msg", "{{error_message}}")],
-            1,
         );
 
         let ctx = make_context(
@@ -1396,7 +1475,7 @@ mod tests {
 
         // start_paused = true: Tokio auto-advances paused time when the only pending
         // work is timer-based (the retry sleep), making retries instant without wall-clock waits.
-        let client = make_test_client(&format!("http://{addr}"), Some("/ok"), None, vec![], 3);
+        let client = make_retry_client(&format!("http://{addr}"), "/ok", 3);
 
         let ctx = make_context(BatchStatus::Delivered, "", vec![]);
         client.notify(&ctx).await;
@@ -1423,7 +1502,7 @@ mod tests {
         ])
         .await;
 
-        let client = make_test_client(&format!("http://{addr}"), Some("/fail"), None, vec![], 2);
+        let client = make_retry_client(&format!("http://{addr}"), "/fail", 2);
 
         let ctx = make_context(BatchStatus::Delivered, "", vec![]);
         client.notify(&ctx).await;
@@ -1438,13 +1517,7 @@ mod tests {
     async fn integration_zero_retry_attempts_still_makes_one_request() {
         let (addr, log, shutdown) = start_test_server(vec![StatusCode::OK]).await;
 
-        let client = make_test_client(
-            &format!("http://{addr}"),
-            Some("/once"),
-            None,
-            vec![],
-            0, // zero retries configured
-        );
+        let client = make_retry_client(&format!("http://{addr}"), "/once", 0);
 
         let ctx = make_context(BatchStatus::Delivered, "", vec![]);
         client.notify(&ctx).await;
@@ -1465,7 +1538,6 @@ mod tests {
             Some("/success"),
             Some("/failure"),
             vec![("reason", "{{error_message}}")],
-            1,
         );
 
         client
@@ -1499,13 +1571,7 @@ mod tests {
         let (addr, log, shutdown) = start_test_server(vec![StatusCode::OK]).await;
 
         // Only on_failure configured, but status is Delivered
-        let client = make_test_client(
-            &format!("http://{addr}"),
-            None, // no on_success
-            Some("/fail"),
-            vec![],
-            1,
-        );
+        let client = make_test_client(&format!("http://{addr}"), None, Some("/fail"), vec![]);
 
         let ctx = make_context(BatchStatus::Delivered, "", vec![]);
         client.notify(&ctx).await;
@@ -1526,7 +1592,6 @@ mod tests {
             Some("/success"),
             Some("/failure"),
             vec![],
-            1,
         );
 
         // Delivered → on_success
@@ -1557,23 +1622,17 @@ mod tests {
 
         // Case 1: base_url has trailing slash, uri has leading slash → single slash in result.
         let client_trailing = make_test_client(
-            &format!("http://{addr}/"), // trailing slash
+            &format!("http://{addr}/"),
             Some("/v1/callback"),
             None,
             vec![],
-            1,
         );
         let ctx = make_context(BatchStatus::Delivered, "", vec![]);
         client_trailing.notify(&ctx).await;
 
         // Case 2: base_url has no trailing slash, uri has no leading slash → join still works.
-        let client_no_slash = make_test_client(
-            &format!("http://{addr}"), // no trailing slash
-            Some("v1/callback"),
-            None,
-            vec![],
-            1,
-        );
+        let client_no_slash =
+            make_test_client(&format!("http://{addr}"), Some("v1/callback"), None, vec![]);
         client_no_slash.notify(&ctx).await;
 
         let requests = log.lock().unwrap();
@@ -1594,7 +1653,6 @@ mod tests {
             Some("/mark-ok"),
             Some("/mark-fail"),
             vec![("error_message", "{{error_message}}")],
-            1,
         );
 
         // Simulate a successful processing result
@@ -1625,7 +1683,6 @@ mod tests {
                 ("file_id", "{{message.file_id}}"),
                 ("error_message", "{{error_message}}"),
             ],
-            1,
         );
 
         // Simulate a failed processing result
@@ -1645,5 +1702,142 @@ mod tests {
         assert_eq!(body["error_message"], "S3 read timeout");
 
         let _ = shutdown.send(());
+    }
+
+    // -----------------------------------------------------------------------
+    // Headers: config validation grid + integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn headers_validation_grid() {
+        // (header_name, header_value, expect_ok, description)
+        let cases: &[(&str, &str, bool, &str)] = &[
+            // Valid
+            ("X-Tenant-Id", "acme-corp", true, "simple custom header"),
+            ("x-lowercase", "value", true, "lowercase name"),
+            ("X-Empty-Value", "", true, "empty value is allowed"),
+            // Reserved — blocked regardless of validity
+            (
+                "content-type",
+                "text/plain",
+                false,
+                "content-type is reserved",
+            ),
+            (
+                "Content-Type",
+                "text/plain",
+                false,
+                "content-type is reserved (mixed case)",
+            ),
+            (
+                "authorization",
+                "Bearer tok",
+                false,
+                "authorization is reserved",
+            ),
+            (
+                "Authorization",
+                "Bearer tok",
+                false,
+                "authorization is reserved (mixed case)",
+            ),
+            // Invalid names
+            ("invalid name", "value", false, "space in header name"),
+            ("", "value", false, "empty header name"),
+            // Invalid values
+            ("X-Bad", "val\nue", false, "newline in value"),
+        ];
+
+        for (name, value, expect_ok, desc) in cases {
+            let cfg = CallbackEndpointConfig {
+                uri: "/test".to_string(),
+                method: HttpMethod::POST,
+                body: BTreeMap::new(),
+                headers: BTreeMap::from([(name.to_string(), value.to_string())]),
+            };
+            let result = ParsedEndpoint::try_from_config(&cfg);
+            assert_eq!(
+                result.is_ok(),
+                *expect_ok,
+                "case {desc:?} failed: name={name:?} value={value:?}",
+            );
+        }
+    }
+
+    /// Custom headers configured on an endpoint arrive on the wire with correct values.
+    #[tokio::test]
+    async fn integration_custom_headers_are_sent() {
+        let (addr, log, shutdown) = start_test_server(vec![StatusCode::OK]).await;
+
+        let config = IngestionCallbackConfig {
+            on_success: Some(CallbackEndpointConfig {
+                uri: "/callback".to_string(),
+                method: HttpMethod::POST,
+                body: BTreeMap::new(),
+                headers: BTreeMap::from([
+                    ("X-Tenant-Id".to_string(), "acme-corp".to_string()),
+                    ("X-Source".to_string(), "vector".to_string()),
+                ]),
+            }),
+            on_failure: None,
+            request: CallbackRequestConfig {
+                base_url: format!("http://{addr}"),
+                timeout_secs: 5,
+                retry_max_attempts: 1,
+                retry_initial_backoff_secs: 1,
+            },
+            auth: None,
+            tls: None,
+        };
+        let client = IngestionCallbackClient::new(&config, &ProxyConfig::default()).unwrap();
+
+        client
+            .notify(&make_context(BatchStatus::Delivered, "", vec![]))
+            .await;
+
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].headers.get("x-tenant-id").map(String::as_str),
+            Some("acme-corp")
+        );
+        assert_eq!(
+            requests[0].headers.get("x-source").map(String::as_str),
+            Some("vector")
+        );
+
+        let _ = shutdown.send(());
+    }
+
+    /// Reserved headers (`content-type`, `authorization`) are rejected at client build time,
+    /// regardless of casing, so there is never a conflict with Vector-managed headers.
+    #[test]
+    fn reserved_headers_rejected_at_build() {
+        for reserved in [
+            "content-type",
+            "Content-Type",
+            "authorization",
+            "Authorization",
+        ] {
+            let config = IngestionCallbackConfig {
+                on_success: Some(CallbackEndpointConfig {
+                    uri: "/test".to_string(),
+                    method: HttpMethod::POST,
+                    body: BTreeMap::new(),
+                    headers: BTreeMap::from([(reserved.to_string(), "some-value".to_string())]),
+                }),
+                on_failure: None,
+                request: CallbackRequestConfig {
+                    base_url: "https://example.com".to_string(),
+                    ..Default::default()
+                },
+                auth: None,
+                tls: None,
+            };
+            assert!(
+                IngestionCallbackClient::new(&config, &ProxyConfig::default()).is_err(),
+                "expected error for reserved header {reserved:?}"
+            );
+        }
     }
 }

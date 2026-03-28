@@ -106,3 +106,4 @@ This lists custom changes merged in Databricks fork of Vector.
 105. Add optional `host_key` metadata field to `kubernetes_logs` source to attach hostname to each event https://github.com/databricks-eng/vector/pull/453
 106. Make `line_delimiter` configurable in the `kubernetes_logs` source to match file source behavior https://github.com/databricks-eng/vector/pull/454
 107. Add encoding/charset transcoding support to kubernetes_logs source, allowing non-UTF-8 log files to be transcoded to UTF-8 on ingestion https://github.com/databricks-eng/vector/pull/455
+108. Add static custom HTTP header support to ingestion callback endpoints (`CallbackEndpointConfig`), with startup validation and reserved-header protection for `content-type` and `authorization` https://github.com/databricks-eng/vector/pull/450

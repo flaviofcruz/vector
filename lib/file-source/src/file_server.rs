@@ -337,10 +337,11 @@ where
                 let start = time::Instant::now();
                 let mut bytes_read: usize = 0;
                 let mut lines_read: usize = 0;
-                while !is_done && let Ok(RawLineResult {
-                    raw_line: Some(line),
-                    discarded_for_size_and_truncated,
-                }) = watcher.read_line().await
+                while !is_done
+                    && let Ok(RawLineResult {
+                        raw_line: Some(line),
+                        discarded_for_size_and_truncated,
+                    }) = watcher.read_line().await
                 {
                     discarded_for_size_and_truncated.iter().for_each(|buf| {
                         self.emitter.emit_file_line_too_long(
