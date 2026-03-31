@@ -226,6 +226,14 @@ pub struct AsyncInsertSettingsConfig {
     pub max_query_number: Option<u64>,
 }
 
+/// Maximum retries for headless mode regardless of the global `request.retry_attempts` setting.
+///
+/// In headless mode each retry may be routed to a different pod IP; with many pods and the
+/// default Fibonacci back-off the cumulative wait before reaching the fallback endpoint can
+/// exceed two minutes. Capping at 4 keeps the fall-through to the ClusterIP fallback fast.
+/// Users can lower this further via `request.retry_attempts`.
+const DEFAULT_HEADLESS_MAX_RETRIES: usize = 4;
+
 /// Common parameters needed to build the ClickHouse sink.
 struct ClickhouseBuildParams {
     client: HttpClient,
@@ -373,8 +381,15 @@ impl ClickhouseConfig {
     /// dynamically resolved pod IPs.
     async fn build_headless(
         &self,
-        params: ClickhouseBuildParams,
+        mut params: ClickhouseBuildParams,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
+        // Cap retries so we fall through to the ClusterIP fallback quickly. Without this,
+        // Fibonacci back-off across N pod IPs can take >2 min before active_count hits 0.
+        params.request_limits.retry_attempts = params
+            .request_limits
+            .retry_attempts
+            .min(DEFAULT_HEADLESS_MAX_RETRIES);
+
         let fallback_uri = self
             .fallback_endpoint
             .as_ref()

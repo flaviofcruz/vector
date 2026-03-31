@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use http::Uri;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower::balance::p2c::Balance;
@@ -69,7 +69,6 @@ pub(super) struct EndpointServiceConfig {
 struct SharedDiscoveryState {
     known_ips: Mutex<HashSet<IpAddr>>,
     active_count: AtomicUsize,
-    refresh_notify: Notify,
 }
 
 /// Wraps an `HttpService` with load tracking and error-based endpoint removal.
@@ -140,25 +139,24 @@ impl Drop for RequestGuard {
 }
 
 /// Removes an endpoint IP from the active set and notifies Balance via the
-/// discover channel. Triggers an immediate DNS refresh if this was the last
-/// active endpoint.
+/// discover channel.
+///
+/// When `active_count` reaches zero, `HeadlessService::poll_ready` routes all
+/// subsequent requests to the fallback ClusterIP service until the next
+/// scheduled DNS refresh re-adds healthy pods.
 fn remove_endpoint(
     shared: &Arc<SharedDiscoveryState>,
     discover_tx: &mpsc::UnboundedSender<DiscoverEvent>,
     ip: IpAddr,
     reason: &str,
 ) {
-    let trigger_refresh = {
+    {
         let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
-        let removed = known.remove(&ip);
-        if removed {
-            let prev = shared.active_count.fetch_sub(1, Ordering::Relaxed);
+        if known.remove(&ip) {
+            shared.active_count.fetch_sub(1, Ordering::Relaxed);
             let _ = discover_tx.send(Ok(Change::Remove(ip)));
-            prev == 1 // was the last endpoint
-        } else {
-            false
         }
-    };
+    }
 
     let active = shared.active_count.load(Ordering::Relaxed);
     emit!(ClickhouseHeadlessEndpointRemoved {
@@ -166,11 +164,6 @@ fn remove_endpoint(
         reason: reason.to_owned(),
         active_endpoints: active,
     });
-
-    if trigger_refresh {
-        warn!(message = "All ClickHouse endpoints failed, triggering immediate DNS refresh.");
-        shared.refresh_notify.notify_one();
-    }
 }
 
 impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
@@ -286,7 +279,6 @@ impl HeadlessService {
         let shared = Arc::new(SharedDiscoveryState {
             known_ips: Mutex::new(initial_ips.clone()),
             active_count: AtomicUsize::new(initial_ips.len()),
-            refresh_notify: Notify::new(),
         });
 
         // Build TrackedHttpService for each initial IP and send Insert events.
@@ -473,18 +465,13 @@ fn spawn_dns_refresh_task(
         interval.tick().await;
 
         loop {
-            let reason = tokio::select! {
-                _ = interval.tick() => "scheduled interval",
-                _ = shared.refresh_notify.notified() => {
-                    interval.reset();
-                    "all endpoints failed (immediate trigger)"
-                },
+            tokio::select! {
+                _ = interval.tick() => {},
                 _ = shutdown_rx.changed() => break,
-            };
+            }
 
             debug!(
                 message = "ClickHouse headless DNS refresh triggered.",
-                reason = reason,
                 active_endpoints = shared.active_count.load(Ordering::Relaxed),
             );
 
@@ -638,7 +625,6 @@ mod tests {
         let shared = Arc::new(SharedDiscoveryState {
             known_ips: Mutex::new(HashSet::new()),
             active_count: AtomicUsize::new(0),
-            refresh_notify: Notify::new(),
         });
 
         let uris: Vec<Uri> = vec![
@@ -683,7 +669,6 @@ mod tests {
         let shared = Arc::new(SharedDiscoveryState {
             known_ips: Mutex::new(initial_ips),
             active_count: AtomicUsize::new(3),
-            refresh_notify: Notify::new(),
         });
 
         // DNS now only returns 2 of the 3 original IPs.
@@ -726,7 +711,6 @@ mod tests {
         let shared = Arc::new(SharedDiscoveryState {
             known_ips: Mutex::new(initial_ips),
             active_count: AtomicUsize::new(2),
-            refresh_notify: Notify::new(),
         });
 
         // DNS returns the same IPs plus a new one.
