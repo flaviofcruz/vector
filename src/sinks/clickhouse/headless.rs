@@ -20,6 +20,7 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use http::Uri;
 use tokio::sync::{Notify, mpsc, watch};
+use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower::balance::p2c::Balance;
 use tower::buffer::Buffer;
@@ -31,11 +32,19 @@ use super::dns;
 use super::service::ClickhouseServiceRequestBuilder;
 use super::sink::PartitionKey;
 use crate::http::{Auth, HttpClient, HttpError};
+use crate::internal_events::{
+    ClickhouseHeadlessDnsRefreshed, ClickhouseHeadlessEndpointRemoved,
+    ClickhouseHeadlessFallbackRouted,
+};
 use crate::sinks::prelude::*;
 use crate::sinks::util::http::{HttpRequest, HttpResponse, HttpService};
 
 /// Default DNS refresh interval.
 const DEFAULT_DNS_REFRESH_SECS: u64 = 30;
+
+/// Fallback buffer bound used when concurrency is unlimited (adaptive mode).
+/// Sized to avoid becoming a bottleneck ahead of the P2C balancer.
+const DEFAULT_BUFFER_BOUND: usize = 1024;
 
 // --- Type aliases ---
 
@@ -139,12 +148,6 @@ fn remove_endpoint(
     ip: IpAddr,
     reason: &str,
 ) {
-    warn!(
-        message = "Removing failed ClickHouse endpoint.",
-        ip = %ip,
-        reason = %reason,
-    );
-
     let trigger_refresh = {
         let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
         let removed = known.remove(&ip);
@@ -156,6 +159,13 @@ fn remove_endpoint(
             false
         }
     };
+
+    let active = shared.active_count.load(Ordering::Relaxed);
+    emit!(ClickhouseHeadlessEndpointRemoved {
+        ip,
+        reason: reason.to_owned(),
+        active_endpoints: active,
+    });
 
     if trigger_refresh {
         warn!(message = "All ClickHouse endpoints failed, triggering immediate DNS refresh.");
@@ -258,6 +268,7 @@ impl HeadlessService {
         svc_config: EndpointServiceConfig,
         dns_refresh_interval_secs: Option<u64>,
         fallback_uri: Uri,
+        concurrency_limit: Option<usize>,
     ) -> crate::Result<Self> {
         let initial_uris = dns::resolve_endpoints(&endpoint).await?;
 
@@ -299,6 +310,11 @@ impl HeadlessService {
             endpoint = %endpoint,
             active_endpoints = initial_ips.len(),
         );
+        // Publish initial gauge so the active-endpoints metric is non-zero from startup.
+        emit!(ClickhouseHeadlessDnsRefreshed {
+            success: true,
+            active_endpoints: initial_ips.len(),
+        });
 
         let fallback = build_endpoint_service(&client, fallback_uri.clone(), &svc_config);
         info!(
@@ -308,7 +324,11 @@ impl HeadlessService {
 
         let discover_stream: DiscoverStream = Box::pin(UnboundedReceiverStream::new(discover_rx));
         let balance = Balance::new(discover_stream);
-        let buffer = Buffer::new(balance, 1);
+        // Use the configured concurrency as the buffer bound so the Buffer layer doesn't
+        // introduce additional backpressure on top of the outer concurrency limiter.
+        // When concurrency is unlimited (adaptive mode), DEFAULT_BUFFER_BOUND is used.
+        let buffer_bound = concurrency_limit.unwrap_or(DEFAULT_BUFFER_BOUND);
+        let buffer = Buffer::new(balance, buffer_bound);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let refresh_secs = dns_refresh_interval_secs.unwrap_or(DEFAULT_DNS_REFRESH_SECS);
@@ -352,10 +372,9 @@ impl tower::Service<HttpRequest<PartitionKey>> for HeadlessService {
 
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
         if self.using_fallback {
-            warn!(
-                message = "All headless endpoints unavailable, routing to fallback ClusterIP service.",
-                active_endpoints = self.shared.active_count.load(Ordering::Relaxed),
-            );
+            emit!(ClickhouseHeadlessFallbackRouted {
+                active_endpoints: self.shared.active_count.load(Ordering::Relaxed),
+            });
             self.fallback.call(request)
         } else {
             debug!(
@@ -447,6 +466,9 @@ fn spawn_dns_refresh_task(
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(refresh_interval);
+        // Skip missed ticks rather than bursting — if the task is delayed (e.g., during
+        // a ClickHouse outage), we don't want a flood of back-to-back DNS queries on recovery.
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // Skip the first tick which fires immediately.
         interval.tick().await;
 
@@ -474,6 +496,10 @@ fn spawn_dns_refresh_task(
                         endpoints = ?new_uris.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
                     );
                     reconcile_endpoints(&shared, &discover_tx, &client, &svc_config, &new_uris);
+                    emit!(ClickhouseHeadlessDnsRefreshed {
+                        success: true,
+                        active_endpoints: shared.active_count.load(Ordering::Relaxed),
+                    });
                 }
                 Err(e) => {
                     warn!(
@@ -481,6 +507,10 @@ fn spawn_dns_refresh_task(
                         error = %e,
                         active_endpoints = shared.active_count.load(Ordering::Relaxed),
                     );
+                    emit!(ClickhouseHeadlessDnsRefreshed {
+                        success: false,
+                        active_endpoints: shared.active_count.load(Ordering::Relaxed),
+                    });
                 }
             }
         }

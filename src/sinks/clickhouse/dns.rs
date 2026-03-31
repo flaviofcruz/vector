@@ -73,11 +73,13 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
 
 /// Extracts the IP address from a resolved URI's host component.
 ///
-/// `http::Uri::host()` delegates to `Authority::host()`, which already strips
-/// IPv6 brackets (e.g., returns `"::1"` for a `[::1]` authority), so the host
-/// string can be parsed directly into an `IpAddr`.
+/// Strips IPv6 brackets before parsing, since `http::Uri::host()` may return
+/// `"[::1]"` with brackets intact depending on the crate version.
 pub fn ip_from_uri(uri: &Uri) -> Option<IpAddr> {
-    uri.host().and_then(|h| h.parse().ok())
+    uri.host().and_then(|h| {
+        let h = h.trim_start_matches('[').trim_end_matches(']');
+        h.parse().ok()
+    })
 }
 
 #[cfg(test)]

@@ -157,11 +157,16 @@ pub struct ClickhouseConfig {
 
     /// Fallback endpoint used when all headless pod IPs are unreachable.
     ///
-    /// Required when `use_headless_service` is true. This should be a normal
-    /// ClusterIP Kubernetes service (not a headless service) that handles its
-    /// own routing. When all resolved pod IPs have been removed due to
-    /// connection errors, requests are routed to this fallback until the
-    /// headless DNS refresh re-discovers healthy pods.
+    /// Required when `use_headless_service` is true. Must point to a normal
+    /// ClusterIP Kubernetes service (not a headless service) so Kubernetes
+    /// handles routing internally. Activated when all resolved pod IPs have
+    /// been removed due to connection errors; traffic returns to P2C once
+    /// the headless DNS refresh re-discovers healthy pods.
+    ///
+    /// Can be HTTP or HTTPS. If HTTPS, the `tls` block must also be configured
+    /// with the appropriate CA certificate — the same `HttpClient` is shared
+    /// between the headless pod connections and this fallback. Without a `tls`
+    /// block, HTTPS will fail for self-signed or custom-CA certificates.
     #[configurable(metadata(
         docs::examples = "http://cluster-service-write.logging-clickhouse.svc.cluster.local:8123"
     ))]
@@ -254,33 +259,7 @@ impl SinkConfig for ClickhouseConfig {
         });
 
         if self.use_headless_service {
-            if self.fallback_endpoint.is_none() {
-                return Err(
-                    "'fallback_endpoint' is required when 'use_headless_service' is true".into(),
-                );
-            }
-            if endpoint.scheme_str() == Some("https") {
-                return Err(
-                    "HTTPS is not supported with 'use_headless_service'. Headless DNS resolution \
-                     replaces the hostname with pod IPs, which breaks TLS certificate hostname \
-                     verification. Use HTTP for pod-to-pod traffic instead."
-                        .into(),
-                );
-            }
-            if self.dns_refresh_interval_secs == Some(0) {
-                return Err("'dns_refresh_interval_secs' must be greater than 0".into());
-            }
-            if self
-                .fallback_endpoint
-                .as_ref()
-                .is_some_and(|fe| fe.uri.scheme_str() == Some("https"))
-            {
-                return Err(
-                    "HTTPS is not supported for 'fallback_endpoint' when 'use_headless_service' \
-                     is enabled. Use HTTP for pod-to-pod traffic instead."
-                        .into(),
-                );
-            }
+            self.validate_headless_config(&endpoint)?;
         } else if self.dns_refresh_interval_secs.is_some() {
             warn!(
                 message = "'dns_refresh_interval_secs' is set but 'use_headless_service' is false; this setting will be ignored.",
@@ -334,6 +313,43 @@ impl SinkConfig for ClickhouseConfig {
 }
 
 impl ClickhouseConfig {
+    /// Validates configuration fields that are only relevant when `use_headless_service` is true.
+    fn validate_headless_config(&self, endpoint: &Uri) -> crate::Result<()> {
+        if self.fallback_endpoint.is_none() {
+            return Err(
+                "'fallback_endpoint' is required when 'use_headless_service' is true".into(),
+            );
+        }
+        if endpoint.scheme_str() == Some("https") {
+            return Err(
+                "HTTPS is not supported with 'use_headless_service'. Headless DNS resolution \
+                 replaces the hostname with pod IPs, which breaks TLS certificate hostname \
+                 verification. Use HTTP for pod-to-pod traffic instead."
+                    .into(),
+            );
+        }
+        if self.dns_refresh_interval_secs == Some(0) {
+            return Err("'dns_refresh_interval_secs' must be greater than 0".into());
+        }
+        // HTTPS fallback is valid when the 'tls' block is also configured (the shared
+        // HttpClient will then have the CA cert needed to verify the ClusterIP service's
+        // certificate). Without a 'tls' block the client uses default system roots, which
+        // will fail for self-signed/custom-CA ClickHouse certs.
+        if self
+            .fallback_endpoint
+            .as_ref()
+            .is_some_and(|fe| fe.uri.scheme_str() == Some("https"))
+            && self.tls.is_none()
+        {
+            warn!(
+                message = "'fallback_endpoint' uses HTTPS but no 'tls' block is configured. \
+                           Certificate verification will likely fail for self-signed or \
+                           custom-CA ClickHouse certificates. Add a 'tls.ca_file' to resolve this.",
+            );
+        }
+        Ok(())
+    }
+
     /// Builds the direct single-endpoint sink (default behavior, no headless routing).
     fn build_direct(
         &self,
@@ -372,6 +388,7 @@ impl ClickhouseConfig {
             params.svc_config.clone(),
             self.dns_refresh_interval_secs,
             fallback_uri,
+            params.request_limits.concurrency,
         )
         .await?;
 
