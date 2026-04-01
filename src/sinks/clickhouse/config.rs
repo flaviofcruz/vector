@@ -145,7 +145,9 @@ pub struct ClickhouseConfig {
     /// load-balanced across all resolved endpoints using the Power of Two
     /// Choices (P2C) algorithm. Failed endpoints are automatically removed
     /// and re-discovered on the next DNS refresh.
-    /// When headless mode is enabled, communication to ClickHouse pod IPs happens over HTTP.
+    /// HTTPS is supported: set `tls.ca_file` and `tls.verify_hostname: false` since pod
+    /// IPs are used directly. Note that TLS SNI is not sent for IP connections (RFC 6066),
+    /// so ClickHouse must serve its certificate without relying on SNI-based selection.
     #[serde(default)]
     pub use_headless_service: bool,
 
@@ -329,30 +331,50 @@ impl ClickhouseConfig {
             );
         }
         if endpoint.scheme_str() == Some("https") {
-            return Err(
-                "HTTPS is not supported with 'use_headless_service'. Headless DNS resolution \
-                 replaces the hostname with pod IPs, which breaks TLS certificate hostname \
-                 verification. Use HTTP for pod-to-pod traffic instead."
-                    .into(),
-            );
+            let tls = self.tls.as_ref().ok_or(
+                "HTTPS headless endpoint requires a 'tls' block with 'ca_file' set. \
+                 Pod IPs are used directly, so the CA certificate must be provided \
+                 for certificate verification.",
+            )?;
+            if tls.ca_file.is_none() {
+                return Err(
+                    "HTTPS headless endpoint requires 'tls.ca_file' to be set. \
+                     Pod IPs are used directly, so the CA certificate must be provided \
+                     for certificate verification."
+                        .into(),
+                );
+            }
+            // Pod IPs never match the service hostname in the cert CN/SAN, so hostname
+            // verification must be disabled. The CA cert still validates the chain.
+            // Note: TLS SNI is not sent for IP-based connections (RFC 6066); ClickHouse
+            // must serve a certificate without relying on SNI-based selection.
+            if tls.verify_hostname != Some(false) {
+                return Err(
+                    "HTTPS headless endpoint requires 'tls.verify_hostname: false'. \
+                     Pod IPs are used directly so hostname verification will always fail \
+                     against the service-hostname certificate. CA verification still applies."
+                        .into(),
+                );
+            }
         }
         if self.dns_refresh_interval_secs == Some(0) {
             return Err("'dns_refresh_interval_secs' must be greater than 0".into());
         }
-        // HTTPS fallback is valid when the 'tls' block is also configured (the shared
-        // HttpClient will then have the CA cert needed to verify the ClusterIP service's
-        // certificate). Without a 'tls' block the client uses default system roots, which
-        // will fail for self-signed/custom-CA ClickHouse certs.
+        // Both the headless endpoint and the fallback share the same HttpClient, so a
+        // 'tls' block with 'ca_file' is sufficient for both. Error (not warn) here for
+        // consistency: a misconfigured fallback is discovered at startup, not at the
+        // worst possible moment (when all pods are already unhealthy).
         if self
             .fallback_endpoint
             .as_ref()
             .is_some_and(|fe| fe.uri.scheme_str() == Some("https"))
-            && self.tls.is_none()
+            && self.tls.as_ref().and_then(|t| t.ca_file.as_ref()).is_none()
         {
-            warn!(
-                message = "'fallback_endpoint' uses HTTPS but no 'tls' block is configured. \
-                           Certificate verification will likely fail for self-signed or \
-                           custom-CA ClickHouse certificates. Add a 'tls.ca_file' to resolve this.",
+            return Err(
+                "'fallback_endpoint' uses HTTPS but 'tls.ca_file' is not configured. \
+                 Certificate verification will fail for self-signed or custom-CA ClickHouse \
+                 certificates. Add 'tls.ca_file' pointing to the CA certificate."
+                    .into(),
             );
         }
         Ok(())
