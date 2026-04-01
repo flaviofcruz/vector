@@ -30,6 +30,7 @@ mod message_decoding;
 pub mod multiline_config;
 #[cfg(any(feature = "sources-utils-net-tcp", feature = "sources-utils-net-udp"))]
 pub mod net;
+pub mod object_storage_compression;
 #[cfg(all(
     unix,
     any(feature = "sources-socket", feature = "sources-utils-net-unix",)
