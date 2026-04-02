@@ -229,9 +229,9 @@ pub struct AsyncInsertSettingsConfig {
 ///
 /// In headless mode each retry may be routed to a different pod IP; with many pods and the
 /// default Fibonacci back-off the cumulative wait before reaching the fallback endpoint can
-/// exceed two minutes. Capping at 4 keeps the fall-through to the ClusterIP fallback fast.
+/// exceed two minutes. Capping at 3 keeps the fall-through to the ClusterIP fallback fast.
 /// Users can lower this further via `request.retry_attempts`.
-const DEFAULT_HEADLESS_MAX_RETRIES: usize = 4;
+const DEFAULT_HEADLESS_MAX_RETRIES: usize = 3;
 
 /// Common parameters needed to build the ClickHouse sink.
 struct ClickhouseBuildParams {
@@ -377,11 +377,14 @@ impl ClickhouseConfig {
             params.endpoint.clone(),
             params.svc_config.clone(),
             self.dns_refresh_interval_secs,
-            fallback_uri,
+            fallback_uri.clone(),
             params.request_limits.concurrency,
         )
         .await?;
 
+        // Healthcheck should target the stable ClusterIP, not the headless DNS name.
+        // The headless name resolves to individual pod IPs which may come and go.
+        params.endpoint = fallback_uri;
         self.build_sink_and_healthcheck(params, headless)
     }
 

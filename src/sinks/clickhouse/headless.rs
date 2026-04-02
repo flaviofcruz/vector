@@ -150,20 +150,18 @@ fn remove_endpoint(
     ip: IpAddr,
     reason: &str,
 ) {
-    {
-        let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
-        if known.remove(&ip) {
-            shared.active_count.fetch_sub(1, Ordering::Relaxed);
-            let _ = discover_tx.send(Ok(Change::Remove(ip)));
-        }
+    let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
+    if known.remove(&ip) {
+        shared.active_count.fetch_sub(1, Ordering::Relaxed);
+        let _ = discover_tx.send(Ok(Change::Remove(ip)));
+        let active = shared.active_count.load(Ordering::Relaxed);
+        drop(known);
+        emit!(ClickhouseHeadlessEndpointRemoved {
+            ip,
+            reason: reason.to_owned(),
+            active_endpoints: active,
+        });
     }
-
-    let active = shared.active_count.load(Ordering::Relaxed);
-    emit!(ClickhouseHeadlessEndpointRemoved {
-        ip,
-        reason: reason.to_owned(),
-        active_endpoints: active,
-    });
 }
 
 impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
