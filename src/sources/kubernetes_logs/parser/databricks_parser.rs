@@ -276,7 +276,9 @@ pub mod tests {
 
         let log = events[0].as_log();
         // The timestamp field should still be the original ingest timestamp, not Utc::now().
-        let ts = log.get(event_path!("timestamp")).expect("timestamp should exist");
+        let ts = log
+            .get(event_path!("timestamp"))
+            .expect("timestamp should exist");
         match ts {
             Value::Timestamp(t) => {
                 assert_eq!(

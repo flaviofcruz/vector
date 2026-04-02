@@ -1106,19 +1106,21 @@ impl Source {
         let checkpoints = checkpointer.view();
         let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
         let mut encoding_decoder = encoding_charset.map(Decoder::new);
-        let events = file_source_rx.flat_map(futures::stream::iter).map(move |mut line| {
-            let byte_size = line.text.len();
-            bytes_received.emit(ByteSize(byte_size));
+        let events = file_source_rx
+            .flat_map(futures::stream::iter)
+            .map(move |mut line| {
+                let byte_size = line.text.len();
+                bytes_received.emit(ByteSize(byte_size));
 
-            // Transcode each line from the file's encoding charset to UTF-8.
-            // This must happen before multiline aggregation so that regex
-            // patterns in the multiline config can match UTF-8 text.
-            line.text = match encoding_decoder.as_mut() {
-                Some(d) => d.decode_to_utf8(line.text),
-                None => line.text,
-            };
-            line
-        });
+                // Transcode each line from the file's encoding charset to UTF-8.
+                // This must happen before multiline aggregation so that regex
+                // patterns in the multiline config can match UTF-8 text.
+                line.text = match encoding_decoder.as_mut() {
+                    Some(d) => d.decode_to_utf8(line.text),
+                    None => line.text,
+                };
+                line
+            });
         let multiline_config = multiline.clone();
         let messages: Box<dyn Stream<Item = Line> + Send + std::marker::Unpin> =
             if let Some(ref multiline_config) = multiline_config {
@@ -1959,7 +1961,10 @@ mod tests {
     fn test_config_host_key_empty_string_suppresses() {
         let config: Config = toml::from_str(r#"host_key = """#).unwrap();
         let opt = config.host_key.expect("host_key should be Some");
-        assert!(opt.path.is_none(), "empty string should parse to path = None");
+        assert!(
+            opt.path.is_none(),
+            "empty string should parse to path = None"
+        );
     }
 
     #[test]
@@ -2004,10 +2009,7 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml_config).unwrap();
         assert!(config.encoding.is_some());
-        assert_eq!(
-            config.encoding.unwrap().charset,
-            encoding_rs::UTF_16LE
-        );
+        assert_eq!(config.encoding.unwrap().charset, encoding_rs::UTF_16LE);
 
         let default_toml = "";
         let default_config: Config = toml::from_str(default_toml).unwrap();
