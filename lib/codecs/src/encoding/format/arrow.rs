@@ -8,11 +8,12 @@ use arrow::{
     array::{
         ArrayRef, BinaryBuilder, BooleanBuilder, Decimal128Builder, Decimal256Builder,
         Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder,
-        LargeBinaryBuilder, LargeStringBuilder, StringBuilder, TimestampMicrosecondBuilder,
-        TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
-        UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+        LargeBinaryBuilder, LargeStringBuilder, ListArray, MapArray, StringBuilder, StructArray,
+        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+        TimestampSecondBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
     },
-    datatypes::{DataType, Schema, TimeUnit, i256},
+    buffer::{NullBuffer, OffsetBuffer, ScalarBuffer},
+    datatypes::{DataType, Field, Fields, Schema, TimeUnit, i256},
     ipc::writer::StreamWriter,
     record_batch::RecordBatch,
 };
@@ -284,46 +285,10 @@ pub fn build_record_batch(
     schema: Arc<Schema>,
     events: &[Event],
 ) -> Result<RecordBatch, ArrowEncodingError> {
-    let num_fields = schema.fields().len();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_fields);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
-        let field_name = field.name();
-        let nullable = field.is_nullable();
-        let array: ArrayRef = match field.data_type() {
-            DataType::Timestamp(time_unit, _) => {
-                build_timestamp_array(events, field_name, *time_unit, nullable)?
-            }
-            DataType::Utf8 => build_string_array(events, field_name, nullable)?,
-            DataType::LargeUtf8 => build_large_string_array(events, field_name, nullable)?,
-            DataType::Int8 => build_int8_array(events, field_name, nullable)?,
-            DataType::Int16 => build_int16_array(events, field_name, nullable)?,
-            DataType::Int32 => build_int32_array(events, field_name, nullable)?,
-            DataType::Int64 => build_int64_array(events, field_name, nullable)?,
-            DataType::UInt8 => build_uint8_array(events, field_name, nullable)?,
-            DataType::UInt16 => build_uint16_array(events, field_name, nullable)?,
-            DataType::UInt32 => build_uint32_array(events, field_name, nullable)?,
-            DataType::UInt64 => build_uint64_array(events, field_name, nullable)?,
-            DataType::Float32 => build_float32_array(events, field_name, nullable)?,
-            DataType::Float64 => build_float64_array(events, field_name, nullable)?,
-            DataType::Boolean => build_boolean_array(events, field_name, nullable)?,
-            DataType::Binary => build_binary_array(events, field_name, nullable)?,
-            DataType::LargeBinary => build_large_binary_array(events, field_name, nullable)?,
-            DataType::Decimal128(precision, scale) => {
-                build_decimal128_array(events, field_name, *precision, *scale, nullable)?
-            }
-            DataType::Decimal256(precision, scale) => {
-                build_decimal256_array(events, field_name, *precision, *scale, nullable)?
-            }
-            other_type => {
-                return Err(ArrowEncodingError::UnsupportedType {
-                    field_name: field_name.into(),
-                    data_type: other_type.clone(),
-                });
-            }
-        };
-
-        columns.push(array);
+        columns.push(build_column_for_path(events, field.name(), field)?);
     }
 
     RecordBatch::try_new(schema, columns)
@@ -388,6 +353,7 @@ fn build_timestamp_array(
     events: &[Event],
     field_name: &str,
     time_unit: TimeUnit,
+    timezone: Option<Arc<str>>,
     nullable: bool,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     macro_rules! build_array {
@@ -419,7 +385,12 @@ fn build_timestamp_array(
                     builder.append_option(value_to_append);
                 }
             }
-            Ok(Arc::new(builder.finish()))
+            let array = builder.finish();
+            if let Some(tz) = timezone {
+                Ok(Arc::new(array.with_timezone(tz)))
+            } else {
+                Ok(Arc::new(array))
+            }
         }};
     }
 
@@ -740,6 +711,537 @@ fn build_decimal256_array(
     }
 
     Ok(Arc::new(builder.finish()))
+}
+
+/// Dispatches building an `ArrayRef` for a field at a dot-separated path in the events.
+///
+/// Used by `build_record_batch` for top-level fields and recursively by
+/// `build_struct_array` for nested child fields.
+fn build_column_for_path(
+    events: &[Event],
+    path: &str,
+    field: &Field,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let nullable = field.is_nullable();
+    match field.data_type() {
+        DataType::Struct(fields) => build_struct_array(events, path, fields, nullable),
+        DataType::Map(entries_field, _sorted) => {
+            build_map_array(events, path, entries_field, nullable)
+        }
+        DataType::List(item_field) => build_list_array(events, path, item_field, nullable),
+        DataType::Timestamp(time_unit, tz) => {
+            build_timestamp_array(events, path, *time_unit, tz.clone(), nullable)
+        }
+        DataType::Utf8 => build_string_array(events, path, nullable),
+        DataType::LargeUtf8 => build_large_string_array(events, path, nullable),
+        DataType::Int8 => build_int8_array(events, path, nullable),
+        DataType::Int16 => build_int16_array(events, path, nullable),
+        DataType::Int32 => build_int32_array(events, path, nullable),
+        DataType::Int64 => build_int64_array(events, path, nullable),
+        DataType::UInt8 => build_uint8_array(events, path, nullable),
+        DataType::UInt16 => build_uint16_array(events, path, nullable),
+        DataType::UInt32 => build_uint32_array(events, path, nullable),
+        DataType::UInt64 => build_uint64_array(events, path, nullable),
+        DataType::Float32 => build_float32_array(events, path, nullable),
+        DataType::Float64 => build_float64_array(events, path, nullable),
+        DataType::Boolean => build_boolean_array(events, path, nullable),
+        DataType::Binary => build_binary_array(events, path, nullable),
+        DataType::LargeBinary => build_large_binary_array(events, path, nullable),
+        DataType::Decimal128(precision, scale) => {
+            build_decimal128_array(events, path, *precision, *scale, nullable)
+        }
+        DataType::Decimal256(precision, scale) => {
+            build_decimal256_array(events, path, *precision, *scale, nullable)
+        }
+        other_type => Err(ArrowEncodingError::UnsupportedType {
+            field_name: path.into(),
+            data_type: other_type.clone(),
+        }),
+    }
+}
+
+/// Builds an Arrow `StructArray` for a struct field at the given dot-separated path.
+///
+/// Child fields are accessed via `path.child_name` using Vector's path lookup,
+/// and built recursively — supporting arbitrarily nested structs.
+fn build_struct_array(
+    events: &[Event],
+    path: &str,
+    fields: &Fields,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let child_arrays: Vec<ArrayRef> = fields
+        .iter()
+        .map(|child_field| {
+            let child_path = format!("{}.{}", path, child_field.name());
+            build_column_for_path(events, &child_path, child_field)
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut has_null = false;
+    let mut validity: Vec<bool> = Vec::with_capacity(events.len());
+    for event in events {
+        if let Event::Log(log) = event {
+            let valid = log.get(path).is_some();
+            if !valid {
+                if !nullable {
+                    return Err(ArrowEncodingError::NullConstraint {
+                        field_name: path.into(),
+                    });
+                }
+                has_null = true;
+            }
+            validity.push(valid);
+        } else {
+            validity.push(false);
+            has_null = true;
+        }
+    }
+    let null_buffer = has_null.then(|| NullBuffer::from(validity));
+
+    let struct_array = StructArray::try_new(fields.clone(), child_arrays, null_buffer)
+        .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+    Ok(Arc::new(struct_array))
+}
+
+/// Converts a string map key to the Arrow key type required by the schema.
+///
+/// Protobuf map keys may be integer types (e.g. `map<int64, bool>` uses `Int64`).
+/// JSON object keys are always strings, so we parse them into the target type.
+/// Protobuf allows bool, int32/64, uint32/64, and string as map key types.
+fn coerce_string_key(k: &str, key_type: &DataType) -> Value {
+    match key_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => {
+            if let Ok(i) = k.parse::<i64>() {
+                Value::Integer(i)
+            } else {
+                Value::Integer(0)
+            }
+        }
+        DataType::Boolean => match k {
+            "true" | "1" => Value::Boolean(true),
+            _ => Value::Boolean(false),
+        },
+        _ => Value::Bytes(k.to_owned().into()),
+    }
+}
+
+/// Builds an Arrow `MapArray` for a map field at the given path.
+///
+/// The Vector event value at `path` must be a `Value::Object` (string-keyed map).
+/// Supported map value types: `LargeUtf8`, `Utf8`, `Boolean`, `Int32`, `Int64`,
+/// `UInt32`, `UInt64`, `Float32`, `Float64`.
+fn build_map_array(
+    events: &[Event],
+    path: &str,
+    entries_field: &Field,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let DataType::Struct(kv_fields) = entries_field.data_type() else {
+        return Err(ArrowEncodingError::UnsupportedType {
+            field_name: path.into(),
+            data_type: entries_field.data_type().clone(),
+        });
+    };
+    if kv_fields.len() < 2 {
+        return Err(ArrowEncodingError::UnsupportedType {
+            field_name: path.into(),
+            data_type: entries_field.data_type().clone(),
+        });
+    }
+    // Arrow Map convention: entries struct has key as field 0, value as field 1.
+    let key_field = &kv_fields[0];
+    let value_field = &kv_fields[1];
+
+    let mut flat_keys: Vec<Value> = Vec::new();
+    let mut flat_values: Vec<Value> = Vec::new();
+    let mut offsets: Vec<i32> = Vec::with_capacity(events.len() + 1);
+    let mut validity: Vec<bool> = Vec::with_capacity(events.len());
+    let mut current_offset: i32 = 0;
+    offsets.push(0);
+
+    for event in events {
+        if let Event::Log(log) = event {
+            match log.get(path) {
+                Some(Value::Object(obj)) => {
+                    validity.push(true);
+                    for (k, v) in obj.iter() {
+                        // JSON object keys are always strings. Convert to the
+                        // schema's key type (e.g. parse "123" → Int64 for map<int64, *>).
+                        let key_val = coerce_string_key(k.as_str(), key_field.data_type());
+                        flat_keys.push(key_val);
+                        flat_values.push(v.clone());
+                        current_offset += 1;
+                    }
+                }
+                _ => {
+                    if !nullable {
+                        return Err(ArrowEncodingError::NullConstraint {
+                            field_name: path.into(),
+                        });
+                    }
+                    validity.push(false);
+                }
+            }
+        } else {
+            validity.push(false);
+        }
+        offsets.push(current_offset);
+    }
+
+    let key_array = build_map_value_array(&flat_keys, key_field)?;
+    let value_array = build_map_value_array(&flat_values, value_field)?;
+
+    let entries_array =
+        StructArray::try_new(kv_fields.clone(), vec![key_array, value_array], None)
+            .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+
+    let null_buffer = validity
+        .iter()
+        .any(|v| !v)
+        .then(|| NullBuffer::from(validity));
+
+    let map_array = MapArray::try_new(
+        Arc::new(entries_field.clone()),
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        entries_array,
+        null_buffer,
+        false,
+    )
+    .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+
+    Ok(Arc::new(map_array))
+}
+
+/// Builds an Arrow `ListArray` for a repeated field at the given path.
+///
+/// The Vector event value at `path` must be a `Value::Array`. Each element
+/// is encoded according to `item_field`, supporting all scalar types, `Struct`,
+/// and nested `List`.  Absent or non-array values produce a null list row when
+/// the field is nullable; non-nullable missing values return `NullConstraint`.
+fn build_list_array(
+    events: &[Event],
+    path: &str,
+    item_field: &Field,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let mut flat_items: Vec<Value> = Vec::new();
+    let mut offsets: Vec<i32> = vec![0];
+    let mut validity: Vec<bool> = Vec::with_capacity(events.len());
+    let mut has_null = false;
+
+    for event in events {
+        let arr_opt = if let Event::Log(log) = event {
+            log.get(path).and_then(|v| {
+                if let Value::Array(a) = v {
+                    Some(a.clone())
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        match arr_opt {
+            Some(arr) => {
+                flat_items.extend(arr.into_iter());
+                offsets.push(flat_items.len() as i32);
+                validity.push(true);
+            }
+            None => {
+                if !nullable {
+                    return Err(ArrowEncodingError::NullConstraint {
+                        field_name: path.into(),
+                    });
+                }
+                offsets.push(*offsets.last().unwrap_or(&0));
+                validity.push(false);
+                has_null = true;
+            }
+        }
+    }
+
+    let child_array = build_list_item_array(&flat_items, item_field)?;
+    let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    let null_buffer = has_null.then(|| NullBuffer::from(validity));
+
+    let list_array = ListArray::try_new(
+        Arc::new(item_field.clone()),
+        offset_buffer,
+        child_array,
+        null_buffer,
+    )
+    .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+
+    Ok(Arc::new(list_array))
+}
+
+/// Builds the flat child array for a `ListArray` from pre-collected item values.
+///
+/// Delegates to `build_map_value_array` for scalar types.  For `Struct`, each
+/// item must be a `Value::Object`; child fields are extracted by name.
+/// For nested `List`, each item must be a `Value::Array`.
+fn build_list_item_array(
+    items: &[Value],
+    field: &Field,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    match field.data_type() {
+        DataType::Struct(fields) => {
+            let child_arrays: Vec<ArrayRef> = fields
+                .iter()
+                .map(|child_field| {
+                    let child_values: Vec<Value> = items
+                        .iter()
+                        .map(|item| match item {
+                            Value::Object(map) => map
+                                .get(child_field.name().as_str())
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            _ => Value::Null,
+                        })
+                        .collect();
+                    build_list_item_array(&child_values, child_field)
+                })
+                .collect::<Result<_, _>>()?;
+
+            // Null buffer: items that were not Value::Object are null struct rows.
+            let mut has_null = false;
+            let validity: Vec<bool> = items
+                .iter()
+                .map(|item| {
+                    let valid = matches!(item, Value::Object(_));
+                    if !valid {
+                        has_null = true;
+                    }
+                    valid
+                })
+                .collect();
+            let null_buffer = has_null.then(|| NullBuffer::from(validity));
+
+            let struct_array = StructArray::try_new(fields.clone(), child_arrays, null_buffer)
+                .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+            Ok(Arc::new(struct_array))
+        }
+        DataType::List(item_field) => {
+            // Nested list: each element of `items` should be a Value::Array.
+            // Flatten them and build offsets, then recurse.
+            let mut flat_items: Vec<Value> = Vec::new();
+            let mut offsets: Vec<i32> = vec![0];
+            let mut validity: Vec<bool> = Vec::with_capacity(items.len());
+            let mut has_null = false;
+
+            for item in items {
+                match item {
+                    Value::Array(arr) => {
+                        flat_items.extend(arr.iter().cloned());
+                        offsets.push(flat_items.len() as i32);
+                        validity.push(true);
+                    }
+                    _ => {
+                        offsets.push(*offsets.last().unwrap_or(&0));
+                        validity.push(false);
+                        has_null = true;
+                    }
+                }
+            }
+
+            let child_array = build_list_item_array(&flat_items, item_field)?;
+            let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
+            let null_buffer = has_null.then(|| NullBuffer::from(validity));
+
+            let list_array = ListArray::try_new(
+                Arc::new(item_field.as_ref().clone()),
+                offset_buffer,
+                child_array,
+                null_buffer,
+            )
+            .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+            Ok(Arc::new(list_array))
+        }
+        DataType::Map(entries_field, _sorted) => {
+            // Each item is a Value::Object representing one row's map.
+            // Build offsets + flat key/value arrays across all rows.
+            let DataType::Struct(kv_fields) = entries_field.data_type() else {
+                return Err(ArrowEncodingError::UnsupportedType {
+                    field_name: field.name().clone(),
+                    data_type: field.data_type().clone(),
+                });
+            };
+            let key_field = &kv_fields[0];
+            let value_field = &kv_fields[1];
+
+            let mut flat_keys: Vec<Value> = Vec::new();
+            let mut flat_values: Vec<Value> = Vec::new();
+            let mut offsets: Vec<i32> = vec![0];
+            let mut validity: Vec<bool> = Vec::with_capacity(items.len());
+            let mut has_null = false;
+
+            for item in items {
+                match item {
+                    Value::Object(obj) => {
+                        for (k, v) in obj.iter() {
+                            flat_keys.push(coerce_string_key(k.as_str(), key_field.data_type()));
+                            flat_values.push(v.clone());
+                        }
+                        offsets.push(flat_keys.len() as i32);
+                        validity.push(true);
+                    }
+                    _ => {
+                        offsets.push(*offsets.last().unwrap_or(&0));
+                        validity.push(false);
+                        has_null = true;
+                    }
+                }
+            }
+
+            let key_array = build_map_value_array(&flat_keys, key_field)?;
+            let value_array = build_map_value_array(&flat_values, value_field)?;
+
+            let entries_array =
+                StructArray::try_new(kv_fields.clone(), vec![key_array, value_array], None)
+                    .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+
+            let null_buffer = has_null.then(|| NullBuffer::from(validity));
+            let map_array = MapArray::try_new(
+                Arc::new(entries_field.as_ref().clone()),
+                OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                entries_array,
+                null_buffer,
+                false,
+            )
+            .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+            Ok(Arc::new(map_array))
+        }
+        _ => build_map_value_array(items, field),
+    }
+}
+
+/// Builds a flat value array for Map entries from pre-collected Vector values.
+fn build_map_value_array(
+    values: &[Value],
+    field: &Field,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let nullable = field.is_nullable();
+    match field.data_type() {
+        DataType::LargeUtf8 => {
+            let mut builder = LargeStringBuilder::with_capacity(values.len(), 0);
+            for v in values {
+                match v {
+                    Value::Bytes(b) => match std::str::from_utf8(b) {
+                        Ok(s) => builder.append_value(s),
+                        Err(_) => builder.append_value(&String::from_utf8_lossy(b)),
+                    },
+                    _ => builder.append_value(&v.to_string_lossy()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::with_capacity(values.len(), 0);
+            for v in values {
+                match v {
+                    Value::Bytes(b) => match std::str::from_utf8(b) {
+                        Ok(s) => builder.append_value(s),
+                        Err(_) => builder.append_value(&String::from_utf8_lossy(b)),
+                    },
+                    _ => builder.append_value(&v.to_string_lossy()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    Value::Boolean(b) => builder.append_value(*b),
+                    _ => handle_null_constraints!(builder, nullable, field.name()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int32 => {
+            let mut builder = Int32Builder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    Value::Integer(i) if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 => {
+                        builder.append_value(*i as i32)
+                    }
+                    _ => handle_null_constraints!(builder, nullable, field.name()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int64 => {
+            let mut builder = Int64Builder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    Value::Integer(i) => builder.append_value(*i),
+                    _ => handle_null_constraints!(builder, nullable, field.name()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::UInt32 => {
+            let mut builder = UInt32Builder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    Value::Integer(i) if *i >= 0 && *i <= u32::MAX as i64 => {
+                        builder.append_value(*i as u32)
+                    }
+                    _ => handle_null_constraints!(builder, nullable, field.name()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::UInt64 => {
+            let mut builder = UInt64Builder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    Value::Integer(i) if *i >= 0 => builder.append_value(*i as u64),
+                    _ => handle_null_constraints!(builder, nullable, field.name()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float32 => {
+            let mut builder = Float32Builder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    Value::Float(f) => builder.append_value(f.into_inner() as f32),
+                    Value::Integer(i) => builder.append_value(*i as f32),
+                    _ => handle_null_constraints!(builder, nullable, field.name()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float64 => {
+            let mut builder = Float64Builder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    Value::Float(f) => builder.append_value(f.into_inner()),
+                    Value::Integer(i) => builder.append_value(*i as f64),
+                    _ => handle_null_constraints!(builder, nullable, field.name()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Struct(_) | DataType::List(_) => {
+            // Delegate to build_list_item_array which already handles Struct and List values.
+            build_list_item_array(values, field)
+        }
+        other => Err(ArrowEncodingError::UnsupportedType {
+            field_name: field.name().clone(),
+            data_type: other.clone(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1761,5 +2263,1606 @@ mod tests {
         } else {
             panic!("Expected Map type for my_map field");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Struct encoding tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_struct_flat() {
+        use arrow::array::{LargeStringArray, StructArray};
+
+        let mut log = LogEvent::default();
+        log.insert("person.name", "Alice");
+        log.insert("person.age", 30_i64);
+
+        let events = vec![Event::Log(log)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "person",
+            DataType::Struct(Fields::from(vec![
+                Field::new("name", DataType::LargeUtf8, true),
+                Field::new("age", DataType::Int64, true),
+            ])),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
+
+        let struct_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(!struct_col.is_null(0));
+
+        let name_col = struct_col
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "Alice");
+
+        let age_col = struct_col
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(age_col.value(0), 30);
+    }
+
+    #[test]
+    fn test_encode_struct_nested() {
+        use arrow::array::StructArray;
+
+        let mut log = LogEvent::default();
+        log.insert("outer.inner.value", 42_i64);
+        log.insert("outer.label", "top");
+
+        let events = vec![Event::Log(log)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![
+                Field::new(
+                    "inner",
+                    DataType::Struct(Fields::from(vec![Field::new(
+                        "value",
+                        DataType::Int64,
+                        true,
+                    )])),
+                    true,
+                ),
+                Field::new("label", DataType::LargeUtf8, true),
+            ])),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let outer = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(!outer.is_null(0));
+
+        let inner = outer
+            .column_by_name("inner")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(!inner.is_null(0));
+
+        let value_col = inner
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(value_col.value(0), 42);
+    }
+
+    #[test]
+    fn test_encode_struct_null_rows() {
+        use arrow::array::StructArray;
+
+        // Row 0: struct present; row 1: struct absent (null).
+        let mut log1 = LogEvent::default();
+        log1.insert("meta.key", "v1");
+
+        let log2 = LogEvent::default(); // meta absent
+
+        let events = vec![Event::Log(log1), Event::Log(log2)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![Field::new("key", DataType::LargeUtf8, true)])),
+            true, // nullable
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let struct_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(!struct_col.is_null(0), "row 0 should be non-null");
+        assert!(struct_col.is_null(1), "row 1 should be null");
+    }
+
+    #[test]
+    fn test_encode_struct_non_nullable_missing_fails() {
+        let log = LogEvent::default(); // struct field absent
+        let events = vec![Event::Log(log)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "required",
+            DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int64, true)])),
+            false, // non-nullable
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(matches!(
+            result,
+            Err(ArrowEncodingError::NullConstraint { .. })
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // List encoding tests
+    // -------------------------------------------------------------------------
+
+    /// `repeated int64` — encodes a List&lt;Int64&gt; field.
+    #[test]
+    fn test_encode_list_int64() {
+        use arrow::array::{Int64Array, ListArray};
+
+        let mut log0 = LogEvent::default();
+        log0.insert(
+            "hashes",
+            Value::Array(vec![
+                Value::Integer(111),
+                Value::Integer(222),
+                Value::Integer(333),
+            ]),
+        );
+
+        let mut log1 = LogEvent::default();
+        log1.insert(
+            "hashes",
+            Value::Array(vec![Value::Integer(999)]),
+        );
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let list_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        // Row 0: [111, 222, 333]
+        assert!(!list_col.is_null(0));
+        let row0 = list_col
+            .value(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(row0, vec![111, 222, 333]);
+
+        // Row 1: [999]
+        assert!(!list_col.is_null(1));
+        let row1 = list_col
+            .value(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(row1, vec![999]);
+    }
+
+    /// `repeated string` — encodes a List&lt;LargeUtf8&gt; field.
+    #[test]
+    fn test_encode_list_string() {
+        use arrow::array::{LargeStringArray, ListArray};
+
+        let mut log0 = LogEvent::default();
+        log0.insert(
+            "ids",
+            Value::Array(vec![
+                Value::Bytes("qpl-abc".into()),
+                Value::Bytes("qpl-def".into()),
+            ]),
+        );
+
+        let events = vec![Event::Log(log0)];
+        let item_field = Field::new("item", DataType::LargeUtf8, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ids",
+            DataType::List(Arc::new(item_field)),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let list_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let row0_val = list_col.value(0);
+        let row0 = row0_val.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(row0.value(0), "qpl-abc");
+        assert_eq!(row0.value(1), "qpl-def");
+    }
+
+    /// Null rows: absent list field → null list; non-nullable missing → error.
+    #[test]
+    fn test_encode_list_null_rows() {
+        use arrow::array::ListArray;
+
+        let mut log0 = LogEvent::default();
+        log0.insert(
+            "hashes",
+            Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
+        );
+        let log1 = LogEvent::default(); // absent → null
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            true, // nullable
+        )]));
+
+        let batch = build_record_batch(Arc::clone(&schema), &events).unwrap();
+        let list_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!list_col.is_null(0), "row 0 should be non-null");
+        assert!(list_col.is_null(1), "row 1 should be null");
+        assert_eq!(list_col.value(0).len(), 2);
+    }
+
+    #[test]
+    fn test_encode_list_non_nullable_missing_fails() {
+        let log = LogEvent::default();
+        let events = vec![Event::Log(log)];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            false, // non-nullable
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(matches!(
+            result,
+            Err(ArrowEncodingError::NullConstraint { .. })
+        ));
+    }
+
+    /// `List<Struct>` — encodes a repeated nested message field.
+    #[test]
+    fn test_encode_list_struct() {
+        use arrow::array::{Int64Array, ListArray, StructArray};
+        use vrl::value::ObjectMap;
+
+        let item_struct_fields = Fields::from(vec![
+            Field::new("rule_id", DataType::Int64, true),
+            Field::new("total_time_ns", DataType::Int64, true),
+            Field::new("phase_id", DataType::Int64, true),
+        ]);
+
+        // Row 0: two rule summaries.
+        let make_rule = |rule_id: i64, total: i64, phase: i64| {
+            let mut m = ObjectMap::new();
+            m.insert("rule_id".into(), Value::Integer(rule_id));
+            m.insert("total_time_ns".into(), Value::Integer(total));
+            m.insert("phase_id".into(), Value::Integer(phase));
+            Value::Object(m)
+        };
+
+        let mut log0 = LogEvent::default();
+        log0.insert(
+            "rule_stats",
+            Value::Array(vec![make_rule(1, 5_000, 3), make_rule(2, 8_000, 4)]),
+        );
+
+        // Row 1: empty list.
+        let mut log1 = LogEvent::default();
+        log1.insert("rule_stats", Value::Array(vec![]));
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+        let item_field = Field::new(
+            "item",
+            DataType::Struct(item_struct_fields.clone()),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "rule_stats",
+            DataType::List(Arc::new(item_field)),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let list_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        // Row 0: 2 struct items.
+        assert!(!list_col.is_null(0));
+        let row0_val = list_col.value(0);
+        let row0_structs = row0_val.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(row0_structs.len(), 2);
+
+        let rule_ids = row0_structs
+            .column_by_name("rule_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(rule_ids.value(0), 1);
+        assert_eq!(rule_ids.value(1), 2);
+
+        let total_ns = row0_structs
+            .column_by_name("total_time_ns")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(total_ns.value(0), 5_000);
+        assert_eq!(total_ns.value(1), 8_000);
+
+        // Row 1: empty list.
+        assert!(!list_col.is_null(1));
+        assert_eq!(list_col.value(1).len(), 0);
+    }
+
+    /// IPC round-trip for List<Int64>.
+    #[test]
+    fn test_encode_list_ipc_roundtrip() {
+        use arrow::ipc::reader::StreamReader;
+        use std::io::Cursor;
+
+        let mut log = LogEvent::default();
+        log.insert(
+            "hashes",
+            Value::Array(vec![
+                Value::Integer(10),
+                Value::Integer(20),
+                Value::Integer(30),
+            ]),
+        );
+
+        let events = vec![Event::Log(log)];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            true,
+        )]));
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)));
+        assert!(bytes.is_ok(), "IPC encoding failed: {:?}", bytes);
+
+        let cursor = Cursor::new(bytes.unwrap());
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Map encoding tests
+    // -------------------------------------------------------------------------
+
+    fn map_field(value_type: DataType, nullable: bool) -> Field {
+        Field::new(
+            "flags",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::LargeUtf8, false),
+                        Field::new("value", value_type, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            nullable,
+        )
+    }
+
+    #[test]
+    fn test_encode_map_string_to_bool() {
+        use arrow::array::MapArray;
+        use serde_json::json;
+
+        let mut log = LogEvent::default();
+        log.insert("flags", json!({"enabled": true, "debug": false}));
+
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field(DataType::Boolean, true)]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let map_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert!(!map_col.is_null(0));
+
+        // The map for row 0 has 2 entries.
+        let entries = map_col.value(0);
+        assert_eq!(entries.len(), 2);
+
+        let keys = entries
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::LargeStringArray>()
+            .unwrap();
+        let vals = entries
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+
+        // BTreeMap iteration order is alphabetical: "debug" < "enabled".
+        assert_eq!(keys.value(0), "debug");
+        assert!(!vals.value(0));
+        assert_eq!(keys.value(1), "enabled");
+        assert!(vals.value(1));
+    }
+
+    #[test]
+    fn test_encode_map_string_to_int64() {
+        use arrow::array::MapArray;
+        use serde_json::json;
+
+        let mut log = LogEvent::default();
+        log.insert("flags", json!({"hits": 10, "misses": 3}));
+
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field(DataType::Int64, true)]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let map_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+
+        let entries = map_col.value(0);
+        assert_eq!(entries.len(), 2);
+
+        let keys = entries
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::LargeStringArray>()
+            .unwrap();
+        let vals = entries
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // Alphabetical: "hits" < "misses"
+        assert_eq!(keys.value(0), "hits");
+        assert_eq!(vals.value(0), 10);
+        assert_eq!(keys.value(1), "misses");
+        assert_eq!(vals.value(1), 3);
+    }
+
+    #[test]
+    fn test_encode_map_null_rows() {
+        use arrow::array::MapArray;
+        use serde_json::json;
+
+        let mut log1 = LogEvent::default();
+        log1.insert("flags", json!({"a": true}));
+
+        let log2 = LogEvent::default(); // flags absent → null map
+
+        let events = vec![Event::Log(log1), Event::Log(log2)];
+        let schema = Arc::new(Schema::new(vec![map_field(DataType::Boolean, true)]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let map_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert!(!map_col.is_null(0), "row 0 should be non-null");
+        assert!(map_col.is_null(1), "row 1 should be null");
+        assert_eq!(map_col.value(0).len(), 1);
+    }
+
+    #[test]
+    fn test_encode_map_non_nullable_missing_fails() {
+        let log = LogEvent::default(); // map field absent
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field(DataType::Boolean, false)]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(matches!(
+            result,
+            Err(ArrowEncodingError::NullConstraint { .. })
+        ));
+    }
+
+    #[test]
+    fn test_encode_map_ipc_roundtrip() {
+        use arrow::ipc::reader::StreamReader;
+        use serde_json::json;
+        use std::io::Cursor;
+
+        let mut log = LogEvent::default();
+        log.insert("settings", json!({"timeout": 30, "retries": 3}));
+
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field(DataType::Int64, true)]));
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)));
+        assert!(bytes.is_ok(), "IPC encoding failed: {:?}", bytes);
+
+        let cursor = Cursor::new(bytes.unwrap());
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
+    }
+
+    /// Helper to build a Map field with an Int64 key type (mirrors proto map<int64, V>).
+    /// Uses "key_value" as the entries field name to match Spark/Delta/UC convention.
+    fn map_field_int64_key(value_type: DataType, nullable: bool) -> Field {
+        Field::new(
+            "config_access",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("value", value_type, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            nullable,
+        )
+    }
+
+    #[test]
+    fn test_encode_map_int64_key_to_bool() {
+        use arrow::array::{Int64Array, MapArray};
+        use serde_json::json;
+
+        let mut log = LogEvent::default();
+        // Keys are string representations of int64 values (how proto map<int64,bool>
+        // arrives in Vector events after JSON decode).
+        log.insert(
+            "config_access",
+            json!({"1234567890": true, "9876543210": false}),
+        );
+
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field_int64_key(
+            DataType::Boolean,
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let map_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert!(!map_col.is_null(0));
+
+        let entries = map_col.value(0);
+        assert_eq!(entries.len(), 2);
+
+        let keys = entries
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let vals = entries
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+
+        // BTreeMap iteration order is lexicographic on the string keys.
+        // "1234567890" < "9876543210" lexicographically.
+        assert_eq!(keys.value(0), 1234567890_i64);
+        assert!(vals.value(0));
+        assert_eq!(keys.value(1), 9876543210_i64);
+        assert!(!vals.value(1));
+    }
+
+    #[test]
+    fn test_encode_map_int64_key_to_float64() {
+        use arrow::array::{Float64Array, Int64Array, MapArray};
+        use serde_json::json;
+
+        let mut log = LogEvent::default();
+        log.insert(
+            "config_access",
+            json!({"1111111111": 200.0, "2222222222": 0.5}),
+        );
+
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field_int64_key(
+            DataType::Float64,
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let map_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        let entries = map_col.value(0);
+        assert_eq!(entries.len(), 2);
+
+        let keys = entries
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let vals = entries
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        assert_eq!(keys.value(0), 1111111111_i64);
+        assert_eq!(vals.value(0), 200.0_f64);
+        assert_eq!(keys.value(1), 2222222222_i64);
+        assert_eq!(vals.value(1), 0.5_f64);
+    }
+
+    #[test]
+    fn test_encode_map_key_value_naming_ipc_roundtrip() {
+        // Verify that a map schema using "key_value" (Spark/Delta/UC convention)
+        // round-trips through Arrow IPC correctly.
+        use arrow::ipc::reader::StreamReader;
+        use serde_json::json;
+        use std::io::Cursor;
+
+        let mut log = LogEvent::default();
+        log.insert(
+            "config_access",
+            json!({"1234567890": true, "9876543210": false}),
+        );
+
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field_int64_key(
+            DataType::Boolean,
+            true,
+        )]));
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)));
+        assert!(bytes.is_ok(), "IPC encoding failed: {:?}", bytes);
+
+        let cursor = Cursor::new(bytes.unwrap());
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // Verify the inner field is named "key_value" (UC/Spark convention).
+        let schema = batch.schema();
+        let map_field = schema.field(0);
+        if let DataType::Map(entries_field, _) = map_field.data_type() {
+            assert_eq!(
+                entries_field.name(),
+                "key_value",
+                "Map entries field must be named 'key_value' for UC compatibility"
+            );
+        } else {
+            panic!("Expected Map type");
+        }
+    }
+
+    /// Struct field set to an empty object `{}` — all child columns are null.
+    ///
+    /// The struct validity bit should be **true** (the field exists) but every
+    /// child column should be **null** (no sub-keys are present in the empty map).
+    #[test]
+    fn test_encode_struct_empty_object_is_valid_with_null_children() {
+        use arrow::array::{Int64Array, LargeStringArray, StructArray};
+        use vrl::value::ObjectMap;
+
+        // Row 0: struct is an empty object — present but has no children.
+        let mut log0 = LogEvent::default();
+        log0.insert("meta", Value::Object(ObjectMap::new()));
+
+        // Row 1: struct is absent altogether — should be null.
+        let log1 = LogEvent::default();
+
+        // Row 2: struct has actual child values.
+        let mut log2 = LogEvent::default();
+        log2.insert("meta.id", 42_i64);
+        log2.insert("meta.label", "hello");
+
+        let events = vec![Event::Log(log0), Event::Log(log1), Event::Log(log2)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("label", DataType::LargeUtf8, true),
+            ])),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let struct_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        // Row 0: empty object → non-null struct, but null children.
+        assert!(
+            !struct_col.is_null(0),
+            "empty-object struct row should be non-null"
+        );
+        let id_col = struct_col
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let label_col = struct_col
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert!(id_col.is_null(0), "id should be null for empty-object row");
+        assert!(
+            label_col.is_null(0),
+            "label should be null for empty-object row"
+        );
+
+        // Row 1: absent struct → null struct.
+        assert!(struct_col.is_null(1), "absent struct row should be null");
+
+        // Row 2: fully populated struct.
+        assert!(
+            !struct_col.is_null(2),
+            "populated struct row should be non-null"
+        );
+        assert_eq!(id_col.value(2), 42);
+        assert_eq!(label_col.value(2), "hello");
+    }
+
+    // -------------------------------------------------------------------------
+    // Realistic proto-schema tests
+    // -------------------------------------------------------------------------
+
+    /// Schema with a mix of scalar, nested struct, list, bool, and binary types.
+    ///
+    /// Field names are intentionally generic (field_N / sub_N).
+    ///
+    /// Field layout (field number → Arrow type):
+    ///   field_1  (1)  LargeUtf8         — optional string
+    ///   field_3  (3)  LargeUtf8         — optional string
+    ///   field_4  (4)  Int32             — optional enum
+    ///   field_5  (5)  Int64             — optional int64
+    ///   field_6  (6)  Int64             — optional int64
+    ///   field_8  (8)  Struct            — nested message (2 string children)
+    ///     sub_1 LargeUtf8, sub_2 LargeUtf8
+    ///   field_9  (9)  Struct            — nested message (6 children)
+    ///     sub_1 Int32, sub_2 LargeUtf8, sub_3 LargeUtf8,
+    ///     sub_4 LargeUtf8, sub_5 Int32, sub_6 Int32
+    ///   field_10 (10) List<Int64>       — repeated int64
+    ///   field_11 (11) Boolean           — optional bool
+    ///   field_12 (12) LargeUtf8         — optional string
+    ///   field_13 (13) LargeUtf8         — optional string
+    ///   field_14 (14) Boolean           — optional bool
+    ///   field_15 (15) LargeUtf8         — optional string
+    ///   field_16 (16) LargeBinary       — optional bytes
+    #[test]
+    fn test_encode_proto_schema_mixed_types() {
+        use arrow::array::{BooleanArray, Int32Array, Int64Array, LargeStringArray, StructArray};
+
+        // field_8: Struct(sub_1 LargeUtf8, sub_2 LargeUtf8)
+        let field_8_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::LargeUtf8, true),
+            Field::new("sub_2", DataType::LargeUtf8, true),
+        ]);
+        // field_9: Struct(sub_1 Int32, sub_2..sub_4 LargeUtf8, sub_5..sub_6 Int32)
+        let field_9_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::Int32, true),
+            Field::new("sub_2", DataType::LargeUtf8, true),
+            Field::new("sub_3", DataType::LargeUtf8, true),
+            Field::new("sub_4", DataType::LargeUtf8, true),
+            Field::new("sub_5", DataType::Int32, true),
+            Field::new("sub_6", DataType::Int32, true),
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("field_1", DataType::LargeUtf8, true),
+            Field::new("field_3", DataType::LargeUtf8, true),
+            Field::new("field_4", DataType::Int32, true),
+            Field::new("field_5", DataType::Int64, true),
+            Field::new("field_6", DataType::Int64, true),
+            Field::new("field_8", DataType::Struct(field_8_fields.clone()), true),
+            Field::new("field_9", DataType::Struct(field_9_fields.clone()), true),
+            Field::new("field_10", DataType::List(Arc::new(Field::new("item", DataType::Int64, true))), true),
+            Field::new("field_11", DataType::Boolean, true),
+            Field::new("field_12", DataType::LargeUtf8, true),
+            Field::new("field_13", DataType::LargeUtf8, true),
+            Field::new("field_14", DataType::Boolean, true),
+            Field::new("field_15", DataType::LargeUtf8, true),
+            Field::new("field_16", DataType::LargeBinary, true),
+        ]));
+
+        // Row 0: all fields populated; nullable sub-fields omitted → null in Arrow.
+        let mut log0 = LogEvent::default();
+        log0.insert("field_1", "val_a");
+        log0.insert("field_3", "val_b");
+        log0.insert("field_4", 1i64);
+        log0.insert("field_5", 42_000i64);
+        log0.insert("field_6", 100i64);
+        log0.insert("field_8.sub_1", "sub_val_a");
+        // field_8.sub_2 absent → null
+        log0.insert("field_9.sub_1", 1i64);
+        log0.insert("field_9.sub_2", "sub_val_b");
+        // field_9.sub_3 absent → null
+        // field_9.sub_4 absent → null
+        log0.insert("field_9.sub_5", 2i64);
+        log0.insert("field_9.sub_6", 0i64);
+        log0.insert("field_10", Value::Array(vec![Value::Integer(111), Value::Integer(222)]));
+        log0.insert("field_11", false);
+        log0.insert("field_12", "val_c");
+        log0.insert("field_13", "val_d");
+        log0.insert("field_14", false);
+        log0.insert("field_15", "val_e");
+        log0.insert("field_16", Value::Bytes(b"\x0a\x05hello".to_vec().into()));
+
+        // Row 1: field_8 and field_9 absent → null structs; several fields absent → null.
+        let mut log1 = LogEvent::default();
+        log1.insert("field_1", "val_f");
+        log1.insert("field_3", "val_g");
+        log1.insert("field_4", 2i64);
+        log1.insert("field_5", 5_000i64);
+        log1.insert("field_6", 200i64);
+        // field_8 absent → null struct
+        // field_9 absent → null struct
+        // field_10 absent → null list
+        log1.insert("field_11", true);
+        log1.insert("field_12", "val_h");
+        // field_13 absent → null
+        log1.insert("field_14", true);
+        // field_15 absent → null
+        // field_16 absent → null
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 14);
+
+        // Scalar fields.
+        let f1 = batch.column_by_name("field_1").unwrap()
+            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(f1.value(0), "val_a");
+        assert_eq!(f1.value(1), "val_f");
+
+        let f4 = batch.column_by_name("field_4").unwrap()
+            .as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(f4.value(0), 1);
+        assert_eq!(f4.value(1), 2);
+
+        let f6 = batch.column_by_name("field_6").unwrap()
+            .as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(f6.value(0), 100);
+        assert_eq!(f6.value(1), 200);
+
+        // field_8 (Struct): row 0 non-null, row 1 null.
+        let f8 = batch.column_by_name("field_8").unwrap()
+            .as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(!f8.is_null(0));
+        assert!(f8.is_null(1));
+        let f8_sub1 = f8.column_by_name("sub_1").unwrap()
+            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(f8_sub1.value(0), "sub_val_a");
+
+        // field_9 (Struct): row 0 non-null, row 1 null.
+        let f9 = batch.column_by_name("field_9").unwrap()
+            .as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(!f9.is_null(0));
+        assert!(f9.is_null(1));
+        let f9_sub6 = f9.column_by_name("sub_6").unwrap()
+            .as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(f9_sub6.value(0), 0);
+
+        // field_10 (List<Int64>): row 0 has [111, 222], row 1 null.
+        use arrow::array::ListArray;
+        let f10 = batch.column_by_name("field_10").unwrap()
+            .as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(!f10.is_null(0));
+        assert!(f10.is_null(1));
+        let f10_vals: Vec<i64> = f10.value(0).as_any()
+            .downcast_ref::<Int64Array>().unwrap()
+            .iter().flatten().collect();
+        assert_eq!(f10_vals, vec![111, 222]);
+
+        // Boolean fields.
+        let f14 = batch.column_by_name("field_14").unwrap()
+            .as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(!f14.value(0));
+        assert!(f14.value(1));
+
+        // field_16 (LargeBinary): row 0 non-null, row 1 null.
+        use arrow::array::LargeBinaryArray;
+        let f16 = batch.column_by_name("field_16").unwrap()
+            .as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        assert!(!f16.is_null(0));
+        assert!(f16.is_null(1));
+        assert_eq!(f16.value(0), b"\x0a\x05hello");
+    }
+
+    // -------------------------------------------------------------------------
+    // complex nested type patterns
+    // -------------------------------------------------------------------------
+
+    /// `List<Struct>` containing its own inner `List<Struct>`.
+    ///
+    /// Schema:
+    ///   field_a: List<Struct {
+    ///     sub_1: Int32,
+    ///     sub_2: Int32,
+    ///     sub_3: List<Struct { inner_1: Int64, inner_2: Int64 }>,
+    ///   }>
+    #[test]
+    fn test_encode_list_struct_with_inner_list_struct() {
+        use arrow::array::{Int32Array, Int64Array, ListArray, StructArray};
+        use vrl::value::ObjectMap;
+
+        // Inner struct builder helper.
+        let make_inner = |inner_1: i64, inner_2: i64| {
+            let mut m = ObjectMap::new();
+            m.insert("inner_1".into(), Value::Integer(inner_1));
+            m.insert("inner_2".into(), Value::Integer(inner_2));
+            Value::Object(m)
+        };
+        let make_outer = |sub_1: i64, sub_2: i64, inners: Vec<Value>| {
+            let mut m = ObjectMap::new();
+            m.insert("sub_1".into(), Value::Integer(sub_1));
+            m.insert("sub_2".into(), Value::Integer(sub_2));
+            m.insert("sub_3".into(), Value::Array(inners));
+            Value::Object(m)
+        };
+
+        // Row 0: two outer elements, first with two inner elements, second with none.
+        let mut log0 = LogEvent::default();
+        log0.insert(
+            "field_a",
+            Value::Array(vec![
+                make_outer(1, 10, vec![make_inner(101, 500_000), make_inner(102, 300_000)]),
+                make_outer(2, 5, vec![]),
+            ]),
+        );
+
+        // Row 1: single outer element, one inner element.
+        let mut log1 = LogEvent::default();
+        log1.insert(
+            "field_a",
+            Value::Array(vec![make_outer(3, 8, vec![make_inner(201, 1_000_000)])]),
+        );
+
+        // Row 2: absent field_a → null list.
+        let log2 = LogEvent::default();
+
+        let events = vec![Event::Log(log0), Event::Log(log1), Event::Log(log2)];
+
+        let inner_struct_fields = Fields::from(vec![
+            Field::new("inner_1", DataType::Int64, true),
+            Field::new("inner_2", DataType::Int64, true),
+        ]);
+        let outer_struct_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::Int32, true),
+            Field::new("sub_2", DataType::Int32, true),
+            Field::new(
+                "sub_3",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(inner_struct_fields),
+                    true,
+                ))),
+                true,
+            ),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "field_a",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(outer_struct_fields),
+                true,
+            ))),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        let outer_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        // Row 0: 2 outer elements.
+        assert!(!outer_col.is_null(0));
+        let row0_outer_arr = outer_col.value(0);
+        let row0_outer = row0_outer_arr
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(row0_outer.len(), 2);
+
+        // sub_1 values of the two outer elements.
+        let sub1_col = row0_outer
+            .column_by_name("sub_1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(sub1_col.value(0), 1);
+        assert_eq!(sub1_col.value(1), 2);
+
+        let sub3_col = row0_outer
+            .column_by_name("sub_3")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        // First outer element's sub_3: [inner_1=101, inner_1=102].
+        let first_inner_arr = sub3_col.value(0);
+        let first_inner = first_inner_arr
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(first_inner.len(), 2);
+        let inner1_col = first_inner
+            .column_by_name("inner_1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(inner1_col.value(0), 101);
+        assert_eq!(inner1_col.value(1), 102);
+
+        // Second outer element's sub_3: empty.
+        assert_eq!(sub3_col.value(1).len(), 0);
+
+        // Row 1: 1 outer element.
+        assert!(!outer_col.is_null(1));
+        assert_eq!(outer_col.value(1).len(), 1);
+
+        // Row 2: absent → null list.
+        assert!(outer_col.is_null(2));
+    }
+
+    /// Map fields nested inside a struct.
+    ///
+    /// Schema:
+    ///   field_a: Struct {
+    ///     sub_1: Int64,
+    ///     sub_2: Map("key_value", Struct(key: Int64, value: Boolean)),
+    ///     sub_3: Map("key_value", Struct(key: Int64, value: Float64)),
+    ///   }
+    #[test]
+    fn test_encode_struct_with_nested_map_fields() {
+        use arrow::array::{Float64Array, Int64Array, MapArray, StructArray};
+        use serde_json::json;
+
+        let sub2_field = Field::new(
+            "sub_2",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("value", DataType::Boolean, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let sub3_field = Field::new(
+            "sub_3",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("value", DataType::Float64, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let struct_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::Int64, true),
+            sub2_field,
+            sub3_field,
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "field_a",
+            DataType::Struct(struct_fields),
+            true,
+        )]));
+
+        // Row 0: fully populated field_a.
+        let mut log0 = LogEvent::default();
+        log0.insert("field_a.sub_1", 42_000_i64);
+        log0.insert(
+            "field_a.sub_2",
+            json!({"100": true, "200": false}),
+        );
+        log0.insert(
+            "field_a.sub_3",
+            json!({"300": 1.5, "400": 2.0}),
+        );
+
+        // Row 1: field_a absent → null struct.
+        let log1 = LogEvent::default();
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let struct_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        // Row 0: non-null struct.
+        assert!(!struct_col.is_null(0), "row 0 struct should be non-null");
+        // Row 1: null struct.
+        assert!(struct_col.is_null(1), "row 1 struct should be null");
+
+        // Check sub_1.
+        let sub1_col = struct_col
+            .column_by_name("sub_1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(sub1_col.value(0), 42_000);
+
+        // Check sub_2 map: 2 entries with int64 keys.
+        let sub2_col = struct_col
+            .column_by_name("sub_2")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert!(!sub2_col.is_null(0));
+        let sub2_entries = sub2_col.value(0);
+        assert_eq!(sub2_entries.len(), 2);
+        let sub2_keys = sub2_entries
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // Keys coerced from string "100"/"200" to Int64.
+        assert_eq!(sub2_keys.value(0), 100_i64);
+        assert_eq!(sub2_keys.value(1), 200_i64);
+
+        // Check sub_3 map: 2 entries with float64 values.
+        let sub3_col = struct_col
+            .column_by_name("sub_3")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert!(!sub3_col.is_null(0));
+        let sub3_entries = sub3_col.value(0);
+        assert_eq!(sub3_entries.len(), 2);
+        let sub3_vals = sub3_entries
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(sub3_vals.value(0), 1.5_f64);
+        assert_eq!(sub3_vals.value(1), 2.0_f64);
+    }
+
+    /// IPC round-trip for a schema combining scalar, Struct, List<Struct>, Map,
+    /// and List<string> fields — verifies the full Arrow IPC serialization path.
+    #[test]
+    fn test_encode_complex_schema_ipc_roundtrip() {
+        use arrow::ipc::reader::StreamReader;
+        use serde_json::json;
+        use std::io::Cursor;
+        use vrl::value::ObjectMap;
+
+        let field3_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::LargeUtf8, true),
+            Field::new("sub_2", DataType::LargeUtf8, true),
+            Field::new("sub_3", DataType::LargeUtf8, true),
+        ]);
+        let field4_struct_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::Int32, true),
+            Field::new("sub_2", DataType::Int32, true),
+            Field::new("sub_3", DataType::LargeUtf8, true),
+        ]);
+        let field5_map = Field::new(
+            "sub_2",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("value", DataType::Boolean, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let field5_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::Int64, true),
+            field5_map,
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("field_1", DataType::LargeUtf8, true),
+            Field::new("field_2", DataType::Boolean, true),
+            Field::new(
+                "field_3",
+                DataType::Struct(field3_fields),
+                true,
+            ),
+            Field::new(
+                "field_4",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(field4_struct_fields),
+                    true,
+                ))),
+                true,
+            ),
+            Field::new(
+                "field_5",
+                DataType::Struct(field5_fields),
+                true,
+            ),
+            Field::new(
+                "field_6",
+                DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                true,
+            ),
+            Field::new(
+                "field_7",
+                DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                true,
+            ),
+        ]));
+
+        // Row 0: field_3 absent, field_4 and field_5 populated.
+        let mut log0 = LogEvent::default();
+        log0.insert("field_1", "rec-a");
+        log0.insert("field_2", true);
+        log0.insert(
+            "field_4",
+            Value::Array({
+                let mut m = ObjectMap::new();
+                m.insert("sub_1".into(), Value::Integer(1));
+                m.insert("sub_2".into(), Value::Integer(10));
+                m.insert("sub_3".into(), Value::Bytes("".into()));
+                vec![Value::Object(m)]
+            }),
+        );
+        log0.insert("field_5.sub_1", 5_000_i64);
+        log0.insert("field_5.sub_2", json!({"12345": true}));
+        log0.insert("field_6", Value::Array(vec![]));
+        log0.insert(
+            "field_7",
+            Value::Array(vec![
+                Value::Bytes("tag-a".into()),
+                Value::Bytes("tag-b".into()),
+            ]),
+        );
+
+        // Row 1: field_3 populated, field_4 absent.
+        let mut log1 = LogEvent::default();
+        log1.insert("field_1", "rec-b");
+        log1.insert("field_2", false);
+        log1.insert("field_3.sub_1", "err-a");
+        log1.insert("field_3.sub_2", "err-sub-a");
+        log1.insert("field_3.sub_3", "code-a");
+        log1.insert(
+            "field_6",
+            Value::Array(vec![Value::Bytes("rec-a".into())]),
+        );
+        log1.insert(
+            "field_7",
+            Value::Array(vec![Value::Bytes("tag-c".into())]),
+        );
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)));
+        assert!(bytes.is_ok(), "IPC encoding failed: {:?}", bytes);
+
+        let cursor = Cursor::new(bytes.unwrap());
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 7);
+    }
+
+    /// Full schema IPC round-trip: 20 columns covering multiple scalar types,
+    /// booleans, two List<string> fields, an optional string, and an optional
+    /// Struct with 5 string children.
+    ///
+    /// Row 0: Struct absent (null), List fields populated with 0 and 2 entries.
+    /// Row 1: Struct populated, List fields populated with 1 entry each.
+    #[test]
+    fn test_encode_wide_schema_with_optional_struct_ipc_roundtrip() {
+        use arrow::array::{
+            BooleanArray, Int64Array, LargeStringArray, ListArray, StructArray,
+        };
+        use arrow::ipc::reader::StreamReader;
+        use std::io::Cursor;
+
+        let field18_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::LargeUtf8, true),
+            Field::new("sub_2", DataType::LargeUtf8, true),
+            Field::new("sub_3", DataType::LargeUtf8, true),
+            Field::new("sub_4", DataType::LargeUtf8, true),
+            Field::new("sub_5", DataType::LargeUtf8, true),
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("field_1",  DataType::LargeUtf8, true),
+            Field::new("field_2",  DataType::LargeUtf8, true),
+            Field::new("field_3",  DataType::LargeUtf8, true),
+            Field::new("field_4",  DataType::Int64, true),
+            Field::new("field_5",  DataType::Int64, true),
+            Field::new("field_6",  DataType::Boolean, true),
+            Field::new("field_7",  DataType::Boolean, true),
+            Field::new("field_8",  DataType::LargeUtf8, true),
+            Field::new("field_9",  DataType::Boolean, true),
+            Field::new("field_10", DataType::Boolean, true),
+            Field::new("field_11", DataType::LargeUtf8, true),
+            Field::new("field_12", DataType::LargeUtf8, true),
+            Field::new("field_13", DataType::LargeUtf8, true),
+            Field::new("field_14", DataType::LargeUtf8, true),
+            Field::new(
+                "field_15",
+                DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                true,
+            ),
+            Field::new(
+                "field_16",
+                DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                true,
+            ),
+            Field::new("field_17", DataType::LargeUtf8, true),
+            Field::new("field_18", DataType::Struct(field18_fields), true),
+            Field::new("field_19", DataType::Int64, true),
+            Field::new("field_20", DataType::LargeUtf8, true),
+        ]));
+
+        // Row 0: field_17 and field_18 absent → null.
+        let mut log0 = LogEvent::default();
+        log0.insert("field_1",  "rec-a");
+        log0.insert("field_2",  "app-test");
+        log0.insert("field_3",  "exec-a");
+        log0.insert("field_4",  1700000000000_i64);
+        log0.insert("field_5",  1700000001523_i64);
+        log0.insert("field_6",  false);
+        log0.insert("field_7",  true);
+        log0.insert("field_8",  "entry-a");
+        log0.insert("field_9",  true);
+        log0.insert("field_10", false);
+        log0.insert("field_11", "wh-a");
+        log0.insert("field_12", "rec-a-date");
+        log0.insert("field_13", "op-a");
+        log0.insert("field_14", "query-a");
+        log0.insert("field_15", Value::Array(vec![]));
+        log0.insert(
+            "field_16",
+            Value::Array(vec![
+                Value::Bytes("tag-a".into()),
+                Value::Bytes("tag-b".into()),
+            ]),
+        );
+        // field_17 and field_18 absent → null
+        log0.insert("field_19", 1700000000000000_i64);
+        log0.insert("field_20", "2026-02-20");
+
+        // Row 1: field_18 struct populated, field_17 present.
+        let mut log1 = LogEvent::default();
+        log1.insert("field_1",  "rec-b");
+        log1.insert("field_2",  "app-test");
+        log1.insert("field_3",  "exec-b");
+        log1.insert("field_4",  1700000010000_i64);
+        log1.insert("field_5",  1700000055230_i64);
+        log1.insert("field_6",  true);
+        log1.insert("field_7",  false);
+        log1.insert("field_8",  "entry-b");
+        log1.insert("field_9",  false);
+        log1.insert("field_10", true);
+        log1.insert("field_11", "wh-b");
+        log1.insert("field_12", "rec-b-date");
+        log1.insert("field_13", "op-b");
+        log1.insert("field_14", "query-b");
+        log1.insert(
+            "field_15",
+            Value::Array(vec![Value::Bytes("rec-a".into())]),
+        );
+        log1.insert(
+            "field_16",
+            Value::Array(vec![Value::Bytes("tag-c".into())]),
+        );
+        log1.insert("field_17", "err-type-a");
+        log1.insert("field_18.sub_1", "err-a");
+        log1.insert("field_18.sub_2", "err-sub-a");
+        log1.insert("field_18.sub_3", "code-a");
+        log1.insert("field_18.sub_4", "trace-a");
+        log1.insert("field_18.sub_5", "err-type-a: detail");
+        log1.insert("field_19", 1700000010000000_i64);
+        log1.insert("field_20", "2026-02-20");
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)));
+        assert!(bytes.is_ok(), "IPC encoding failed: {:?}", bytes);
+
+        let cursor = Cursor::new(bytes.unwrap());
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 20);
+
+        // Spot-check scalar fields.
+        let f1 = batch.column_by_name("field_1").unwrap()
+            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(f1.value(0), "rec-a");
+        assert_eq!(f1.value(1), "rec-b");
+
+        let f4 = batch.column_by_name("field_4").unwrap()
+            .as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(f4.value(0), 1700000000000_i64);
+        assert_eq!(f4.value(1), 1700000010000_i64);
+
+        let f7 = batch.column_by_name("field_7").unwrap()
+            .as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(f7.value(0));
+        assert!(!f7.value(1));
+
+        // field_15: row 0 empty list, row 1 has one entry.
+        let f15 = batch.column_by_name("field_15").unwrap()
+            .as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(!f15.is_null(0));
+        assert_eq!(f15.value(0).len(), 0);
+        assert!(!f15.is_null(1));
+        let f15_row1 = f15.value(1);
+        let f15_row1_str = f15_row1.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(f15_row1_str.value(0), "rec-a");
+
+        // field_16: row 0 has ["tag-a","tag-b"], row 1 has ["tag-c"].
+        let f16 = batch.column_by_name("field_16").unwrap()
+            .as_any().downcast_ref::<ListArray>().unwrap();
+        let f16_row0 = f16.value(0);
+        let f16_row0_str = f16_row0.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(f16_row0_str.value(0), "tag-a");
+        assert_eq!(f16_row0_str.value(1), "tag-b");
+
+        // field_17: row 0 null, row 1 present.
+        let f17 = batch.column_by_name("field_17").unwrap()
+            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert!(f17.is_null(0));
+        assert_eq!(f17.value(1), "err-type-a");
+
+        // field_18 struct: row 0 null, row 1 non-null.
+        let f18 = batch.column_by_name("field_18").unwrap()
+            .as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(f18.is_null(0));
+        assert!(!f18.is_null(1));
+        let f18_sub1 = f18.column_by_name("sub_1").unwrap()
+            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(f18_sub1.value(1), "err-a");
+        let f18_sub3 = f18.column_by_name("sub_3").unwrap()
+            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(f18_sub3.value(1), "code-a");
     }
 }
