@@ -1,3 +1,6 @@
+[patch.crates-io]
+hyper-http-proxy = { path = "vendor/hyper-http-proxy-1.1.0" }
+
 [alias]
 vdev = "run --quiet --package vdev --"
 

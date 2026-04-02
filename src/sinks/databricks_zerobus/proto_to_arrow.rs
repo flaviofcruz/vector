@@ -29,12 +29,69 @@ fn proto_field_to_arrow_field(field: &FieldDescriptor) -> Result<Field, ZerobusS
     let nullable = field.cardinality() != Cardinality::Required;
 
     if field.is_map() {
-        return Err(ZerobusSinkError::ConfigError {
-            message: format!(
-                "Map fields are not supported in proto-to-Arrow conversion (field: '{}')",
-                name
-            ),
-        });
+        // Protobuf maps are represented as repeated messages with `key` (field 1)
+        // and `value` (field 2). Convert to Arrow Map<K, V>.
+        let map_msg = match field.kind() {
+            Kind::Message(m) => m,
+            _ => unreachable!("map field must have a message kind"),
+        };
+        let key_field = map_msg
+            .get_field_by_name("key")
+            .expect("map entry message must have a 'key' field");
+        let val_field = map_msg
+            .get_field_by_name("value")
+            .expect("map entry message must have a 'value' field");
+
+        let key_type = proto_kind_to_arrow_type(&key_field.kind(), "key")?;
+        let val_type = proto_kind_to_arrow_type(&val_field.kind(), "value")?;
+
+        // DEBUG: VECTOR_ARROW_MAP_DEBUG=skip  → replace all maps with Utf8 (tests server acceptance)
+        //        VECTOR_ARROW_MAP_DEBUG=int64  → only emit Map when key is Int64
+        //        VECTOR_ARROW_MAP_DEBUG=int32  → only emit Map when key is Int32
+        //        VECTOR_ARROW_MAP_DEBUG=string → only emit Map when key is Utf8
+        //        unset / other                 → normal behaviour (emit Arrow Map for all)
+        let debug_mode = std::env::var("VECTOR_ARROW_MAP_DEBUG")
+            .unwrap_or_default()
+            .to_lowercase();
+        let use_arrow_map = match debug_mode.as_str() {
+            "skip" => false,
+            "int64" => matches!(key_type, DataType::Int64),
+            "int32" => matches!(key_type, DataType::Int32),
+            "string" => matches!(key_type, DataType::LargeUtf8),
+            _ => true,
+        };
+
+        if !use_arrow_map {
+            // Fall back to LargeUtf8 so the field is still present but as a plain
+            // string column — lets us confirm the server accepts the schema without Map.
+            tracing::debug!(
+                field = %name,
+                key_type = ?key_type,
+                val_type = ?val_type,
+                mode = %debug_mode,
+                "VECTOR_ARROW_MAP_DEBUG: replacing map column with LargeUtf8"
+            );
+            return Ok(Field::new(name, DataType::LargeUtf8, true));
+        }
+
+        tracing::debug!(
+            field = %name,
+            key_type = ?key_type,
+            val_type = ?val_type,
+            "emitting Arrow Map column"
+        );
+
+        let entries = DataType::Struct(Fields::from(vec![
+            Field::new("key", key_type, false),
+            Field::new("value", val_type, true),
+        ]));
+        // Use "key_value" as the entries field name — this matches Spark/Delta
+        // Arrow IPC convention and is required by the Databricks Arrow Flight server.
+        return Ok(Field::new(
+            name,
+            DataType::Map(Arc::new(Field::new("key_value", entries, false)), false),
+            nullable,
+        ));
     }
 
     let data_type = proto_kind_to_arrow_type(&field.kind(), &name)?;
@@ -136,6 +193,105 @@ mod tests {
     }
 
     #[test]
+    fn test_map_field_produces_key_value_naming() {
+        // A proto map<int64, bool> field must become Arrow Map("key_value", Struct(key: Int64,
+        // value: Bool)) — the inner entries field must be named "key_value" to match
+        // the Spark / Delta / Unity Catalog Arrow IPC convention.
+        use super::super::unity_catalog_schema::{
+            UnityCatalogColumn, UnityCatalogTableSchema, generate_descriptor_from_schema,
+        };
+
+        let schema = UnityCatalogTableSchema {
+            name: "test_table".to_string(),
+            catalog_name: "test_catalog".to_string(),
+            schema_name: "test_schema".to_string(),
+            columns: vec![UnityCatalogColumn {
+                name: "boolean_config_access".to_string(),
+                type_text: "map<bigint,boolean>".to_string(),
+                type_name: "MAP".to_string(),
+                position: 0,
+                nullable: true,
+                type_json: r#"{"type":"map","keyType":"long","valueType":"boolean","valueContainsNull":true}"#.to_string(),
+            }],
+        };
+
+        let descriptor =
+            generate_descriptor_from_schema(&schema).expect("Failed to generate descriptor");
+        let arrow_schema =
+            proto_descriptor_to_arrow_schema(&descriptor).expect("Failed to build Arrow schema");
+
+        assert_eq!(arrow_schema.fields().len(), 1);
+        let field = arrow_schema.field(0);
+        assert_eq!(field.name(), "boolean_config_access");
+
+        match field.data_type() {
+            DataType::Map(entries_field, _sorted) => {
+                assert_eq!(
+                    entries_field.name(),
+                    "key_value",
+                    "Map entries field must be 'key_value' for UC/Spark compatibility"
+                );
+                match entries_field.data_type() {
+                    DataType::Struct(kv_fields) => {
+                        assert_eq!(kv_fields.len(), 2);
+                        assert_eq!(kv_fields[0].name(), "key");
+                        assert_eq!(kv_fields[0].data_type(), &DataType::Int64);
+                        assert!(!kv_fields[0].is_nullable(), "map key must not be nullable");
+                        assert_eq!(kv_fields[1].name(), "value");
+                        assert_eq!(kv_fields[1].data_type(), &DataType::Boolean);
+                    }
+                    other => panic!("Expected Struct inside Map, got {:?}", other),
+                }
+            }
+            other => panic!("Expected Map type for boolean_config_access, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_field_string_to_string() {
+        // map<string, string> → Arrow Map("key_value", Struct(key: Utf8, value: Utf8))
+        use super::super::unity_catalog_schema::{
+            UnityCatalogColumn, UnityCatalogTableSchema, generate_descriptor_from_schema,
+        };
+
+        let schema = UnityCatalogTableSchema {
+            name: "test_table".to_string(),
+            catalog_name: "test_catalog".to_string(),
+            schema_name: "test_schema".to_string(),
+            columns: vec![UnityCatalogColumn {
+                name: "sql_confs".to_string(),
+                type_text: "map<string,string>".to_string(),
+                type_name: "MAP".to_string(),
+                position: 0,
+                nullable: true,
+                type_json: r#"{"type":"map","keyType":"string","valueType":"string","valueContainsNull":true}"#.to_string(),
+            }],
+        };
+
+        let descriptor =
+            generate_descriptor_from_schema(&schema).expect("Failed to generate descriptor");
+        let arrow_schema =
+            proto_descriptor_to_arrow_schema(&descriptor).expect("Failed to build Arrow schema");
+
+        let field = arrow_schema.field(0);
+        assert_eq!(field.name(), "sql_confs");
+
+        match field.data_type() {
+            DataType::Map(entries_field, _) => {
+                assert_eq!(entries_field.name(), "key_value");
+                match entries_field.data_type() {
+                    DataType::Struct(kv_fields) => {
+                        assert_eq!(kv_fields[0].data_type(), &DataType::LargeUtf8);
+                        assert_eq!(kv_fields[1].data_type(), &DataType::LargeUtf8);
+                    }
+                    other => panic!("Expected Struct, got {:?}", other),
+                }
+            }
+            other => panic!("Expected Map, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_nested_message_from_unity_catalog() {
         use super::super::unity_catalog_schema::{
             UnityCatalogColumn, UnityCatalogTableSchema, generate_descriptor_from_schema,
@@ -198,5 +354,58 @@ mod tests {
 
         let active_field = arrow_schema.field_with_name("active").unwrap();
         assert_eq!(active_field.data_type(), &DataType::Boolean);
+    }
+
+    #[test]
+    fn test_string_maps_to_large_utf8_and_bytes_maps_to_large_binary() {
+        // Verifies that proto `string` → Arrow `LargeUtf8` and proto `bytes` → Arrow `LargeBinary`.
+        // This is required for compatibility with the Databricks Arrow Flight server, which
+        // expects LargeUtf8/LargeBinary rather than the narrow Utf8/Binary variants.
+        use super::super::unity_catalog_schema::{
+            UnityCatalogColumn, UnityCatalogTableSchema, generate_descriptor_from_schema,
+        };
+
+        let schema = UnityCatalogTableSchema {
+            name: "test_table".to_string(),
+            catalog_name: "cat".to_string(),
+            schema_name: "sch".to_string(),
+            columns: vec![
+                UnityCatalogColumn {
+                    name: "name".to_string(),
+                    type_text: "STRING".to_string(),
+                    type_name: "STRING".to_string(),
+                    position: 0,
+                    nullable: true,
+                    type_json: String::new(),
+                },
+                UnityCatalogColumn {
+                    name: "data".to_string(),
+                    type_text: "BINARY".to_string(),
+                    type_name: "BINARY".to_string(),
+                    position: 1,
+                    nullable: true,
+                    type_json: String::new(),
+                },
+            ],
+        };
+
+        let descriptor =
+            generate_descriptor_from_schema(&schema).expect("Failed to generate descriptor");
+        let arrow_schema =
+            proto_descriptor_to_arrow_schema(&descriptor).expect("Failed to build Arrow schema");
+
+        let name_field = arrow_schema.field_with_name("name").unwrap();
+        assert_eq!(
+            name_field.data_type(),
+            &DataType::LargeUtf8,
+            "proto string must map to LargeUtf8 for Databricks Flight compatibility"
+        );
+
+        let data_field = arrow_schema.field_with_name("data").unwrap();
+        assert_eq!(
+            data_field.data_type(),
+            &DataType::LargeBinary,
+            "proto bytes must map to LargeBinary for Databricks Flight compatibility"
+        );
     }
 }

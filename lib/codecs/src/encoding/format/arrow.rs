@@ -285,53 +285,10 @@ pub fn build_record_batch(
     schema: Arc<Schema>,
     events: &[Event],
 ) -> Result<RecordBatch, ArrowEncodingError> {
-    let num_fields = schema.fields().len();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_fields);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
-        let field_name = field.name();
-        let nullable = field.is_nullable();
-        let array: ArrayRef = match field.data_type() {
-            DataType::Timestamp(time_unit, tz) => {
-                build_timestamp_array(events, field_name, *time_unit, tz.clone(), nullable)?
-            }
-            DataType::Utf8 => build_string_array(events, field_name, nullable)?,
-            DataType::LargeUtf8 => build_large_string_array(events, field_name, nullable)?,
-            DataType::Int8 => build_int8_array(events, field_name, nullable)?,
-            DataType::Int16 => build_int16_array(events, field_name, nullable)?,
-            DataType::Int32 => build_int32_array(events, field_name, nullable)?,
-            DataType::Int64 => build_int64_array(events, field_name, nullable)?,
-            DataType::UInt8 => build_uint8_array(events, field_name, nullable)?,
-            DataType::UInt16 => build_uint16_array(events, field_name, nullable)?,
-            DataType::UInt32 => build_uint32_array(events, field_name, nullable)?,
-            DataType::UInt64 => build_uint64_array(events, field_name, nullable)?,
-            DataType::Float32 => build_float32_array(events, field_name, nullable)?,
-            DataType::Float64 => build_float64_array(events, field_name, nullable)?,
-            DataType::Boolean => build_boolean_array(events, field_name, nullable)?,
-            DataType::Binary => build_binary_array(events, field_name, nullable)?,
-            DataType::LargeBinary => build_large_binary_array(events, field_name, nullable)?,
-            DataType::Decimal128(precision, scale) => {
-                build_decimal128_array(events, field_name, *precision, *scale, nullable)?
-            }
-            DataType::Decimal256(precision, scale) => {
-                build_decimal256_array(events, field_name, *precision, *scale, nullable)?
-            }
-            DataType::Struct(fields) => build_struct_array(events, field_name, fields, nullable)?,
-            DataType::Map(entries_field, _sorted) => {
-                build_map_array(events, field_name, entries_field, nullable)?
-            }
-            DataType::List(item_field) => {
-                build_list_array(events, field_name, item_field, nullable)?
-            }
-            other_type => {
-                return Err(ArrowEncodingError::UnsupportedType {
-                    field_name: field_name.into(),
-                    data_type: other_type.clone(),
-                });
-            }
-        };
-
-        columns.push(array);
+        columns.push(build_column_for_path(events, field.name(), field)?);
     }
 
     RecordBatch::try_new(schema, columns)
@@ -847,6 +804,35 @@ fn build_struct_array(
     Ok(Arc::new(struct_array))
 }
 
+/// Converts a string map key to the Arrow key type required by the schema.
+///
+/// Protobuf map keys may be integer types (e.g. `map<int64, bool>` uses `Int64`).
+/// JSON object keys are always strings, so we parse them into the target type.
+/// Protobuf allows bool, int32/64, uint32/64, and string as map key types.
+fn coerce_string_key(k: &str, key_type: &DataType) -> Value {
+    match key_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => {
+            if let Ok(i) = k.parse::<i64>() {
+                Value::Integer(i)
+            } else {
+                Value::Integer(0)
+            }
+        }
+        DataType::Boolean => match k {
+            "true" | "1" => Value::Boolean(true),
+            _ => Value::Boolean(false),
+        },
+        _ => Value::Bytes(k.to_owned().into()),
+    }
+}
+
 /// Builds an Arrow `MapArray` for a map field at the given path.
 ///
 /// The Vector event value at `path` must be a `Value::Object` (string-keyed map).
@@ -871,9 +857,10 @@ fn build_map_array(
         });
     }
     // Arrow Map convention: entries struct has key as field 0, value as field 1.
+    let key_field = &kv_fields[0];
     let value_field = &kv_fields[1];
 
-    let mut key_builder = LargeStringBuilder::new();
+    let mut flat_keys: Vec<Value> = Vec::new();
     let mut flat_values: Vec<Value> = Vec::new();
     let mut offsets: Vec<i32> = Vec::with_capacity(events.len() + 1);
     let mut validity: Vec<bool> = Vec::with_capacity(events.len());
@@ -886,7 +873,10 @@ fn build_map_array(
                 Some(Value::Object(obj)) => {
                     validity.push(true);
                     for (k, v) in obj.iter() {
-                        key_builder.append_value(k.as_str());
+                        // JSON object keys are always strings. Convert to the
+                        // schema's key type (e.g. parse "123" → Int64 for map<int64, *>).
+                        let key_val = coerce_string_key(k.as_str(), key_field.data_type());
+                        flat_keys.push(key_val);
                         flat_values.push(v.clone());
                         current_offset += 1;
                     }
@@ -906,7 +896,7 @@ fn build_map_array(
         offsets.push(current_offset);
     }
 
-    let key_array: ArrayRef = Arc::new(key_builder.finish());
+    let key_array = build_map_value_array(&flat_keys, key_field)?;
     let value_array = build_map_value_array(&flat_values, value_field)?;
 
     let entries_array =
@@ -1040,6 +1030,96 @@ fn build_list_item_array(
                 .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
             Ok(Arc::new(struct_array))
         }
+        DataType::List(item_field) => {
+            // Nested list: each element of `items` should be a Value::Array.
+            // Flatten them and build offsets, then recurse.
+            let mut flat_items: Vec<Value> = Vec::new();
+            let mut offsets: Vec<i32> = vec![0];
+            let mut validity: Vec<bool> = Vec::with_capacity(items.len());
+            let mut has_null = false;
+
+            for item in items {
+                match item {
+                    Value::Array(arr) => {
+                        flat_items.extend(arr.iter().cloned());
+                        offsets.push(flat_items.len() as i32);
+                        validity.push(true);
+                    }
+                    _ => {
+                        offsets.push(*offsets.last().unwrap_or(&0));
+                        validity.push(false);
+                        has_null = true;
+                    }
+                }
+            }
+
+            let child_array = build_list_item_array(&flat_items, item_field)?;
+            let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
+            let null_buffer = has_null.then(|| NullBuffer::from(validity));
+
+            let list_array = ListArray::try_new(
+                Arc::new(item_field.as_ref().clone()),
+                offset_buffer,
+                child_array,
+                null_buffer,
+            )
+            .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+            Ok(Arc::new(list_array))
+        }
+        DataType::Map(entries_field, _sorted) => {
+            // Each item is a Value::Object representing one row's map.
+            // Build offsets + flat key/value arrays across all rows.
+            let DataType::Struct(kv_fields) = entries_field.data_type() else {
+                return Err(ArrowEncodingError::UnsupportedType {
+                    field_name: field.name().clone(),
+                    data_type: field.data_type().clone(),
+                });
+            };
+            let key_field = &kv_fields[0];
+            let value_field = &kv_fields[1];
+
+            let mut flat_keys: Vec<Value> = Vec::new();
+            let mut flat_values: Vec<Value> = Vec::new();
+            let mut offsets: Vec<i32> = vec![0];
+            let mut validity: Vec<bool> = Vec::with_capacity(items.len());
+            let mut has_null = false;
+
+            for item in items {
+                match item {
+                    Value::Object(obj) => {
+                        for (k, v) in obj.iter() {
+                            flat_keys.push(coerce_string_key(k.as_str(), key_field.data_type()));
+                            flat_values.push(v.clone());
+                        }
+                        offsets.push(flat_keys.len() as i32);
+                        validity.push(true);
+                    }
+                    _ => {
+                        offsets.push(*offsets.last().unwrap_or(&0));
+                        validity.push(false);
+                        has_null = true;
+                    }
+                }
+            }
+
+            let key_array = build_map_value_array(&flat_keys, key_field)?;
+            let value_array = build_map_value_array(&flat_values, value_field)?;
+
+            let entries_array =
+                StructArray::try_new(kv_fields.clone(), vec![key_array, value_array], None)
+                    .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+
+            let null_buffer = has_null.then(|| NullBuffer::from(validity));
+            let map_array = MapArray::try_new(
+                Arc::new(entries_field.as_ref().clone()),
+                OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                entries_array,
+                null_buffer,
+                false,
+            )
+            .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+            Ok(Arc::new(map_array))
+        }
         _ => build_map_value_array(items, field),
     }
 }
@@ -1152,6 +1232,10 @@ fn build_map_value_array(
                 }
             }
             Ok(Arc::new(builder.finish()))
+        }
+        DataType::Struct(_) | DataType::List(_) => {
+            // Delegate to build_list_item_array which already handles Struct and List values.
+            build_list_item_array(values, field)
         }
         other => Err(ArrowEncodingError::UnsupportedType {
             field_name: field.name().clone(),
@@ -2785,6 +2869,248 @@ mod tests {
         assert_eq!(batch.num_columns(), 1);
     }
 
+    /// Helper to build a Map field with an Int64 key type (mirrors proto map<int64, V>).
+    /// Uses "key_value" as the entries field name to match Spark/Delta/UC convention.
+    fn map_field_int64_key(value_type: DataType, nullable: bool) -> Field {
+        Field::new(
+            "config_access",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("value", value_type, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            nullable,
+        )
+    }
+
+    #[test]
+    fn test_encode_map_int64_key_to_bool() {
+        use arrow::array::{Int64Array, MapArray};
+        use serde_json::json;
+
+        let mut log = LogEvent::default();
+        // Keys are string representations of int64 values (how proto map<int64,bool>
+        // arrives in Vector events after JSON decode).
+        log.insert(
+            "config_access",
+            json!({"1234567890": true, "9876543210": false}),
+        );
+
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field_int64_key(
+            DataType::Boolean,
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let map_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert!(!map_col.is_null(0));
+
+        let entries = map_col.value(0);
+        assert_eq!(entries.len(), 2);
+
+        let keys = entries
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let vals = entries
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+
+        // BTreeMap iteration order is lexicographic on the string keys.
+        // "1234567890" < "9876543210" lexicographically.
+        assert_eq!(keys.value(0), 1234567890_i64);
+        assert!(vals.value(0));
+        assert_eq!(keys.value(1), 9876543210_i64);
+        assert!(!vals.value(1));
+    }
+
+    #[test]
+    fn test_encode_map_int64_key_to_float64() {
+        use arrow::array::{Float64Array, Int64Array, MapArray};
+        use serde_json::json;
+
+        let mut log = LogEvent::default();
+        log.insert(
+            "config_access",
+            json!({"1111111111": 200.0, "2222222222": 0.5}),
+        );
+
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field_int64_key(
+            DataType::Float64,
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let map_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        let entries = map_col.value(0);
+        assert_eq!(entries.len(), 2);
+
+        let keys = entries
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let vals = entries
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        assert_eq!(keys.value(0), 1111111111_i64);
+        assert_eq!(vals.value(0), 200.0_f64);
+        assert_eq!(keys.value(1), 2222222222_i64);
+        assert_eq!(vals.value(1), 0.5_f64);
+    }
+
+    #[test]
+    fn test_encode_map_key_value_naming_ipc_roundtrip() {
+        // Verify that a map schema using "key_value" (Spark/Delta/UC convention)
+        // round-trips through Arrow IPC correctly.
+        use arrow::ipc::reader::StreamReader;
+        use serde_json::json;
+        use std::io::Cursor;
+
+        let mut log = LogEvent::default();
+        log.insert(
+            "config_access",
+            json!({"1234567890": true, "9876543210": false}),
+        );
+
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field_int64_key(
+            DataType::Boolean,
+            true,
+        )]));
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)));
+        assert!(bytes.is_ok(), "IPC encoding failed: {:?}", bytes);
+
+        let cursor = Cursor::new(bytes.unwrap());
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // Verify the inner field is named "key_value" (UC/Spark convention).
+        let schema = batch.schema();
+        let map_field = schema.field(0);
+        if let DataType::Map(entries_field, _) = map_field.data_type() {
+            assert_eq!(
+                entries_field.name(),
+                "key_value",
+                "Map entries field must be named 'key_value' for UC compatibility"
+            );
+        } else {
+            panic!("Expected Map type");
+        }
+    }
+
+    /// Struct field set to an empty object `{}` (e.g. `_log_metadata = {}` or
+    /// `_environment = {}` in the service_health_event demo pipeline).
+    ///
+    /// The struct validity bit should be **true** (the field exists) but every
+    /// child column should be **null** (no sub-keys are present in the empty map).
+    #[test]
+    fn test_encode_struct_empty_object_is_valid_with_null_children() {
+        use arrow::array::{Int64Array, LargeStringArray, StructArray};
+        use vrl::value::ObjectMap;
+
+        // Row 0: struct is an empty object — present but has no children.
+        let mut log0 = LogEvent::default();
+        log0.insert("meta", Value::Object(ObjectMap::new()));
+
+        // Row 1: struct is absent altogether — should be null.
+        let log1 = LogEvent::default();
+
+        // Row 2: struct has actual child values.
+        let mut log2 = LogEvent::default();
+        log2.insert("meta.id", 42_i64);
+        log2.insert("meta.label", "hello");
+
+        let events = vec![Event::Log(log0), Event::Log(log1), Event::Log(log2)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("label", DataType::LargeUtf8, true),
+            ])),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let struct_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        // Row 0: empty object → non-null struct, but null children.
+        assert!(
+            !struct_col.is_null(0),
+            "empty-object struct row should be non-null"
+        );
+        let id_col = struct_col
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let label_col = struct_col
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert!(id_col.is_null(0), "id should be null for empty-object row");
+        assert!(
+            label_col.is_null(0),
+            "label should be null for empty-object row"
+        );
+
+        // Row 1: absent struct → null struct.
+        assert!(struct_col.is_null(1), "absent struct row should be null");
+
+        // Row 2: fully populated struct.
+        assert!(
+            !struct_col.is_null(2),
+            "populated struct row should be non-null"
+        );
+        assert_eq!(id_col.value(2), 42);
+        assert_eq!(label_col.value(2), "hello");
+    }
+
     // -------------------------------------------------------------------------
     // Realistic proto-schema tests
     // -------------------------------------------------------------------------
@@ -2956,5 +3282,623 @@ mod tests {
         assert!(!f16.is_null(0));
         assert!(f16.is_null(1));
         assert_eq!(f16.value(0), b"\x0a\x05hello");
+    }
+
+    // -------------------------------------------------------------------------
+    // query_profile_log schema patterns
+    // -------------------------------------------------------------------------
+
+    /// `List<Struct>` containing its own inner `List<Struct>` — mirrors
+    /// `stage_data` (repeated `StageDataElement`) where `StageDataElement`
+    /// itself has `repeated metrics_for_k_slowest_tasks`.
+    ///
+    /// Schema:
+    ///   stage_data: List<Struct {
+    ///     stage_id: Int32,
+    ///     num_tasks: Int32,
+    ///     k_slowest: List<Struct { task_id: Int64, duration_ns: Int64 }>,
+    ///   }>
+    #[test]
+    fn test_encode_list_struct_with_inner_list_struct() {
+        use arrow::array::{Int32Array, Int64Array, ListArray, StructArray};
+        use vrl::value::ObjectMap;
+
+        // Inner struct builder helper.
+        let make_task = |task_id: i64, dur: i64| {
+            let mut m = ObjectMap::new();
+            m.insert("task_id".into(), Value::Integer(task_id));
+            m.insert("duration_ns".into(), Value::Integer(dur));
+            Value::Object(m)
+        };
+        let make_stage = |stage_id: i64, num_tasks: i64, tasks: Vec<Value>| {
+            let mut m = ObjectMap::new();
+            m.insert("stage_id".into(), Value::Integer(stage_id));
+            m.insert("num_tasks".into(), Value::Integer(num_tasks));
+            m.insert("k_slowest".into(), Value::Array(tasks));
+            Value::Object(m)
+        };
+
+        // Row 0: two stages, first with two slow tasks, second with none.
+        let mut log0 = LogEvent::default();
+        log0.insert(
+            "stage_data",
+            Value::Array(vec![
+                make_stage(1, 10, vec![make_task(101, 500_000), make_task(102, 300_000)]),
+                make_stage(2, 5, vec![]),
+            ]),
+        );
+
+        // Row 1: single stage, one slow task.
+        let mut log1 = LogEvent::default();
+        log1.insert(
+            "stage_data",
+            Value::Array(vec![make_stage(3, 8, vec![make_task(201, 1_000_000)])]),
+        );
+
+        // Row 2: absent stage_data → null list.
+        let log2 = LogEvent::default();
+
+        let events = vec![Event::Log(log0), Event::Log(log1), Event::Log(log2)];
+
+        let k_slowest_struct_fields = Fields::from(vec![
+            Field::new("task_id", DataType::Int64, true),
+            Field::new("duration_ns", DataType::Int64, true),
+        ]);
+        let stage_struct_fields = Fields::from(vec![
+            Field::new("stage_id", DataType::Int32, true),
+            Field::new("num_tasks", DataType::Int32, true),
+            Field::new(
+                "k_slowest",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(k_slowest_struct_fields),
+                    true,
+                ))),
+                true,
+            ),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "stage_data",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(stage_struct_fields),
+                true,
+            ))),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        let stage_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        // Row 0: 2 stages.
+        assert!(!stage_col.is_null(0));
+        let row0_stages_arr = stage_col.value(0);
+        let row0_stages = row0_stages_arr
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(row0_stages.len(), 2);
+
+        // First stage: stage_id=1, num_tasks=10, k_slowest has 2 tasks.
+        let stage_ids = row0_stages
+            .column_by_name("stage_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(stage_ids.value(0), 1);
+        assert_eq!(stage_ids.value(1), 2);
+
+        let k_slowest_col = row0_stages
+            .column_by_name("k_slowest")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        // First stage's k_slowest: [task_id=101, task_id=102].
+        let first_stage_tasks_arr = k_slowest_col.value(0);
+        let first_stage_tasks = first_stage_tasks_arr
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(first_stage_tasks.len(), 2);
+        let task_ids = first_stage_tasks
+            .column_by_name("task_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(task_ids.value(0), 101);
+        assert_eq!(task_ids.value(1), 102);
+
+        // Second stage's k_slowest: empty.
+        assert_eq!(k_slowest_col.value(1).len(), 0);
+
+        // Row 1: 1 stage.
+        assert!(!stage_col.is_null(1));
+        assert_eq!(stage_col.value(1).len(), 1);
+
+        // Row 2: absent → null list.
+        assert!(stage_col.is_null(2));
+    }
+
+    /// Map fields nested inside a struct — mirrors `QueryMetrics` which has
+    /// `map<int64, bool> boolean_config_access` and
+    /// `map<int64, double> double_config_access` as child fields.
+    ///
+    /// Schema:
+    ///   query_metrics: Struct {
+    ///     parsing_time_ns: Int64,
+    ///     boolean_config_access: Map("key_value", Struct(key: Int64, value: Boolean)),
+    ///     double_config_access:  Map("key_value", Struct(key: Int64, value: Float64)),
+    ///   }
+    #[test]
+    fn test_encode_struct_with_nested_map_fields() {
+        use arrow::array::{Float64Array, Int64Array, MapArray, StructArray};
+        use serde_json::json;
+
+        let bool_map_field = Field::new(
+            "boolean_config_access",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("value", DataType::Boolean, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let double_map_field = Field::new(
+            "double_config_access",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("value", DataType::Float64, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let metrics_fields = Fields::from(vec![
+            Field::new("parsing_time_ns", DataType::Int64, true),
+            bool_map_field,
+            double_map_field,
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "query_metrics",
+            DataType::Struct(metrics_fields),
+            true,
+        )]));
+
+        // Row 0: fully populated query_metrics.
+        let mut log0 = LogEvent::default();
+        log0.insert("query_metrics.parsing_time_ns", 42_000_i64);
+        log0.insert(
+            "query_metrics.boolean_config_access",
+            json!({"100": true, "200": false}),
+        );
+        log0.insert(
+            "query_metrics.double_config_access",
+            json!({"300": 1.5, "400": 2.0}),
+        );
+
+        // Row 1: query_metrics absent → null struct.
+        let log1 = LogEvent::default();
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let metrics_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        // Row 0: non-null struct.
+        assert!(!metrics_col.is_null(0), "row 0 struct should be non-null");
+        // Row 1: null struct.
+        assert!(metrics_col.is_null(1), "row 1 struct should be null");
+
+        // Check parsing_time_ns.
+        let parse_ns = metrics_col
+            .column_by_name("parsing_time_ns")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(parse_ns.value(0), 42_000);
+
+        // Check boolean_config_access map: 2 entries with int64 keys.
+        let bool_map = metrics_col
+            .column_by_name("boolean_config_access")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert!(!bool_map.is_null(0));
+        let bool_entries = bool_map.value(0);
+        assert_eq!(bool_entries.len(), 2);
+        let bool_keys = bool_entries
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // Keys coerced from string "100"/"200" to Int64.
+        assert_eq!(bool_keys.value(0), 100_i64);
+        assert_eq!(bool_keys.value(1), 200_i64);
+
+        // Check double_config_access map: 2 entries with float64 values.
+        let dbl_map = metrics_col
+            .column_by_name("double_config_access")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert!(!dbl_map.is_null(0));
+        let dbl_entries = dbl_map.value(0);
+        assert_eq!(dbl_entries.len(), 2);
+        let dbl_vals = dbl_entries
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(dbl_vals.value(0), 1.5_f64);
+        assert_eq!(dbl_vals.value(1), 2.0_f64);
+    }
+
+    /// IPC round-trip for a schema with nested `List<Struct>` and `Map` inside
+    /// a `Struct` — verifies the full Arrow IPC serialization path works for
+    /// the query_profile_log schema patterns.
+    #[test]
+    fn test_encode_query_profile_log_patterns_ipc_roundtrip() {
+        use arrow::ipc::reader::StreamReader;
+        use serde_json::json;
+        use std::io::Cursor;
+        use vrl::value::ObjectMap;
+
+        // Build a simplified QPL-like schema.
+        let failure_fields = Fields::from(vec![
+            Field::new("error_class", DataType::LargeUtf8, true),
+            Field::new("sub_error_class", DataType::LargeUtf8, true),
+            Field::new("sql_state", DataType::LargeUtf8, true),
+        ]);
+        let stage_struct_fields = Fields::from(vec![
+            Field::new("stage_id", DataType::Int32, true),
+            Field::new("num_tasks", DataType::Int32, true),
+            Field::new("failure_reason", DataType::LargeUtf8, true),
+        ]);
+        let bool_map_field = Field::new(
+            "boolean_config_access",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Int64, false),
+                        Field::new("value", DataType::Boolean, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        let query_metrics_fields = Fields::from(vec![
+            Field::new("parsing_time_ns", DataType::Int64, true),
+            bool_map_field,
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::LargeUtf8, true),
+            Field::new("is_success", DataType::Boolean, true),
+            Field::new(
+                "failure",
+                DataType::Struct(failure_fields),
+                true,
+            ),
+            Field::new(
+                "stage_data",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(stage_struct_fields),
+                    true,
+                ))),
+                true,
+            ),
+            Field::new(
+                "query_metrics",
+                DataType::Struct(query_metrics_fields),
+                true,
+            ),
+            Field::new(
+                "contributing_query_ids",
+                DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                true,
+            ),
+            Field::new(
+                "query_tags",
+                DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                true,
+            ),
+        ]));
+
+        // Row 0: success query with stage_data, query_metrics, and tags.
+        let mut log0 = LogEvent::default();
+        log0.insert("id", "q-00001");
+        log0.insert("is_success", true);
+        log0.insert(
+            "stage_data",
+            Value::Array({
+                let mut m = ObjectMap::new();
+                m.insert("stage_id".into(), Value::Integer(1));
+                m.insert("num_tasks".into(), Value::Integer(10));
+                m.insert("failure_reason".into(), Value::Bytes("".into()));
+                vec![Value::Object(m)]
+            }),
+        );
+        log0.insert("query_metrics.parsing_time_ns", 5_000_i64);
+        log0.insert(
+            "query_metrics.boolean_config_access",
+            json!({"12345": true}),
+        );
+        log0.insert(
+            "contributing_query_ids",
+            Value::Array(vec![]),
+        );
+        log0.insert(
+            "query_tags",
+            Value::Array(vec![
+                Value::Bytes("etl".into()),
+                Value::Bytes("prod".into()),
+            ]),
+        );
+
+        // Row 1: failed query with failure struct populated.
+        let mut log1 = LogEvent::default();
+        log1.insert("id", "q-00002");
+        log1.insert("is_success", false);
+        log1.insert("failure.error_class", "ANALYSIS_ERROR");
+        log1.insert("failure.sub_error_class", "UNRESOLVED_COLUMN");
+        log1.insert("failure.sql_state", "42000");
+        log1.insert(
+            "contributing_query_ids",
+            Value::Array(vec![Value::Bytes("q-00001".into())]),
+        );
+        log1.insert(
+            "query_tags",
+            Value::Array(vec![Value::Bytes("streaming".into())]),
+        );
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)));
+        assert!(bytes.is_ok(), "IPC encoding failed: {:?}", bytes);
+
+        let cursor = Cursor::new(bytes.unwrap());
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 7);
+    }
+
+    /// Full schema test mirroring the `demo_query_profile_log.json` pipeline.
+    ///
+    /// Two events are encoded:
+    ///   - Row 0 (q-00001): successful query, no failure struct, empty
+    ///     contributing_query_ids, two query_tags.
+    ///   - Row 1 (q-00002): failed query, failure struct populated, one
+    ///     contributing_query_id, one query_tag, exception string present.
+    ///
+    /// Schema (matches the fields emitted by the remap transform + the raw
+    /// JSON payload):
+    ///   id, app_id, execution_id           LargeUtf8
+    ///   time_submitted_unix_ms,
+    ///     time_completed_unix_ms           Int64
+    ///   is_streaming, is_success,
+    ///     is_serverless, is_dbsql          Boolean
+    ///   entry_point, sql_warehouse_id,
+    ///     id_with_date, statement_type,
+    ///     redacted_sql                     LargeUtf8
+    ///   contributing_query_ids             List<LargeUtf8>
+    ///   query_tags                         List<LargeUtf8>
+    ///   exception                          LargeUtf8 (optional)
+    ///   failure                            Struct { error_class, sub_error_class,
+    ///                                               sql_state, stack_trace,
+    ///                                               redacted_exception } (optional)
+    ///   _event_time                        Int64
+    ///   _partition_date                    LargeUtf8
+    #[test]
+    fn test_encode_query_profile_log_demo_schema() {
+        use arrow::array::{
+            BooleanArray, Int64Array, LargeStringArray, ListArray, StructArray,
+        };
+        use arrow::ipc::reader::StreamReader;
+        use std::io::Cursor;
+
+        let failure_fields = Fields::from(vec![
+            Field::new("error_class", DataType::LargeUtf8, true),
+            Field::new("sub_error_class", DataType::LargeUtf8, true),
+            Field::new("sql_state", DataType::LargeUtf8, true),
+            Field::new("stack_trace", DataType::LargeUtf8, true),
+            Field::new("redacted_exception", DataType::LargeUtf8, true),
+        ]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::LargeUtf8, true),
+            Field::new("app_id", DataType::LargeUtf8, true),
+            Field::new("execution_id", DataType::LargeUtf8, true),
+            Field::new("time_submitted_unix_ms", DataType::Int64, true),
+            Field::new("time_completed_unix_ms", DataType::Int64, true),
+            Field::new("is_streaming", DataType::Boolean, true),
+            Field::new("is_success", DataType::Boolean, true),
+            Field::new("entry_point", DataType::LargeUtf8, true),
+            Field::new("is_serverless", DataType::Boolean, true),
+            Field::new("is_dbsql", DataType::Boolean, true),
+            Field::new("sql_warehouse_id", DataType::LargeUtf8, true),
+            Field::new("id_with_date", DataType::LargeUtf8, true),
+            Field::new("statement_type", DataType::LargeUtf8, true),
+            Field::new("redacted_sql", DataType::LargeUtf8, true),
+            Field::new(
+                "contributing_query_ids",
+                DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                true,
+            ),
+            Field::new(
+                "query_tags",
+                DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
+                true,
+            ),
+            Field::new("exception", DataType::LargeUtf8, true),
+            Field::new("failure", DataType::Struct(failure_fields), true),
+            Field::new("_event_time", DataType::Int64, true),
+            Field::new("_partition_date", DataType::LargeUtf8, true),
+        ]));
+
+        // Row 0: q-00001 — successful SELECT, no failure, empty contributing_query_ids.
+        let mut log0 = LogEvent::default();
+        log0.insert("id", "q-00001");
+        log0.insert("app_id", "app-vector-test");
+        log0.insert("execution_id", "exec-111");
+        log0.insert("time_submitted_unix_ms", 1700000000000_i64);
+        log0.insert("time_completed_unix_ms", 1700000001523_i64);
+        log0.insert("is_streaming", false);
+        log0.insert("is_success", true);
+        log0.insert("entry_point", "NativeCommand");
+        log0.insert("is_serverless", true);
+        log0.insert("is_dbsql", false);
+        log0.insert("sql_warehouse_id", "wh-001");
+        log0.insert("id_with_date", "q-00001-2026-02-20");
+        log0.insert("statement_type", "SELECT");
+        log0.insert("redacted_sql", "SELECT * FROM tbl WHERE id = ?");
+        log0.insert("contributing_query_ids", Value::Array(vec![]));
+        log0.insert(
+            "query_tags",
+            Value::Array(vec![
+                Value::Bytes("etl".into()),
+                Value::Bytes("prod".into()),
+            ]),
+        );
+        // exception and failure absent → null
+        log0.insert("_event_time", 1700000000000000_i64);
+        log0.insert("_partition_date", "2026-02-20");
+
+        // Row 1: q-00002 — failed INSERT, failure struct populated, one contributing id.
+        let mut log1 = LogEvent::default();
+        log1.insert("id", "q-00002");
+        log1.insert("app_id", "app-vector-test");
+        log1.insert("execution_id", "exec-222");
+        log1.insert("time_submitted_unix_ms", 1700000010000_i64);
+        log1.insert("time_completed_unix_ms", 1700000055230_i64);
+        log1.insert("is_streaming", true);
+        log1.insert("is_success", false);
+        log1.insert("entry_point", "SparkPlan");
+        log1.insert("is_serverless", false);
+        log1.insert("is_dbsql", true);
+        log1.insert("sql_warehouse_id", "wh-002");
+        log1.insert("id_with_date", "q-00002-2026-02-20");
+        log1.insert("statement_type", "INSERT");
+        log1.insert("redacted_sql", "INSERT INTO tbl VALUES (?)");
+        log1.insert(
+            "contributing_query_ids",
+            Value::Array(vec![Value::Bytes("q-00001".into())]),
+        );
+        log1.insert(
+            "query_tags",
+            Value::Array(vec![Value::Bytes("streaming".into())]),
+        );
+        log1.insert("exception", "AnalysisException");
+        log1.insert("failure.error_class", "ANALYSIS_ERROR");
+        log1.insert("failure.sub_error_class", "UNRESOLVED_COLUMN");
+        log1.insert("failure.sql_state", "42000");
+        log1.insert("failure.stack_trace", "at line 1");
+        log1.insert("failure.redacted_exception", "AnalysisException: col not found");
+        log1.insert("_event_time", 1700000010000000_i64);
+        log1.insert("_partition_date", "2026-02-20");
+
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)));
+        assert!(bytes.is_ok(), "IPC encoding failed: {:?}", bytes);
+
+        let cursor = Cursor::new(bytes.unwrap());
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 20);
+
+        // Spot-check scalar fields.
+        let id_col = batch.column_by_name("id").unwrap()
+            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(id_col.value(0), "q-00001");
+        assert_eq!(id_col.value(1), "q-00002");
+
+        let submitted_col = batch.column_by_name("time_submitted_unix_ms").unwrap()
+            .as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(submitted_col.value(0), 1700000000000_i64);
+        assert_eq!(submitted_col.value(1), 1700000010000_i64);
+
+        let success_col = batch.column_by_name("is_success").unwrap()
+            .as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(success_col.value(0));
+        assert!(!success_col.value(1));
+
+        // contributing_query_ids: row 0 empty list, row 1 has one entry.
+        let cqi_col = batch.column_by_name("contributing_query_ids").unwrap()
+            .as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(!cqi_col.is_null(0));
+        assert_eq!(cqi_col.value(0).len(), 0);
+        assert!(!cqi_col.is_null(1));
+        let row1_cqi = cqi_col.value(1);
+        let row1_cqi_str = row1_cqi.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(row1_cqi_str.value(0), "q-00001");
+
+        // query_tags: row 0 has ["etl","prod"], row 1 has ["streaming"].
+        let tags_col = batch.column_by_name("query_tags").unwrap()
+            .as_any().downcast_ref::<ListArray>().unwrap();
+        let row0_tags = tags_col.value(0);
+        let row0_tags_str = row0_tags.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(row0_tags_str.value(0), "etl");
+        assert_eq!(row0_tags_str.value(1), "prod");
+
+        // exception: row 0 null, row 1 present.
+        let exc_col = batch.column_by_name("exception").unwrap()
+            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert!(exc_col.is_null(0));
+        assert_eq!(exc_col.value(1), "AnalysisException");
+
+        // failure struct: row 0 null, row 1 non-null.
+        let failure_col = batch.column_by_name("failure").unwrap()
+            .as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(failure_col.is_null(0));
+        assert!(!failure_col.is_null(1));
+        let err_class = failure_col.column_by_name("error_class").unwrap()
+            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(err_class.value(1), "ANALYSIS_ERROR");
+        let sql_state = failure_col.column_by_name("sql_state").unwrap()
+            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(sql_state.value(1), "42000");
     }
 }
