@@ -1,3 +1,30 @@
+# ---------------------------------------------------------------------------
+# Dependency conflict workaround: hyper-http-proxy vendored locally
+#
+# WHY THIS IS NEEDED
+# databricks-zerobus-ingest-sdk v1.0.1 depends on hyper-http-proxy, which
+# requires hyper 1.x + headers 0.4.x.  Vector's existing stack uses
+# hyper 0.14.x + headers 0.3.x, causing Cargo to resolve hyper-http-proxy
+# to a version that is incompatible with those older transitive deps.
+# The [patch.crates-io] override below forces Cargo to use the local copy
+# in vendor/ instead of the conflicting crates.io version.
+#
+# WHY NOT JUST UPGRADE VECTOR TO HYPER 1.X
+# Upgrading is non-trivial (~2-4 weeks of work) because:
+#   - ~70 files across sinks/sources directly use hyper 0.14 APIs
+#     (hyper::Body, hyper::Client, make_service_fn, AddrIncoming, etc.)
+#   - The Body type was removed and replaced by http-body-util in 1.x,
+#     requiring changes to every sink/source that reads or writes bodies
+#   - The server builder API changed significantly (Server::builder is gone)
+#   - A coordinated dep-tree bump is required:
+#       reqwest 0.11 → 0.12, axum 0.6 → 0.7, warp 0.3 → 0.4,
+#       hyper-proxy 0.9 → 1.x, hyper-openssl 0.9 → 0.10
+#
+# WHEN TO REMOVE THIS
+# Once vector's hyper/headers stack is upgraded to 1.x, delete the vendor/
+# directory and this [patch.crates-io] block — the SDK will then resolve
+# hyper-http-proxy cleanly from crates.io.
+# ---------------------------------------------------------------------------
 [patch.crates-io]
 hyper-http-proxy = { path = "vendor/hyper-http-proxy-1.1.0" }
 
