@@ -73,11 +73,16 @@ pub async fn resolve_endpoints(endpoint: &Uri) -> crate::Result<Vec<Uri>> {
 
 /// Extracts the IP address from a resolved URI's host component.
 ///
-/// Strips IPv6 brackets before parsing, since `http::Uri::host()` may return
-/// `"[::1]"` with brackets intact depending on the crate version.
+/// Strips IPv6 brackets before parsing, since `http::Uri::host()` returns
+/// `"[::1]"` with brackets intact for IPv6 addresses.
 pub fn ip_from_uri(uri: &Uri) -> Option<IpAddr> {
     uri.host().and_then(|h| {
-        let h = h.trim_start_matches('[').trim_end_matches(']');
+        // Strip exactly one leading '[' and trailing ']' for IPv6 addresses.
+        // Falls back to the original string for IPv4 or hostnames.
+        let h = h
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(h);
         h.parse().ok()
     })
 }
