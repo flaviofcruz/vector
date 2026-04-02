@@ -1,10 +1,5 @@
 /// Shared compression types and detection/decoding logic for object storage sources
 /// (`aws_s3`, `azure_blob`, `gcp_gcs`).
-///
-/// Detection checks in priority order: `Content-Encoding` → `Content-Type` → file extension.
-/// Decoding (via [`Compression::build_decoder`]) is available when the `sources-aws_s3` or
-/// `sources-azure_blob` feature is enabled; the gate will extend to `sources-gcp_gcs` once
-/// that source is introduced.
 use vector_lib::configurable::configurable_component;
 
 /// Compression scheme for objects retrieved from cloud object storage.
@@ -77,7 +72,11 @@ impl Compression {
     ///
     /// The caller is responsible for converting cloud-provider-specific stream error types
     /// to `std::io::Error` before calling this method (typically via `.map_err(io::Error::other)`).
-    #[cfg(any(feature = "sources-aws_s3", feature = "sources-azure_blob"))]
+    #[cfg(any(
+        feature = "sources-aws_s3",
+        feature = "sources-azure_blob",
+        feature = "sources-gcp_gcs"
+    ))]
     pub async fn build_decoder<S>(self, mut body: S) -> Box<dyn tokio::io::AsyncRead + Send + Unpin>
     where
         S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + Unpin + 'static,
@@ -257,7 +256,11 @@ mod tests {
     // Decoder tests — require async-compression via one of the source features
     // -------------------------------------------------------------------------
 
-    #[cfg(any(feature = "sources-aws_s3", feature = "sources-azure_blob"))]
+    #[cfg(any(
+        feature = "sources-aws_s3",
+        feature = "sources-azure_blob",
+        feature = "sources-gcp_gcs"
+    ))]
     mod decoder {
         use tokio::io::AsyncReadExt;
 

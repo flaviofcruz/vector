@@ -36,6 +36,8 @@ pub mod file;
 pub mod file_descriptors;
 #[cfg(feature = "sources-fluent")]
 pub mod fluent;
+#[cfg(feature = "sources-gcp_gcs")]
+pub mod gcp_gcs;
 #[cfg(feature = "sources-gcp_pubsub")]
 pub mod gcp_pubsub;
 #[cfg(feature = "sources-heroku_logs")]
