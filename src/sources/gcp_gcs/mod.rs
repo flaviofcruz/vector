@@ -233,3 +233,254 @@ enum CreateIngestorError {
     #[snafu(display("`project` must not be empty"))]
     EmptyProject,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // GcpGcsConfig TOML parsing
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn config_minimal_valid() {
+        let config: Result<GcpGcsConfig, _> = toml::from_str(
+            r#"
+            project = "my-project"
+            [pubsub]
+            subscription = "my-sub"
+            "#,
+        );
+        assert!(config.is_ok(), "minimal config should parse: {config:?}");
+        let config = config.unwrap();
+        assert_eq!(config.project, "my-project");
+        assert_eq!(config.pubsub.unwrap().subscription, "my-sub");
+        assert_eq!(config.compression, Compression::Auto);
+    }
+
+    #[test]
+    fn config_with_compression() {
+        for (value, expected) in [
+            ("auto", Compression::Auto),
+            ("none", Compression::None),
+            ("gzip", Compression::Gzip),
+            ("zstd", Compression::Zstd),
+        ] {
+            let toml = format!(
+                r#"
+                project = "p"
+                compression = "{value}"
+                [pubsub]
+                subscription = "s"
+                "#
+            );
+            let config: GcpGcsConfig = toml::from_str(&toml)
+                .unwrap_or_else(|e| panic!("compression={value} should parse: {e}"));
+            assert_eq!(config.compression, expected, "compression={value}");
+        }
+    }
+
+    #[test]
+    fn config_invalid_compression_rejected() {
+        let config: Result<GcpGcsConfig, _> = toml::from_str(
+            r#"
+            project = "p"
+            compression = "lz4"
+            [pubsub]
+            subscription = "s"
+            "#,
+        );
+        assert!(config.is_err(), "unknown compression value should fail");
+    }
+
+    #[test]
+    fn config_unknown_fields_rejected() {
+        let config: Result<GcpGcsConfig, _> = toml::from_str(
+            r#"
+            project = "p"
+            unknown_field = "oops"
+            [pubsub]
+            subscription = "s"
+            "#,
+        );
+        assert!(
+            config.is_err(),
+            "unknown fields should be rejected by deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn config_without_pubsub_block_is_valid_toml() {
+        // Missing pubsub is valid TOML (optional field) but fails at build() time.
+        let config: Result<GcpGcsConfig, _> = toml::from_str(
+            r#"
+            project = "p"
+            "#,
+        );
+        assert!(
+            config.is_ok(),
+            "pubsub block is optional at parse time (enforced at build)"
+        );
+        assert!(config.unwrap().pubsub.is_none());
+    }
+
+    #[test]
+    fn config_missing_project_uses_default_empty_string() {
+        let config: Result<GcpGcsConfig, _> = toml::from_str(
+            r#"
+            [pubsub]
+            subscription = "s"
+            "#,
+        );
+        assert!(config.is_ok());
+        assert_eq!(config.unwrap().project, "");
+    }
+
+    #[test]
+    fn config_with_auth_credentials_path() {
+        let config: Result<GcpGcsConfig, _> = toml::from_str(
+            r#"
+            project = "p"
+            credentials_path = "/path/to/key.json"
+            [pubsub]
+            subscription = "s"
+            "#,
+        );
+        assert!(config.is_ok(), "credentials_path should parse: {config:?}");
+        let config = config.unwrap();
+        assert_eq!(
+            config.auth.credentials_path.as_deref(),
+            Some("/path/to/key.json")
+        );
+    }
+
+    #[test]
+    fn config_with_all_pubsub_options() {
+        let config: Result<GcpGcsConfig, _> = toml::from_str(
+            r#"
+            project = "my-project"
+            compression = "gzip"
+
+            [pubsub]
+            subscription = "my-sub"
+            poll_secs = 30
+            max_number_of_messages = 100
+            acknowledge_message = true
+            acknowledge_failed_message = false
+            client_concurrency = 8
+            "#,
+        );
+        assert!(config.is_ok(), "full config should parse: {config:?}");
+        let config = config.unwrap();
+        let pubsub = config.pubsub.unwrap();
+        assert_eq!(pubsub.poll_secs, 30);
+        assert_eq!(pubsub.max_number_of_messages, 100);
+        assert!(pubsub.acknowledge_message);
+        assert!(!pubsub.acknowledge_failed_message);
+        assert_eq!(
+            pubsub.client_concurrency,
+            Some(std::num::NonZeroUsize::new(8).unwrap())
+        );
+    }
+}
+
+#[cfg(test)]
+mod ingestor_tests {
+    use std::sync::Arc;
+
+    use vector_lib::codecs::{
+        NewlineDelimitedDecoderConfig,
+        decoding::{FramingConfig, NewlineDelimitedDecoderOptions},
+    };
+    use vector_lib::config::LogNamespace;
+
+    use crate::codecs::DecodingConfig;
+    use crate::config::ProxyConfig;
+    use crate::gcp::GcpAuthenticator;
+    use crate::http::HttpClient;
+    use crate::serde::default_decoding;
+    use crate::tls::TlsSettings;
+
+    use super::Compression;
+    use super::object::GcsDownloader;
+    use super::pubsub::{Config as PubSubConfig, Ingestor, IngestorNewError};
+
+    fn make_test_downloader() -> Arc<GcsDownloader> {
+        let framing = FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig {
+            newline_delimited: NewlineDelimitedDecoderOptions { max_length: None },
+        });
+        let client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default())
+            .expect("HttpClient must build");
+        let decoder = DecodingConfig::new(framing, default_decoding(), LogNamespace::Legacy)
+            .build()
+            .expect("Decoder must build");
+        Arc::new(GcsDownloader::new(
+            client,
+            GcpAuthenticator::None,
+            Compression::Auto,
+            decoder,
+            None,
+            "test-project".into(),
+        ))
+    }
+
+    async fn build_ingestor(max_number_of_messages: u32) -> Result<Ingestor, IngestorNewError> {
+        let client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default())
+            .expect("HttpClient must build");
+        let config = PubSubConfig {
+            subscription: "test-sub".into(),
+            max_number_of_messages,
+            ..Default::default()
+        };
+        Ingestor::new(
+            "test-project".into(),
+            client,
+            GcpAuthenticator::None,
+            config,
+            make_test_downloader(),
+        )
+        .await
+    }
+
+    /// The Pub/Sub pull API requires at least 1 message per request.
+    /// Verify Ingestor::new rejects 0 before doing any network calls.
+    #[tokio::test]
+    async fn ingestor_rejects_zero_max_messages() {
+        let result = build_ingestor(0).await;
+        assert!(
+            matches!(
+                result,
+                Err(IngestorNewError::InvalidNumberOfMessages { messages: 0 })
+            ),
+            "0 must be rejected (Pub/Sub requires at least 1)"
+        );
+    }
+
+    /// The Pub/Sub pull API caps a single request at 1000 messages.
+    /// Verify Ingestor::new rejects values above 1000.
+    #[tokio::test]
+    async fn ingestor_rejects_max_messages_over_1000() {
+        let result = build_ingestor(1001).await;
+        assert!(
+            matches!(
+                result,
+                Err(IngestorNewError::InvalidNumberOfMessages { messages: 1001 })
+            ),
+            "1001 must be rejected (Pub/Sub caps at 1000)"
+        );
+    }
+
+    /// 1000 is the upper boundary and must be accepted.
+    #[tokio::test]
+    async fn ingestor_accepts_max_messages_at_1000() {
+        let result = build_ingestor(1000).await;
+        assert!(result.is_ok(), "1000 (upper bound) must be accepted");
+    }
+
+    /// 1 is the lower boundary and must be accepted.
+    #[tokio::test]
+    async fn ingestor_accepts_max_messages_at_1() {
+        let result = build_ingestor(1).await;
+        assert!(result.is_ok(), "1 (lower bound) must be accepted");
+    }
+}

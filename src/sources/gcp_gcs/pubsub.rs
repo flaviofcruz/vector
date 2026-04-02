@@ -114,6 +114,10 @@ pub(crate) struct DirectIngestMessage {
     /// The GCS object key / path within the bucket.
     pub key: String,
     /// Unique file identifier assigned by the upstream ingestion service.
+    ///
+    /// Required. Used by the ingestion callback (added in stack/add-callback) to
+    /// notify the upstream service of processing completion or failure.
+    /// Messages without this field are rejected at deserialization time.
     pub file_id: String,
 }
 
@@ -189,6 +193,18 @@ pub enum ProcessingError {
         key: String,
     },
 
+    /// The GCS object was not found (HTTP 404).
+    ///
+    /// This typically means the object was deleted after the Pub/Sub notification was
+    /// enqueued but before Vector processed it. The message should be acknowledged to
+    /// prevent an infinite retry loop.
+    #[snafu(display("GCS object not found gs://{}/{}: {}", bucket, key, reason))]
+    ObjectNotFound {
+        bucket: String,
+        key: String,
+        reason: String,
+    },
+
     /// The downstream sink reported an error for this object.
     #[snafu(display("Sink reported an error for gs://{}/{}", bucket, key))]
     ErrorAcknowledgement { bucket: String, key: String },
@@ -209,14 +225,11 @@ impl ProcessingError {
     /// resolve on re-delivery.
     pub fn is_retriable(&self) -> bool {
         match self {
-            // Permanently-invalid: the message payload itself is broken.
-            ProcessingError::InvalidPubSubMessage { .. } | ProcessingError::EmptyFileId { .. } => {
-                false
-            }
-
-            // 404 means the GCS object was deleted after the Pub/Sub notification
-            // was enqueued. It will never reappear — retrying is pointless.
-            ProcessingError::GetObject { status: 404, .. } => false,
+            // Permanently-invalid: message payload is broken, or the object is
+            // gone for good. No amount of retrying will ever succeed.
+            ProcessingError::InvalidPubSubMessage { .. }
+            | ProcessingError::EmptyFileId { .. }
+            | ProcessingError::ObjectNotFound { .. } => false,
 
             // Transient errors: network blips, temporary GCS unavailability (429,
             // 503), downstream pipeline pressure. Re-delivery may succeed.
@@ -679,4 +692,197 @@ const fn default_max_messages() -> u32 {
 
 const fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // Pub/Sub Config: business-logic validation
+    // -------------------------------------------------------------------------
+
+    /// Verify the defaults match the documented values — these are part of the
+    /// public interface and must not change without a migration.
+    #[test]
+    fn config_defaults_are_correct() {
+        let config: Config = toml::from_str(r#"subscription = "s""#).unwrap();
+        assert_eq!(config.poll_secs, 15, "default poll_secs must be 15s");
+        assert_eq!(
+            config.max_number_of_messages, 10,
+            "default max_number_of_messages must be 10"
+        );
+        assert!(
+            config.acknowledge_message,
+            "messages must be acknowledged by default"
+        );
+        assert!(
+            config.acknowledge_failed_message,
+            "failed messages must be acknowledged by default to prevent infinite retries"
+        );
+    }
+
+    /// Unknown fields must be rejected so that misconfigured deployments fail
+    /// loudly at startup rather than silently ignoring unrecognised options.
+    #[test]
+    fn config_unknown_fields_rejected() {
+        let result: Result<Config, _> = toml::from_str(
+            r#"subscription = "s"
+               unknown_field = "oops""#,
+        );
+        assert!(
+            result.is_err(),
+            "unknown fields must be rejected at parse time"
+        );
+    }
+
+    // max_number_of_messages bounds are tested via Ingestor::new in mod.rs::tests.
+
+    // -------------------------------------------------------------------------
+    // DirectIngestMessage: schema constraints
+    // -------------------------------------------------------------------------
+
+    /// file_id is required — messages without it must be rejected so that the
+    /// ingestion callback can always reference the upstream file identifier.
+    #[test]
+    fn message_without_file_id_is_rejected() {
+        let json = r#"{"kind": "INGEST", "bucket": "b", "key": "k"}"#;
+        let msg: Result<DirectIngestMessage, _> = serde_json::from_str(json);
+        assert!(
+            msg.is_err(),
+            "missing file_id must fail — field is required"
+        );
+    }
+
+    /// Extra fields must be rejected so that future message types don't
+    /// silently match as DirectIngest when they shouldn't.
+    #[test]
+    fn message_with_unknown_field_is_rejected() {
+        let json = r#"{"kind": "INGEST", "bucket": "b", "key": "k", "file_id": "f", "extra": "x"}"#;
+        let msg: Result<DirectIngestMessage, _> = serde_json::from_str(json);
+        assert!(
+            msg.is_err(),
+            "deny_unknown_fields must prevent unrecognised fields from silently passing"
+        );
+    }
+
+    /// QueueEvent must reject messages that match no known variant so that a
+    /// misconfigured producer doesn't produce endlessly-retried dead letters.
+    #[test]
+    fn queue_event_rejects_unrecognised_message() {
+        let json = r#"{"something": "completely_different"}"#;
+        let event: Result<QueueEvent, _> = serde_json::from_str(json);
+        assert!(
+            event.is_err(),
+            "unrecognised structure must fail to prevent silent data loss"
+        );
+    }
+
+    /// An empty file_id must parse successfully (it's a valid String) but be
+    /// rejected at processing time with EmptyFileId, matching aws_s3/azure_blob.
+    #[test]
+    fn message_with_empty_file_id_parses_but_is_rejected_by_is_retriable() {
+        let json = r#"{"kind": "INGEST", "bucket": "my-logs-bucket", "key": "app/2026/03/21/events.log", "file_id": ""}"#;
+        let msg: DirectIngestMessage = serde_json::from_str(json)
+            .expect("empty file_id must parse — validation is at processing time, not parse time");
+        assert!(
+            msg.file_id.is_empty(),
+            "empty file_id must be preserved after parsing"
+        );
+        // The EmptyFileId error that would be produced is non-retriable.
+        let err = ProcessingError::EmptyFileId {
+            bucket: msg.bucket,
+            key: msg.key,
+        };
+        assert!(
+            !err.is_retriable(),
+            "EmptyFileId must not be retriable — empty file_id can never be fixed by retrying"
+        );
+    }
+
+    #[test]
+    fn is_retriable_classification() {
+        let cases: &[(ProcessingError, bool, &str)] = &[
+            // ── Permanent: never retry ──────────────────────────────────────
+            (
+                ProcessingError::InvalidPubSubMessage {
+                    source: serde_json::from_str::<()>(r#"{"kind":"INGEST"}"#).unwrap_err(),
+                    message_id: "projects/my-project/subscriptions/my-sub:1234".into(),
+                },
+                false,
+                "malformed Pub/Sub message can never be fixed by re-delivery",
+            ),
+            (
+                ProcessingError::EmptyFileId {
+                    bucket: "my-logs-bucket".into(),
+                    key: "app/2026/03/21/events.log".into(),
+                },
+                false,
+                "empty file_id is a producer bug — re-delivering the same message won't fix it",
+            ),
+            (
+                ProcessingError::ObjectNotFound {
+                    bucket: "my-logs-bucket".into(),
+                    key: "app/2026/03/21/events.log".into(),
+                    reason:
+                        "GCS returned HTTP 404 — object deleted after notification was enqueued"
+                            .into(),
+                },
+                false,
+                "deleted GCS object will never reappear — retrying would loop forever",
+            ),
+            // ── Transient: retry (unless acknowledge_failed_message=true) ───
+            (
+                ProcessingError::GetObject {
+                    status: 503,
+                    bucket: "my-logs-bucket".into(),
+                    key: "app/2026/03/21/events.log".into(),
+                },
+                true,
+                "GCS 503 is a transient server error that may resolve on re-delivery",
+            ),
+            (
+                ProcessingError::GetObject {
+                    status: 429,
+                    bucket: "my-logs-bucket".into(),
+                    key: "app/2026/03/21/events.log".into(),
+                },
+                true,
+                "GCS 429 rate-limit is transient — backing off and retrying is correct",
+            ),
+            (
+                ProcessingError::ReadObject {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection reset while reading object body",
+                    )),
+                    bucket: "my-logs-bucket".into(),
+                    key: "app/2026/03/21/events.log".into(),
+                },
+                true,
+                "mid-stream connection drop is transient — object may be readable on retry",
+            ),
+            (
+                ProcessingError::PipelineSend {
+                    source: vector_lib::source_sender::SendError::Closed,
+                    bucket: "my-logs-bucket".into(),
+                    key: "app/2026/03/21/events.log".into(),
+                },
+                true,
+                "downstream pipeline closed transiently — retry may succeed after recovery",
+            ),
+            (
+                ProcessingError::ErrorAcknowledgement {
+                    bucket: "my-logs-bucket".into(),
+                    key: "app/2026/03/21/events.log".into(),
+                },
+                true,
+                "sink error acknowledgement is transient — sink may recover on re-delivery",
+            ),
+        ];
+
+        for (err, expected, reason) in cases {
+            assert_eq!(err.is_retriable(), *expected, "{err:?}: {reason}");
+        }
+    }
 }

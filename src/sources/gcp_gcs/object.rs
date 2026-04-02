@@ -45,6 +45,8 @@ pub(super) struct GcsDownloader {
     decoder: Decoder,
     multiline: Option<line_agg::Config>,
     project: String,
+    /// Base URL for GCS requests. Overridable in tests to point at a mock server.
+    base_url: String,
 }
 
 impl GcsDownloader {
@@ -63,7 +65,16 @@ impl GcsDownloader {
             decoder,
             multiline,
             project,
+            base_url: GCS_BASE_URL.to_string(),
         }
+    }
+
+    /// Creates a downloader with a custom base URL. Used in tests to point at a
+    /// mock HTTP server instead of the real GCS endpoint.
+    #[cfg(test)]
+    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
     }
 
     /// Downloads a GCS object, decompresses, frames, decodes, and emits events.
@@ -82,14 +93,14 @@ impl GcsDownloader {
         let bucket = bucket.to_owned();
         let key = key.to_owned();
 
-        // Build the GCS XML API URL using the `url` crate so that the bucket
-        // name and each segment of the object key are correctly percent-encoded.
-        // This handles spaces, `?`, `#`, `&`, and other URL-special characters
-        // automatically without hardcoding character sets.
+        // Build the URL using url::Url so object key segments are percent-encoded.
+        // Special characters (?, #, &, spaces etc.) would break URL parsing if left
+        // raw. self.base_url is used instead of GCS_BASE_URL so tests can redirect
+        // to a local mock server.
         let url = {
-            let mut u = url::Url::parse(GCS_BASE_URL).expect("GCS base URL is valid");
+            let mut u = url::Url::parse(&self.base_url).expect("base_url must be valid");
             u.path_segments_mut()
-                .expect("GCS base URL has a path")
+                .expect("base_url must have a path")
                 .push(&bucket)
                 .extend(key.split('/'));
             u
@@ -109,6 +120,19 @@ impl GcsDownloader {
                     bucket: bucket.clone(),
                     key: key.clone(),
                 })?;
+
+        // 404 means the object was deleted after the notification was enqueued.
+        // Return ObjectNotFound so the caller can acknowledge the message and avoid
+        // an infinite retry loop.
+        if response.status() == http::StatusCode::NOT_FOUND {
+            return Err(ProcessingError::ObjectNotFound {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                reason: "GCS returned HTTP 404 — the object may have been deleted after the \
+                         notification was enqueued"
+                    .to_string(),
+            });
+        }
 
         if !response.status().is_success() {
             return Err(ProcessingError::GetObject {
@@ -305,6 +329,363 @@ fn enrich_log_event(
             if let Some(timestamp_key) = log_schema().timestamp_key() {
                 log.try_insert((PathPrefix::Event, timestamp_key), Utc::now());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+
+    use hyper::{
+        Body, Response, Server,
+        service::{make_service_fn, service_fn},
+    };
+    use vector_lib::codecs::{
+        NewlineDelimitedDecoderConfig,
+        decoding::{FramingConfig, NewlineDelimitedDecoderOptions},
+    };
+    use vector_lib::config::LogNamespace;
+    use vector_lib::internal_event::Protocol;
+    use vector_lib::lookup::metadata_path;
+
+    use super::*;
+    use crate::event::{EventStatus, LogEvent};
+    use crate::test_util::collect_n;
+    use crate::{SourceSender, config::ProxyConfig, gcp::GcpAuthenticator, tls::TlsSettings};
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    fn test_downloader(base_url: &str) -> GcsDownloader {
+        use crate::codecs::DecodingConfig;
+        use crate::serde::default_decoding;
+
+        let framing = FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig {
+            newline_delimited: NewlineDelimitedDecoderOptions { max_length: None },
+        });
+        let client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default())
+            .expect("HttpClient must build in tests");
+        let decoder = DecodingConfig::new(framing, default_decoding(), LogNamespace::Legacy)
+            .build()
+            .expect("Decoder must build in tests");
+
+        GcsDownloader::new(
+            client,
+            GcpAuthenticator::None,
+            Compression::Auto,
+            decoder,
+            None,
+            "test-project".into(),
+        )
+        .with_base_url(base_url)
+    }
+
+    /// Spawns a one-shot HTTP server that returns the given bytes with `status`.
+    async fn spawn_test_server_bytes(status: u16, body: bytes::Bytes) -> SocketAddr {
+        use std::sync::Arc;
+        let body = Arc::new(body);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let server = Server::from_tcp(listener.into_std().unwrap())
+                .unwrap()
+                .serve(make_service_fn(move |_| {
+                    let body = Arc::clone(&body);
+                    async move {
+                        Ok::<_, Infallible>(service_fn(move |_req| {
+                            let body = Arc::clone(&body);
+                            async move {
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(status)
+                                        .body(Body::from((*body).clone()))
+                                        .unwrap(),
+                                )
+                            }
+                        }))
+                    }
+                }));
+            let _ = server.await;
+        });
+
+        addr
+    }
+
+    // -------------------------------------------------------------------------
+    // enrich_log_event: verify source metadata is attached to each event
+    // -------------------------------------------------------------------------
+
+    /// In Legacy namespace, enrich_log_event must set bucket/object/project on
+    /// the event body and insert a timestamp within the call window.
+    #[test]
+    fn enrich_log_event_legacy_namespace() {
+        let mut log = LogEvent::default();
+        let before = chrono::Utc::now();
+        enrich_log_event(
+            &mut log,
+            LogNamespace::Legacy,
+            "my-bucket",
+            "path/file.log",
+            "my-project",
+        );
+        let after = chrono::Utc::now();
+
+        assert_eq!(log["bucket"], "my-bucket".into());
+        assert_eq!(log["object"], "path/file.log".into());
+        assert_eq!(log["project"], "my-project".into());
+
+        use vector_lib::lookup::PathPrefix;
+        let key = log_schema()
+            .timestamp_key()
+            .expect("log schema must have a timestamp key");
+        let ts = log
+            .get((PathPrefix::Event, key))
+            .and_then(|v| v.as_timestamp())
+            .copied()
+            .expect("timestamp must be set in Legacy namespace");
+        assert!(
+            ts >= before && ts <= after,
+            "timestamp must be within the test window"
+        );
+    }
+
+    /// In the Vector namespace, GCS fields go into source metadata (not the event
+    /// body). Assert the actual values are correct, not just that they're present.
+    #[test]
+    fn enrich_log_event_sets_gcs_metadata_in_vector_namespace() {
+        let mut log = LogEvent::default();
+        enrich_log_event(
+            &mut log,
+            LogNamespace::Vector,
+            "my-bucket",
+            "path/file.log",
+            "my-project",
+        );
+
+        // In Vector namespace, fields must NOT appear in the event body.
+        assert!(
+            log.get("bucket").is_none(),
+            "bucket must not be in the event body"
+        );
+        assert!(
+            log.get("object").is_none(),
+            "object must not be in the event body"
+        );
+        assert!(
+            log.get("project").is_none(),
+            "project must not be in the event body"
+        );
+
+        // The source name metadata must be set.
+        let source_type = log
+            .get(metadata_path!("vector", "source_type"))
+            .and_then(|v| v.as_str().map(|s| s.to_owned()));
+        assert_eq!(
+            source_type.as_deref(),
+            Some(GcpGcsConfig::NAME),
+            "source_type metadata must be gcp_gcs"
+        );
+
+        // ingest_timestamp must be set.
+        assert!(
+            log.get(metadata_path!("vector", "ingest_timestamp"))
+                .is_some(),
+            "vector.ingest_timestamp must be set in Vector namespace"
+        );
+    }
+
+    /// In the Vector namespace, process_object end-to-end must route source
+    /// metadata (bucket, object, project) to the Vector metadata path and not
+    /// the event body — consistent with enrich_log_event above.
+    #[tokio::test]
+    async fn process_object_vector_namespace_metadata_in_vector_path() {
+        let addr = spawn_test_server_bytes(200, bytes::Bytes::from_static(b"msg\n")).await;
+        let framing = FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig {
+            newline_delimited: NewlineDelimitedDecoderOptions { max_length: None },
+        });
+        let client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default()).unwrap();
+        let decoder = crate::codecs::DecodingConfig::new(
+            framing,
+            crate::serde::default_decoding(),
+            LogNamespace::Vector,
+        )
+        .build()
+        .unwrap();
+        let downloader = GcsDownloader::new(
+            client,
+            GcpAuthenticator::None,
+            Compression::Auto,
+            decoder,
+            None,
+            "my-project".into(),
+        )
+        .with_base_url(&format!("http://{addr}"));
+
+        let (mut tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        let result = downloader
+            .process_object(
+                "my-bucket",
+                "key.log",
+                &mut tx,
+                LogNamespace::Vector,
+                false,
+                false,
+                &register!(BytesReceived::from(Protocol::HTTP)),
+                &register!(EventsReceived),
+            )
+            .await;
+
+        assert!(result.is_ok(), "Vector namespace must succeed: {result:?}");
+        let events = collect_n(rx, 1).await;
+        let log = events[0].as_log();
+
+        assert!(
+            log.get("bucket").is_none(),
+            "bucket must not be in event body"
+        );
+        assert!(
+            log.get("object").is_none(),
+            "object must not be in event body"
+        );
+        assert!(
+            log.get("project").is_none(),
+            "project must not be in event body"
+        );
+
+        let source_type = log
+            .get(metadata_path!("vector", "source_type"))
+            .and_then(|v| v.as_str().map(|s| s.to_owned()));
+        assert_eq!(source_type.as_deref(), Some(GcpGcsConfig::NAME));
+    }
+
+    // -------------------------------------------------------------------------
+    // process_object: test against a real in-process HTTP server
+    // -------------------------------------------------------------------------
+
+    /// When GCS returns 404 the downloader must return ObjectNotFound so the
+    /// caller can acknowledge the Pub/Sub message and break the retry loop.
+    #[tokio::test]
+    async fn process_object_404_returns_object_not_found() {
+        let addr = spawn_test_server_bytes(404, bytes::Bytes::new()).await;
+        let downloader = test_downloader(&format!("http://{addr}"));
+        let (mut tx, _rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+
+        let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
+        let events_received = register!(EventsReceived);
+        let result = downloader
+            .process_object(
+                "my-bucket",
+                "my-key",
+                &mut tx,
+                LogNamespace::Legacy,
+                false,
+                false,
+                &bytes_received,
+                &events_received,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ProcessingError::ObjectNotFound { .. })),
+            "404 from GCS must produce ObjectNotFound so the Pub/Sub message is acked: {result:?}"
+        );
+    }
+
+    /// A successful 200 response with newline-delimited text must produce one
+    /// event per line, and each event must carry the correct GCS metadata fields.
+    #[tokio::test]
+    async fn process_object_200_emits_events_with_gcs_metadata() {
+        let body = "first line\nsecond line\nthird line\n";
+        let addr = spawn_test_server_bytes(200, bytes::Bytes::from_static(body.as_bytes())).await;
+        let downloader = test_downloader(&format!("http://{addr}"));
+        let (mut tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+
+        let result = downloader
+            .process_object(
+                "my-bucket",
+                "logs/app.log",
+                &mut tx,
+                LogNamespace::Legacy,
+                false,
+                false,
+                &register!(BytesReceived::from(Protocol::HTTP)),
+                &register!(EventsReceived),
+            )
+            .await;
+
+        assert!(result.is_ok(), "200 response must succeed: {result:?}");
+
+        let events = collect_n(rx, 3).await;
+        assert_eq!(events.len(), 3, "must emit one event per line");
+
+        for event in &events {
+            let log = event.as_log();
+            assert_eq!(
+                log["bucket"],
+                "my-bucket".into(),
+                "bucket metadata must be set"
+            );
+            assert_eq!(
+                log["object"],
+                "logs/app.log".into(),
+                "object metadata must be set"
+            );
+            assert_eq!(
+                log["project"],
+                "test-project".into(),
+                "project metadata must be set"
+            );
+        }
+
+        assert_eq!(events[0].as_log()["message"], "first line".into());
+        assert_eq!(events[1].as_log()["message"], "second line".into());
+        assert_eq!(events[2].as_log()["message"], "third line".into());
+    }
+
+    // -------------------------------------------------------------------------
+    // URL encoding: keys with spaces and special characters
+    // -------------------------------------------------------------------------
+
+    /// Object keys with spaces or special URL characters (?, #, &) must be
+    /// percent-encoded. The mock server accepts any path — a successful response
+    /// confirms the URL was valid HTTP (raw spaces/specials would be rejected by hyper).
+    #[tokio::test]
+    async fn process_object_keys_with_special_chars_are_url_encoded() {
+        let addr = spawn_test_server_bytes(200, bytes::Bytes::from_static(b"event\n")).await;
+        let downloader = test_downloader(&format!("http://{addr}"));
+
+        for key in [
+            "path/my file with spaces.log",
+            "path/file?query=1&flag#section.log",
+            "path/unicode_日本語/file.log",
+            "path/brackets[0]/file (copy).log",
+        ] {
+            let (mut tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+
+            let result = downloader
+                .process_object(
+                    "my-logs-bucket",
+                    key,
+                    &mut tx,
+                    LogNamespace::Legacy,
+                    false,
+                    false,
+                    &register!(BytesReceived::from(Protocol::HTTP)),
+                    &register!(EventsReceived),
+                )
+                .await;
+
+            assert!(
+                result.is_ok(),
+                "key {key:?} must be URL-encoded and successfully requested: {result:?}"
+            );
+            let events = collect_n(rx, 1).await;
+            assert_eq!(events[0].as_log()["message"], "event".into());
         }
     }
 }
