@@ -676,7 +676,7 @@ fn map_simple_databricks_type(
         "DOUBLE" => Ok(prost_types::field_descriptor_proto::Type::Double),
         "FLOAT" => Ok(prost_types::field_descriptor_proto::Type::Float),
         "TIMESTAMP" => Ok(prost_types::field_descriptor_proto::Type::Int64), // Unix timestamp in microseconds
-        "DATE" => Ok(prost_types::field_descriptor_proto::Type::String),
+        "DATE" => Ok(prost_types::field_descriptor_proto::Type::Int32), // Days since Unix epoch
         "BINARY" => Ok(prost_types::field_descriptor_proto::Type::Bytes),
         "DECIMAL" => Ok(prost_types::field_descriptor_proto::Type::String),
 
@@ -700,8 +700,8 @@ const fn map_primitive_to_protobuf(
         PrimitiveType::Float => prost_types::field_descriptor_proto::Type::Float,
         PrimitiveType::Boolean => prost_types::field_descriptor_proto::Type::Bool,
         PrimitiveType::Binary => prost_types::field_descriptor_proto::Type::Bytes,
-        PrimitiveType::Timestamp => prost_types::field_descriptor_proto::Type::String,
-        PrimitiveType::Date => prost_types::field_descriptor_proto::Type::String,
+        PrimitiveType::Timestamp => prost_types::field_descriptor_proto::Type::Int64, // Unix timestamp in microseconds
+        PrimitiveType::Date => prost_types::field_descriptor_proto::Type::Int32, // Days since Unix epoch
         PrimitiveType::Decimal { .. } => prost_types::field_descriptor_proto::Type::String,
     }
 }
@@ -1087,6 +1087,43 @@ mod tests {
             let result = map_simple_databricks_type(databricks_type);
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), expected_proto_type);
+        }
+    }
+
+    /// Integration test: parse the all_primitive_types fixture through generate_descriptor_from_schema
+    /// (the real caller path) and assert every field maps to the correct proto Kind.
+    /// This exercises the full schema-to-proto pipeline end-to-end for all primitive Delta types.
+    #[test]
+    fn test_all_primitive_types_fixture_field_kinds() {
+        let fixture = include_str!("tests/fixtures/all_primitive_types_schema.json");
+        let schema: UnityCatalogTableSchema =
+            serde_json::from_str(fixture).expect("fixture should deserialize");
+
+        let descriptor =
+            generate_descriptor_from_schema(&schema).expect("schema should produce a descriptor");
+
+        // field name → expected proto Kind
+        let expected: &[(&str, prost_reflect::Kind)] = &[
+            ("col_string", prost_reflect::Kind::String),
+            ("col_int", prost_reflect::Kind::Int32),
+            ("col_long", prost_reflect::Kind::Int64),
+            ("col_double", prost_reflect::Kind::Double),
+            ("col_float", prost_reflect::Kind::Float),
+            ("col_boolean", prost_reflect::Kind::Bool),
+            ("col_binary", prost_reflect::Kind::Bytes),
+            ("col_timestamp", prost_reflect::Kind::Int64), // microseconds since epoch
+            ("col_date", prost_reflect::Kind::Int32),      // days since epoch
+        ];
+
+        for (field_name, expected_kind) in expected {
+            let field = descriptor
+                .get_field_by_name(field_name)
+                .unwrap_or_else(|| panic!("field '{field_name}' must exist in descriptor"));
+            assert_eq!(
+                field.kind(),
+                *expected_kind,
+                "field '{field_name}': expected Kind::{expected_kind:?}"
+            );
         }
     }
 
