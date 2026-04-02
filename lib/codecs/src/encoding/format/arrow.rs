@@ -2427,8 +2427,7 @@ mod tests {
     // List encoding tests
     // -------------------------------------------------------------------------
 
-    /// `repeated int64` — mirrors `flag_evaluation_hashes` in service_health_event.proto
-    /// and `contributing_query_ids` (repeated string) pattern.
+    /// `repeated int64` — encodes a List&lt;Int64&gt; field.
     #[test]
     fn test_encode_list_int64() {
         use arrow::array::{Int64Array, ListArray};
@@ -2492,7 +2491,7 @@ mod tests {
         assert_eq!(row1, vec![999]);
     }
 
-    /// `repeated string` — mirrors `contributing_query_ids` / `redacted_task_retryable_errors`.
+    /// `repeated string` — encodes a List&lt;LargeUtf8&gt; field.
     #[test]
     fn test_encode_list_string() {
         use arrow::array::{LargeStringArray, ListArray};
@@ -2578,7 +2577,7 @@ mod tests {
         ));
     }
 
-    /// `List<Struct>` — mirrors repeated message fields like QPL's `stage_data`.
+    /// `List<Struct>` — encodes a repeated nested message field.
     #[test]
     fn test_encode_list_struct() {
         use arrow::array::{Int64Array, ListArray, StructArray};
@@ -3033,8 +3032,7 @@ mod tests {
         }
     }
 
-    /// Struct field set to an empty object `{}` (e.g. `_log_metadata = {}` or
-    /// `_environment = {}` in the service_health_event demo pipeline).
+    /// Struct field set to an empty object `{}` — all child columns are null.
     ///
     /// The struct validity bit should be **true** (the field exists) but every
     /// child column should be **null** (no sub-keys are present in the empty map).
@@ -3115,21 +3113,19 @@ mod tests {
     // Realistic proto-schema tests
     // -------------------------------------------------------------------------
 
-    /// Schema mirroring proto/logs/sla/service_health_event.proto.
+    /// Schema with a mix of scalar, nested struct, list, bool, and binary types.
     ///
-    /// Field names are intentionally generic (field_N / sub_N) to avoid
-    /// encoding sensitive schema details in test data; types and proto field
-    /// numbers match the real proto.
+    /// Field names are intentionally generic (field_N / sub_N).
     ///
-    /// Proto field layout (field number → Arrow type):
+    /// Field layout (field number → Arrow type):
     ///   field_1  (1)  LargeUtf8         — optional string
     ///   field_3  (3)  LargeUtf8         — optional string
     ///   field_4  (4)  Int32             — optional enum
     ///   field_5  (5)  Int64             — optional int64
     ///   field_6  (6)  Int64             — optional int64
-    ///   field_8  (8)  Struct            — deprecated nested message
+    ///   field_8  (8)  Struct            — nested message (2 string children)
     ///     sub_1 LargeUtf8, sub_2 LargeUtf8
-    ///   field_9  (9)  Struct            — nested message
+    ///   field_9  (9)  Struct            — nested message (6 children)
     ///     sub_1 Int32, sub_2 LargeUtf8, sub_3 LargeUtf8,
     ///     sub_4 LargeUtf8, sub_5 Int32, sub_6 Int32
     ///   field_10 (10) List<Int64>       — repeated int64
@@ -3140,7 +3136,7 @@ mod tests {
     ///   field_15 (15) LargeUtf8         — optional string
     ///   field_16 (16) LargeBinary       — optional bytes
     #[test]
-    fn test_encode_service_health_event_schema() {
+    fn test_encode_proto_schema_mixed_types() {
         use arrow::array::{BooleanArray, Int32Array, Int64Array, LargeStringArray, StructArray};
 
         // field_8: Struct(sub_1 LargeUtf8, sub_2 LargeUtf8)
@@ -3285,18 +3281,16 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // query_profile_log schema patterns
+    // complex nested type patterns
     // -------------------------------------------------------------------------
 
-    /// `List<Struct>` containing its own inner `List<Struct>` — mirrors
-    /// `stage_data` (repeated `StageDataElement`) where `StageDataElement`
-    /// itself has `repeated metrics_for_k_slowest_tasks`.
+    /// `List<Struct>` containing its own inner `List<Struct>`.
     ///
     /// Schema:
-    ///   stage_data: List<Struct {
-    ///     stage_id: Int32,
-    ///     num_tasks: Int32,
-    ///     k_slowest: List<Struct { task_id: Int64, duration_ns: Int64 }>,
+    ///   field_a: List<Struct {
+    ///     sub_1: Int32,
+    ///     sub_2: Int32,
+    ///     sub_3: List<Struct { inner_1: Int64, inner_2: Int64 }>,
     ///   }>
     #[test]
     fn test_encode_list_struct_with_inner_list_struct() {
@@ -3304,64 +3298,64 @@ mod tests {
         use vrl::value::ObjectMap;
 
         // Inner struct builder helper.
-        let make_task = |task_id: i64, dur: i64| {
+        let make_inner = |inner_1: i64, inner_2: i64| {
             let mut m = ObjectMap::new();
-            m.insert("task_id".into(), Value::Integer(task_id));
-            m.insert("duration_ns".into(), Value::Integer(dur));
+            m.insert("inner_1".into(), Value::Integer(inner_1));
+            m.insert("inner_2".into(), Value::Integer(inner_2));
             Value::Object(m)
         };
-        let make_stage = |stage_id: i64, num_tasks: i64, tasks: Vec<Value>| {
+        let make_outer = |sub_1: i64, sub_2: i64, inners: Vec<Value>| {
             let mut m = ObjectMap::new();
-            m.insert("stage_id".into(), Value::Integer(stage_id));
-            m.insert("num_tasks".into(), Value::Integer(num_tasks));
-            m.insert("k_slowest".into(), Value::Array(tasks));
+            m.insert("sub_1".into(), Value::Integer(sub_1));
+            m.insert("sub_2".into(), Value::Integer(sub_2));
+            m.insert("sub_3".into(), Value::Array(inners));
             Value::Object(m)
         };
 
-        // Row 0: two stages, first with two slow tasks, second with none.
+        // Row 0: two outer elements, first with two inner elements, second with none.
         let mut log0 = LogEvent::default();
         log0.insert(
-            "stage_data",
+            "field_a",
             Value::Array(vec![
-                make_stage(1, 10, vec![make_task(101, 500_000), make_task(102, 300_000)]),
-                make_stage(2, 5, vec![]),
+                make_outer(1, 10, vec![make_inner(101, 500_000), make_inner(102, 300_000)]),
+                make_outer(2, 5, vec![]),
             ]),
         );
 
-        // Row 1: single stage, one slow task.
+        // Row 1: single outer element, one inner element.
         let mut log1 = LogEvent::default();
         log1.insert(
-            "stage_data",
-            Value::Array(vec![make_stage(3, 8, vec![make_task(201, 1_000_000)])]),
+            "field_a",
+            Value::Array(vec![make_outer(3, 8, vec![make_inner(201, 1_000_000)])]),
         );
 
-        // Row 2: absent stage_data → null list.
+        // Row 2: absent field_a → null list.
         let log2 = LogEvent::default();
 
         let events = vec![Event::Log(log0), Event::Log(log1), Event::Log(log2)];
 
-        let k_slowest_struct_fields = Fields::from(vec![
-            Field::new("task_id", DataType::Int64, true),
-            Field::new("duration_ns", DataType::Int64, true),
+        let inner_struct_fields = Fields::from(vec![
+            Field::new("inner_1", DataType::Int64, true),
+            Field::new("inner_2", DataType::Int64, true),
         ]);
-        let stage_struct_fields = Fields::from(vec![
-            Field::new("stage_id", DataType::Int32, true),
-            Field::new("num_tasks", DataType::Int32, true),
+        let outer_struct_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::Int32, true),
+            Field::new("sub_2", DataType::Int32, true),
             Field::new(
-                "k_slowest",
+                "sub_3",
                 DataType::List(Arc::new(Field::new(
                     "item",
-                    DataType::Struct(k_slowest_struct_fields),
+                    DataType::Struct(inner_struct_fields),
                     true,
                 ))),
                 true,
             ),
         ]);
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "stage_data",
+            "field_a",
             DataType::List(Arc::new(Field::new(
                 "item",
-                DataType::Struct(stage_struct_fields),
+                DataType::Struct(outer_struct_fields),
                 true,
             ))),
             true,
@@ -3372,82 +3366,80 @@ mod tests {
         let batch = result.unwrap();
         assert_eq!(batch.num_rows(), 3);
 
-        let stage_col = batch
+        let outer_col = batch
             .column(0)
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();
 
-        // Row 0: 2 stages.
-        assert!(!stage_col.is_null(0));
-        let row0_stages_arr = stage_col.value(0);
-        let row0_stages = row0_stages_arr
+        // Row 0: 2 outer elements.
+        assert!(!outer_col.is_null(0));
+        let row0_outer_arr = outer_col.value(0);
+        let row0_outer = row0_outer_arr
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap();
-        assert_eq!(row0_stages.len(), 2);
+        assert_eq!(row0_outer.len(), 2);
 
-        // First stage: stage_id=1, num_tasks=10, k_slowest has 2 tasks.
-        let stage_ids = row0_stages
-            .column_by_name("stage_id")
+        // sub_1 values of the two outer elements.
+        let sub1_col = row0_outer
+            .column_by_name("sub_1")
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(stage_ids.value(0), 1);
-        assert_eq!(stage_ids.value(1), 2);
+        assert_eq!(sub1_col.value(0), 1);
+        assert_eq!(sub1_col.value(1), 2);
 
-        let k_slowest_col = row0_stages
-            .column_by_name("k_slowest")
+        let sub3_col = row0_outer
+            .column_by_name("sub_3")
             .unwrap()
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();
 
-        // First stage's k_slowest: [task_id=101, task_id=102].
-        let first_stage_tasks_arr = k_slowest_col.value(0);
-        let first_stage_tasks = first_stage_tasks_arr
+        // First outer element's sub_3: [inner_1=101, inner_1=102].
+        let first_inner_arr = sub3_col.value(0);
+        let first_inner = first_inner_arr
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap();
-        assert_eq!(first_stage_tasks.len(), 2);
-        let task_ids = first_stage_tasks
-            .column_by_name("task_id")
+        assert_eq!(first_inner.len(), 2);
+        let inner1_col = first_inner
+            .column_by_name("inner_1")
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(task_ids.value(0), 101);
-        assert_eq!(task_ids.value(1), 102);
+        assert_eq!(inner1_col.value(0), 101);
+        assert_eq!(inner1_col.value(1), 102);
 
-        // Second stage's k_slowest: empty.
-        assert_eq!(k_slowest_col.value(1).len(), 0);
+        // Second outer element's sub_3: empty.
+        assert_eq!(sub3_col.value(1).len(), 0);
 
-        // Row 1: 1 stage.
-        assert!(!stage_col.is_null(1));
-        assert_eq!(stage_col.value(1).len(), 1);
+        // Row 1: 1 outer element.
+        assert!(!outer_col.is_null(1));
+        assert_eq!(outer_col.value(1).len(), 1);
 
         // Row 2: absent → null list.
-        assert!(stage_col.is_null(2));
+        assert!(outer_col.is_null(2));
     }
 
-    /// Map fields nested inside a struct — mirrors `QueryMetrics` which has
-    /// `map<int64, bool> boolean_config_access` and
-    /// `map<int64, double> double_config_access` as child fields.
+    /// Map fields nested inside a struct.
     ///
     /// Schema:
-    ///   query_metrics: Struct {
-    ///     parsing_time_ns: Int64,
-    ///     boolean_config_access: Map("key_value", Struct(key: Int64, value: Boolean)),
-    ///     double_config_access:  Map("key_value", Struct(key: Int64, value: Float64)),
+    ///   field_a: Struct {
+    ///     sub_1: Int64,
+    ///     sub_2: Map("key_value", Struct(key: Int64, value: Boolean)),
+    ///     sub_3: Map("key_value", Struct(key: Int64, value: Float64)),
     ///   }
     #[test]
     fn test_encode_struct_with_nested_map_fields() {
         use arrow::array::{Float64Array, Int64Array, MapArray, StructArray};
         use serde_json::json;
 
-        let bool_map_field = Field::new(
-            "boolean_config_access",
+        let sub2_field = Field::new(
+            "sub_2",
             DataType::Map(
                 Arc::new(Field::new(
                     "key_value",
@@ -3461,8 +3453,8 @@ mod tests {
             ),
             true,
         );
-        let double_map_field = Field::new(
-            "double_config_access",
+        let sub3_field = Field::new(
+            "sub_3",
             DataType::Map(
                 Arc::new(Field::new(
                     "key_value",
@@ -3476,31 +3468,31 @@ mod tests {
             ),
             true,
         );
-        let metrics_fields = Fields::from(vec![
-            Field::new("parsing_time_ns", DataType::Int64, true),
-            bool_map_field,
-            double_map_field,
+        let struct_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::Int64, true),
+            sub2_field,
+            sub3_field,
         ]);
 
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "query_metrics",
-            DataType::Struct(metrics_fields),
+            "field_a",
+            DataType::Struct(struct_fields),
             true,
         )]));
 
-        // Row 0: fully populated query_metrics.
+        // Row 0: fully populated field_a.
         let mut log0 = LogEvent::default();
-        log0.insert("query_metrics.parsing_time_ns", 42_000_i64);
+        log0.insert("field_a.sub_1", 42_000_i64);
         log0.insert(
-            "query_metrics.boolean_config_access",
+            "field_a.sub_2",
             json!({"100": true, "200": false}),
         );
         log0.insert(
-            "query_metrics.double_config_access",
+            "field_a.sub_3",
             json!({"300": 1.5, "400": 2.0}),
         );
 
-        // Row 1: query_metrics absent → null struct.
+        // Row 1: field_a absent → null struct.
         let log1 = LogEvent::default();
 
         let events = vec![Event::Log(log0), Event::Log(log1)];
@@ -3510,89 +3502,87 @@ mod tests {
         let batch = result.unwrap();
         assert_eq!(batch.num_rows(), 2);
 
-        let metrics_col = batch
+        let struct_col = batch
             .column(0)
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap();
 
         // Row 0: non-null struct.
-        assert!(!metrics_col.is_null(0), "row 0 struct should be non-null");
+        assert!(!struct_col.is_null(0), "row 0 struct should be non-null");
         // Row 1: null struct.
-        assert!(metrics_col.is_null(1), "row 1 struct should be null");
+        assert!(struct_col.is_null(1), "row 1 struct should be null");
 
-        // Check parsing_time_ns.
-        let parse_ns = metrics_col
-            .column_by_name("parsing_time_ns")
+        // Check sub_1.
+        let sub1_col = struct_col
+            .column_by_name("sub_1")
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(parse_ns.value(0), 42_000);
+        assert_eq!(sub1_col.value(0), 42_000);
 
-        // Check boolean_config_access map: 2 entries with int64 keys.
-        let bool_map = metrics_col
-            .column_by_name("boolean_config_access")
+        // Check sub_2 map: 2 entries with int64 keys.
+        let sub2_col = struct_col
+            .column_by_name("sub_2")
             .unwrap()
             .as_any()
             .downcast_ref::<MapArray>()
             .unwrap();
-        assert!(!bool_map.is_null(0));
-        let bool_entries = bool_map.value(0);
-        assert_eq!(bool_entries.len(), 2);
-        let bool_keys = bool_entries
+        assert!(!sub2_col.is_null(0));
+        let sub2_entries = sub2_col.value(0);
+        assert_eq!(sub2_entries.len(), 2);
+        let sub2_keys = sub2_entries
             .column_by_name("key")
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
         // Keys coerced from string "100"/"200" to Int64.
-        assert_eq!(bool_keys.value(0), 100_i64);
-        assert_eq!(bool_keys.value(1), 200_i64);
+        assert_eq!(sub2_keys.value(0), 100_i64);
+        assert_eq!(sub2_keys.value(1), 200_i64);
 
-        // Check double_config_access map: 2 entries with float64 values.
-        let dbl_map = metrics_col
-            .column_by_name("double_config_access")
+        // Check sub_3 map: 2 entries with float64 values.
+        let sub3_col = struct_col
+            .column_by_name("sub_3")
             .unwrap()
             .as_any()
             .downcast_ref::<MapArray>()
             .unwrap();
-        assert!(!dbl_map.is_null(0));
-        let dbl_entries = dbl_map.value(0);
-        assert_eq!(dbl_entries.len(), 2);
-        let dbl_vals = dbl_entries
+        assert!(!sub3_col.is_null(0));
+        let sub3_entries = sub3_col.value(0);
+        assert_eq!(sub3_entries.len(), 2);
+        let sub3_vals = sub3_entries
             .column_by_name("value")
             .unwrap()
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();
-        assert_eq!(dbl_vals.value(0), 1.5_f64);
-        assert_eq!(dbl_vals.value(1), 2.0_f64);
+        assert_eq!(sub3_vals.value(0), 1.5_f64);
+        assert_eq!(sub3_vals.value(1), 2.0_f64);
     }
 
-    /// IPC round-trip for a schema with nested `List<Struct>` and `Map` inside
-    /// a `Struct` — verifies the full Arrow IPC serialization path works for
-    /// the query_profile_log schema patterns.
+    /// IPC round-trip for a schema combining scalar, Struct, List<Struct>, Map,
+    /// and List<string> fields — verifies the full Arrow IPC serialization path.
     #[test]
-    fn test_encode_query_profile_log_patterns_ipc_roundtrip() {
+    fn test_encode_complex_schema_ipc_roundtrip() {
         use arrow::ipc::reader::StreamReader;
         use serde_json::json;
         use std::io::Cursor;
         use vrl::value::ObjectMap;
 
-        // Build a simplified QPL-like schema.
-        let failure_fields = Fields::from(vec![
-            Field::new("error_class", DataType::LargeUtf8, true),
-            Field::new("sub_error_class", DataType::LargeUtf8, true),
-            Field::new("sql_state", DataType::LargeUtf8, true),
+        let field3_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::LargeUtf8, true),
+            Field::new("sub_2", DataType::LargeUtf8, true),
+            Field::new("sub_3", DataType::LargeUtf8, true),
         ]);
-        let stage_struct_fields = Fields::from(vec![
-            Field::new("stage_id", DataType::Int32, true),
-            Field::new("num_tasks", DataType::Int32, true),
-            Field::new("failure_reason", DataType::LargeUtf8, true),
+        let field4_struct_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::Int32, true),
+            Field::new("sub_2", DataType::Int32, true),
+            Field::new("sub_3", DataType::LargeUtf8, true),
         ]);
-        let bool_map_field = Field::new(
-            "boolean_config_access",
+        let field5_map = Field::new(
+            "sub_2",
             DataType::Map(
                 Arc::new(Field::new(
                     "key_value",
@@ -3606,90 +3596,84 @@ mod tests {
             ),
             true,
         );
-        let query_metrics_fields = Fields::from(vec![
-            Field::new("parsing_time_ns", DataType::Int64, true),
-            bool_map_field,
+        let field5_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::Int64, true),
+            field5_map,
         ]);
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::LargeUtf8, true),
-            Field::new("is_success", DataType::Boolean, true),
+            Field::new("field_1", DataType::LargeUtf8, true),
+            Field::new("field_2", DataType::Boolean, true),
             Field::new(
-                "failure",
-                DataType::Struct(failure_fields),
+                "field_3",
+                DataType::Struct(field3_fields),
                 true,
             ),
             Field::new(
-                "stage_data",
+                "field_4",
                 DataType::List(Arc::new(Field::new(
                     "item",
-                    DataType::Struct(stage_struct_fields),
+                    DataType::Struct(field4_struct_fields),
                     true,
                 ))),
                 true,
             ),
             Field::new(
-                "query_metrics",
-                DataType::Struct(query_metrics_fields),
+                "field_5",
+                DataType::Struct(field5_fields),
                 true,
             ),
             Field::new(
-                "contributing_query_ids",
+                "field_6",
                 DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
                 true,
             ),
             Field::new(
-                "query_tags",
+                "field_7",
                 DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
                 true,
             ),
         ]));
 
-        // Row 0: success query with stage_data, query_metrics, and tags.
+        // Row 0: field_3 absent, field_4 and field_5 populated.
         let mut log0 = LogEvent::default();
-        log0.insert("id", "q-00001");
-        log0.insert("is_success", true);
+        log0.insert("field_1", "rec-a");
+        log0.insert("field_2", true);
         log0.insert(
-            "stage_data",
+            "field_4",
             Value::Array({
                 let mut m = ObjectMap::new();
-                m.insert("stage_id".into(), Value::Integer(1));
-                m.insert("num_tasks".into(), Value::Integer(10));
-                m.insert("failure_reason".into(), Value::Bytes("".into()));
+                m.insert("sub_1".into(), Value::Integer(1));
+                m.insert("sub_2".into(), Value::Integer(10));
+                m.insert("sub_3".into(), Value::Bytes("".into()));
                 vec![Value::Object(m)]
             }),
         );
-        log0.insert("query_metrics.parsing_time_ns", 5_000_i64);
+        log0.insert("field_5.sub_1", 5_000_i64);
+        log0.insert("field_5.sub_2", json!({"12345": true}));
+        log0.insert("field_6", Value::Array(vec![]));
         log0.insert(
-            "query_metrics.boolean_config_access",
-            json!({"12345": true}),
-        );
-        log0.insert(
-            "contributing_query_ids",
-            Value::Array(vec![]),
-        );
-        log0.insert(
-            "query_tags",
+            "field_7",
             Value::Array(vec![
-                Value::Bytes("etl".into()),
-                Value::Bytes("prod".into()),
+                Value::Bytes("tag-a".into()),
+                Value::Bytes("tag-b".into()),
             ]),
         );
 
-        // Row 1: failed query with failure struct populated.
+        // Row 1: field_3 populated, field_4 absent.
         let mut log1 = LogEvent::default();
-        log1.insert("id", "q-00002");
-        log1.insert("is_success", false);
-        log1.insert("failure.error_class", "ANALYSIS_ERROR");
-        log1.insert("failure.sub_error_class", "UNRESOLVED_COLUMN");
-        log1.insert("failure.sql_state", "42000");
+        log1.insert("field_1", "rec-b");
+        log1.insert("field_2", false);
+        log1.insert("field_3.sub_1", "err-a");
+        log1.insert("field_3.sub_2", "err-sub-a");
+        log1.insert("field_3.sub_3", "code-a");
         log1.insert(
-            "contributing_query_ids",
-            Value::Array(vec![Value::Bytes("q-00001".into())]),
+            "field_6",
+            Value::Array(vec![Value::Bytes("rec-a".into())]),
         );
         log1.insert(
-            "query_tags",
-            Value::Array(vec![Value::Bytes("streaming".into())]),
+            "field_7",
+            Value::Array(vec![Value::Bytes("tag-c".into())]),
         );
 
         let events = vec![Event::Log(log0), Event::Log(log1)];
@@ -3704,139 +3688,119 @@ mod tests {
         assert_eq!(batch.num_columns(), 7);
     }
 
-    /// Full schema test mirroring the `demo_query_profile_log.json` pipeline.
+    /// Full schema IPC round-trip: 20 columns covering multiple scalar types,
+    /// booleans, two List<string> fields, an optional string, and an optional
+    /// Struct with 5 string children.
     ///
-    /// Two events are encoded:
-    ///   - Row 0 (q-00001): successful query, no failure struct, empty
-    ///     contributing_query_ids, two query_tags.
-    ///   - Row 1 (q-00002): failed query, failure struct populated, one
-    ///     contributing_query_id, one query_tag, exception string present.
-    ///
-    /// Schema (matches the fields emitted by the remap transform + the raw
-    /// JSON payload):
-    ///   id, app_id, execution_id           LargeUtf8
-    ///   time_submitted_unix_ms,
-    ///     time_completed_unix_ms           Int64
-    ///   is_streaming, is_success,
-    ///     is_serverless, is_dbsql          Boolean
-    ///   entry_point, sql_warehouse_id,
-    ///     id_with_date, statement_type,
-    ///     redacted_sql                     LargeUtf8
-    ///   contributing_query_ids             List<LargeUtf8>
-    ///   query_tags                         List<LargeUtf8>
-    ///   exception                          LargeUtf8 (optional)
-    ///   failure                            Struct { error_class, sub_error_class,
-    ///                                               sql_state, stack_trace,
-    ///                                               redacted_exception } (optional)
-    ///   _event_time                        Int64
-    ///   _partition_date                    LargeUtf8
+    /// Row 0: Struct absent (null), List fields populated with 0 and 2 entries.
+    /// Row 1: Struct populated, List fields populated with 1 entry each.
     #[test]
-    fn test_encode_query_profile_log_demo_schema() {
+    fn test_encode_wide_schema_with_optional_struct_ipc_roundtrip() {
         use arrow::array::{
             BooleanArray, Int64Array, LargeStringArray, ListArray, StructArray,
         };
         use arrow::ipc::reader::StreamReader;
         use std::io::Cursor;
 
-        let failure_fields = Fields::from(vec![
-            Field::new("error_class", DataType::LargeUtf8, true),
-            Field::new("sub_error_class", DataType::LargeUtf8, true),
-            Field::new("sql_state", DataType::LargeUtf8, true),
-            Field::new("stack_trace", DataType::LargeUtf8, true),
-            Field::new("redacted_exception", DataType::LargeUtf8, true),
+        let field18_fields = Fields::from(vec![
+            Field::new("sub_1", DataType::LargeUtf8, true),
+            Field::new("sub_2", DataType::LargeUtf8, true),
+            Field::new("sub_3", DataType::LargeUtf8, true),
+            Field::new("sub_4", DataType::LargeUtf8, true),
+            Field::new("sub_5", DataType::LargeUtf8, true),
         ]);
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::LargeUtf8, true),
-            Field::new("app_id", DataType::LargeUtf8, true),
-            Field::new("execution_id", DataType::LargeUtf8, true),
-            Field::new("time_submitted_unix_ms", DataType::Int64, true),
-            Field::new("time_completed_unix_ms", DataType::Int64, true),
-            Field::new("is_streaming", DataType::Boolean, true),
-            Field::new("is_success", DataType::Boolean, true),
-            Field::new("entry_point", DataType::LargeUtf8, true),
-            Field::new("is_serverless", DataType::Boolean, true),
-            Field::new("is_dbsql", DataType::Boolean, true),
-            Field::new("sql_warehouse_id", DataType::LargeUtf8, true),
-            Field::new("id_with_date", DataType::LargeUtf8, true),
-            Field::new("statement_type", DataType::LargeUtf8, true),
-            Field::new("redacted_sql", DataType::LargeUtf8, true),
+            Field::new("field_1",  DataType::LargeUtf8, true),
+            Field::new("field_2",  DataType::LargeUtf8, true),
+            Field::new("field_3",  DataType::LargeUtf8, true),
+            Field::new("field_4",  DataType::Int64, true),
+            Field::new("field_5",  DataType::Int64, true),
+            Field::new("field_6",  DataType::Boolean, true),
+            Field::new("field_7",  DataType::Boolean, true),
+            Field::new("field_8",  DataType::LargeUtf8, true),
+            Field::new("field_9",  DataType::Boolean, true),
+            Field::new("field_10", DataType::Boolean, true),
+            Field::new("field_11", DataType::LargeUtf8, true),
+            Field::new("field_12", DataType::LargeUtf8, true),
+            Field::new("field_13", DataType::LargeUtf8, true),
+            Field::new("field_14", DataType::LargeUtf8, true),
             Field::new(
-                "contributing_query_ids",
+                "field_15",
                 DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
                 true,
             ),
             Field::new(
-                "query_tags",
+                "field_16",
                 DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
                 true,
             ),
-            Field::new("exception", DataType::LargeUtf8, true),
-            Field::new("failure", DataType::Struct(failure_fields), true),
-            Field::new("_event_time", DataType::Int64, true),
-            Field::new("_partition_date", DataType::LargeUtf8, true),
+            Field::new("field_17", DataType::LargeUtf8, true),
+            Field::new("field_18", DataType::Struct(field18_fields), true),
+            Field::new("field_19", DataType::Int64, true),
+            Field::new("field_20", DataType::LargeUtf8, true),
         ]));
 
-        // Row 0: q-00001 — successful SELECT, no failure, empty contributing_query_ids.
+        // Row 0: field_17 and field_18 absent → null.
         let mut log0 = LogEvent::default();
-        log0.insert("id", "q-00001");
-        log0.insert("app_id", "app-vector-test");
-        log0.insert("execution_id", "exec-111");
-        log0.insert("time_submitted_unix_ms", 1700000000000_i64);
-        log0.insert("time_completed_unix_ms", 1700000001523_i64);
-        log0.insert("is_streaming", false);
-        log0.insert("is_success", true);
-        log0.insert("entry_point", "NativeCommand");
-        log0.insert("is_serverless", true);
-        log0.insert("is_dbsql", false);
-        log0.insert("sql_warehouse_id", "wh-001");
-        log0.insert("id_with_date", "q-00001-2026-02-20");
-        log0.insert("statement_type", "SELECT");
-        log0.insert("redacted_sql", "SELECT * FROM tbl WHERE id = ?");
-        log0.insert("contributing_query_ids", Value::Array(vec![]));
+        log0.insert("field_1",  "rec-a");
+        log0.insert("field_2",  "app-test");
+        log0.insert("field_3",  "exec-a");
+        log0.insert("field_4",  1700000000000_i64);
+        log0.insert("field_5",  1700000001523_i64);
+        log0.insert("field_6",  false);
+        log0.insert("field_7",  true);
+        log0.insert("field_8",  "entry-a");
+        log0.insert("field_9",  true);
+        log0.insert("field_10", false);
+        log0.insert("field_11", "wh-a");
+        log0.insert("field_12", "rec-a-date");
+        log0.insert("field_13", "op-a");
+        log0.insert("field_14", "query-a");
+        log0.insert("field_15", Value::Array(vec![]));
         log0.insert(
-            "query_tags",
+            "field_16",
             Value::Array(vec![
-                Value::Bytes("etl".into()),
-                Value::Bytes("prod".into()),
+                Value::Bytes("tag-a".into()),
+                Value::Bytes("tag-b".into()),
             ]),
         );
-        // exception and failure absent → null
-        log0.insert("_event_time", 1700000000000000_i64);
-        log0.insert("_partition_date", "2026-02-20");
+        // field_17 and field_18 absent → null
+        log0.insert("field_19", 1700000000000000_i64);
+        log0.insert("field_20", "2026-02-20");
 
-        // Row 1: q-00002 — failed INSERT, failure struct populated, one contributing id.
+        // Row 1: field_18 struct populated, field_17 present.
         let mut log1 = LogEvent::default();
-        log1.insert("id", "q-00002");
-        log1.insert("app_id", "app-vector-test");
-        log1.insert("execution_id", "exec-222");
-        log1.insert("time_submitted_unix_ms", 1700000010000_i64);
-        log1.insert("time_completed_unix_ms", 1700000055230_i64);
-        log1.insert("is_streaming", true);
-        log1.insert("is_success", false);
-        log1.insert("entry_point", "SparkPlan");
-        log1.insert("is_serverless", false);
-        log1.insert("is_dbsql", true);
-        log1.insert("sql_warehouse_id", "wh-002");
-        log1.insert("id_with_date", "q-00002-2026-02-20");
-        log1.insert("statement_type", "INSERT");
-        log1.insert("redacted_sql", "INSERT INTO tbl VALUES (?)");
+        log1.insert("field_1",  "rec-b");
+        log1.insert("field_2",  "app-test");
+        log1.insert("field_3",  "exec-b");
+        log1.insert("field_4",  1700000010000_i64);
+        log1.insert("field_5",  1700000055230_i64);
+        log1.insert("field_6",  true);
+        log1.insert("field_7",  false);
+        log1.insert("field_8",  "entry-b");
+        log1.insert("field_9",  false);
+        log1.insert("field_10", true);
+        log1.insert("field_11", "wh-b");
+        log1.insert("field_12", "rec-b-date");
+        log1.insert("field_13", "op-b");
+        log1.insert("field_14", "query-b");
         log1.insert(
-            "contributing_query_ids",
-            Value::Array(vec![Value::Bytes("q-00001".into())]),
+            "field_15",
+            Value::Array(vec![Value::Bytes("rec-a".into())]),
         );
         log1.insert(
-            "query_tags",
-            Value::Array(vec![Value::Bytes("streaming".into())]),
+            "field_16",
+            Value::Array(vec![Value::Bytes("tag-c".into())]),
         );
-        log1.insert("exception", "AnalysisException");
-        log1.insert("failure.error_class", "ANALYSIS_ERROR");
-        log1.insert("failure.sub_error_class", "UNRESOLVED_COLUMN");
-        log1.insert("failure.sql_state", "42000");
-        log1.insert("failure.stack_trace", "at line 1");
-        log1.insert("failure.redacted_exception", "AnalysisException: col not found");
-        log1.insert("_event_time", 1700000010000000_i64);
-        log1.insert("_partition_date", "2026-02-20");
+        log1.insert("field_17", "err-type-a");
+        log1.insert("field_18.sub_1", "err-a");
+        log1.insert("field_18.sub_2", "err-sub-a");
+        log1.insert("field_18.sub_3", "code-a");
+        log1.insert("field_18.sub_4", "trace-a");
+        log1.insert("field_18.sub_5", "err-type-a: detail");
+        log1.insert("field_19", 1700000010000000_i64);
+        log1.insert("field_20", "2026-02-20");
 
         let events = vec![Event::Log(log0), Event::Log(log1)];
 
@@ -3850,55 +3814,55 @@ mod tests {
         assert_eq!(batch.num_columns(), 20);
 
         // Spot-check scalar fields.
-        let id_col = batch.column_by_name("id").unwrap()
+        let f1 = batch.column_by_name("field_1").unwrap()
             .as_any().downcast_ref::<LargeStringArray>().unwrap();
-        assert_eq!(id_col.value(0), "q-00001");
-        assert_eq!(id_col.value(1), "q-00002");
+        assert_eq!(f1.value(0), "rec-a");
+        assert_eq!(f1.value(1), "rec-b");
 
-        let submitted_col = batch.column_by_name("time_submitted_unix_ms").unwrap()
+        let f4 = batch.column_by_name("field_4").unwrap()
             .as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(submitted_col.value(0), 1700000000000_i64);
-        assert_eq!(submitted_col.value(1), 1700000010000_i64);
+        assert_eq!(f4.value(0), 1700000000000_i64);
+        assert_eq!(f4.value(1), 1700000010000_i64);
 
-        let success_col = batch.column_by_name("is_success").unwrap()
+        let f7 = batch.column_by_name("field_7").unwrap()
             .as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(success_col.value(0));
-        assert!(!success_col.value(1));
+        assert!(f7.value(0));
+        assert!(!f7.value(1));
 
-        // contributing_query_ids: row 0 empty list, row 1 has one entry.
-        let cqi_col = batch.column_by_name("contributing_query_ids").unwrap()
+        // field_15: row 0 empty list, row 1 has one entry.
+        let f15 = batch.column_by_name("field_15").unwrap()
             .as_any().downcast_ref::<ListArray>().unwrap();
-        assert!(!cqi_col.is_null(0));
-        assert_eq!(cqi_col.value(0).len(), 0);
-        assert!(!cqi_col.is_null(1));
-        let row1_cqi = cqi_col.value(1);
-        let row1_cqi_str = row1_cqi.as_any().downcast_ref::<LargeStringArray>().unwrap();
-        assert_eq!(row1_cqi_str.value(0), "q-00001");
+        assert!(!f15.is_null(0));
+        assert_eq!(f15.value(0).len(), 0);
+        assert!(!f15.is_null(1));
+        let f15_row1 = f15.value(1);
+        let f15_row1_str = f15_row1.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(f15_row1_str.value(0), "rec-a");
 
-        // query_tags: row 0 has ["etl","prod"], row 1 has ["streaming"].
-        let tags_col = batch.column_by_name("query_tags").unwrap()
+        // field_16: row 0 has ["tag-a","tag-b"], row 1 has ["tag-c"].
+        let f16 = batch.column_by_name("field_16").unwrap()
             .as_any().downcast_ref::<ListArray>().unwrap();
-        let row0_tags = tags_col.value(0);
-        let row0_tags_str = row0_tags.as_any().downcast_ref::<LargeStringArray>().unwrap();
-        assert_eq!(row0_tags_str.value(0), "etl");
-        assert_eq!(row0_tags_str.value(1), "prod");
+        let f16_row0 = f16.value(0);
+        let f16_row0_str = f16_row0.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(f16_row0_str.value(0), "tag-a");
+        assert_eq!(f16_row0_str.value(1), "tag-b");
 
-        // exception: row 0 null, row 1 present.
-        let exc_col = batch.column_by_name("exception").unwrap()
+        // field_17: row 0 null, row 1 present.
+        let f17 = batch.column_by_name("field_17").unwrap()
             .as_any().downcast_ref::<LargeStringArray>().unwrap();
-        assert!(exc_col.is_null(0));
-        assert_eq!(exc_col.value(1), "AnalysisException");
+        assert!(f17.is_null(0));
+        assert_eq!(f17.value(1), "err-type-a");
 
-        // failure struct: row 0 null, row 1 non-null.
-        let failure_col = batch.column_by_name("failure").unwrap()
+        // field_18 struct: row 0 null, row 1 non-null.
+        let f18 = batch.column_by_name("field_18").unwrap()
             .as_any().downcast_ref::<StructArray>().unwrap();
-        assert!(failure_col.is_null(0));
-        assert!(!failure_col.is_null(1));
-        let err_class = failure_col.column_by_name("error_class").unwrap()
+        assert!(f18.is_null(0));
+        assert!(!f18.is_null(1));
+        let f18_sub1 = f18.column_by_name("sub_1").unwrap()
             .as_any().downcast_ref::<LargeStringArray>().unwrap();
-        assert_eq!(err_class.value(1), "ANALYSIS_ERROR");
-        let sql_state = failure_col.column_by_name("sql_state").unwrap()
+        assert_eq!(f18_sub1.value(1), "err-a");
+        let f18_sub3 = f18.column_by_name("sub_3").unwrap()
             .as_any().downcast_ref::<LargeStringArray>().unwrap();
-        assert_eq!(sql_state.value(1), "42000");
+        assert_eq!(f18_sub3.value(1), "code-a");
     }
 }
