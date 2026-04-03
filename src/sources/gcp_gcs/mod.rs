@@ -21,6 +21,7 @@ use crate::{
     http::HttpClient,
     line_agg,
     serde::{bool_or_struct, default_decoding},
+    sources::ingestion_callback::IngestionCallbackConfig,
     tls::{TlsConfig, TlsSettings},
 };
 
@@ -102,6 +103,13 @@ pub struct GcpGcsConfig {
     #[serde(default = "default_decoding")]
     #[derivative(Default(value = "default_decoding()"))]
     pub decoding: DeserializerConfig,
+
+    /// Optional ingestion callback configuration.
+    ///
+    /// When present, the source fires HTTP callbacks to notify an upstream
+    /// service after a direct-ingest file finishes processing.
+    #[configurable(derived)]
+    pub ingestion_callback: Option<IngestionCallbackConfig>,
 }
 
 const fn default_framing() -> FramingConfig {
@@ -213,12 +221,22 @@ impl GcpGcsConfig {
             self.project.clone(),
         ));
 
+        let callback_client = self
+            .ingestion_callback
+            .as_ref()
+            .map(|cb_config| {
+                crate::sources::ingestion_callback::IngestionCallbackClient::new(cb_config, proxy)
+            })
+            .transpose()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
         let ingestor = pubsub::Ingestor::new(
             self.project.clone(),
             client,
             auth,
             pubsub_config.clone(),
             downloader,
+            callback_client,
         )
         .await?;
 
@@ -382,6 +400,59 @@ mod tests {
             Some(std::num::NonZeroUsize::new(8).unwrap())
         );
     }
+
+    #[test]
+    fn config_with_ingestion_callback() {
+        let config: Result<GcpGcsConfig, _> = toml::from_str(
+            r#"
+            project = "my-project"
+
+            [pubsub]
+            subscription = "my-sub"
+
+            [ingestion_callback]
+
+            [ingestion_callback.on_success]
+            uri = "/v2/files/{{message.file_id}}/mark-successful"
+
+            [ingestion_callback.on_failure]
+            uri = "/v2/files/{{message.file_id}}/mark-failed"
+
+            [ingestion_callback.on_failure.body]
+            file_id = "{{message.file_id}}"
+            error_message = "{{error_message}}"
+
+            [ingestion_callback.request]
+            base_url = "https://log-access.example.com"
+            timeout_secs = 5
+            retry_max_attempts = 2
+
+            [ingestion_callback.auth]
+            strategy = "bearer"
+            token = "my-token"
+            "#,
+        );
+        assert!(
+            config.is_ok(),
+            "ingestion_callback config must parse: {config:?}"
+        );
+        let cb = config
+            .unwrap()
+            .ingestion_callback
+            .expect("ingestion_callback must be present");
+
+        assert!(cb.on_success.is_some());
+        assert!(cb.on_failure.is_some());
+        assert_eq!(cb.request.base_url, "https://log-access.example.com");
+        assert_eq!(cb.request.timeout_secs, 5);
+        assert_eq!(cb.request.retry_max_attempts, 2);
+        assert!(cb.auth.is_some());
+
+        let on_failure = cb.on_failure.unwrap();
+        assert_eq!(on_failure.body.len(), 2);
+        assert_eq!(on_failure.body["file_id"], "{{message.file_id}}");
+        assert_eq!(on_failure.body["error_message"], "{{error_message}}");
+    }
 }
 
 #[cfg(test)]
@@ -438,6 +509,7 @@ mod ingestor_tests {
             GcpAuthenticator::None,
             config,
             make_test_downloader(),
+            None,
         )
         .await
     }

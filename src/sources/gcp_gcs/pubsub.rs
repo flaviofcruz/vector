@@ -29,6 +29,7 @@ use crate::{
         PubSubMessageReceiveSucceeded, QueueNotificationProcessLag,
     },
     shutdown::ShutdownSignal,
+    sources::ingestion_callback::IngestionCallbackClient,
 };
 
 use super::object::GcsDownloader;
@@ -286,11 +287,13 @@ struct State {
     auth: GcpAuthenticator,
     /// Full Pub/Sub resource name: `projects/{project}/subscriptions/{subscription}`.
     subscription_resource_name: String,
+    project: String,
     poll_secs: u64,
     max_number_of_messages: u32,
     client_concurrency: usize,
     acknowledge_message: bool,
     acknowledge_failed_message: bool,
+    callback_client: Option<IngestionCallbackClient>,
 }
 
 pub(super) struct Ingestor {
@@ -305,6 +308,7 @@ impl Ingestor {
         auth: GcpAuthenticator,
         config: Config,
         downloader: Arc<GcsDownloader>,
+        callback_client: Option<IngestionCallbackClient>,
     ) -> Result<Self, IngestorNewError> {
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 1000 {
             return Err(IngestorNewError::InvalidNumberOfMessages {
@@ -319,6 +323,7 @@ impl Ingestor {
             client,
             auth,
             subscription_resource_name,
+            project,
             poll_secs: config.poll_secs,
             max_number_of_messages: config.max_number_of_messages,
             client_concurrency: config
@@ -327,6 +332,7 @@ impl Ingestor {
                 .unwrap_or_else(crate::num_threads),
             acknowledge_message: config.acknowledge_message,
             acknowledge_failed_message: config.acknowledge_failed_message,
+            callback_client,
         });
 
         Ok(Self { state, downloader })
@@ -570,7 +576,9 @@ impl IngestorProcess {
             message_id = %message_id,
         );
 
-        self.downloader
+        let processing_start = std::time::Instant::now();
+        let result = self
+            .downloader
             .process_object(
                 &msg.bucket,
                 &msg.key,
@@ -581,7 +589,20 @@ impl IngestorProcess {
                 &self.bytes_received,
                 &self.events_received,
             )
-            .await
+            .await;
+
+        // Fire ingestion callback if configured (non-blocking).
+        if let Some(ref cb_client) = self.state.callback_client {
+            let message_fields = std::collections::HashMap::from([
+                ("file_id".to_string(), msg.file_id.clone()),
+                ("bucket".to_string(), msg.bucket.clone()),
+                ("key".to_string(), msg.key.clone()),
+                ("project".to_string(), self.state.project.clone()),
+            ]);
+            let _ = cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
+        }
+
+        result
     }
 
     // ========================================================================

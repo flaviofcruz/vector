@@ -48,7 +48,11 @@ pub mod host_metrics;
 pub mod http_client;
 #[cfg(feature = "sources-http_server")]
 pub mod http_server;
-#[cfg(any(feature = "sources-aws_s3", feature = "sources-azure_blob"))]
+#[cfg(any(
+    feature = "sources-aws_s3",
+    feature = "sources-azure_blob",
+    feature = "sources-gcp_gcs"
+))]
 pub mod ingestion_callback;
 #[cfg(feature = "sources-internal_logs")]
 pub mod internal_logs;
