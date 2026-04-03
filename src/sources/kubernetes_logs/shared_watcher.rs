@@ -200,3 +200,386 @@ pub(super) fn reset_registry() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    use futures::channel::mpsc;
+    use futures_util::SinkExt;
+    use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use kube::runtime::reflector;
+    use kube::runtime::reflector::ObjectRef;
+    use kube::runtime::watcher as kube_watcher;
+    use serial_test::serial;
+
+    use super::*;
+    use crate::kubernetes::{custom_reflector, meta_cache::MetaCache};
+
+    fn default_key() -> WatcherKey {
+        WatcherKey {
+            kube_config_file: None,
+            field_selector: "spec.nodeName=node1".to_string(),
+            label_selector: "vector.dev/exclude!=true".to_string(),
+            namespace_label_selector: "vector.dev/exclude!=true".to_string(),
+            node_selector: "metadata.name=node1".to_string(),
+            use_apiserver_cache: false,
+            delay_deletion: Duration::from_secs(60),
+            insert_namespace_fields: true,
+        }
+    }
+
+    fn mock_created_watcher() -> CreatedWatcher {
+        let pod_store_w = reflector::store::Writer::<Pod>::default();
+        let pod_state = pod_store_w.as_reader();
+        let ns_store_w = reflector::store::Writer::<Namespace>::default();
+        let ns_state = ns_store_w.as_reader();
+        let node_store_w = reflector::store::Writer::<Node>::default();
+        let node_state = node_store_w.as_reader();
+
+        let mut reflector_handles = Vec::new();
+        reflector_handles.push(tokio::spawn(futures::future::pending::<()>()));
+        reflector_handles.push(tokio::spawn(futures::future::pending::<()>()));
+        reflector_handles.push(tokio::spawn(futures::future::pending::<()>()));
+
+        CreatedWatcher {
+            pod_state,
+            ns_state,
+            node_state,
+            reflector_handles,
+        }
+    }
+
+    fn hash_of(key: &WatcherKey) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4: WatcherKey equality tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn identical_keys_are_equal_and_hash_the_same() {
+        let a = default_key();
+        let b = default_key();
+        assert_eq!(a, b);
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn differing_kube_config_file_produces_different_key() {
+        let a = default_key();
+        let mut b = default_key();
+        b.kube_config_file = Some(PathBuf::from("/other/config"));
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn differing_field_selector_produces_different_key() {
+        let a = default_key();
+        let mut b = default_key();
+        b.field_selector = "spec.nodeName=node2".to_string();
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn differing_label_selector_produces_different_key() {
+        let a = default_key();
+        let mut b = default_key();
+        b.label_selector = "app=nginx".to_string();
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn differing_namespace_label_selector_produces_different_key() {
+        let a = default_key();
+        let mut b = default_key();
+        b.namespace_label_selector = "team=backend".to_string();
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn differing_node_selector_produces_different_key() {
+        let a = default_key();
+        let mut b = default_key();
+        b.node_selector = "metadata.name=node2".to_string();
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn differing_use_apiserver_cache_produces_different_key() {
+        let a = default_key();
+        let mut b = default_key();
+        b.use_apiserver_cache = true;
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn differing_delay_deletion_produces_different_key() {
+        let a = default_key();
+        let mut b = default_key();
+        b.delay_deletion = Duration::from_secs(120);
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn differing_insert_namespace_fields_produces_different_key() {
+        let a = default_key();
+        let mut b = default_key();
+        b.insert_namespace_fields = false;
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 5: Registry lifecycle tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[serial]
+    async fn acquire_creates_new_entry_and_cleanup_on_drop() {
+        reset_registry();
+        let key = default_key();
+
+        let result = acquire(key.clone(), || async { Ok(mock_created_watcher()) })
+            .await
+            .expect("acquire should succeed");
+
+        assert_eq!(consumer_count(&key), Some(1));
+
+        // Drop the guard — entry should be removed.
+        drop(result.guard);
+        assert_eq!(consumer_count(&key), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn acquire_same_key_reuses_entry_and_does_not_call_create_fn() {
+        reset_registry();
+        let key = default_key();
+        let call_count = AtomicUsize::new(0);
+
+        let r1 = acquire(key.clone(), || {
+            call_count.fetch_add(1, Ordering::SeqCst);
+            async { Ok(mock_created_watcher()) }
+        })
+        .await
+        .expect("first acquire should succeed");
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(consumer_count(&key), Some(1));
+
+        // Second acquire with the same key should reuse, NOT call create_fn.
+        let r2 = acquire(key.clone(), || {
+            call_count.fetch_add(1, Ordering::SeqCst);
+            async { Ok(mock_created_watcher()) }
+        })
+        .await
+        .expect("second acquire should succeed");
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "create_fn should NOT have been called a second time");
+        assert_eq!(consumer_count(&key), Some(2));
+
+        // Drop first guard — count goes to 1.
+        drop(r1.guard);
+        assert_eq!(consumer_count(&key), Some(1));
+
+        // Drop second guard — entry removed.
+        drop(r2.guard);
+        assert_eq!(consumer_count(&key), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn different_keys_get_separate_entries() {
+        reset_registry();
+        let key1 = default_key();
+        let mut key2 = default_key();
+        key2.field_selector = "spec.nodeName=node2".to_string();
+
+        let r1 = acquire(key1.clone(), || async { Ok(mock_created_watcher()) })
+            .await
+            .expect("acquire key1");
+        let r2 = acquire(key2.clone(), || async { Ok(mock_created_watcher()) })
+            .await
+            .expect("acquire key2");
+
+        assert_eq!(consumer_count(&key1), Some(1));
+        assert_eq!(consumer_count(&key2), Some(1));
+
+        drop(r1.guard);
+        assert_eq!(consumer_count(&key1), None);
+        assert_eq!(consumer_count(&key2), Some(1));
+
+        drop(r2.guard);
+        assert_eq!(consumer_count(&key2), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reflector_handles_are_aborted_when_last_consumer_drops() {
+        reset_registry();
+        let key = default_key();
+
+        // Create a watcher with handles we can observe.
+        let h1 = tokio::spawn(futures::future::pending::<()>());
+        let h2 = tokio::spawn(futures::future::pending::<()>());
+        // Keep clones of abort handles so we can check them later.
+        let abort1 = h1.abort_handle();
+        let abort2 = h2.abort_handle();
+
+        let pod_store_w = reflector::store::Writer::<Pod>::default();
+        let pod_state = pod_store_w.as_reader();
+        let ns_store_w = reflector::store::Writer::<Namespace>::default();
+        let ns_state = ns_store_w.as_reader();
+        let node_store_w = reflector::store::Writer::<Node>::default();
+        let node_state = node_store_w.as_reader();
+
+        let created = CreatedWatcher {
+            pod_state,
+            ns_state,
+            node_state,
+            reflector_handles: vec![h1, h2],
+        };
+
+        let result = acquire(key.clone(), || async { Ok(created) })
+            .await
+            .expect("acquire should succeed");
+
+        assert!(!abort1.is_finished());
+        assert!(!abort2.is_finished());
+
+        // Drop guard — last consumer, handles should be aborted.
+        drop(result.guard);
+        // Yield to let the runtime process the aborts.
+        tokio::task::yield_now().await;
+        assert!(abort1.is_finished());
+        assert!(abort2.is_finished());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn guard_drop_on_error_path_still_cleans_up() {
+        reset_registry();
+        let key = default_key();
+
+        let result = acquire(key.clone(), || async { Ok(mock_created_watcher()) })
+            .await
+            .expect("acquire should succeed");
+
+        assert_eq!(consumer_count(&key), Some(1));
+
+        // Simulate an error path: drop everything (including guard) via drop.
+        drop(result);
+        assert_eq!(consumer_count(&key), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6: Store data visibility test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[serial]
+    async fn data_written_to_shared_reflector_is_visible_to_all_consumers() {
+        reset_registry();
+        let key = default_key();
+
+        // Create a pod store with a writer we control.
+        let pod_store_w = reflector::store::Writer::<Pod>::default();
+        let pod_state = pod_store_w.as_reader();
+
+        // Namespace and node stores — not under test, just placeholders.
+        let ns_store_w = reflector::store::Writer::<Namespace>::default();
+        let ns_state = ns_store_w.as_reader();
+        let node_store_w = reflector::store::Writer::<Node>::default();
+        let node_state = node_store_w.as_reader();
+
+        // Create a mock watcher stream using an mpsc channel.
+        let (tx, rx) = mpsc::channel::<kube_watcher::Result<kube_watcher::Event<Pod>>>(10);
+
+        // Spawn a custom_reflector to process events from the channel.
+        let meta_cache = MetaCache::new();
+        let reflector_handle = tokio::spawn(custom_reflector(
+            pod_store_w,
+            meta_cache,
+            rx,
+            Duration::from_secs(60),
+        ));
+
+        // Build the CreatedWatcher and insert it via acquire.
+        let created = CreatedWatcher {
+            pod_state: pod_state.clone(),
+            ns_state,
+            node_state,
+            reflector_handles: vec![reflector_handle],
+        };
+
+        // First consumer acquires.
+        let r1 = acquire(key.clone(), || async { Ok(created) })
+            .await
+            .expect("first acquire should succeed");
+
+        // Second consumer acquires (reuses).
+        let r2 = acquire(key.clone(), || async {
+            panic!("create_fn should not be called for second consumer");
+        })
+        .await
+        .expect("second acquire should succeed");
+
+        assert_eq!(consumer_count(&key), Some(2));
+
+        // Create a test pod and send it through the channel.
+        let test_pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("test-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        };
+
+        let mut tx = tx;
+        tx.send(Ok(kube_watcher::Event::Apply(test_pod.clone())))
+            .await
+            .expect("send event");
+
+        // Give the reflector time to process.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Both consumers should see the pod in their stores.
+        let pod_ref = ObjectRef::from_obj(&test_pod);
+        let pod_from_r1 = r1.stores.pod_state.get(&pod_ref);
+        let pod_from_r2 = r2.stores.pod_state.get(&pod_ref);
+
+        assert_eq!(
+            pod_from_r1.as_deref(),
+            Some(&test_pod),
+            "consumer 1 should see the pod"
+        );
+        assert_eq!(
+            pod_from_r2.as_deref(),
+            Some(&test_pod),
+            "consumer 2 should see the pod"
+        );
+
+        // Cleanup.
+        drop(r1.guard);
+        drop(r2.guard);
+    }
+}
