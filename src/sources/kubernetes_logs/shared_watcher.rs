@@ -582,4 +582,45 @@ mod tests {
         drop(r1.guard);
         drop(r2.guard);
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn double_check_race_discards_loser_and_reuses_winner() {
+        reset_registry();
+        let key = default_key();
+
+        // The create_fn simulates a race: before returning, it manually
+        // inserts a competing entry (as if another source won the race).
+        let result = acquire(key.clone(), || {
+            let race_key = key.clone();
+            async move {
+                // Simulate another source winning the race by inserting directly.
+                let winner = mock_created_watcher();
+                {
+                    let mut registry =
+                        SHARED_WATCHERS.lock().expect("shared watcher registry poisoned");
+                    registry.insert(
+                        race_key,
+                        SharedWatcherEntry {
+                            pod_state: winner.pod_state.clone(),
+                            ns_state: winner.ns_state.clone(),
+                            node_state: winner.node_state.clone(),
+                            reflector_handles: winner.reflector_handles,
+                            consumer_count: 1,
+                        },
+                    );
+                }
+                // Return our "loser" watcher — acquire() should discard it.
+                Ok(mock_created_watcher())
+            }
+        })
+        .await
+        .expect("acquire should succeed");
+
+        // Consumer count should be 2 (winner's 1 + our increment).
+        assert_eq!(consumer_count(&key), Some(2));
+        drop(result.guard);
+        // Winner's original count remains.
+        assert_eq!(consumer_count(&key), Some(1));
+    }
 }
