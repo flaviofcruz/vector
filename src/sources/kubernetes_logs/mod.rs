@@ -81,6 +81,7 @@ mod parser;
 mod partial_events_merger;
 mod path_helpers;
 mod pod_metadata_annotator;
+mod shared_watcher;
 mod transform_utils;
 mod util;
 
