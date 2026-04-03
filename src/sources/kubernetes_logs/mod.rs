@@ -20,6 +20,7 @@ use kube::{
     api::Api,
     config::{self, KubeConfigOptions},
     runtime::{WatchStreamExt, reflector, watcher},
+    runtime::reflector::store::Store,
 };
 use lifecycle::Lifecycle;
 use serde_with::serde_as;
@@ -710,22 +711,20 @@ impl SourceConfig for Config {
     }
 }
 
-#[derive(Clone)]
 struct Source {
-    client: Client,
+    pod_state: Store<Pod>,
+    ns_state: Store<Namespace>,
+    node_state: Store<Node>,
+    watcher_guard: shared_watcher::SharedWatcherGuard,
     data_dir: PathBuf,
     auto_partial_merge: bool,
     pod_fields_spec: pod_metadata_annotator::FieldsSpec,
     namespace_fields_spec: namespace_metadata_annotator::FieldsSpec,
     node_field_spec: node_metadata_annotator::FieldsSpec,
-    field_selector: String,
-    label_selector: String,
-    namespace_label_selector: String,
     insert_namespace_fields: bool,
     extract_databricks_logs: bool,
     use_hostpath_logging_annotation_override: bool,
     ttl_removal_config: Option<TTLRemovalConfig>,
-    node_selector: String,
     self_node_name: String,
     pod_logs_glob_patterns: Vec<String>,
     include_paths: Vec<glob::Pattern>,
@@ -738,9 +737,7 @@ struct Source {
     max_merged_line_bytes: Option<usize>,
     fingerprint_lines: usize,
     glob_minimum_cooldown: Duration,
-    use_apiserver_cache: bool,
     ingestion_timestamp_field: Option<OwnedTargetPath>,
-    delay_deletion: Duration,
     include_file_metric_tag: bool,
     rotate_wait: Duration,
     file_to_pod_map: Arc<Mutex<HashMap<PathBuf, LogFileInfo>>>,
@@ -778,25 +775,131 @@ impl Source {
             prepare_label_selector(config.extra_namespace_label_selector.as_ref());
         let node_selector = prepare_node_selector(self_node_name.as_str())?;
 
-        // If the user passed a custom Kubeconfig use it, otherwise
-        // we attempt to load the local kubeconfig, followed by the
-        // in-cluster environment variables
-        let mut client_config = match &config.kube_config_file {
-            Some(kc) => {
-                ClientConfig::from_custom_kubeconfig(
-                    config::Kubeconfig::read_from(kc)?,
-                    &KubeConfigOptions::default(),
-                )
-                .await?
-            }
-            None => ClientConfig::infer().await?,
+        let delay_deletion = config.delay_deletion_ms;
+        let use_apiserver_cache = config.use_apiserver_cache;
+        let insert_namespace_fields = config.insert_namespace_fields;
+
+        let watcher_key = shared_watcher::WatcherKey {
+            kube_config_file: config.kube_config_file.clone(),
+            field_selector: field_selector.clone(),
+            label_selector: label_selector.clone(),
+            namespace_label_selector: namespace_label_selector.clone(),
+            node_selector: node_selector.clone(),
+            use_apiserver_cache,
+            delay_deletion,
+            insert_namespace_fields,
         };
-        if let Ok(user_agent) = HeaderValue::from_str(&format!("{PKG_NAME}/{PKG_VERSION}")) {
-            client_config
-                .headers
-                .push((HeaderName::from_static("user-agent"), user_agent));
-        }
-        let client = Client::try_from(client_config)?;
+
+        let kube_config_file = config.kube_config_file.clone();
+        let acquire_result = shared_watcher::acquire(watcher_key, move || async move {
+            // If the user passed a custom Kubeconfig use it, otherwise
+            // we attempt to load the local kubeconfig, followed by the
+            // in-cluster environment variables
+            let mut client_config = match &kube_config_file {
+                Some(kc) => {
+                    ClientConfig::from_custom_kubeconfig(
+                        config::Kubeconfig::read_from(kc)?,
+                        &KubeConfigOptions::default(),
+                    )
+                    .await?
+                }
+                None => ClientConfig::infer().await?,
+            };
+            if let Ok(user_agent) = HeaderValue::from_str(&format!("{PKG_NAME}/{PKG_VERSION}")) {
+                client_config
+                    .headers
+                    .push((HeaderName::from_static("user-agent"), user_agent));
+            }
+            let client = Client::try_from(client_config)?;
+
+            let list_semantic = if use_apiserver_cache {
+                watcher::ListSemantic::Any
+            } else {
+                watcher::ListSemantic::MostRecent
+            };
+
+            let mut reflector_handles = Vec::new();
+
+            // Pod watcher
+            let pods = Api::<Pod>::all(client.clone());
+            let pod_watcher = watcher(
+                pods,
+                watcher::Config {
+                    field_selector: Some(field_selector),
+                    label_selector: Some(label_selector),
+                    list_semantic: list_semantic.clone(),
+                    page_size: get_page_size(use_apiserver_cache),
+                    ..Default::default()
+                },
+            )
+            .backoff(watcher::DefaultBackoff::default());
+
+            let pod_store_w = reflector::store::Writer::default();
+            let pod_state = pod_store_w.as_reader();
+            let pod_cacher = MetaCache::new();
+
+            reflector_handles.push(tokio::spawn(custom_reflector(
+                pod_store_w,
+                pod_cacher,
+                pod_watcher,
+                delay_deletion,
+            )));
+
+            // Namespace watcher
+            let ns_store_w = reflector::store::Writer::default();
+            let ns_state = ns_store_w.as_reader();
+            if insert_namespace_fields {
+                let namespaces = Api::<Namespace>::all(client.clone());
+                let ns_watcher = watcher(
+                    namespaces,
+                    watcher::Config {
+                        label_selector: Some(namespace_label_selector),
+                        list_semantic: list_semantic.clone(),
+                        page_size: get_page_size(use_apiserver_cache),
+                        ..Default::default()
+                    },
+                )
+                .backoff(watcher::DefaultBackoff::default());
+
+                reflector_handles.push(tokio::spawn(custom_reflector(
+                    ns_store_w,
+                    MetaCache::new(),
+                    ns_watcher,
+                    delay_deletion,
+                )));
+            }
+
+            // Node watcher
+            let nodes = Api::<Node>::all(client);
+            let node_watcher = watcher(
+                nodes,
+                watcher::Config {
+                    field_selector: Some(node_selector),
+                    list_semantic,
+                    page_size: get_page_size(use_apiserver_cache),
+                    ..Default::default()
+                },
+            )
+            .backoff(watcher::DefaultBackoff::default());
+            let node_store_w = reflector::store::Writer::default();
+            let node_state = node_store_w.as_reader();
+            let node_cacher = MetaCache::new();
+
+            reflector_handles.push(tokio::spawn(custom_reflector(
+                node_store_w,
+                node_cacher,
+                node_watcher,
+                delay_deletion,
+            )));
+
+            Ok(shared_watcher::CreatedWatcher {
+                pod_state,
+                ns_state,
+                node_state,
+                reflector_handles,
+            })
+        })
+        .await?;
 
         let data_dir = globals.resolve_and_make_data_subdir(config.data_dir.as_ref(), key.id())?;
 
@@ -808,29 +911,26 @@ impl Source {
 
         let glob_minimum_cooldown = config.glob_minimum_cooldown_ms;
 
-        let delay_deletion = config.delay_deletion_ms;
-
         let ingestion_timestamp_field = config
             .ingestion_timestamp_field
             .clone()
             .and_then(|k| k.path);
 
         Ok(Self {
-            client,
+            pod_state: acquire_result.stores.pod_state,
+            ns_state: acquire_result.stores.ns_state,
+            node_state: acquire_result.stores.node_state,
+            watcher_guard: acquire_result.guard,
             data_dir,
             auto_partial_merge: config.auto_partial_merge,
             pod_fields_spec: config.pod_annotation_fields.clone(),
             namespace_fields_spec: config.namespace_annotation_fields.clone(),
             node_field_spec: config.node_annotation_fields.clone(),
-            field_selector,
-            label_selector,
-            namespace_label_selector,
-            insert_namespace_fields: config.insert_namespace_fields,
+            insert_namespace_fields,
             extract_databricks_logs: config.extract_databricks_logs,
             use_hostpath_logging_annotation_override: config
                 .use_hostpath_logging_annotation_override,
             ttl_removal_config: config.ttl_removal_config.clone(),
-            node_selector,
             self_node_name,
             pod_logs_glob_patterns,
             include_paths,
@@ -843,9 +943,7 @@ impl Source {
             max_merged_line_bytes: config.max_merged_line_bytes,
             fingerprint_lines: config.fingerprint_lines,
             glob_minimum_cooldown,
-            use_apiserver_cache: config.use_apiserver_cache,
             ingestion_timestamp_field,
-            delay_deletion,
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
             file_to_pod_map: Arc::new(Mutex::new(HashMap::new())),
@@ -867,20 +965,19 @@ impl Source {
         log_namespace: LogNamespace,
     ) -> crate::Result<()> {
         let Self {
-            client,
+            pod_state,
+            ns_state,
+            node_state,
+            watcher_guard,
             data_dir,
             auto_partial_merge,
             pod_fields_spec,
             namespace_fields_spec,
             node_field_spec,
-            field_selector,
-            label_selector,
-            namespace_label_selector,
             insert_namespace_fields,
             extract_databricks_logs,
             use_hostpath_logging_annotation_override,
             ttl_removal_config,
-            node_selector,
             self_node_name,
             pod_logs_glob_patterns,
             include_paths,
@@ -893,9 +990,7 @@ impl Source {
             max_merged_line_bytes,
             fingerprint_lines,
             glob_minimum_cooldown,
-            use_apiserver_cache,
             ingestion_timestamp_field,
-            delay_deletion,
             include_file_metric_tag,
             rotate_wait,
             file_to_pod_map,
@@ -918,88 +1013,6 @@ impl Source {
                 }
             }
         });
-
-        let mut reflectors = Vec::new();
-
-        let pods = Api::<Pod>::all(client.clone());
-
-        let list_semantic = if use_apiserver_cache {
-            watcher::ListSemantic::Any
-        } else {
-            watcher::ListSemantic::MostRecent
-        };
-
-        let pod_watcher = watcher(
-            pods,
-            watcher::Config {
-                field_selector: Some(field_selector),
-                label_selector: Some(label_selector),
-                list_semantic: list_semantic.clone(),
-                page_size: get_page_size(use_apiserver_cache),
-                ..Default::default()
-            },
-        )
-        .backoff(watcher::DefaultBackoff::default());
-
-        let pod_store_w = reflector::store::Writer::default();
-        let pod_state = pod_store_w.as_reader();
-        let pod_cacher = MetaCache::new();
-
-        reflectors.push(tokio::spawn(custom_reflector(
-            pod_store_w,
-            pod_cacher,
-            pod_watcher,
-            delay_deletion,
-        )));
-
-        // -----------------------------------------------------------------
-
-        let ns_store_w = reflector::store::Writer::default();
-        let ns_state = ns_store_w.as_reader();
-        if insert_namespace_fields {
-            let namespaces = Api::<Namespace>::all(client.clone());
-            let ns_watcher = watcher(
-                namespaces,
-                watcher::Config {
-                    label_selector: Some(namespace_label_selector),
-                    list_semantic: list_semantic.clone(),
-                    page_size: get_page_size(use_apiserver_cache),
-                    ..Default::default()
-                },
-            )
-            .backoff(watcher::DefaultBackoff::default());
-
-            reflectors.push(tokio::spawn(custom_reflector(
-                ns_store_w,
-                MetaCache::new(),
-                ns_watcher,
-                delay_deletion,
-            )));
-        }
-
-        // -----------------------------------------------------------------
-
-        let nodes = Api::<Node>::all(client);
-        let node_watcher = watcher(
-            nodes,
-            watcher::Config {
-                field_selector: Some(node_selector),
-                list_semantic,
-                page_size: get_page_size(use_apiserver_cache),
-                ..Default::default()
-            },
-        )
-        .backoff(watcher::DefaultBackoff::default());
-        let node_store_w = reflector::store::Writer::default();
-        let node_state = node_store_w.as_reader();
-        let node_cacher = MetaCache::new();
-
-        reflectors.push(tokio::spawn(custom_reflector(
-            node_store_w,
-            node_cacher,
-            node_watcher,
-            delay_deletion,
-        )));
 
         let paths_provider = K8sPathsProvider::new(
             pod_state.clone(),
@@ -1249,10 +1262,9 @@ impl Source {
         }
 
         lifecycle.run(global_shutdown).await;
-        // Stop Kubernetes object reflectors to avoid their leak on vector reload.
-        for reflector in reflectors {
-            reflector.abort();
-        }
+        // The SharedWatcherGuard handles reflector cleanup on drop.
+        // When the last consumer drops, reflectors are automatically aborted.
+        drop(watcher_guard);
         info!(message = "Done.");
         Ok(())
     }
