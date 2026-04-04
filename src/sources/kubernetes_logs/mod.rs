@@ -307,6 +307,18 @@ pub struct Config {
     /// Determines if requests to the kube-apiserver can be served by a cache.
     use_apiserver_cache: bool,
 
+    /// Whether to share Kubernetes API watchers across multiple `kubernetes_logs` sources
+    /// with identical watcher parameters.
+    ///
+    /// When `true`, sources with the same kube config, selectors, and cache settings will
+    /// share a single set of Kubernetes API watch connections and in-memory stores, reducing
+    /// load on the API server and memory usage in topologies with multiple kubernetes_logs
+    /// sources.
+    ///
+    /// When `false` (default), each source creates its own independent watchers.
+    #[serde(default = "default_share_watcher")]
+    share_watcher: bool,
+
     /// How long to delay removing metadata entries from the cache when a pod deletion event
     /// event is received from the watch stream.
     ///
@@ -452,6 +464,7 @@ impl Default for Config {
             timezone: None,
             kube_config_file: None,
             use_apiserver_cache: false,
+            share_watcher: default_share_watcher(),
             delay_deletion_ms: default_delay_deletion_ms(),
             log_namespace: None,
             internal_metrics: Default::default(),
@@ -715,7 +728,10 @@ struct Source {
     pod_state: Store<Pod>,
     ns_state: Store<Namespace>,
     node_state: Store<Node>,
-    watcher_guard: shared_watcher::SharedWatcherGuard,
+    /// Present when `share_watcher` is true — RAII cleanup via shared registry.
+    watcher_guard: Option<shared_watcher::SharedWatcherGuard>,
+    /// Present when `share_watcher` is false — owned reflector tasks for direct cleanup.
+    reflector_handles: Vec<tokio::task::JoinHandle<()>>,
     data_dir: PathBuf,
     auto_partial_merge: bool,
     pod_fields_spec: pod_metadata_annotator::FieldsSpec,
@@ -778,23 +794,15 @@ impl Source {
         let delay_deletion = config.delay_deletion_ms;
         let use_apiserver_cache = config.use_apiserver_cache;
         let insert_namespace_fields = config.insert_namespace_fields;
+        let share_watcher = config.share_watcher;
 
-        let watcher_key = shared_watcher::WatcherKey {
-            kube_config_file: config.kube_config_file.clone(),
-            field_selector: field_selector.clone(),
-            label_selector: label_selector.clone(),
-            namespace_label_selector: namespace_label_selector.clone(),
-            node_selector: node_selector.clone(),
-            use_apiserver_cache,
-            delay_deletion,
-            insert_namespace_fields,
-        };
-
-        let kube_config_file = config.kube_config_file.clone();
-        let acquire_result = shared_watcher::acquire(watcher_key, move || async move {
-            // If the user passed a custom Kubeconfig use it, otherwise
-            // we attempt to load the local kubeconfig, followed by the
-            // in-cluster environment variables
+        // Helper: creates a K8s client and spawns the reflector tasks.
+        // Used by both the shared and non-shared paths.
+        let create_watchers = |field_selector: String,
+                               label_selector: String,
+                               namespace_label_selector: String,
+                               node_selector: String,
+                               kube_config_file: Option<PathBuf>| async move {
             let mut client_config = match &kube_config_file {
                 Some(kc) => {
                     ClientConfig::from_custom_kubeconfig(
@@ -898,8 +906,58 @@ impl Source {
                 node_state,
                 reflector_handles,
             })
-        })
-        .await?;
+        };
+
+        // Stores and cleanup handles differ based on whether watcher sharing is enabled.
+        let (pod_state, ns_state, node_state, watcher_guard, reflector_handles) = if share_watcher {
+            let watcher_key = shared_watcher::WatcherKey {
+                kube_config_file: config.kube_config_file.clone(),
+                field_selector: field_selector.clone(),
+                label_selector: label_selector.clone(),
+                namespace_label_selector: namespace_label_selector.clone(),
+                node_selector: node_selector.clone(),
+                use_apiserver_cache,
+                delay_deletion,
+                insert_namespace_fields,
+            };
+
+            let kube_config_file = config.kube_config_file.clone();
+            let acquire_result = shared_watcher::acquire(watcher_key, move || {
+                create_watchers(
+                    field_selector,
+                    label_selector,
+                    namespace_label_selector,
+                    node_selector,
+                    kube_config_file,
+                )
+            })
+            .await?;
+
+            (
+                acquire_result.stores.pod_state,
+                acquire_result.stores.ns_state,
+                acquire_result.stores.node_state,
+                Some(acquire_result.guard),
+                Vec::new(),
+            )
+        } else {
+            let created = create_watchers(
+                field_selector,
+                label_selector,
+                namespace_label_selector,
+                node_selector,
+                config.kube_config_file.clone(),
+            )
+            .await?;
+
+            (
+                created.pod_state,
+                created.ns_state,
+                created.node_state,
+                None,
+                created.reflector_handles,
+            )
+        };
 
         let data_dir = globals.resolve_and_make_data_subdir(config.data_dir.as_ref(), key.id())?;
 
@@ -917,10 +975,11 @@ impl Source {
             .and_then(|k| k.path);
 
         Ok(Self {
-            pod_state: acquire_result.stores.pod_state,
-            ns_state: acquire_result.stores.ns_state,
-            node_state: acquire_result.stores.node_state,
-            watcher_guard: acquire_result.guard,
+            pod_state,
+            ns_state,
+            node_state,
+            watcher_guard,
+            reflector_handles,
             data_dir,
             auto_partial_merge: config.auto_partial_merge,
             pod_fields_spec: config.pod_annotation_fields.clone(),
@@ -969,6 +1028,7 @@ impl Source {
             ns_state,
             node_state,
             watcher_guard,
+            reflector_handles,
             data_dir,
             auto_partial_merge,
             pod_fields_spec,
@@ -1262,9 +1322,16 @@ impl Source {
         }
 
         lifecycle.run(global_shutdown).await;
-        // The SharedWatcherGuard handles reflector cleanup on drop.
-        // When the last consumer drops, reflectors are automatically aborted.
-        drop(watcher_guard);
+        if let Some(guard) = watcher_guard {
+            // Shared path: the guard handles reflector cleanup on drop.
+            // When the last consumer drops, reflectors are automatically aborted.
+            drop(guard);
+        } else {
+            // Non-shared path: stop reflectors directly.
+            for handle in reflector_handles {
+                handle.abort();
+            }
+        }
         info!(message = "Done.");
         Ok(())
     }
@@ -1424,6 +1491,10 @@ const fn default_rotate_wait() -> Duration {
 }
 
 const fn default_drain_on_shutdown() -> bool {
+    false
+}
+
+const fn default_share_watcher() -> bool {
     false
 }
 
