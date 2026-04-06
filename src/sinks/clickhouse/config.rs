@@ -379,6 +379,7 @@ impl ClickhouseConfig {
             self.dns_refresh_interval_secs,
             fallback_uri.clone(),
             params.request_limits.concurrency,
+            params.request_limits.retry_attempts,
         )
         .await?;
 

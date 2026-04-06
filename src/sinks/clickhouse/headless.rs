@@ -9,10 +9,10 @@
 //! A background task periodically re-resolves DNS to discover new pods and
 //! re-add recovered ones.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -34,7 +34,7 @@ use super::sink::PartitionKey;
 use crate::http::{Auth, HttpClient, HttpError};
 use crate::internal_events::{
     ClickhouseHeadlessDnsRefreshed, ClickhouseHeadlessEndpointRemoved,
-    ClickhouseHeadlessFallbackRouted,
+    ClickhouseHeadlessFallbackRouted, ClickhouseHeadlessP2cBufferFull,
 };
 use crate::sinks::prelude::*;
 use crate::sinks::util::http::{HttpRequest, HttpResponse, HttpService};
@@ -67,8 +67,12 @@ pub(super) struct EndpointServiceConfig {
 
 /// Shared state between TrackedHttpService error handlers and the DNS refresh task.
 struct SharedDiscoveryState {
-    known_ips: Mutex<HashSet<IpAddr>>,
+    /// Maps each known pod IP to its current generation. The generation is
+    /// bumped each time an IP is re-inserted after a removal, so that a stale
+    /// in-flight `remove_endpoint` call does not evict a freshly re-added pod.
+    known_ips: Mutex<HashMap<IpAddr, u64>>,
     active_count: AtomicUsize,
+    next_generation: AtomicU64,
 }
 
 /// Wraps an `HttpService` with load tracking and error-based endpoint removal.
@@ -80,6 +84,9 @@ struct SharedDiscoveryState {
 struct TrackedHttpService {
     inner: HttpService<ClickhouseServiceRequestBuilder, PartitionKey>,
     ip: IpAddr,
+    /// Generation assigned when this service instance was inserted. Used by
+    /// `remove_endpoint` to guard against stale removals after a re-insertion.
+    generation: u64,
     pending: Arc<AtomicUsize>,
     discover_tx: mpsc::UnboundedSender<DiscoverEvent>,
     shared: Arc<SharedDiscoveryState>,
@@ -103,6 +110,7 @@ impl Load for TrackedHttpService {
 /// pending counter would leak.
 struct RequestGuard {
     ip: IpAddr,
+    generation: u64,
     pending: Arc<AtomicUsize>,
     discover_tx: mpsc::UnboundedSender<DiscoverEvent>,
     shared: Arc<SharedDiscoveryState>,
@@ -132,6 +140,7 @@ impl Drop for RequestGuard {
                 &self.shared,
                 &self.discover_tx,
                 self.ip,
+                self.generation,
                 "request cancelled (likely timeout)",
             );
         }
@@ -141,6 +150,10 @@ impl Drop for RequestGuard {
 /// Removes an endpoint IP from the active set and notifies Balance via the
 /// discover channel.
 ///
+/// The `generation` parameter guards against stale removals: if DNS has
+/// re-inserted this IP with a newer generation since the request was
+/// dispatched, the remove is skipped.
+///
 /// When `active_count` reaches zero, `HeadlessService::poll_ready` routes all
 /// subsequent requests to the fallback ClusterIP service until the next
 /// scheduled DNS refresh re-adds healthy pods.
@@ -148,20 +161,27 @@ fn remove_endpoint(
     shared: &Arc<SharedDiscoveryState>,
     discover_tx: &mpsc::UnboundedSender<DiscoverEvent>,
     ip: IpAddr,
+    generation: u64,
     reason: &str,
 ) {
-    let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
-    if known.remove(&ip) {
-        shared.active_count.fetch_sub(1, Ordering::Relaxed);
-        let _ = discover_tx.send(Ok(Change::Remove(ip)));
-        let active = shared.active_count.load(Ordering::Relaxed);
-        drop(known);
-        emit!(ClickhouseHeadlessEndpointRemoved {
-            ip,
-            reason: reason.to_owned(),
-            active_endpoints: active,
-        });
-    }
+    let active = {
+        let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
+        if known.get(&ip) != Some(&generation) {
+            // Either already removed, or DNS re-inserted this IP with a newer
+            // generation. Don't evict the fresh instance.
+            return;
+        }
+        known.remove(&ip);
+        let active = known.len();
+        shared.active_count.store(active, Ordering::Relaxed);
+        active
+    };
+    let _ = discover_tx.send(Ok(Change::Remove(ip)));
+    emit!(ClickhouseHeadlessEndpointRemoved {
+        ip,
+        reason: reason.to_owned(),
+        active_endpoints: active,
+    });
 }
 
 impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
@@ -183,8 +203,10 @@ impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
             in_flight_on_pod = in_flight,
         );
 
+        let generation = self.generation;
         let mut guard = RequestGuard {
             ip,
+            generation,
             pending: self.pending.clone(),
             discover_tx: self.discover_tx.clone(),
             shared: self.shared.clone(),
@@ -208,7 +230,7 @@ impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
                             pod_ip = %ip,
                             error = %e,
                         );
-                        remove_endpoint(&guard.shared, &guard.discover_tx, ip, &e.to_string());
+                        remove_endpoint(&guard.shared, &guard.discover_tx, ip, generation, &e.to_string());
                     } else {
                         debug!(
                             message = "Non-connection error on ClickHouse pod (endpoint kept).",
@@ -260,6 +282,7 @@ impl HeadlessService {
         dns_refresh_interval_secs: Option<u64>,
         fallback_uri: Uri,
         concurrency_limit: Option<usize>,
+        max_retries: usize,
     ) -> crate::Result<Self> {
         let initial_uris = dns::resolve_endpoints(&endpoint).await?;
 
@@ -274,18 +297,30 @@ impl HeadlessService {
             return Err("DNS resolution returned no usable IP addresses for ClickHouse".into());
         }
 
+        // Assign a generation to each initial IP. The generation is used by
+        // remove_endpoint to avoid evicting a freshly re-inserted pod when a
+        // stale request to an old service instance errors out later.
+        let mut gen_counter: u64 = 0;
+        let mut known_ips: HashMap<IpAddr, u64> = HashMap::new();
+        for &ip in &initial_ips {
+            known_ips.insert(ip, gen_counter);
+            gen_counter += 1;
+        }
+
         let shared = Arc::new(SharedDiscoveryState {
-            known_ips: Mutex::new(initial_ips.clone()),
+            known_ips: Mutex::new(known_ips.clone()),
             active_count: AtomicUsize::new(initial_ips.len()),
+            next_generation: AtomicU64::new(gen_counter),
         });
 
         // Build TrackedHttpService for each initial IP and send Insert events.
         for uri in &initial_uris {
             if let Some(ip) = dns::ip_from_uri(uri) {
-                if initial_ips.contains(&ip) {
+                if let Some(&generation) = known_ips.get(&ip) {
                     let service = TrackedHttpService {
                         inner: build_endpoint_service(&client, uri.clone(), &svc_config),
                         ip,
+                        generation,
                         pending: Arc::new(AtomicUsize::new(0)),
                         discover_tx: discover_tx.clone(),
                         shared: shared.clone(),
@@ -314,10 +349,14 @@ impl HeadlessService {
 
         let discover_stream: DiscoverStream = Box::pin(UnboundedReceiverStream::new(discover_rx));
         let balance = Balance::new(discover_stream);
-        // Use the configured concurrency as the buffer bound so the Buffer layer doesn't
-        // introduce additional backpressure on top of the outer concurrency limiter.
+        // Size the buffer to hold concurrent requests plus their retries. The
+        // Tower retry layer re-enters through this Buffer, so if bound == concurrency
+        // all slots can be occupied by non-retried in-flight requests, blocking
+        // retries from being dispatched.
         // When concurrency is unlimited (adaptive mode), DEFAULT_BUFFER_BOUND is used.
-        let buffer_bound = concurrency_limit.unwrap_or(DEFAULT_BUFFER_BOUND);
+        let buffer_bound = concurrency_limit
+            .map(|c| (c * (1 + max_retries)).max(32))
+            .unwrap_or(DEFAULT_BUFFER_BOUND);
         let buffer = Buffer::new(balance, buffer_bound);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(());
@@ -356,7 +395,11 @@ impl tower::Service<HttpRequest<PartitionKey>> for HeadlessService {
             self.fallback.poll_ready(cx)
         } else {
             self.using_fallback = false;
-            self.inner.poll_ready(cx).map_err(Into::into)
+            let poll = self.inner.poll_ready(cx).map_err(Into::into);
+            if poll.is_pending() {
+                emit!(ClickhouseHeadlessP2cBufferFull);
+            }
+            poll
         }
     }
 
@@ -506,6 +549,11 @@ fn spawn_dns_refresh_task(
 
 /// Reconciles the active endpoint set with freshly resolved URIs by sending
 /// `Change::Insert` and `Change::Remove` events to the discover channel.
+///
+/// The mutex is held only long enough to compute the diff and update
+/// `known_ips` + `active_count`. Channel sends and service construction happen
+/// after the lock is released to avoid blocking Tokio threads that call
+/// `remove_endpoint` from async request handlers.
 fn reconcile_endpoints(
     shared: &Arc<SharedDiscoveryState>,
     discover_tx: &mpsc::UnboundedSender<DiscoverEvent>,
@@ -518,14 +566,47 @@ fn reconcile_endpoints(
         .filter_map(|u| dns::ip_from_uri(u))
         .collect();
 
-    let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
+    // Compute diff and update state under the lock, then release before sends.
+    let (stale_ips, fresh_entries, active) = {
+        let mut known = shared.known_ips.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Remove endpoints no longer in DNS.
-    let stale_ips: Vec<IpAddr> = known.difference(&new_ips).copied().collect();
+        let stale_ips: Vec<IpAddr> = known
+            .keys()
+            .filter(|ip| !new_ips.contains(*ip))
+            .copied()
+            .collect();
+        for ip in &stale_ips {
+            known.remove(ip);
+        }
+
+        let mut fresh_entries: Vec<(Uri, IpAddr, u64)> = Vec::new();
+        for uri in new_uris {
+            if let Some(ip) = dns::ip_from_uri(uri) {
+                if !known.contains_key(&ip) {
+                    let next_gen = shared.next_generation.fetch_add(1, Ordering::Relaxed);
+                    known.insert(ip, next_gen);
+                    fresh_entries.push((uri.clone(), ip, next_gen));
+                } else {
+                    trace!(
+                        message = "ClickHouse headless endpoint unchanged (already active).",
+                        pod_ip = %ip,
+                    );
+                }
+            }
+        }
+
+        // Single atomic store eliminates transient undercounts that would
+        // otherwise occur between incremental fetch_sub / fetch_add calls
+        // while poll_ready reads active_count lock-free.
+        let active = known.len();
+        shared.active_count.store(active, Ordering::Relaxed);
+        (stale_ips, fresh_entries, active)
+    };
+
     let removed_count = stale_ips.len();
+    let added_count = fresh_entries.len();
+
     for ip in &stale_ips {
-        known.remove(ip);
-        shared.active_count.fetch_sub(1, Ordering::Relaxed);
         let _ = discover_tx.send(Ok(Change::Remove(*ip)));
         debug!(
             message = "ClickHouse headless endpoint removed (no longer in DNS).",
@@ -533,34 +614,21 @@ fn reconcile_endpoints(
         );
     }
 
-    // Add new endpoints.
-    let mut added_count = 0;
-    for uri in new_uris {
-        if let Some(ip) = dns::ip_from_uri(uri) {
-            if !known.contains(&ip) {
-                debug!(
-                    message = "ClickHouse headless endpoint added (new in DNS).",
-                    pod_ip = %ip,
-                    uri = %uri,
-                );
-                let service = TrackedHttpService {
-                    inner: build_endpoint_service(client, uri.clone(), svc_config),
-                    ip,
-                    pending: Arc::new(AtomicUsize::new(0)),
-                    discover_tx: discover_tx.clone(),
-                    shared: shared.clone(),
-                };
-                let _ = discover_tx.send(Ok(Change::Insert(ip, service)));
-                known.insert(ip);
-                shared.active_count.fetch_add(1, Ordering::Relaxed);
-                added_count += 1;
-            } else {
-                trace!(
-                    message = "ClickHouse headless endpoint unchanged (already active).",
-                    pod_ip = %ip,
-                );
-            }
-        }
+    for (uri, ip, generation) in fresh_entries {
+        debug!(
+            message = "ClickHouse headless endpoint added (new in DNS).",
+            pod_ip = %ip,
+            uri = %uri,
+        );
+        let service = TrackedHttpService {
+            inner: build_endpoint_service(client, uri.clone(), svc_config),
+            ip,
+            generation,
+            pending: Arc::new(AtomicUsize::new(0)),
+            discover_tx: discover_tx.clone(),
+            shared: shared.clone(),
+        };
+        let _ = discover_tx.send(Ok(Change::Insert(ip, service)));
     }
 
     if removed_count > 0 || added_count > 0 {
@@ -568,7 +636,7 @@ fn reconcile_endpoints(
             message = "ClickHouse headless service endpoints reconciled.",
             added = added_count,
             removed = removed_count,
-            active = known.len(),
+            active = active,
         );
     }
 }
@@ -621,8 +689,9 @@ mod tests {
         let (discover_tx, mut discover_rx) = mpsc::unbounded_channel::<DiscoverEvent>();
 
         let shared = Arc::new(SharedDiscoveryState {
-            known_ips: Mutex::new(HashSet::new()),
+            known_ips: Mutex::new(HashMap::new()),
             active_count: AtomicUsize::new(0),
+            next_generation: AtomicU64::new(0),
         });
 
         let uris: Vec<Uri> = vec![
@@ -635,8 +704,8 @@ mod tests {
         // Verify shared state.
         let known = shared.known_ips.lock().unwrap();
         assert_eq!(known.len(), 2);
-        assert!(known.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(known.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+        assert!(known.contains_key(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(known.contains_key(&"10.0.0.2".parse::<IpAddr>().unwrap()));
         drop(known);
         assert_eq!(shared.active_count.load(Ordering::Relaxed), 2);
 
@@ -656,10 +725,10 @@ mod tests {
         let config = make_test_config();
         let (discover_tx, mut discover_rx) = mpsc::unbounded_channel::<DiscoverEvent>();
 
-        let initial_ips: HashSet<IpAddr> = vec![
-            "10.0.0.1".parse().unwrap(),
-            "10.0.0.2".parse().unwrap(),
-            "10.0.0.3".parse().unwrap(),
+        let initial_ips: HashMap<IpAddr, u64> = vec![
+            ("10.0.0.1".parse().unwrap(), 0u64),
+            ("10.0.0.2".parse().unwrap(), 1u64),
+            ("10.0.0.3".parse().unwrap(), 2u64),
         ]
         .into_iter()
         .collect();
@@ -667,6 +736,7 @@ mod tests {
         let shared = Arc::new(SharedDiscoveryState {
             known_ips: Mutex::new(initial_ips),
             active_count: AtomicUsize::new(3),
+            next_generation: AtomicU64::new(3),
         });
 
         // DNS now only returns 2 of the 3 original IPs.
@@ -679,9 +749,9 @@ mod tests {
 
         let known = shared.known_ips.lock().unwrap();
         assert_eq!(known.len(), 2);
-        assert!(known.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(!known.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
-        assert!(known.contains(&"10.0.0.3".parse::<IpAddr>().unwrap()));
+        assert!(known.contains_key(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!known.contains_key(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+        assert!(known.contains_key(&"10.0.0.3".parse::<IpAddr>().unwrap()));
         drop(known);
         assert_eq!(shared.active_count.load(Ordering::Relaxed), 2);
 
@@ -701,14 +771,17 @@ mod tests {
         let config = make_test_config();
         let (discover_tx, mut discover_rx) = mpsc::unbounded_channel::<DiscoverEvent>();
 
-        let initial_ips: HashSet<IpAddr> =
-            vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()]
-                .into_iter()
-                .collect();
+        let initial_ips: HashMap<IpAddr, u64> = vec![
+            ("10.0.0.1".parse().unwrap(), 0u64),
+            ("10.0.0.2".parse().unwrap(), 1u64),
+        ]
+        .into_iter()
+        .collect();
 
         let shared = Arc::new(SharedDiscoveryState {
             known_ips: Mutex::new(initial_ips),
             active_count: AtomicUsize::new(2),
+            next_generation: AtomicU64::new(2),
         });
 
         // DNS returns the same IPs plus a new one.

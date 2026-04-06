@@ -90,6 +90,20 @@ impl InternalEvent for ClickhouseHeadlessFallbackRouted {
     }
 }
 
+/// Emitted each time Tower's P2C buffer returns `Pending` during `poll_ready`,
+/// meaning all buffer slots are occupied and the next dispatch must wait.
+///
+/// Rising `clickhouse_headless_p2c_buffer_full_total` indicates the buffer
+/// bound is too small for the current concurrency + retry load.
+#[derive(Debug, NamedInternalEvent)]
+pub struct ClickhouseHeadlessP2cBufferFull;
+
+impl InternalEvent for ClickhouseHeadlessP2cBufferFull {
+    fn emit(self) {
+        counter!("clickhouse_headless_p2c_buffer_full_total").increment(1);
+    }
+}
+
 /// Emitted when a ClickHouse pod IP is removed from the active P2C pool due to
 /// a connection failure or request timeout.
 ///
