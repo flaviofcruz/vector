@@ -39,6 +39,8 @@ struct Checkpoint {
     fingerprint: FileFingerprint,
     position: FilePosition,
     modified: DateTime<Utc>,
+    #[serde(default)]
+    is_done: bool,
 }
 
 pub struct Checkpointer {
@@ -55,6 +57,7 @@ pub struct CheckpointsView {
     checkpoints: DashMap<FileFingerprint, FilePosition>,
     modified_times: DashMap<FileFingerprint, DateTime<Utc>>,
     removed_times: DashMap<FileFingerprint, DateTime<Utc>>,
+    done: DashMap<FileFingerprint, bool>,
 }
 
 impl CheckpointsView {
@@ -66,6 +69,14 @@ impl CheckpointsView {
 
     pub fn get(&self, fng: FileFingerprint) -> Option<FilePosition> {
         self.checkpoints.get(&fng).map(|r| *r.value())
+    }
+
+    pub fn set_done(&self, fng: FileFingerprint) {
+        self.done.insert(fng, true);
+    }
+
+    pub fn get_done(&self, fng: FileFingerprint) -> bool {
+        self.done.get(&fng).map(|r| *r.value()).unwrap_or(false)
     }
 
     pub fn set_dead(&self, fng: FileFingerprint) {
@@ -83,6 +94,10 @@ impl CheckpointsView {
 
         if let Some((_, value)) = self.removed_times.remove(&old) {
             self.removed_times.insert(new, value);
+        }
+
+        if let Some((_, value)) = self.done.remove(&old) {
+            self.done.insert(new, value);
         }
     }
 
@@ -107,6 +122,7 @@ impl CheckpointsView {
             self.checkpoints.remove(&fng);
             self.modified_times.remove(&fng);
             self.removed_times.remove(&fng);
+            self.done.remove(&fng);
         }
     }
 
@@ -115,6 +131,9 @@ impl CheckpointsView {
             .insert(checkpoint.fingerprint, checkpoint.position);
         self.modified_times
             .insert(checkpoint.fingerprint, checkpoint.modified);
+        if checkpoint.is_done {
+            self.done.insert(checkpoint.fingerprint, true);
+        }
     }
 
     fn set_state(&self, state: State, ignore_before: Option<DateTime<Utc>>) {
@@ -148,6 +167,11 @@ impl CheckpointsView {
                             .get(fingerprint)
                             .map(|r| *r.value())
                             .unwrap_or_else(Utc::now),
+                        is_done: self
+                            .done
+                            .get(fingerprint)
+                            .map(|r| *r.value())
+                            .unwrap_or(false),
                     }
                 })
                 .collect(),
@@ -334,6 +358,7 @@ mod test {
                     fingerprint: *fingerprint,
                     position,
                     modified: *modified,
+                    is_done: false,
                 });
                 assert_eq!(chkptr.get_checkpoint(*fingerprint), Some(position));
                 chkptr.write_checkpoints().await.unwrap();
@@ -496,11 +521,11 @@ mod test {
         let fingerprints = vec![
             (
                 FileFingerprint::DevInode(1, 2),
-                r#"{"version":"1","checkpoints":[{"fingerprint":{"dev_inode":[1,2]},"position":1234}]}"#,
+                r#"{"version":"1","checkpoints":[{"fingerprint":{"dev_inode":[1,2]},"is_done":false,"position":1234}]}"#,
             ),
             (
                 FileFingerprint::FirstLinesChecksum(78910),
-                r#"{"version":"1","checkpoints":[{"fingerprint":{"first_lines_checksum":78910},"position":1234}]}"#,
+                r#"{"version":"1","checkpoints":[{"fingerprint":{"first_lines_checksum":78910},"is_done":false,"position":1234}]}"#,
             ),
         ];
         for (fingerprint, expected) in fingerprints {
@@ -576,5 +601,164 @@ mod test {
         for fingerprint in fingerprints {
             assert_eq!(chkptr.get_checkpoint(fingerprint), Some(1234))
         }
+    }
+
+    #[test]
+    fn test_checkpoints_view_set_done_and_get_done() {
+        let view = super::CheckpointsView::default();
+        let fng = FileFingerprint::DevInode(1, 2);
+
+        // Not done by default
+        assert!(!view.get_done(fng));
+
+        // Mark as done
+        view.set_done(fng);
+        assert!(view.get_done(fng));
+
+        // Different fingerprint is still not done
+        let other = FileFingerprint::FirstLinesChecksum(999);
+        assert!(!view.get_done(other));
+    }
+
+    #[test]
+    fn test_checkpoints_view_update_key_transfers_done() {
+        let view = super::CheckpointsView::default();
+        let old = FileFingerprint::DevInode(1, 2);
+        let new = FileFingerprint::DevInode(3, 4);
+
+        view.set_done(old);
+        assert!(view.get_done(old));
+
+        view.update_key(old, new);
+        assert!(!view.get_done(old));
+        assert!(view.get_done(new));
+    }
+
+    #[test]
+    fn test_checkpoints_view_update_key_without_done() {
+        let view = super::CheckpointsView::default();
+        let old = FileFingerprint::DevInode(1, 2);
+        let new = FileFingerprint::DevInode(3, 4);
+
+        // update_key when old has no done entry should not create one for new
+        view.update_key(old, new);
+        assert!(!view.get_done(new));
+    }
+
+    #[test]
+    fn test_checkpoints_view_remove_dead_clears_done() {
+        let view = super::CheckpointsView::default();
+        let fng = FileFingerprint::DevInode(1, 2);
+
+        view.checkpoints.insert(fng, 100);
+        view.set_done(fng);
+        view.removed_times
+            .insert(fng, Utc::now() - Duration::seconds(120));
+
+        view.remove_expired();
+
+        assert!(view.get(fng).is_none());
+        assert!(!view.get_done(fng));
+    }
+
+    #[test]
+    fn test_checkpoints_view_load_with_is_done() {
+        let view = super::CheckpointsView::default();
+        let fng = FileFingerprint::DevInode(5, 6);
+
+        // Load a checkpoint with is_done = true
+        view.load(Checkpoint {
+            fingerprint: fng,
+            position: 42,
+            modified: Utc::now(),
+            is_done: true,
+        });
+        assert!(view.get_done(fng));
+
+        // Load a checkpoint with is_done = false
+        let fng2 = FileFingerprint::FirstLinesChecksum(111);
+        view.load(Checkpoint {
+            fingerprint: fng2,
+            position: 99,
+            modified: Utc::now(),
+            is_done: false,
+        });
+        assert!(!view.get_done(fng2));
+    }
+
+    #[test]
+    fn test_checkpoints_view_get_state_includes_is_done() {
+        let view = super::CheckpointsView::default();
+        let fng = FileFingerprint::DevInode(1, 2);
+
+        view.checkpoints.insert(fng, 100);
+        view.modified_times.insert(fng, Utc::now());
+        view.set_done(fng);
+
+        let state = view.get_state();
+        match state {
+            super::State::V1 { checkpoints } => {
+                assert_eq!(checkpoints.len(), 1);
+                let checkpoint = checkpoints.into_iter().next().unwrap();
+                assert!(checkpoint.is_done);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpointer_done_persists_across_restart() {
+        let fng = FileFingerprint::DevInode(10, 20);
+        let position: FilePosition = 5678;
+        let data_dir = tempdir().unwrap();
+
+        // Write a checkpoint with done=true
+        {
+            let chkptr = Checkpointer::new(data_dir.path());
+            chkptr.checkpoints.load(Checkpoint {
+                fingerprint: fng,
+                position,
+                modified: Utc::now(),
+                is_done: true,
+            });
+            assert!(chkptr.checkpoints.get_done(fng));
+            chkptr.write_checkpoints().await.unwrap();
+        }
+
+        // Read it back and verify done is preserved
+        {
+            let mut chkptr = Checkpointer::new(data_dir.path());
+            chkptr.read_checkpoints(None).await;
+            assert_eq!(chkptr.get_checkpoint(fng), Some(position));
+            assert!(chkptr.checkpoints.get_done(fng));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpointer_deserialization_without_is_done() {
+        // Verify backward compat: old checkpoints without is_done field default to false
+        let serialized = r#"
+{
+  "version": "1",
+  "checkpoints": [
+    {
+      "fingerprint": { "dev_inode": [ 7, 8 ] },
+      "position": 999,
+      "modified": "2021-07-12T18:19:11.769003Z"
+    }
+  ]
+}
+        "#;
+        let data_dir = tempdir().unwrap();
+        let mut chkptr = Checkpointer::new(data_dir.path());
+
+        fs::write(data_dir.path().join(CHECKPOINT_FILE_NAME), serialized)
+            .await
+            .unwrap();
+
+        chkptr.read_checkpoints(None).await;
+
+        let fng = FileFingerprint::DevInode(7, 8);
+        assert_eq!(chkptr.get_checkpoint(fng), Some(999));
+        assert!(!chkptr.checkpoints.get_done(fng));
     }
 }

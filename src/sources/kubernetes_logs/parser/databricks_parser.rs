@@ -20,9 +20,10 @@ const DEFAULT_PRIORITY: Bytes = Bytes::from_static(b"INFO");
 
 /// Parser for structured and/or unstructured Databricks logs.
 ///
-/// Expects logs to arrive in a structured or unstructured format. This parse never fails a parse;
-/// instead, we will just pass on the message without transformation and fill in the timestamp field
-/// with the current time.
+/// Expects logs to arrive in a structured or unstructured format. This parser never fails a parse;
+/// instead, we will just pass on the message without transformation. If no timestamp can be
+/// extracted from the log line, the event retains whatever timestamp was set at creation time
+/// (the ingest timestamp), matching the behavior of the file source.
 #[derive(Clone, Derivative)]
 #[derivative(Debug)]
 pub(super) struct DatabricksParser {
@@ -52,19 +53,21 @@ impl FunctionTransform for DatabricksParser {
                 return;
             }
             // Always parse the message as unstructured. Don't attempt to perform any formatting
-            // on the log message; just insert the read timestamp and priority.
+            // on the log message; just insert the priority (and timestamp, if one was parsed).
             Some(s) => {
                 let parsed_log = parse_log_as_unstructured(&s);
 
                 drop(log.insert(&message_path, Value::Bytes(s.slice_ref(parsed_log.message))));
 
-                self.log_namespace.insert_source_metadata(
-                    Config::NAME,
-                    log,
-                    log_schema().timestamp_key().map(LegacyKey::Overwrite),
-                    path!(TIMESTAMP_KEY),
-                    Value::Timestamp(parsed_log.timestamp),
-                );
+                if let Some(ts) = parsed_log.timestamp {
+                    self.log_namespace.insert_source_metadata(
+                        Config::NAME,
+                        log,
+                        log_schema().timestamp_key().map(LegacyKey::Overwrite),
+                        path!(TIMESTAMP_KEY),
+                        Value::Timestamp(ts),
+                    );
+                }
                 let priority = if parsed_log.priority.is_empty() {
                     Value::Bytes(DEFAULT_PRIORITY)
                 } else {
@@ -84,18 +87,18 @@ impl FunctionTransform for DatabricksParser {
 }
 
 struct ParsedLog<'a> {
-    timestamp: DateTime<Utc>,
+    timestamp: Option<DateTime<Utc>>,
     priority: &'a [u8],
     message: &'a [u8],
 }
 
 #[inline]
 fn parse_log_as_unstructured(line: &[u8]) -> ParsedLog<'_> {
-    return ParsedLog {
-        timestamp: Utc::now(),
+    ParsedLog {
+        timestamp: None,
         priority: &[],
         message: line,
-    };
+    }
 }
 
 #[cfg(test)]
@@ -248,5 +251,65 @@ pub mod tests {
     #[test]
     fn test_parsing_invalid_legacy_namespace() {
         test_parsing_invalid_messages(LogNamespace::Legacy);
+    }
+
+    #[test]
+    fn test_parser_does_not_set_timestamp_legacy() {
+        use vector_lib::lookup::event_path;
+
+        let original_timestamp = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Create a log event with a known timestamp already set (simulating the ingest timestamp).
+        let mut log = LogEvent::default();
+        log.insert(event_path!("message"), "some log line");
+        log.insert(event_path!("timestamp"), original_timestamp);
+        let input = Event::Log(log);
+
+        let mut parser = DatabricksParser::new(LogNamespace::Legacy);
+        let mut output = OutputBuffer::default();
+        parser.transform(&mut output, input);
+
+        let events: Vec<_> = output.into_events().collect();
+        assert_eq!(events.len(), 1);
+
+        let log = events[0].as_log();
+        // The timestamp field should still be the original ingest timestamp, not Utc::now().
+        let ts = log
+            .get(event_path!("timestamp"))
+            .expect("timestamp should exist");
+        match ts {
+            Value::Timestamp(t) => {
+                assert_eq!(
+                    *t, original_timestamp,
+                    "parser should not overwrite the event timestamp"
+                );
+            }
+            other => panic!("expected Timestamp value, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parser_does_not_set_timestamp_vector() {
+        use vector_lib::lookup::metadata_path;
+
+        let input = Event::Log(LogEvent::from(value!("some log line")));
+
+        let mut parser = DatabricksParser::new(LogNamespace::Vector);
+        let mut output = OutputBuffer::default();
+        parser.transform(&mut output, input);
+
+        let events: Vec<_> = output.into_events().collect();
+        assert_eq!(events.len(), 1);
+
+        let log = events[0].as_log();
+        // The parser should NOT have inserted a timestamp into the source metadata.
+        let ts = log.get(metadata_path!(Config::NAME, "timestamp"));
+        assert!(
+            ts.is_none(),
+            "parser should not set a timestamp in source metadata, but found: {:?}",
+            ts
+        );
     }
 }

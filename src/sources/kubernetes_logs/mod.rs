@@ -37,11 +37,15 @@ use vector_lib::{
         Checkpointer, FileFingerprint, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
     },
     internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
-    lookup::{OwnedTargetPath, lookup_v2::OptionalTargetPath, owned_value_path, path},
+    lookup::{
+        OwnedTargetPath, OwnedValuePath,
+        lookup_v2::{OptionalTargetPath, OptionalValuePath},
+        owned_value_path, path,
+    },
 };
 use vrl::value::{Kind, kind::Collection};
 
-use crate::sources::util::MultilineConfig;
+use crate::sources::util::{EncodingConfig, MultilineConfig};
 use crate::{
     SourceSender,
     built_info::{PKG_NAME, PKG_VERSION},
@@ -49,6 +53,7 @@ use crate::{
         ComponentKey, DataType, GenerateConfig, GlobalOptions, SourceConfig, SourceContext,
         SourceOutput, log_schema,
     },
+    encoding_transcode::{Decoder, Encoder},
     event::Event,
     internal_events::{
         FileInternalMetricsConfig, FileSourceInternalEventsEmitter, KubernetesLifecycleError,
@@ -363,10 +368,44 @@ pub struct Config {
     #[configurable(metadata(docs::examples = 60))]
     #[configurable(metadata(docs::human_name = "Wait Time Before Removing File"))]
     pub remove_after_secs: Option<u64>,
+
+    /// Whether to drain all watched files up to their current EOF on shutdown
+    /// before closing the output channel.
+    ///
+    /// When enabled, the file server will snapshot each file's size at shutdown
+    /// time and continue reading until every file has been read up to that point,
+    /// persisting checkpoints per-file so progress is not lost even if the process
+    /// is killed mid-drain.
+    #[serde(default = "default_drain_on_shutdown")]
+    drain_on_shutdown: bool,
+
+    /// Overrides the name of the log field used to add the current hostname to each event.
+    /// Disabled by default. Set to "host" to match the file source behavior.
+    /// Set to "" to explicitly suppress this key.
+    #[configurable(metadata(docs::examples = "host"))]
+    #[serde(default)]
+    pub host_key: Option<OptionalValuePath>,
+
+    /// String sequence used to separate one log line from another.
+    #[serde(default = "default_line_delimiter")]
+    #[configurable(metadata(docs::examples = "\r\n"))]
+    pub line_delimiter: String,
+
+    /// Character set encoding of the source log files.
+    ///
+    /// When set, the log file bytes are transcoded from the specified encoding to UTF-8.
+    /// If not set, UTF-8 is assumed.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub encoding: Option<EncodingConfig>,
 }
 
 const fn default_read_from() -> ReadFromConfig {
     ReadFromConfig::Beginning
+}
+
+fn default_line_delimiter() -> String {
+    "\n".to_string()
 }
 
 impl GenerateConfig for Config {
@@ -419,6 +458,10 @@ impl Default for Config {
             source_context: None,
             multiline: None,
             remove_after_secs: None,
+            drain_on_shutdown: default_drain_on_shutdown(),
+            host_key: None,
+            line_delimiter: default_line_delimiter(),
+            encoding: None,
         }
     }
 }
@@ -643,6 +686,16 @@ impl SourceConfig for Config {
                 Kind::timestamp(),
                 Some("timestamp"),
             )
+            .with_source_metadata(
+                Self::NAME,
+                self.host_key
+                    .clone()
+                    .and_then(|v| v.path)
+                    .map(LegacyKey::Overwrite),
+                &owned_value_path!("host"),
+                Kind::bytes().or_undefined(),
+                Some("host"),
+            )
             .with_standard_vector_source_metadata();
 
         vec![SourceOutput::new_maybe_logs(
@@ -694,6 +747,10 @@ struct Source {
     source_context: Option<HashMap<String, String>>,
     multiline: Option<MultilineConfig>,
     remove_after_secs: Option<u64>,
+    drain_on_shutdown: bool,
+    host_key: Option<OwnedValuePath>,
+    line_delimiter: String,
+    encoding: Option<EncodingConfig>,
 }
 
 impl Source {
@@ -795,6 +852,10 @@ impl Source {
             source_context: config.source_context.clone(),
             multiline: config.multiline.clone(),
             remove_after_secs: config.remove_after_secs,
+            drain_on_shutdown: config.drain_on_shutdown,
+            host_key: config.host_key.clone().and_then(|v| v.path),
+            line_delimiter: config.line_delimiter.clone(),
+            encoding: config.encoding.clone(),
         })
     }
 
@@ -841,7 +902,21 @@ impl Source {
             ref source_context,
             multiline,
             remove_after_secs,
+            drain_on_shutdown,
+            host_key,
+            line_delimiter,
+            encoding,
         } = self;
+
+        let hostname = host_key.as_ref().and_then(|_| {
+            match crate::get_hostname() {
+                Ok(h) => Some(Bytes::from(h)),
+                Err(error) => {
+                    warn!(message = "Failed to resolve hostname; host_key will not be added to events.", %error);
+                    None
+                }
+            }
+        });
 
         let mut reflectors = Vec::new();
 
@@ -940,6 +1015,8 @@ impl Source {
             NamespaceMetadataAnnotator::new(ns_state, namespace_fields_spec, log_namespace);
         let node_annotator = NodeMetadataAnnotator::new(node_state, node_field_spec, log_namespace);
 
+        let encoding_charset = encoding.as_ref().map(|e| e.charset);
+
         let ignore_before = calculate_ignore_before(ignore_older_secs);
 
         let mut resolved_max_line_bytes = max_line_bytes;
@@ -987,7 +1064,10 @@ impl Source {
             // protects against malformed lines or tailing incorrect files.
             max_line_bytes: resolved_max_line_bytes,
             // Delimiter bytes that is used to read the file line-by-line
-            line_delimiter: Bytes::from("\n"),
+            line_delimiter: match encoding_charset {
+                Some(e) => Encoder::new(e).encode_from_utf8(&line_delimiter),
+                None => Bytes::from(line_delimiter),
+            },
             // The directory where to keep the checkpoints.
             data_dir,
             // This value specifies not exactly the globbing, but interval
@@ -1018,12 +1098,29 @@ impl Source {
             ttl_removal_config: file_ttl_removal_config,
             source_context: source_context.clone(),
             file_to_pod_map: Some(file_to_pod_map_ref),
+            drain_on_shutdown,
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
 
         let checkpoints = checkpointer.view();
-        let events = file_source_rx.flat_map(futures::stream::iter);
+        let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
+        let mut encoding_decoder = encoding_charset.map(Decoder::new);
+        let events = file_source_rx
+            .flat_map(futures::stream::iter)
+            .map(move |mut line| {
+                let byte_size = line.text.len();
+                bytes_received.emit(ByteSize(byte_size));
+
+                // Transcode each line from the file's encoding charset to UTF-8.
+                // This must happen before multiline aggregation so that regex
+                // patterns in the multiline config can match UTF-8 text.
+                line.text = match encoding_decoder.as_mut() {
+                    Some(d) => d.decode_to_utf8(line.text),
+                    None => line.text,
+                };
+                line
+            });
         let multiline_config = multiline.clone();
         let messages: Box<dyn Stream<Item = Line> + Send + std::marker::Unpin> =
             if let Some(ref multiline_config) = multiline_config {
@@ -1034,11 +1131,7 @@ impl Source {
             } else {
                 Box::new(events)
             };
-        let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
         let events = messages.map(move |line| {
-            let byte_size = line.text.len();
-            bytes_received.emit(ByteSize(byte_size));
-
             let mut event = create_event(
                 line.text,
                 &line.filename,
@@ -1084,6 +1177,16 @@ impl Source {
                     emit!(KubernetesLogsEventNodeAnnotationError { event: &event });
                 }
                 */
+            }
+
+            if let (Some(hk), Some(hn)) = (&host_key, &hostname) {
+                log_namespace.insert_source_metadata(
+                    Config::NAME,
+                    event.as_mut_log(),
+                    Some(LegacyKey::Overwrite(hk)),
+                    path!("host"),
+                    hn.clone(),
+                );
             }
 
             checkpoints.update(line.file_id, line.end_offset);
@@ -1307,6 +1410,10 @@ const fn default_rotate_wait() -> Duration {
     Duration::from_secs(u64::MAX / 2)
 }
 
+const fn default_drain_on_shutdown() -> bool {
+    false
+}
+
 // This function constructs the patterns we include for file watching, created
 // from the defaults or user provided configuration.
 fn prepare_include_paths(config: &Config) -> crate::Result<Vec<glob::Pattern>> {
@@ -1382,6 +1489,7 @@ fn prepare_label_selector(selector: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use similar_asserts::assert_eq;
     use vector_lib::{
         config::LogNamespace,
@@ -1392,6 +1500,7 @@ mod tests {
 
     use super::Config;
     use crate::config::SourceConfig;
+    use crate::encoding_transcode::{Decoder, Encoder};
 
     #[test]
     fn generate_config() {
@@ -1682,6 +1791,11 @@ mod tests {
                         Some("timestamp")
                     )
                     .with_metadata_field(
+                        &owned_value_path!("kubernetes_logs", "host"),
+                        Kind::bytes().or_undefined(),
+                        Some("host")
+                    )
+                    .with_metadata_field(
                         &owned_value_path!("vector", "source_type"),
                         Kind::bytes(),
                         None
@@ -1800,5 +1914,123 @@ mod tests {
                 )
             )
         )
+    }
+
+    #[test]
+    fn test_default_config_drain_on_shutdown() {
+        let config = Config::default();
+        assert_eq!(config.drain_on_shutdown, false);
+    }
+
+    #[test]
+    fn test_config_drain_on_shutdown_enabled() {
+        let config = Config {
+            drain_on_shutdown: true,
+            ..Default::default()
+        };
+        assert_eq!(config.drain_on_shutdown, true);
+    }
+
+    #[test]
+    fn test_config_serialization_drain_on_shutdown() {
+        let toml_config = r#"
+            drain_on_shutdown = true
+        "#;
+        let config: Config = toml::from_str(toml_config).unwrap();
+        assert_eq!(config.drain_on_shutdown, true);
+
+        let default_toml = "";
+        let default_config: Config = toml::from_str(default_toml).unwrap();
+        assert_eq!(default_config.drain_on_shutdown, false);
+    }
+
+    #[test]
+    fn test_default_config_host_key_is_none() {
+        let config = Config::default();
+        assert!(config.host_key.is_none());
+    }
+
+    #[test]
+    fn test_config_host_key_from_toml() {
+        let config: Config = toml::from_str(r#"host_key = "host""#).unwrap();
+        let path = config.host_key.expect("host_key should be Some").path;
+        assert_eq!(path, Some(owned_value_path!("host")));
+    }
+
+    #[test]
+    fn test_config_host_key_empty_string_suppresses() {
+        let config: Config = toml::from_str(r#"host_key = """#).unwrap();
+        let opt = config.host_key.expect("host_key should be Some");
+        assert!(
+            opt.path.is_none(),
+            "empty string should parse to path = None"
+        );
+    }
+
+    #[test]
+    fn test_default_config_line_delimiter() {
+        let config = Config::default();
+        assert_eq!(config.line_delimiter, "\n");
+    }
+
+    #[test]
+    fn test_config_line_delimiter_custom() {
+        let config = Config {
+            line_delimiter: "\r\n".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.line_delimiter, "\r\n");
+    }
+
+    #[test]
+    fn test_config_serialization_line_delimiter() {
+        let toml_config = r#"
+            line_delimiter = "\r\n"
+        "#;
+        let config: Config = toml::from_str(toml_config).unwrap();
+        assert_eq!(config.line_delimiter, "\r\n");
+
+        let default_toml = "";
+        let default_config: Config = toml::from_str(default_toml).unwrap();
+        assert_eq!(default_config.line_delimiter, "\n");
+    }
+
+    #[test]
+    fn test_default_config_encoding_is_none() {
+        let config = Config::default();
+        assert!(config.encoding.is_none());
+    }
+
+    #[test]
+    fn test_config_serialization_encoding() {
+        let toml_config = r#"
+            [encoding]
+            charset = "utf-16le"
+        "#;
+        let config: Config = toml::from_str(toml_config).unwrap();
+        assert!(config.encoding.is_some());
+        assert_eq!(config.encoding.unwrap().charset, encoding_rs::UTF_16LE);
+
+        let default_toml = "";
+        let default_config: Config = toml::from_str(default_toml).unwrap();
+        assert!(default_config.encoding.is_none());
+    }
+
+    #[test]
+    fn test_encoding_transcode_roundtrip() {
+        // Simulate the transcoding pipeline: encode a UTF-8 line delimiter to
+        // the target charset, then decode a line (in the target charset) back
+        // to UTF-8 — mirroring what the source does at runtime.
+        let charset = encoding_rs::UTF_16LE;
+
+        // Encoder: "\n" -> UTF-16LE bytes (used for line_delimiter)
+        let delimiter = Encoder::new(charset).encode_from_utf8("\n");
+        assert_eq!(delimiter, Bytes::from_static(b"\n\x00"));
+
+        // Decoder: UTF-16LE bytes -> UTF-8 string
+        let mut decoder = Decoder::new(charset);
+        let utf16le_hello = Encoder::new(charset).encode_from_utf8("hello world");
+        let decoded = decoder.decode_to_utf8(utf16le_hello);
+        assert_eq!(decoded, Bytes::from("hello world"));
     }
 }

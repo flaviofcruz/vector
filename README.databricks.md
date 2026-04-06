@@ -95,3 +95,17 @@ This lists custom changes merged in Databricks fork of Vector.
 94. Handle object/blob not found (404) in `aws_s3` and `azure_blob` sources by deleting the queue message instead of retrying indefinitely https://github.com/databricks-eng/vector/pull/433
 95. Add cryptographic nonce file prefix functionality to cloud blob sinks - https://github.com/databricks-eng/vector/pull/414
 96. Add config-driven ingestion callback component for object storage sources (aws_s3, azure_blob) to notify upstream services on file processing completion https://github.com/databricks-eng/vector/pull/429
+97. Add required file_id field to direct ingest messages in aws_s3 and azure_blob sources for ingestion callback integration https://github.com/databricks-eng/vector/pull/430
+98. Modifies termination behavior for kubernetes_logs to deliver logs up until the termination time - https://github.com/databricks-eng/vector/pull/402
+99. Integrate ingestion callback component with aws_s3 and azure_blob sources to notify upstream services on direct-ingest file processing completion https://github.com/databricks-eng/vector/pull/431
+100. Fix file source infinite retry loop when `remove_after_secs` is configured and the file is already deleted externally (e.g. kubelet cleaning up emptyDir volumes on pod termination) https://github.com/databricks-eng/vector/pull/443
+101. Emit `VECTOR_PROCESS_COMPONENTS_CLOSED` VEL event during shutdown to signal that graceful shutdown completed successfully https://github.com/databricks-eng/vector/pull/438
+102. add is_done in file checkpoints to represent archieved file has reached eof https://github.com/databricks-eng/vector/pull/448
+103. Support reading from in-progress gzipped files https://github.com/databricks-eng/vector/pull/447
+104. Stop overwriting event timestamps with Utc::now() in DatabricksParser for kubernetes_logs source https://github.com/databricks-eng/vector/pull/451
+105. Add optional `host_key` metadata field to `kubernetes_logs` source to attach hostname to each event https://github.com/databricks-eng/vector/pull/453
+106. Make `line_delimiter` configurable in the `kubernetes_logs` source to match file source behavior https://github.com/databricks-eng/vector/pull/454
+107. Add encoding/charset transcoding support to kubernetes_logs source, allowing non-UTF-8 log files to be transcoded to UTF-8 on ingestion https://github.com/databricks-eng/vector/pull/455
+108. Add static custom HTTP header support to ingestion callback endpoints (`CallbackEndpointConfig`), with startup validation and reserved-header protection for `content-type` and `authorization` https://github.com/databricks-eng/vector/pull/450
+109. Add `gcp_gcs` source for ingesting logs from Google Cloud Storage via a Pub/Sub subscription, with shared compression detection/decoding across all object-storage sources https://github.com/databricks-eng/vector/pull/439 https://github.com/databricks-eng/vector/pull/440 https://github.com/databricks-eng/vector/pull/441 https://github.com/databricks-eng/vector/pull/442
+110. Fix incorrect protobuf type mappings for Delta DATE and TIMESTAMP columns in the Zerobus sink https://github.com/databricks-eng/vector/pull/463

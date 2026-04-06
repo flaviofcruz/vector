@@ -242,7 +242,7 @@ vector-config-macros.workspace = true
 vector-vrl-functions = { workspace = true, features = ["vrl-metrics"] }
 vector-vrl-metrics = { path = "lib/vector-vrl-metrics" }
 loki-logproto = { path = "lib/loki-logproto", optional = true }
-databricks-zerobus-ingest-sdk = { git = "https://github.com/databricks/zerobus-sdk-rs", rev = "326f97e7048fc411165b8ffba7cfef460b04c86a", optional = true }
+databricks-zerobus-ingest-sdk = { git = "https://github.com/databricks/zerobus-sdk-rs", rev = "617d7ddae09c475269ef25dcf92b43cf182026d7", optional = true }
 # Use prost 0.13 to match the SDK's version (workspace has 0.12)
 zerobus-prost = { package = "prost", version = "0.13", optional = true }
 zerobus-prost-types = { package = "prost-types", version = "0.13", optional = true }
@@ -628,6 +628,7 @@ sources-logs = [
   "sources-exec",
   "sources-file",
   "sources-fluent",
+  "sources-gcp_gcs",
   "sources-gcp_pubsub",
   "sources-heroku_logs",
   "sources-http_server",
@@ -684,6 +685,7 @@ sources-exec = []
 sources-file = ["vector-lib/file-source"]
 sources-file_descriptor = ["tokio-util/io"]
 sources-fluent = ["dep:base64", "sources-utils-net-tcp", "sources-utils-net-unix", "tokio-util/net", "dep:rmpv", "dep:rmp-serde", "dep:serde_bytes"]
+sources-gcp_gcs = ["gcp", "dep:base64", "dep:async-compression", "tokio-util/io"]
 sources-gcp_pubsub = ["gcp", "dep:h2", "dep:prost", "dep:prost-types", "protobuf-build", "dep:tonic"]
 sources-heroku_logs = ["sources-utils-http", "sources-utils-http-query", "sources-http_server"]
 sources-host_metrics = ["heim/cpu", "heim/host", "heim/memory", "heim/net"]

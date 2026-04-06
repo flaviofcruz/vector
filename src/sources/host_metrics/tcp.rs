@@ -215,7 +215,7 @@ fn parse_netlink_messages(
 /// Asynchronously queries the kernel via a Netlink socket for TCP socket info.
 async fn fetch_netlink_inet_headers(addr_family: u8) -> Result<Vec<InetResponseHeader>, TcpError> {
     let unicast_socket: SocketAddr = SocketAddr::new(0, 0);
-    let mut socket = TokioSocket::new(NETLINK_SOCK_DIAG).context(NetlinkSocketSnafu)?;
+    let socket = TokioSocket::new(NETLINK_SOCK_DIAG).context(NetlinkSocketSnafu)?;
 
     let mut inet_req = InetRequest {
         family: addr_family,

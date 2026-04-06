@@ -1,10 +1,7 @@
 use std::convert::TryInto;
 
-use async_compression::tokio::bufread;
 use aws_smithy_types::byte_stream::ByteStream;
-use futures::{TryStreamExt, stream, stream::StreamExt};
 use snafu::Snafu;
-use tokio_util::io::StreamReader;
 use vector_lib::{
     codecs::{
         NewlineDelimitedDecoderConfig,
@@ -17,6 +14,7 @@ use vector_lib::{
 use vrl::value::{Kind, kind::Collection};
 
 use super::util::MultilineConfig;
+pub use super::util::object_storage_compression::Compression;
 use crate::{
     aws::{RegionOrEndpoint, auth::AwsAuthentication, create_client, create_client_and_region},
     codecs::DecodingConfig,
@@ -30,32 +28,6 @@ use crate::{
 };
 
 pub mod sqs;
-
-/// Compression scheme for objects retrieved from S3.
-#[configurable_component]
-#[configurable(metadata(docs::advanced))]
-#[derive(Clone, Copy, Debug, Derivative, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-#[derivative(Default)]
-pub enum Compression {
-    /// Automatically attempt to determine the compression scheme.
-    ///
-    /// The compression scheme of the object is determined from its `Content-Encoding` and
-    /// `Content-Type` metadata, as well as the key suffix (for example, `.gz`).
-    ///
-    /// It is set to `none` if the compression scheme cannot be determined.
-    #[derivative(Default)]
-    Auto,
-
-    /// Uncompressed.
-    None,
-
-    /// GZIP.
-    Gzip,
-
-    /// ZSTD.
-    Zstd,
-}
 
 /// Strategies for consuming objects from AWS S3.
 #[configurable_component]
@@ -139,6 +111,14 @@ pub struct AwsS3Config {
     #[serde(default = "default_true")]
     #[derivative(Default(value = "default_true()"))]
     pub force_path_style: bool,
+
+    /// Optional ingestion callback configuration.
+    ///
+    /// When present, the source fires HTTP callbacks to notify an upstream
+    /// service after a custom direct-ingest file finishes processing.
+    /// Only triggered for messages with `process_custom_message = true`.
+    #[configurable(derived)]
+    pub ingestion_callback: Option<super::ingestion_callback::IngestionCallbackConfig>,
 }
 
 const fn default_framing() -> FramingConfig {
@@ -274,6 +254,15 @@ impl AwsS3Config {
                 )
                 .await?;
 
+                let callback_client = self
+                    .ingestion_callback
+                    .as_ref()
+                    .map(|cb_config| {
+                        super::ingestion_callback::IngestionCallbackClient::new(cb_config, proxy)
+                    })
+                    .transpose()
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
                 let ingestor = sqs::Ingestor::new(
                     region,
                     sqs_client,
@@ -282,6 +271,7 @@ impl AwsS3Config {
                     self.compression,
                     multiline,
                     decoder,
+                    callback_client,
                 )
                 .await?;
 
@@ -298,7 +288,9 @@ enum CreateSqsIngestorError {
     ConfigMissing,
 }
 
-/// None if body is empty
+/// `ByteStream` has its own `.next()` method but doesn't implement `futures::Stream`,
+/// so we convert it to a compatible stream with `async_stream` before passing to
+/// the shared `Compression::build_decoder`.
 async fn s3_object_decoder(
     compression: Compression,
     key: &str,
@@ -306,141 +298,17 @@ async fn s3_object_decoder(
     content_type: Option<&str>,
     mut body: ByteStream,
 ) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {
-    let first = match body.next().await {
-        Some(first) => first,
-        _ => {
-            return Box::new(tokio::io::empty());
+    // async_stream::stream! is not Unpin, so Box::pin to satisfy build_decoder's bounds.
+    let body_stream = Box::pin(async_stream::stream! {
+        while let Some(chunk) = body.next().await {
+            yield chunk.map_err(std::io::Error::other);
         }
-    };
+    });
 
-    let r = tokio::io::BufReader::new(StreamReader::new(
-        stream::iter(Some(first))
-            .chain(Box::pin(async_stream::stream! {
-                while let Some(next) = body.next().await {
-                    yield next;
-                }
-            }))
-            .map_err(std::io::Error::other),
-    ));
-
-    let compression = match compression {
-        Auto => determine_compression(content_encoding, content_type, key).unwrap_or(None),
-        _ => compression,
-    };
-
-    use Compression::*;
-    match compression {
-        Auto => unreachable!(), // is mapped above
-        None => Box::new(r),
-        Gzip => Box::new({
-            let mut decoder = bufread::GzipDecoder::new(r);
-            decoder.multiple_members(true);
-            decoder
-        }),
-        Zstd => Box::new({
-            let mut decoder = bufread::ZstdDecoder::new(r);
-            decoder.multiple_members(true);
-            decoder
-        }),
-    }
-}
-
-// try to determine the compression given the:
-// * content-encoding
-// * content-type
-// * key name (for file extension)
-//
-// It will use this information in this order
-fn determine_compression(
-    content_encoding: Option<&str>,
-    content_type: Option<&str>,
-    key: &str,
-) -> Option<Compression> {
-    content_encoding
-        .and_then(content_encoding_to_compression)
-        .or_else(|| content_type.and_then(content_type_to_compression))
-        .or_else(|| object_key_to_compression(key))
-}
-
-fn content_encoding_to_compression(content_encoding: &str) -> Option<Compression> {
-    match content_encoding {
-        "gzip" => Some(Compression::Gzip),
-        "zstd" => Some(Compression::Zstd),
-        _ => None,
-    }
-}
-
-fn content_type_to_compression(content_type: &str) -> Option<Compression> {
-    match content_type {
-        "application/gzip" | "application/x-gzip" => Some(Compression::Gzip),
-        "application/zstd" => Some(Compression::Zstd),
-        _ => None,
-    }
-}
-
-fn object_key_to_compression(key: &str) -> Option<Compression> {
-    let extension = std::path::Path::new(key)
-        .extension()
-        .and_then(std::ffi::OsStr::to_str);
-
-    use Compression::*;
-    extension.and_then(|extension| match extension {
-        "gz" => Some(Gzip),
-        "zst" => Some(Zstd),
-        _ => Option::None,
-    })
-}
-
-#[cfg(test)]
-mod test {
-    use tokio::io::AsyncReadExt;
-
-    use super::*;
-
-    #[test]
-    fn determine_compression() {
-        use super::Compression;
-
-        let cases = vec![
-            ("out.log", Some("gzip"), None, Some(Compression::Gzip)),
-            (
-                "out.log",
-                None,
-                Some("application/gzip"),
-                Some(Compression::Gzip),
-            ),
-            ("out.log.gz", None, None, Some(Compression::Gzip)),
-            ("out.txt", None, None, None),
-        ];
-        for case in cases {
-            let (key, content_encoding, content_type, expected) = case;
-            assert_eq!(
-                super::determine_compression(content_encoding, content_type, key),
-                expected,
-                "key={key:?} content_encoding={content_encoding:?} content_type={content_type:?}",
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn decode_empty_message_gzip() {
-        let key = uuid::Uuid::new_v4().to_string();
-
-        let mut data = Vec::new();
-        s3_object_decoder(
-            Compression::Auto,
-            &key,
-            Some("gzip"),
-            None,
-            ByteStream::default(),
-        )
+    compression
+        .resolve(content_encoding, content_type, key)
+        .build_decoder(body_stream)
         .await
-        .read_to_end(&mut data)
-        .await
-        .unwrap();
-
-        assert!(data.is_empty());
-    }
 }
 
 #[cfg(feature = "aws-s3-integration-tests")]

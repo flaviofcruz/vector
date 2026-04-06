@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower::Service;
-use tracing::warn;
+use tracing::{info, warn};
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
@@ -274,6 +274,19 @@ impl ZerobusService {
                 }
                 #[cfg(feature = "codecs-arrow")]
                 StreamMode::Arrow { arrow_schema } => {
+                    // Log Arrow IPC schema size to help diagnose large-schema issues.
+                    {
+                        use arrow::ipc::writer::StreamWriter;
+                        let mut buf = Vec::new();
+                        if let Ok(mut w) = StreamWriter::try_new(&mut buf, arrow_schema) {
+                            let _ = w.finish();
+                        }
+                        info!(
+                            schema_fields = arrow_schema.fields().len(),
+                            ipc_bytes = buf.len(),
+                            "Arrow schema IPC size for stream setup"
+                        );
+                    }
                     let table_properties = ArrowTableProperties {
                         table_name: self.config.table_name.clone(),
                         schema: Arc::clone(arrow_schema),

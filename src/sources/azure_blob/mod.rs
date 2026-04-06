@@ -1,19 +1,17 @@
 // Standard library imports for core functionality
-use std::{convert::TryInto, io::ErrorKind, sync::Arc};
+use std::{convert::TryInto, sync::Arc};
 
 // Azure SDK imports for blob and queue operations
-use async_compression::tokio::bufread;
 use azure_storage::{ConnectionString, StorageCredentials};
 use azure_storage_blobs::prelude::*;
 use azure_storage_queues::prelude::*;
 
 // Utility and serialization imports
 use bytes::Bytes;
-use futures::{Stream, TryStreamExt, stream, stream::StreamExt};
+use futures::Stream;
 use snafu::Snafu;
 #[cfg(test)]
 use std::num::NonZeroUsize;
-use tokio_util::io::StreamReader;
 use url::Url;
 
 // Vector-specific imports
@@ -28,9 +26,12 @@ use vrl::value::{Kind, kind::Collection};
 
 // Local imports
 use super::util::MultilineConfig;
+pub use super::util::object_storage_compression::Compression;
 use crate::codecs::DecodingConfig;
 use crate::{
-    config::{SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput},
+    config::{
+        ProxyConfig, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput,
+    },
     line_agg,
     serde::{bool_or_struct, default_decoding},
     tls::TlsConfig,
@@ -40,38 +41,6 @@ pub mod pem_certificate_credential;
 pub mod queue;
 
 use pem_certificate_credential::PemCertificateCredential;
-
-/// Compression scheme for objects retrieved from Azure Blob Storage.
-///
-/// This enum defines the supported compression formats for blob content.
-/// The source can automatically detect compression based on metadata or
-/// use a specific compression format as configured.
-#[configurable_component]
-#[configurable(metadata(docs::advanced))]
-#[derive(Clone, Copy, Debug, Derivative, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-#[derivative(Default)]
-pub enum Compression {
-    /// Automatically attempt to determine the compression scheme.
-    ///
-    /// The compression scheme is determined by checking:
-    /// 1. The blob's `Content-Encoding` header
-    /// 2. The blob's `Content-Type` header
-    /// 3. The blob's file extension (e.g., .gz, .zst)
-    ///
-    /// Falls back to `None` if the compression scheme cannot be determined.
-    #[derivative(Default)]
-    Auto,
-
-    /// No compression - process the blob content as-is.
-    None,
-
-    /// GZIP compression - decompress using GZIP algorithm.
-    Gzip,
-
-    /// ZSTD compression - decompress using Zstandard algorithm.
-    Zstd,
-}
 
 /// Configuration for the Azure Blob Storage source.
 ///
@@ -163,6 +132,14 @@ pub struct AzureBlobConfig {
     #[serde(default = "default_decoding")]
     #[derivative(Default(value = "default_decoding()"))]
     pub decoding: DeserializerConfig,
+
+    /// Optional ingestion callback configuration.
+    ///
+    /// When present, the source fires HTTP callbacks to notify an upstream
+    /// service after a custom direct-ingest file finishes processing.
+    /// Only triggered for messages with `process_custom_message = true`.
+    #[configurable(derived)]
+    pub ingestion_callback: Option<super::ingestion_callback::IngestionCallbackConfig>,
 }
 
 /// Default framing configuration for backward compatibility.
@@ -204,7 +181,7 @@ impl SourceConfig for AzureBlobConfig {
 
         // Create and run the queue ingestor
         Ok(Box::pin(
-            self.create_queue_ingestor(multiline_config, log_namespace)
+            self.create_queue_ingestor(multiline_config, log_namespace, &cx.proxy)
                 .await?
                 .run(cx, self.acknowledgements, log_namespace),
         ))
@@ -309,6 +286,7 @@ impl AzureBlobConfig {
         &self,
         multiline: Option<line_agg::Config>,
         log_namespace: LogNamespace,
+        proxy: &ProxyConfig,
     ) -> crate::Result<queue::Ingestor> {
         let (blob_client, queue_client) = match (&self.connection_string, &self.client_certificate)
         {
@@ -333,6 +311,16 @@ impl AzureBlobConfig {
             DecodingConfig::new(self.framing.clone(), self.decoding.clone(), log_namespace)
                 .build()?;
 
+        // Build callback client if configured
+        let callback_client = self
+            .ingestion_callback
+            .as_ref()
+            .map(|cb_config| {
+                super::ingestion_callback::IngestionCallbackClient::new(cb_config, proxy)
+            })
+            .transpose()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
         // Create and return ingestor
         let ingestor = queue::Ingestor::new(
             blob_client,
@@ -341,6 +329,7 @@ impl AzureBlobConfig {
             self.compression,
             multiline,
             decoder,
+            callback_client,
         )
         .await?;
 
@@ -427,140 +416,17 @@ impl AzureBlobConfig {
     }
 }
 
-/// Decodes a blob's content based on its compression settings.
-///
-/// This function:
-/// 1. Reads the first chunk of data
-/// 2. Determines the compression type if auto-detection is enabled
-/// 3. Creates an appropriate decoder for the content
-///
-/// # Arguments
-/// * `compression` - The compression scheme to use
-/// * `blob_name` - Name of the blob being processed
-/// * `content_encoding` - Content-Encoding header from blob metadata
-/// * `content_type` - Content-Type header from blob metadata
-/// * `body` - Stream of blob content chunks
-///
-/// # Returns
-/// A boxed AsyncRead implementation that handles decompression
 async fn blob_object_decoder(
     compression: Compression,
     blob_name: &str,
     content_encoding: Option<&str>,
     content_type: Option<&str>,
-    mut body: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
+    body: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
 ) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {
-    // Read first chunk to determine if content exists
-    let first = if let Some(first) = body.next().await {
-        first
-    } else {
-        return Box::new(tokio::io::empty());
-    };
-
-    // Create buffered reader for the content stream
-    let r = tokio::io::BufReader::new(StreamReader::new(
-        stream::iter(Some(first))
-            .chain(body)
-            .map_err(|e| std::io::Error::new(ErrorKind::Other, e)),
-    ));
-
-    // Determine compression type if auto-detection is enabled
-    let compression = match compression {
-        Auto => determine_compression(content_encoding, content_type, blob_name).unwrap_or(None),
-        _ => compression,
-    };
-
-    // Create appropriate decoder based on compression type
-    use Compression::*;
-    match compression {
-        Auto => unreachable!(), // Handled above
-        None => Box::new(r),
-        Gzip => Box::new({
-            let mut decoder = bufread::GzipDecoder::new(r);
-            decoder.multiple_members(true);
-            decoder
-        }),
-        Zstd => Box::new({
-            let mut decoder = bufread::ZstdDecoder::new(r);
-            decoder.multiple_members(true);
-            decoder
-        }),
-    }
-}
-
-/// Determines the compression type of a blob based on its metadata.
-///
-/// Checks the following in order:
-/// 1. Content-Encoding header
-/// 2. Content-Type header
-/// 3. File extension
-///
-/// # Arguments
-/// * `content_encoding` - Content-Encoding header value
-/// * `content_type` - Content-Type header value
-/// * `blob_name` - Name of the blob
-///
-/// # Returns
-/// Some(Compression) if type can be determined, None otherwise
-fn determine_compression(
-    content_encoding: Option<&str>,
-    content_type: Option<&str>,
-    blob_name: &str,
-) -> Option<Compression> {
-    content_encoding
-        .and_then(content_encoding_to_compression)
-        .or_else(|| content_type.and_then(content_type_to_compression))
-        .or_else(|| blob_name_to_compression(blob_name))
-}
-
-/// Converts a Content-Encoding header value to a Compression type.
-///
-/// # Arguments
-/// * `content_encoding` - The Content-Encoding header value
-///
-/// # Returns
-/// Some(Compression) if the encoding is supported, None otherwise
-fn content_encoding_to_compression(content_encoding: &str) -> Option<Compression> {
-    match content_encoding {
-        "gzip" => Some(Compression::Gzip),
-        "zstd" => Some(Compression::Zstd),
-        _ => None,
-    }
-}
-
-/// Converts a Content-Type header value to a Compression type.
-///
-/// # Arguments
-/// * `content_type` - The Content-Type header value
-///
-/// # Returns
-/// Some(Compression) if the type indicates compression, None otherwise
-fn content_type_to_compression(content_type: &str) -> Option<Compression> {
-    match content_type {
-        "application/gzip" | "application/x-gzip" => Some(Compression::Gzip),
-        "application/zstd" => Some(Compression::Zstd),
-        _ => None,
-    }
-}
-
-/// Determines compression type from a blob's file extension.
-///
-/// # Arguments
-/// * `blob_name` - The name of the blob
-///
-/// # Returns
-/// Some(Compression) if the extension indicates compression, None otherwise
-fn blob_name_to_compression(blob_name: &str) -> Option<Compression> {
-    let extension = std::path::Path::new(blob_name)
-        .extension()
-        .and_then(std::ffi::OsStr::to_str);
-
-    use Compression::*;
-    extension.and_then(|extension| match extension {
-        "gz" => Some(Gzip),
-        "zst" => Some(Zstd),
-        _ => Option::None,
-    })
+    compression
+        .resolve(content_encoding, content_type, blob_name)
+        .build_decoder(body)
+        .await
 }
 
 /// Errors that can occur during queue ingestor creation.
@@ -590,78 +456,6 @@ enum CreateQueueIngestorError {
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn test_module_works() {
-        assert_eq!(Compression::Auto, Compression::Auto);
-    }
-
-    /// Tests the compression detection logic with various input combinations.
-    ///
-    /// Verifies that compression type is correctly determined from:
-    /// - Content-Encoding header
-    /// - Content-Type header
-    /// - File extension
-    #[test]
-    fn determine_compression() {
-        use super::Compression;
-
-        let cases = vec![
-            // Test Case 1: Gzip via Content-Encoding
-            ("out.log", Some("gzip"), None, Some(Compression::Gzip)),
-            // Test Case 2: Gzip via Content-Type
-            (
-                "out.log",
-                None,
-                Some("application/gzip"),
-                Some(Compression::Gzip),
-            ),
-            // Test Case 3: Gzip via file extension
-            ("out.log.gz", None, None, Some(Compression::Gzip)),
-            // Test Case 4: Zstd via Content-Encoding
-            ("data.log", Some("zstd"), None, Some(Compression::Zstd)),
-            // Test Case 5: Zstd via Content-Type
-            (
-                "data.log",
-                None,
-                Some("application/zstd"),
-                Some(Compression::Zstd),
-            ),
-            // Test Case 6: Zstd via file extension
-            ("data.log.zst", None, None, Some(Compression::Zstd)),
-            // Test Case 7: No compression
-            ("out.txt", None, None, None),
-            // Test Case 8: Unknown compression type
-            ("out.log", Some("unknown"), None, None),
-            // Test Case 9: Priority - Content-Encoding wins over Content-Type
-            (
-                "out.log",
-                Some("gzip"),
-                Some("application/zstd"),
-                Some(Compression::Gzip),
-            ),
-            // Test Case 10: Priority - Content-Type wins over extension
-            (
-                "out.log.gz",
-                None,
-                Some("application/zstd"),
-                Some(Compression::Zstd),
-            ),
-        ];
-
-        for (i, case) in cases.iter().enumerate() {
-            let (blob_name, content_encoding, content_type, expected) = case;
-            assert_eq!(
-                super::determine_compression(*content_encoding, *content_type, blob_name),
-                *expected,
-                "Test case {} failed: blob_name={:?} content_encoding={:?} content_type={:?}",
-                i + 1,
-                blob_name,
-                content_encoding,
-                content_type,
-            );
-        }
-    }
 
     /// Tests valid configuration parsing
     /// This test only checks if the TOML -> AzureBlobConfig object is happening
@@ -1023,7 +817,7 @@ mod test {
         for (i, test_case) in test_cases.iter().enumerate() {
             let result = test_case
                 .config
-                .create_queue_ingestor(None, LogNamespace::Legacy)
+                .create_queue_ingestor(None, LogNamespace::Legacy, &ProxyConfig::default())
                 .await;
 
             assert!(

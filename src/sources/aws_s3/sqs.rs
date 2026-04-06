@@ -63,6 +63,7 @@ use crate::{
     line_agg::{self, LineAgg},
     shutdown::ShutdownSignal,
     sources::aws_s3::AwsS3Config,
+    sources::ingestion_callback::IngestionCallbackClient,
     tls::TlsConfig,
 };
 
@@ -294,6 +295,12 @@ pub enum ProcessingError {
         bucket: String,
         key: String,
     },
+    #[snafu(display(
+        "Direct ingest message for s3://{}/{} has an empty file_id, ignoring.",
+        bucket,
+        key
+    ))]
+    EmptyFileId { bucket: String, key: String },
 }
 
 pub struct State {
@@ -316,6 +323,7 @@ pub struct State {
 
     deferred: Option<DeferredConfig>,
     process_custom_message: bool,
+    callback_client: Option<IngestionCallbackClient>,
 }
 
 pub(super) struct Ingestor {
@@ -331,6 +339,7 @@ impl Ingestor {
         compression: super::Compression,
         multiline: Option<line_agg::Config>,
         decoder: Decoder,
+        callback_client: Option<IngestionCallbackClient>,
     ) -> Result<Ingestor, IngestorNewError> {
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 10 {
             return Err(IngestorNewError::InvalidNumberOfMessages {
@@ -361,6 +370,7 @@ impl Ingestor {
 
             deferred: config.deferred,
             process_custom_message: config.process_custom_message,
+            callback_client,
         });
 
         Ok(Ingestor { state })
@@ -576,6 +586,31 @@ impl IngestorProcess {
                                 );
                             }
                         }
+                        ProcessingError::EmptyFileId {
+                            ref bucket,
+                            ref key,
+                        } => {
+                            warn!(
+                                message = "Direct ingest message has empty file_id, discarding.",
+                                message_id = &message_id,
+                                bucket = %bucket,
+                                key = %key,
+                            );
+                            emit!(SqsMessageProcessingSucceeded {
+                                message_id: &message_id
+                            });
+                            // Empty file_id is a permanent invalid state — retrying won't help.
+                            // Delete the SQS message to prevent infinite retries.
+                            if self.state.delete_message {
+                                delete_entries.push(
+                                    DeleteMessageBatchRequestEntry::builder()
+                                        .id(message_id)
+                                        .receipt_handle(receipt_handle)
+                                        .build()
+                                        .expect("all required builder params specified"),
+                                );
+                            }
+                        }
                         _ => {
                             emit!(SqsMessageProcessingError {
                                 message_id: &message_id,
@@ -723,6 +758,12 @@ impl IngestorProcess {
             );
             return Ok(());
         }
+        if msg.file_id.is_empty() {
+            return Err(ProcessingError::EmptyFileId {
+                bucket: msg.bucket,
+                key: msg.key,
+            });
+        }
         let region = msg
             .region
             .unwrap_or_else(|| self.state.region.as_ref().to_owned());
@@ -755,9 +796,26 @@ impl IngestorProcess {
             bucket = %msg.bucket,
             key = %msg.key,
             region = %region,
+            file_id = %msg.file_id,
         );
-        self.process_s3_object(&msg.bucket, &msg.key, &region, self.log_namespace)
-            .await
+
+        let processing_start = Instant::now();
+        let result = self
+            .process_s3_object(&msg.bucket, &msg.key, &region, self.log_namespace)
+            .await;
+
+        // Fire ingestion callback if configured (non-blocking).
+        if let Some(ref cb_client) = self.state.callback_client {
+            let message_fields = HashMap::from([
+                ("file_id".to_string(), msg.file_id.clone()),
+                ("bucket".to_string(), msg.bucket.clone()),
+                ("key".to_string(), msg.key.clone()),
+                ("region".to_string(), region.clone()),
+            ]);
+            let _ = cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
+        }
+
+        result
     }
 
     async fn handle_s3_event(
@@ -1250,11 +1308,15 @@ const DIRECT_INGEST_KIND: &str = "INGEST";
 ///
 /// Example message:
 /// ```json
-/// {"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log"}
+/// {"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log", "file_id": "f-abc-123"}
 /// ```
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectIngestMessage {
+    /// File identifier assigned by the upstream service.
+    /// Used by the ingestion callback component to notify the upstream
+    /// service of processing completion.
+    pub file_id: String,
     /// Must be "INGEST".
     pub kind: String,
     /// The S3 bucket name.
@@ -1538,7 +1600,7 @@ fn test_s3_sns_testevent() {
 fn test_direct_ingest_message() {
     // Basic direct ingest message
     let value: SqsEvent = serde_json::from_str(
-        r#"{"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log"}"#,
+        r#"{"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log", "file_id": "f-123"}"#,
     )
     .unwrap();
     match value {
@@ -1547,18 +1609,20 @@ fn test_direct_ingest_message() {
             assert_eq!(msg.bucket, "my-bucket");
             assert_eq!(msg.key, "path/to/file.log");
             assert!(msg.region.is_none());
+            assert_eq!(msg.file_id, "f-123");
         }
         _ => panic!("Expected DirectIngest variant"),
     }
 
     // With optional region
     let value: SqsEvent = serde_json::from_str(
-        r#"{"kind": "INGEST", "bucket": "my-bucket", "key": "data.csv", "region": "eu-west-1"}"#,
+        r#"{"kind": "INGEST", "bucket": "my-bucket", "key": "data.csv", "region": "eu-west-1", "file_id": "f-456"}"#,
     )
     .unwrap();
     match value {
         SqsEvent::DirectIngest(msg) => {
             assert_eq!(msg.region.as_deref(), Some("eu-west-1"));
+            assert_eq!(msg.file_id, "f-456");
         }
         _ => panic!("Expected DirectIngest variant"),
     }
@@ -1586,7 +1650,8 @@ fn test_direct_ingest_unknown_kind_still_parses() {
     // A message with unknown kind still deserializes into DirectIngest —
     // the runtime check in handle_direct_ingest rejects it, not serde.
     let value: SqsEvent =
-        serde_json::from_str(r#"{"kind": "UNKNOWN", "bucket": "b", "key": "k"}"#).unwrap();
+        serde_json::from_str(r#"{"kind": "UNKNOWN", "bucket": "b", "key": "k", "file_id": "f-1"}"#)
+            .unwrap();
     match value {
         SqsEvent::DirectIngest(msg) => {
             assert_eq!(msg.kind, "UNKNOWN");
@@ -1600,12 +1665,37 @@ fn test_direct_ingest_extra_fields_rejected() {
     // deny_unknown_fields on DirectIngestMessage means a message with extra
     // fields won't match DirectIngest. It should fall through to another
     // variant or fail to parse entirely.
-    let msg_with_extra =
-        r#"{"kind": "INGEST", "bucket": "b", "key": "k", "unexpected_field": true}"#;
+    let msg_with_extra = r#"{"kind": "INGEST", "bucket": "b", "key": "k", "file_id": "f-1", "unexpected_field": true}"#;
     let result: Result<SqsEvent, _> = serde_json::from_str(msg_with_extra);
     // Should not parse as DirectIngest (deny_unknown_fields), and won't match
     // S3Event or S3TestEvent either, so parsing fails.
     assert!(result.is_err());
+}
+
+#[test]
+fn test_direct_ingest_missing_required_fields() {
+    let cases = [
+        (
+            "missing key",
+            r#"{"kind": "INGEST", "bucket": "b", "file_id": "f-1"}"#,
+        ),
+        (
+            "missing bucket",
+            r#"{"kind": "INGEST", "key": "k", "file_id": "f-1"}"#,
+        ),
+        (
+            "missing kind",
+            r#"{"bucket": "b", "key": "k", "file_id": "f-1"}"#,
+        ),
+        (
+            "missing file_id",
+            r#"{"kind": "INGEST", "bucket": "b", "key": "k"}"#,
+        ),
+    ];
+    for (name, json) in cases {
+        let result: Result<SqsEvent, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "expected error for case: {name}");
+    }
 }
 
 #[test]
@@ -1693,4 +1783,52 @@ fn parse_sqs_config() {
         "#,
     );
     assert!(test.is_err());
+}
+
+#[test]
+fn test_aws_s3_config_with_ingestion_callback() {
+    // Config parses with ingestion_callback present
+    let config: super::AwsS3Config = toml::from_str(
+        r#"
+            [sqs]
+            queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+            process_custom_message = true
+
+            [ingestion_callback]
+
+            [ingestion_callback.on_success]
+            uri = "/v2/files/{{message.file_id}}/mark-successful"
+
+            [ingestion_callback.on_failure]
+            uri = "/v2/files/{{message.file_id}}/mark-failed"
+
+            [ingestion_callback.on_failure.body]
+            file_id = "{{message.file_id}}"
+            error_message = "{{error_message}}"
+
+            [ingestion_callback.request]
+            base_url = "https://log-access.example.com"
+            timeout_secs = 5
+            retry_max_attempts = 2
+
+            [ingestion_callback.auth]
+            strategy = "bearer"
+            token = "my-token"
+        "#,
+    )
+    .unwrap();
+
+    let cb = config
+        .ingestion_callback
+        .expect("ingestion_callback should be present");
+    assert!(cb.on_success.is_some());
+    assert!(cb.on_failure.is_some());
+    assert_eq!(cb.request.base_url, "https://log-access.example.com");
+    assert_eq!(cb.request.timeout_secs, 5);
+    assert_eq!(cb.request.retry_max_attempts, 2);
+    assert!(cb.auth.is_some());
+
+    let on_failure = cb.on_failure.unwrap();
+    assert_eq!(on_failure.body.len(), 2);
+    assert_eq!(on_failure.body["file_id"], "{{message.file_id}}");
 }
