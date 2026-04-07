@@ -1,6 +1,7 @@
+use std::net::IpAddr;
 use std::time::Duration;
 
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use vector_lib::NamedInternalEvent;
 use vector_lib::internal_event::InternalEvent;
 
@@ -66,6 +67,91 @@ impl InternalEvent for ClickhouseBatchInterval {
             interval_secs = %self.interval.as_secs_f64(),
         );
         histogram!("clickhouse_batch_interval_seconds").record(self.interval.as_secs_f64());
+    }
+}
+
+/// Emitted each time a request is routed to the fallback ClusterIP endpoint
+/// because all headless pod IPs have been removed from the active set.
+///
+/// A non-zero rate of this metric means the headless pool is fully exhausted.
+/// Alert on `clickhouse_headless_fallback_total` increasing to detect outages.
+#[derive(Debug, NamedInternalEvent)]
+pub struct ClickhouseHeadlessFallbackRouted {
+    pub active_endpoints: usize,
+}
+
+impl InternalEvent for ClickhouseHeadlessFallbackRouted {
+    fn emit(self) {
+        warn!(
+            message = "All headless endpoints unavailable, routing to fallback ClusterIP service.",
+            active_endpoints = self.active_endpoints,
+        );
+        counter!("clickhouse_headless_fallback_total").increment(1);
+    }
+}
+
+/// Emitted each time Tower's P2C buffer returns `Pending` during `poll_ready`,
+/// meaning all buffer slots are occupied and the next dispatch must wait.
+///
+/// Rising `clickhouse_headless_p2c_buffer_full_total` indicates the buffer
+/// bound is too small for the current concurrency + retry load.
+#[derive(Debug, NamedInternalEvent)]
+pub struct ClickhouseHeadlessP2cBufferFull;
+
+impl InternalEvent for ClickhouseHeadlessP2cBufferFull {
+    fn emit(self) {
+        counter!("clickhouse_headless_p2c_buffer_full_total").increment(1);
+    }
+}
+
+/// Emitted when a ClickHouse pod IP is removed from the active P2C pool due to
+/// a connection failure or request timeout.
+///
+/// `clickhouse_headless_endpoint_removed_total` is a diagnostic counter for
+/// tracking pod-level churn. Spikes indicate instability in the ClickHouse cluster.
+#[derive(Debug, NamedInternalEvent)]
+pub struct ClickhouseHeadlessEndpointRemoved {
+    pub ip: IpAddr,
+    pub reason: String,
+    pub active_endpoints: usize,
+}
+
+impl InternalEvent for ClickhouseHeadlessEndpointRemoved {
+    fn emit(self) {
+        warn!(
+            message = "Removing failed ClickHouse endpoint.",
+            ip = %self.ip,
+            reason = %self.reason,
+            active_endpoints = self.active_endpoints,
+        );
+        counter!("clickhouse_headless_endpoint_removed_total").increment(1);
+        gauge!("clickhouse_headless_active_endpoints").set(self.active_endpoints as f64);
+    }
+}
+
+/// Emitted after each DNS reconciliation cycle (scheduled or immediate).
+///
+/// `clickhouse_headless_active_endpoints` gauge shows how many pod IPs are
+/// currently in the P2C pool — use this to detect pool shrinkage or recovery.
+/// `clickhouse_headless_dns_refresh_total{status="failure"}` rising indicates
+/// DNS is unhealthy.
+#[derive(Debug, NamedInternalEvent)]
+pub struct ClickhouseHeadlessDnsRefreshed {
+    pub success: bool,
+    pub active_endpoints: usize,
+}
+
+impl InternalEvent for ClickhouseHeadlessDnsRefreshed {
+    fn emit(self) {
+        let status = if self.success { "success" } else { "failure" };
+        counter!(
+            "clickhouse_headless_dns_refresh_total",
+            "status" => status,
+        )
+        .increment(1);
+        if self.success {
+            gauge!("clickhouse_headless_active_endpoints").set(self.active_endpoints as f64);
+        }
     }
 }
 

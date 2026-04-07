@@ -8,6 +8,7 @@ use vector_lib::codecs::encoding::format::SchemaProvider;
 use vector_lib::codecs::encoding::{ArrowStreamSerializerConfig, BatchSerializerConfig};
 
 use super::{
+    headless::{EndpointServiceConfig, HeadlessService},
     request_builder::ClickhouseRequestBuilder,
     service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
     sink::{ClickhouseSink, PartitionKey},
@@ -16,7 +17,10 @@ use crate::{
     http::{Auth, HttpClient, MaybeAuth},
     sinks::{
         prelude::*,
-        util::{RealtimeSizeBasedDefaultBatchSettings, UriSerde, http::HttpService},
+        util::{
+            RealtimeSizeBasedDefaultBatchSettings, TowerRequestSettings, UriSerde,
+            http::{HttpRequest, HttpResponse, HttpService},
+        },
     },
 };
 
@@ -134,6 +138,39 @@ pub struct ClickhouseConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub query_settings: QuerySettingsConfig,
+
+    /// When true, treat the endpoint as a headless Kubernetes service DNS name.
+    ///
+    /// The hostname is resolved to individual pod IPs and requests are
+    /// load-balanced across all resolved endpoints using the Power of Two
+    /// Choices (P2C) algorithm. Failed endpoints are automatically removed
+    /// and re-discovered on the next DNS refresh.
+    #[serde(default)]
+    pub use_headless_service: bool,
+
+    /// DNS re-resolution interval in seconds when `use_headless_service` is enabled.
+    ///
+    /// Defaults to 30 seconds.
+    #[serde(default)]
+    pub dns_refresh_interval_secs: Option<u64>,
+
+    /// Fallback endpoint used when all headless pod IPs are unreachable.
+    ///
+    /// Required when `use_headless_service` is true. Must point to a normal
+    /// ClusterIP Kubernetes service (not a headless service) so Kubernetes
+    /// handles routing internally. Activated when all resolved pod IPs have
+    /// been removed due to connection errors; traffic returns to P2C once
+    /// the headless DNS refresh re-discovers healthy pods.
+    ///
+    /// Can be HTTP or HTTPS. If HTTPS, the `tls` block must also be configured
+    /// with the appropriate CA certificate — the same `HttpClient` is shared
+    /// between the headless pod connections and this fallback. Without a `tls`
+    /// block, HTTPS will fail for self-signed or custom-CA certificates.
+    #[configurable(metadata(
+        docs::examples = "http://cluster-service-write.logging-clickhouse.svc.cluster.local:8123"
+    ))]
+    #[serde(default)]
+    pub fallback_endpoint: Option<UriSerde>,
 }
 
 /// Query settings for the `clickhouse` sink.
@@ -188,6 +225,27 @@ pub struct AsyncInsertSettingsConfig {
     pub max_query_number: Option<u64>,
 }
 
+/// Maximum retries for headless mode regardless of the global `request.retry_attempts` setting.
+///
+/// In headless mode each retry may be routed to a different pod IP; with many pods and the
+/// default Fibonacci back-off the cumulative wait before reaching the fallback endpoint can
+/// exceed two minutes. Capping at 3 keeps the fall-through to the ClusterIP fallback fast.
+/// Users can lower this further via `request.retry_attempts`.
+const DEFAULT_HEADLESS_MAX_RETRIES: usize = 3;
+
+/// Common parameters needed to build the ClickHouse sink.
+struct ClickhouseBuildParams {
+    client: HttpClient,
+    endpoint: Uri,
+    auth: Option<Auth>,
+    request_limits: TowerRequestSettings,
+    batch_settings: BatcherSettings,
+    database: Template,
+    format: Format,
+    request_builder: ClickhouseRequestBuilder,
+    svc_config: EndpointServiceConfig,
+}
+
 impl_generate_config_from_default!(ClickhouseConfig);
 
 #[async_trait::async_trait]
@@ -195,32 +253,10 @@ impl_generate_config_from_default!(ClickhouseConfig);
 impl SinkConfig for ClickhouseConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let endpoint = self.endpoint.with_default_parts().uri;
-
         let auth = self.auth.choose_one(&self.endpoint.auth)?;
-
         let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
-
         let client = HttpClient::new(tls_settings, &cx.proxy)?;
-
-        let clickhouse_service_request_builder = ClickhouseServiceRequestBuilder {
-            auth: auth.clone(),
-            endpoint: endpoint.clone(),
-            skip_unknown_fields: self.skip_unknown_fields,
-            date_time_best_effort: self.date_time_best_effort,
-            insert_random_shard: self.insert_random_shard,
-            compression: self.compression,
-            query_settings: self.query_settings,
-        };
-
-        let service: HttpService<ClickhouseServiceRequestBuilder, PartitionKey> =
-            HttpService::new(client.clone(), clickhouse_service_request_builder);
-
         let request_limits = self.request.into_settings();
-
-        let service = ServiceBuilder::new()
-            .settings(request_limits, ClickhouseRetryLogic::default())
-            .service(service);
-
         let batch_settings = self.batch.into_batcher_settings()?;
 
         let database = self.database.clone().unwrap_or_else(|| {
@@ -229,7 +265,14 @@ impl SinkConfig for ClickhouseConfig {
                 .expect("'default' should be a valid template")
         });
 
-        // Resolve the encoding strategy (format + encoder) based on configuration
+        if self.use_headless_service {
+            self.validate_headless_config(&endpoint)?;
+        } else if self.dns_refresh_interval_secs.is_some() {
+            warn!(
+                message = "'dns_refresh_interval_secs' is set but 'use_headless_service' is false; this setting will be ignored.",
+            );
+        }
+
         let (format, encoder_kind) = self
             .resolve_strategy(&client, &endpoint, &database, auth.as_ref())
             .await?;
@@ -239,18 +282,32 @@ impl SinkConfig for ClickhouseConfig {
             encoder: (self.encoding.clone(), encoder_kind),
         };
 
-        let sink = ClickhouseSink::new(
+        let svc_config = EndpointServiceConfig {
+            auth: auth.clone(),
+            skip_unknown_fields: self.skip_unknown_fields,
+            date_time_best_effort: self.date_time_best_effort,
+            insert_random_shard: self.insert_random_shard,
+            compression: self.compression,
+            query_settings: self.query_settings,
+        };
+
+        let params = ClickhouseBuildParams {
+            client,
+            endpoint,
+            auth,
+            request_limits,
             batch_settings,
-            service,
             database,
-            self.table.clone(),
             format,
             request_builder,
-        );
+            svc_config,
+        };
 
-        let healthcheck = Box::pin(healthcheck(client, endpoint, auth));
-
-        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
+        if self.use_headless_service {
+            self.build_headless(params).await
+        } else {
+            self.build_direct(params)
+        }
     }
 
     fn input(&self) -> Input {
@@ -263,6 +320,107 @@ impl SinkConfig for ClickhouseConfig {
 }
 
 impl ClickhouseConfig {
+    /// Validates configuration fields that are only relevant when `use_headless_service` is true.
+    fn validate_headless_config(&self, _endpoint: &Uri) -> crate::Result<()> {
+        if self.fallback_endpoint.is_none() {
+            return Err(
+                "'fallback_endpoint' is required when 'use_headless_service' is true".into(),
+            );
+        }
+        if self.dns_refresh_interval_secs == Some(0) {
+            return Err("'dns_refresh_interval_secs' must be greater than 0".into());
+        }
+        Ok(())
+    }
+
+    /// Builds the direct single-endpoint sink (default behavior, no headless routing).
+    fn build_direct(
+        &self,
+        params: ClickhouseBuildParams,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        let service_request_builder = ClickhouseServiceRequestBuilder {
+            auth: params.svc_config.auth.clone(),
+            endpoint: params.endpoint.clone(),
+            skip_unknown_fields: params.svc_config.skip_unknown_fields,
+            date_time_best_effort: params.svc_config.date_time_best_effort,
+            insert_random_shard: params.svc_config.insert_random_shard,
+            compression: params.svc_config.compression,
+            query_settings: params.svc_config.query_settings,
+        };
+
+        let service = HttpService::new(params.client.clone(), service_request_builder);
+        self.build_sink_and_healthcheck(params, service)
+    }
+
+    /// Builds the headless-service sink with P2C load-balanced dispatch across
+    /// dynamically resolved pod IPs.
+    async fn build_headless(
+        &self,
+        mut params: ClickhouseBuildParams,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        // Cap retries so we fall through to the ClusterIP fallback quickly. Without this,
+        // Fibonacci back-off across N pod IPs can take >2 min before active_count hits 0.
+        params.request_limits.retry_attempts = params
+            .request_limits
+            .retry_attempts
+            .min(DEFAULT_HEADLESS_MAX_RETRIES);
+
+        let fallback_uri = self
+            .fallback_endpoint
+            .as_ref()
+            .expect("fallback_endpoint validated above")
+            .with_default_parts()
+            .uri;
+
+        let headless = HeadlessService::new(
+            params.client.clone(),
+            params.endpoint.clone(),
+            params.svc_config.clone(),
+            self.dns_refresh_interval_secs,
+            fallback_uri.clone(),
+            params.request_limits.concurrency,
+            params.request_limits.retry_attempts,
+        )
+        .await?;
+
+        // Healthcheck should target the stable ClusterIP, not the headless DNS name.
+        // The headless name resolves to individual pod IPs which may come and go.
+        params.endpoint = fallback_uri;
+        self.build_sink_and_healthcheck(params, headless)
+    }
+
+    /// Wraps an inner service with Tower middleware and constructs the
+    /// sink + healthcheck pair. Shared by both single-endpoint and headless
+    /// code paths.
+    fn build_sink_and_healthcheck<S>(
+        &self,
+        params: ClickhouseBuildParams,
+        inner_service: S,
+    ) -> crate::Result<(VectorSink, Healthcheck)>
+    where
+        S: Service<HttpRequest<PartitionKey>, Response = HttpResponse, Error = crate::Error>
+            + Send
+            + Clone
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        let service = ServiceBuilder::new()
+            .settings(params.request_limits, ClickhouseRetryLogic::default())
+            .service(inner_service);
+
+        let sink = ClickhouseSink::new(
+            params.batch_settings,
+            service,
+            params.database,
+            self.table.clone(),
+            params.format,
+            params.request_builder,
+        );
+
+        let healthcheck = Box::pin(healthcheck(params.client, params.endpoint, params.auth));
+        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
+    }
+
     /// Resolves the encoding strategy (format + encoder) based on configuration.
     ///
     /// This method determines the appropriate ClickHouse format and Vector encoder
