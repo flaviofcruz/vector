@@ -731,7 +731,7 @@ struct Source {
     /// Present when `share_watcher` is true — RAII cleanup via shared registry.
     watcher_guard: Option<shared_watcher::SharedWatcherGuard>,
     /// Present when `share_watcher` is false — owned reflector tasks for direct cleanup.
-    reflector_handles: Vec<tokio::task::JoinHandle<()>>,
+    reflector_handles: OwnedReflectorHandles,
     data_dir: PathBuf,
     auto_partial_merge: bool,
     pod_fields_spec: pod_metadata_annotator::FieldsSpec,
@@ -765,6 +765,19 @@ struct Source {
     host_key: Option<OwnedValuePath>,
     line_delimiter: String,
     encoding: Option<EncodingConfig>,
+}
+
+/// Wrapper that aborts owned reflector tasks on drop, preventing leaks if the
+/// Source is dropped before run() (e.g. during a failed pipeline build).
+/// Empty in the shared-watcher path where SharedWatcherGuard handles cleanup.
+struct OwnedReflectorHandles(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for OwnedReflectorHandles {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
 }
 
 impl Source {
@@ -938,7 +951,7 @@ impl Source {
                 acquire_result.stores.ns_state,
                 acquire_result.stores.node_state,
                 Some(acquire_result.guard),
-                Vec::new(),
+                OwnedReflectorHandles(Vec::new()),
             )
         } else {
             let created = create_watchers(
@@ -955,7 +968,7 @@ impl Source {
                 created.ns_state,
                 created.node_state,
                 None,
-                created.reflector_handles,
+                OwnedReflectorHandles(created.reflector_handles),
             )
         };
 
@@ -1322,16 +1335,11 @@ impl Source {
         }
 
         lifecycle.run(global_shutdown).await;
-        if let Some(guard) = watcher_guard {
-            // Shared path: the guard handles reflector cleanup on drop.
-            // When the last consumer drops, reflectors are automatically aborted.
-            drop(guard);
-        } else {
-            // Non-shared path: stop reflectors directly.
-            for handle in reflector_handles {
-                handle.abort();
-            }
-        }
+        // Shared path: the guard handles reflector cleanup on drop (when the
+        // last consumer drops, reflectors are automatically aborted).
+        // Non-shared path: OwnedReflectorHandles aborts tasks on drop.
+        drop(watcher_guard);
+        drop(reflector_handles);
         info!(message = "Done.");
         Ok(())
     }

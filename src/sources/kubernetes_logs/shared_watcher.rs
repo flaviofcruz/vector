@@ -244,10 +244,11 @@ mod tests {
         let node_store_w = reflector::store::Writer::<Node>::default();
         let node_state = node_store_w.as_reader();
 
-        let mut reflector_handles = Vec::new();
-        reflector_handles.push(tokio::spawn(futures::future::pending::<()>()));
-        reflector_handles.push(tokio::spawn(futures::future::pending::<()>()));
-        reflector_handles.push(tokio::spawn(futures::future::pending::<()>()));
+        let reflector_handles = vec![
+            tokio::spawn(futures::future::pending::<()>()),
+            tokio::spawn(futures::future::pending::<()>()),
+            tokio::spawn(futures::future::pending::<()>()),
+        ];
 
         CreatedWatcher {
             pod_state,
@@ -264,7 +265,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Task 4: WatcherKey equality tests
+    // WatcherKey equality / hashing tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -348,7 +349,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Task 5: Registry lifecycle tests
+    // Registry lifecycle tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -491,7 +492,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Task 6: Store data visibility test
+    // Store data visibility test
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -511,7 +512,7 @@ mod tests {
         let node_state = node_store_w.as_reader();
 
         // Create a mock watcher stream using an mpsc channel.
-        let (tx, rx) = mpsc::channel::<kube_watcher::Result<kube_watcher::Event<Pod>>>(10);
+        let (mut tx, rx) = mpsc::channel::<kube_watcher::Result<kube_watcher::Event<Pod>>>(10);
 
         // Spawn a custom_reflector to process events from the channel.
         let meta_cache = MetaCache::new();
@@ -554,7 +555,6 @@ mod tests {
             ..Pod::default()
         };
 
-        let mut tx = tx;
         tx.send(Ok(kube_watcher::Event::Apply(test_pod.clone())))
             .await
             .expect("send event");
