@@ -671,6 +671,8 @@ fn map_simple_databricks_type(
     match type_name {
         "STRING" => Ok(prost_types::field_descriptor_proto::Type::String),
         "INT" => Ok(prost_types::field_descriptor_proto::Type::Int32),
+        "SHORT" | "SMALLINT" => Ok(prost_types::field_descriptor_proto::Type::Int32),
+        "BYTE" | "TINYINT" => Ok(prost_types::field_descriptor_proto::Type::Int32),
         "LONG" | "BIGINT" => Ok(prost_types::field_descriptor_proto::Type::Int64),
         "BOOLEAN" | "BOOL" => Ok(prost_types::field_descriptor_proto::Type::Bool),
         "DOUBLE" => Ok(prost_types::field_descriptor_proto::Type::Double),
