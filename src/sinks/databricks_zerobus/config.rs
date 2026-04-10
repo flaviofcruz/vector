@@ -507,7 +507,7 @@ mod tests {
         let sdk_options: databricks_zerobus_ingest_sdk::StreamConfigurationOptions = options.into();
         assert_eq!(sdk_options.flush_timeout_ms, 45000);
         assert_eq!(sdk_options.server_lack_of_ack_timeout_ms, 90000);
-        assert_eq!(sdk_options.recovery, true);
+        assert!(sdk_options.recovery);
         assert_eq!(sdk_options.recovery_retries, 4);
     }
 }

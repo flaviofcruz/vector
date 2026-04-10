@@ -575,10 +575,10 @@ mod tests {
         // Inject a retryable error for the next call.
         {
             let guard = service.stream.lock().await;
-            if let Some(arc) = guard.as_ref() {
-                if let ActiveStream::Mock(mock) = arc.as_ref() {
-                    mock.set_next_error(ZerobusError::ChannelCreationError("reset".to_string()));
-                }
+            if let Some(arc) = guard.as_ref()
+                && let ActiveStream::Mock(mock) = arc.as_ref()
+            {
+                mock.set_next_error(ZerobusError::ChannelCreationError("reset".to_string()));
             }
         }
 
