@@ -171,6 +171,19 @@ pub struct ClickhouseConfig {
     ))]
     #[serde(default)]
     pub fallback_endpoint: Option<UriSerde>,
+
+    /// Maximum number of idle connections to retain per host in the connection pool.
+    ///
+    /// When using `use_headless_service`, Vector opens a separate connection pool entry
+    /// for each resolved pod IP. Without a cap, idle connections accumulate independently
+    /// per pod, multiplying total ClickHouse TCP connections by the number of pods.
+    /// Setting this to 1 bounds the steady-state connection count to at most one idle
+    /// connection per pod IP.
+    ///
+    /// Defaults to 1. Set to a higher value if request concurrency requires more warm
+    /// connections. Set to 0 to disable connection reuse entirely.
+    #[serde(default)]
+    pub pool_max_idle_per_host: Option<usize>,
 }
 
 /// Query settings for the `clickhouse` sink.
@@ -258,7 +271,8 @@ impl SinkConfig for ClickhouseConfig {
         let client = HttpClient::new_with_custom_client(
             tls_settings,
             &cx.proxy,
-            hyper::Client::builder().pool_max_idle_per_host(1),
+            hyper::Client::builder()
+                .pool_max_idle_per_host(self.pool_max_idle_per_host.unwrap_or(1)),
         )?;
         let request_limits = self.request.into_settings();
         let batch_settings = self.batch.into_batcher_settings()?;
