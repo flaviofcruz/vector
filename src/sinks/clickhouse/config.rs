@@ -255,7 +255,11 @@ impl SinkConfig for ClickhouseConfig {
         let endpoint = self.endpoint.with_default_parts().uri;
         let auth = self.auth.choose_one(&self.endpoint.auth)?;
         let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
-        let client = HttpClient::new(tls_settings, &cx.proxy)?;
+        let client = HttpClient::new_with_custom_client(
+            tls_settings,
+            &cx.proxy,
+            hyper::Client::builder().pool_max_idle_per_host(1),
+        )?;
         let request_limits = self.request.into_settings();
         let batch_settings = self.batch.into_batcher_settings()?;
 
