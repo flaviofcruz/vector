@@ -172,6 +172,11 @@ pub struct ClickhouseConfig {
     #[serde(default)]
     pub fallback_endpoint: Option<UriSerde>,
 
+    /// Maximum number of idle connections to keep per ClickHouse pod IP.
+    ///
+    /// When `use_headless_service` is true, Vector maintains a separate Hyper
+    /// connection pool per pod IP. Setting this to `1` bounds idle connections
+    /// to N (one per pod) instead of N × concurrency. Defaults to `1`.
     #[serde(default)]
     pub pool_max_idle_per_host: Option<usize>,
 }
