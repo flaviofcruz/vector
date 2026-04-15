@@ -1,26 +1,7 @@
-name: Create Preview Sites
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
-on:
-  workflow_call:
-    inputs:
-      APP_ID:
-        description: "App ID for the associated website"
-        required: true
-        type: string
-      APP_NAME:
-        description: "Application name for the comment"
-        required: true
-        type: string
-    secrets:
-      REQUEST_TOKEN:
-        description: "Token for the request"
-        required: true
-      REQUEST_MESSAGE:
-        description: "Message for the request"
-        required: true
-      ENDPOINT:
-        description: "Request endpoint"
-        required: true
+name: Create Preview Sites
 
 permissions:
   issues: write

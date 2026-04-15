@@ -1,13 +1,7 @@
-name: Check minimum supported Rust version (MSRV)
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
-on:
-  workflow_call:
-  workflow_dispatch:
-    inputs:
-      checkout_ref:
-        description: "Git ref (branch, tag or SHA) to check out"
-        required: false
-        type: string
+name: Check minimum supported Rust version (MSRV)
 
 env:
   RUST_BACKTRACE: full

@@ -1,7 +1,7 @@
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
+
 name: Call Build Preview
-on:
-  pull_request:
-    types: [opened, reopened, synchronize]
 jobs:
   approval_check:
     runs-on: ubuntu-24.04

@@ -1,21 +1,7 @@
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
+
 name: Test Make Command - Linux
-
-on:
-  workflow_call:
-    inputs:
-      command:
-        description: 'Make command to run (e.g., test-behavior, check-examples, test-docs)'
-        required: true
-        type: string
-      job_name:
-        description: 'Display name for the job/status check'
-        required: true
-        type: string
-      ref:
-        description: 'Git ref to checkout'
-        required: false
-        type: string
-
 
 permissions:
   contents: read

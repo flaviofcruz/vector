@@ -1,18 +1,7 @@
-# Integration Test Suite
-#
-# This workflow runs the integration tests. If the workflow is triggered in the merge queue, all integration tests
-# are run. If the workflow is triggered in a PR commit, then the files changed in the PR are evaluated to determine
-# if any integration tests will run.
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
 name: Integration Test Suite
-
-on:
-  workflow_dispatch:
-  pull_request:
-    branches-ignore:
-      - 'v*-custom'
-  merge_group:
-    types: [ checks_requested ]
 
 concurrency:
   # `github.event.number` exists for pull requests, otherwise fall back to SHA for merge queue

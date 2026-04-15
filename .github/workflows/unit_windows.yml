@@ -1,13 +1,7 @@
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
+
 name: Unit - Windows
-
-on:
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Git ref to checkout'
-        required: false
-        type: string
-
 
 permissions:
   contents: read

@@ -1,25 +1,7 @@
-# Master Merge Queue Test Suite
-#
-# This workflow orchestrates a collection of workflows that are required for the merge queue check.
-#
-# Most of the workflows that are jobs within this one, are able to be run on demand
-# by issuing a PR comment with the respective command to trigger said workflow.
-#
-# The design of this workflow relies on the first real job "changes" to detect file
-# changes against the base, and each downstream workflow after that will only be
-# called if the files for that area have changed.
-#
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
 name: Master Merge Queue Test Suite
-
-on:
-  # Only want to run this on merge queue, but because GH doesn't allow specifying different required checks
-  # for pull request and merge queue, we need to "run" it in pull request, but in the jobs we will just auto pass.
-  pull_request:
-    branches-ignore:
-      - 'v*-custom'
-  merge_group:
-    types: [checks_requested]
 
 permissions:
   contents: read

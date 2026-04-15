@@ -1,11 +1,7 @@
-name: Test Suite
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
-on:
-  pull_request:
-    branches-ignore:
-      - 'v*-custom'
-  merge_group:
-    types: [checks_requested]
+name: Test Suite
 
 concurrency:
   # `github.ref` is unique for MQ runs and PRs

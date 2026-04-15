@@ -1,36 +1,7 @@
-# Integration CI Review Trigger
-#
-# This workflow runs one or more integration tests triggered by a comment in a PR.
-# The comment must include '/ci-run-integration'.
-# More than one can be specified.
-#
-# Examples:
-#
-# 1. Run a single integration test:
-#
-#     /ci-run-integration-amqp
-#
-# 2. Run two integration tests:
-#
-#     /ci-run-integration-datadog-logs
-#     /ci-run-integration-splunk
-#
-# 3. Run all integration tests:
-#
-#     /ci-run-integration-all
-#
-# 4. Run all CI (including all integration tests)
-#
-#     /ci-run-all
-#
-# NOTE: This workflow runs on Pull Request Review Comments rather than normal comments to be able to
-# capture the SHA that the comment is associated with.
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
 name: CI Integration Review Trigger
-
-on:
-  pull_request_review:
-    types: [ submitted ]
 
 permissions:
   statuses: write

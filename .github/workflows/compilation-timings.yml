@@ -1,11 +1,7 @@
-# Executes various builds of vector to time the results in order to track compilation times.
-#
-# This workflow is unrelated to the Regression workflow.
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
 name: Compilation Timings
-
-on:
-  workflow_dispatch:
 
 env:
   CI: true

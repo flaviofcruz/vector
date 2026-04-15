@@ -1,12 +1,7 @@
-name: CLI - Linux
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
-on:
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Git ref to checkout'
-        required: false
-        type: string
+name: CLI - Linux
 
 permissions:
   contents: read

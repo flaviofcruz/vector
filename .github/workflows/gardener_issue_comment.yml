@@ -1,14 +1,7 @@
-# Gardener Issue Comment
-#
-# This workflow moves GH issues from the Gardener board's "Blocked / Waiting" column
-# to "Triage", when a comment is posted on an issue from a non-team member
-# so that the Gardener can assess the issue in light of new information.
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
 name: Gardener Issue Comment
-
-on:
-  issue_comment:
-    types: [created]
 
 jobs:
   move-to-backlog:

@@ -2,9 +2,13 @@ name: "BLOCKING: Formatting Check"
 
 on:
   pull_request:
-    branches: 
+    branches:
       - v*-custom
   workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,13 +23,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           path: vector
 
       - name: Generate access token for VRL repository
         id: generate-token-gh-app
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ secrets.VECTOR_VRL_GH_APP_ID }}
           private-key: ${{ secrets.VECTOR_VRL_GH_PRIVATE_KEY }}
@@ -33,26 +37,27 @@ jobs:
           repositories: vrl
 
       - name: Checkout VRL repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           repository: databricks-eng/vrl
-          ref: v0.27.0-custom          
+          ref: v0.30.0-custom
           token: ${{ steps.generate-token-gh-app.outputs.token }}
           persist-credentials: false
           path: vrl
 
+      - name: Configure JFrog registries
+        uses: ./.github/actions/jfrog-auth
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt, clippy
 
       - name: Configure Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
-          # Include Cargo.lock in cache key for more precise invalidation
-          key: ${{ hashFiles('**/Cargo.lock') }}
-          # Cache target directory and registry
-          cache-targets: true
+          shared-key: rust-v1
+          cache-targets: false
           cache-all-crates: true
           workspaces: vector
           cache-on-failure: true

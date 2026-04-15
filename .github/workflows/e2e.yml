@@ -1,24 +1,7 @@
-# End to End Suite
-#
-# Runs on:
-#   - PRs if there are code changes to the source files that are noted in `vdev e2e ci_paths`
-#   - MQ (always pass)
-#   - Scheduled: at midnight UTC Tues-Sat
-#   - Manual trigger via Actions UI.
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
 name: E2E Test Suite
-
-on:
-  workflow_dispatch:
-  pull_request:
-    branches-ignore:
-      - 'v*-custom'
-  # Needs to pass by default in MQ
-  merge_group:
-    types: [ checks_requested ]
-  schedule:
-    # At midnight UTC Tue-Sat
-    - cron: '0 0 * * 2-6'
 
 permissions:
   statuses: write

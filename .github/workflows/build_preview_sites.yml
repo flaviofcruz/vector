@@ -1,10 +1,7 @@
-name: Deploy Vector Preview Sites
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
-on:
-  workflow_run:
-    workflows: ["Call Build Preview"]
-    types:
-      - completed
+name: Deploy Vector Preview Sites
 
 permissions:
   actions: read

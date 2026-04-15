@@ -2,9 +2,12 @@ name: "BLOCKING: Build and Unit Test"
 
 on:
   pull_request:
-    branches: 
+    branches:
       - v*-custom
-  workflow_dispatch:    
+
+permissions:
+  id-token: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,21 +17,21 @@ env:
 jobs:
   build-and-unit-test:
     name: Build and Unit Test
-    runs-on: 
+    runs-on:
       # Use protected runner group with 32 core machines as the regular runner would just OOM
       group: databricks-eng-protected-runner-group-32core
       labels: linux-ubuntu-latest-32core
     timeout-minutes: 60
-    
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           path: vector
 
       - name: Generate access token for VRL repository
         id: generate-token-gh-app
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ secrets.VECTOR_VRL_GH_APP_ID }}
           private-key: ${{ secrets.VECTOR_VRL_GH_PRIVATE_KEY }}
@@ -36,7 +39,7 @@ jobs:
           repositories: vrl
 
       - name: Checkout VRL repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           repository: databricks-eng/vrl
           ref: v0.30.0-custom
@@ -44,8 +47,11 @@ jobs:
           persist-credentials: false
           path: vrl
 
+      - name: Configure JFrog registries
+        uses: ./.github/actions/jfrog-auth
+
       - name: Install protobuf compiler
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           # Pass the token to avoid rate limiting as per the action docs
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -54,16 +60,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsasl2-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt, clippy
-          
+
       - name: Configure Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
-          # Include Cargo.lock in cache key for more precise invalidation
-          key: ${{ hashFiles('**/Cargo.lock') }}
-          # Cache target directory and registry
+          shared-key: rust-v1
           cache-targets: true
           cache-all-crates: true
           workspaces: vector
@@ -72,9 +76,9 @@ jobs:
       - name: Run build test
         run: cargo build
         working-directory: vector
-      
+
       - name: Install cargo-nextest
-        uses: baptiste0928/cargo-install@v3
+        uses: baptiste0928/cargo-install@f204293d9709061b7bc1756fec3ec4e2cd57dec0 # v3.4.0
         with:
           crate: cargo-nextest
           locked: true

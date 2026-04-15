@@ -1,26 +1,7 @@
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
+
 name: Environment Suite
-
-on:
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Git ref to checkout'
-        required: false
-        type: string
-
-  workflow_dispatch:
-    inputs:
-      push:
-        description: "Push image when manually triggered"
-        type: boolean
-        default: false
-      ref:
-        description: 'Git ref to checkout'
-        required: false
-        type: string
-
-  schedule:
-    - cron: '0 6 * * 1'  # Every Monday at 06:00 UTC
 
 env:
   VERBOSE: true

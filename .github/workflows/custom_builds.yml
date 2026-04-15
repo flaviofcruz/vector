@@ -1,11 +1,11 @@
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
+
 name: Custom Builds
 
 permissions:
   contents: write
   packages: write
-
-on:
-  workflow_dispatch: {}
 
 jobs:
   Custom:

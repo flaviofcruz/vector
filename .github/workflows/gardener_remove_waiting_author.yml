@@ -1,16 +1,10 @@
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
+
 name: Remove Awaiting Author Label
 
 permissions:
   pull-requests: write
-
-on:
-  pull_request_target:
-    types: [synchronize, review_requested]
-
-  pull_request:
-    branches-ignore:
-      - 'v*-custom'
-    types: [synchronize, review_requested]
 
 jobs:
   remove_label:

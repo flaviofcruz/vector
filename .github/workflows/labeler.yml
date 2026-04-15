@@ -1,7 +1,7 @@
-name: "Pull Request Labeler"
-on:
-  pull_request_target:
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
+name: "Pull Request Labeler"
 permissions:
   contents: read
 

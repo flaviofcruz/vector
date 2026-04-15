@@ -1,8 +1,7 @@
-name: Publish vdev
-on:
-  push:
-    tags: [ "vdev-v*.*.*" ]
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
+name: Publish vdev
 permissions:
   contents: write  # needed for creating releases
 

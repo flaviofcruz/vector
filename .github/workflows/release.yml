@@ -1,14 +1,11 @@
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
+
 name: Release Suite
 
 permissions:
   contents: write
   packages: write
-
-on:
-  push:
-    tags:
-      - v0.*
-      - v1.*
 
 jobs:
   Release:

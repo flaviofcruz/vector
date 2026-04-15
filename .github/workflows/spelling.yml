@@ -1,3 +1,6 @@
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
+
 name: Check Spelling
 
 # Comment management is handled through a secondary job, for details see:
@@ -55,15 +58,6 @@ name: Check Spelling
 #     # remove `security-events: write` and `use_sarif: 1`
 #     # remove `experimental_apply_changes_via_bot: 1`
 #     ... otherwise adjust the `with:` as you wish
-
-on:
-  pull_request_target:
-    branches-ignore:
-      - 'v*-custom'
-    types:
-    - 'opened'
-    - 'reopened'
-    - 'synchronize'
 
 permissions:
   contents: read

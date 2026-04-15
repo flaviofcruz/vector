@@ -1,34 +1,7 @@
-# Deny - Linux
-#
-# Checks for security vulnerabilities or license incompatibilities
-#
-# Runs on:
-#  - scheduled UTC midnight
-#  - on PR review (see comment-trigger.yml)
-#  - on demand from github actions UI
-#  - on pull requests when Cargo.toml or Cargo.lock files change
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
 name: Deny - Linux
-
-on:
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Git ref to checkout'
-        required: false
-        type: string
-
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Git ref to checkout'
-        required: false
-        type: string
-
-  pull_request:
-  schedule:
-    # Same schedule as nightly.yml
-    - cron: "0 5 * * 2-6"  # Runs at 5:00 AM UTC, Tuesday through Saturday
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

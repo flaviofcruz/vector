@@ -1,20 +1,11 @@
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
+
 name: Publish
 
 permissions:
   contents: write
   packages: write
-
-on:
-  workflow_call:
-    inputs:
-      git_ref:
-        type: string
-        required: true
-        # channel is the dir/namespace packages are organized into.
-        # Options are release/nightly/custom.
-      channel:
-        type: string
-        required: true
 
 env:
   VERBOSE: true

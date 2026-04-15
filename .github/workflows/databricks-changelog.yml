@@ -2,21 +2,21 @@ name: "BLOCKING: Databricks Changelog Check"
 
 on:
   pull_request:
-    branches: 
+    branches:
       - v*-custom
     types:
       - opened
       - edited
       - synchronize
-    
+
 jobs:
   check-db-changelog:
-    runs-on: 
+    runs-on:
       group: databricks-eng-protected-runner-group
       labels: linux-ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Fetch base branch
         run: git fetch origin ${{ github.event.pull_request.base.ref }}:${{ github.event.pull_request.base.ref }}

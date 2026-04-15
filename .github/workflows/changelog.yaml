@@ -1,3 +1,6 @@
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
+
 # Changelog
 #
 # Validates that a changelog entry was added.
@@ -7,16 +10,6 @@
 #   - label is added or removed
 # Runs on merge queues, but just passes, because it is a required check.
 name: Changelog
-
-on:
-  pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
-    branches-ignore:
-      - 'v*-custom'
-
-  # Required by GitHub merge queue due to branch protection rules. Should always be successful
-  merge_group:
-    types: [checks_requested]
 
 permissions:
   contents: read

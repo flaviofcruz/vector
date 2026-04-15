@@ -1,18 +1,7 @@
-name: Update install.sh Suite
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
-on:
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Git ref to checkout'
-        required: false
-        type: string
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Git ref to checkout'
-        required: false
-        type: string
+name: Update install.sh Suite
 
 permissions:
   contents: read

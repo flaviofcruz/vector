@@ -1,38 +1,7 @@
-# Regression Detection Suite
-#
-# This workflow runs under the following conditions:
-#   - Once per day, based on a schedule
-#   - On demand, triggered from https://github.com/vectordotdev/vector/actions/workflows/regression_v2.yml
-#
-# The workflow accepts two optional inputs:
-#   - The baseline SHA:
-#     - If not specified, the SHA from 7 days ago on origin/master is used.
-#   - The comparison SHA:
-#     - If not specified, the current HEAD of origin/master is used.
-#
-# This workflow runs regression detection experiments, performing relative
-# evaluations of the baseline SHA and comparison SHA. The exact SHAs are determined
-# by how the workflow is triggered.
-#
-# The goal is to provide quick feedback on Vector's performance across a variety
-# of configurations, checking if throughput performance has degraded or become
-# more variable in the comparison SHA relative to the baseline SHA.
-#
-# Docker image tags are based on the resolved SHAs.
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
 name: Regression Detection Suite
-
-on:
-  workflow_dispatch:
-    inputs:
-      baseline-sha:
-        description: "The SHA to use as the baseline (optional). If not provided, it defaults to the SHA from 7 days ago."
-        required: false
-      comparison-sha:
-        description: "The SHA to use for comparison (optional). If not provided, it defaults to the current HEAD of the origin/master branch."
-        required: false
-  schedule:
-    - cron: '0 7 * * 1' # Runs at 7 AM UTC on Mondays
 
 env:
   SINGLE_MACHINE_PERFORMANCE_API: ${{ secrets.SINGLE_MACHINE_PERFORMANCE_API }}

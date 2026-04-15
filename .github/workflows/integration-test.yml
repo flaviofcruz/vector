@@ -1,18 +1,7 @@
-# Integration Test
-#
-# This workflow is used to run an integration test on demand.
-# An input for the test name needs to be provided.
-# TODO: check if the input is "all" , and run all, without a timeout?
+# Workflow from upstream: Never ran
+# Only kept to reduce conflicts while syncing from upstream.
 
 name: Integration Test
-
-on:
-  workflow_dispatch:
-    inputs:
-      test_name:
-        description: "Which integration to test."
-        required: true
-        type: string
 
 env:
   AXIOM_TOKEN: ${{ secrets.AXIOM_TOKEN }}
