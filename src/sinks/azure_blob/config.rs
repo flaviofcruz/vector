@@ -10,6 +10,7 @@ use vector_lib::{
 };
 
 use super::request_builder::AzureBlobRequestOptions;
+use crate::sinks::util::vector_event_log::EventLoggingService;
 use crate::{
     Result,
     codecs::{Encoder, EncodingConfigWithFraming, SinkType},
@@ -221,6 +222,7 @@ impl AzureBlobSinkConfig {
                 result
             })
             .service(AzureBlobService::new(client));
+        let event_logging_service = EventLoggingService::new(service);
 
         // Configure our partitioning/batching.
         let batcher_settings = self.batch.into_batcher_settings()?;
@@ -248,7 +250,7 @@ impl AzureBlobSinkConfig {
         };
 
         let sink = AzureBlobSink::new(
-            service,
+            event_logging_service,
             request_options,
             self.key_partitioner()?,
             batcher_settings,

@@ -37,7 +37,10 @@ impl RequestBuilder<(String, Event)> for KafkaRequestBuilder {
         input: (String, Event),
     ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
         let (topic, mut event) = input;
-        let builder = RequestMetadataBuilder::from_event(&event);
+        // Attach sink-delivery event metadata so the EventLoggingService wrapper can emit
+        // VECTOR_LOG_DELIVERY_EVENT (SINK_UPLOAD_STAGED / SINK_UPLOAD_DELIVERED). No
+        // file-send metadata — Kafka isn't a file-upload sink.
+        let builder = RequestMetadataBuilder::from_event_with_event_log(&event, None);
 
         let metadata = KafkaRequestMetadata {
             finalizers: event.take_finalizers(),

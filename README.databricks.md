@@ -110,3 +110,4 @@ This lists custom changes merged in Databricks fork of Vector.
 109. Add `gcp_gcs` source for ingesting logs from Google Cloud Storage via a Pub/Sub subscription, with shared compression detection/decoding across all object-storage sources https://github.com/databricks-eng/vector/pull/439 https://github.com/databricks-eng/vector/pull/440 https://github.com/databricks-eng/vector/pull/441 https://github.com/databricks-eng/vector/pull/442
 110. Fix incorrect protobuf type mappings for Delta DATE and TIMESTAMP columns in the Zerobus sink https://github.com/databricks-eng/vector/pull/463
 111. Add shared Kubernetes API watcher registry for `kubernetes_logs` source to deduplicate watch connections across multiple source instances with identical watcher parameters https://github.com/databricks-eng/vector/pull/467
+112. Instrument `azure_blob` and native `kafka` sinks with VECTOR_LOG_DELIVERY_EVENT / VECTOR_FILE_SEND_EVENT emissions (via EventLoggingService wrapper)

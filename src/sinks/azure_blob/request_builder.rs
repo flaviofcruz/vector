@@ -2,6 +2,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use rand::Rng;
 use uuid::Uuid;
+use vector_common::internal_event::vector_event::file_send_event::FileEventMetadata;
 use vector_lib::event::event_log::generate_count_map;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf, codecs::encoding::Framer, request_metadata::RequestMetadata,
@@ -75,7 +76,13 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
             event_log_metadata,
         };
 
-        let builder = RequestMetadataBuilder::from_events(&events);
+        // Attach file-send event metadata so the EventLoggingService wrapper can emit
+        // VECTOR_FILE_SEND_EVENT (staged/uploaded/error) for each blob upload. The
+        // concrete blob name and byte count are filled in below in build_request().
+        let builder = RequestMetadataBuilder::from_events_with_event_log(
+            &events,
+            Some(FileEventMetadata::default()),
+        );
 
         (azure_metadata, builder, events)
     }
@@ -107,7 +114,14 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
 
         let blob_data = payload.into_payload();
 
+        let mut request_metadata = request_metadata;
         // Update some components of the metadata since they've been computed now
+        request_metadata.update_file_metadata(
+            blob_data.len(),
+            azure_metadata.count,
+            azure_metadata.partition_key.clone(),
+            self.container_name.clone(),
+        );
         azure_metadata.event_log_metadata.bytes = blob_data.len();
         azure_metadata.event_log_metadata.blob = azure_metadata.partition_key.clone();
         azure_metadata.event_log_metadata.emit_sending_event();

@@ -17,6 +17,7 @@ use crate::{
     sinks::{
         kafka::{request_builder::KafkaRequestBuilder, service::KafkaService},
         prelude::*,
+        util::vector_event_log::EventLoggingService,
     },
 };
 
@@ -30,7 +31,7 @@ pub(super) enum BuildError {
 pub struct KafkaSink {
     transformer: Transformer,
     encoder: Encoder<()>,
-    service: RateLimit<KafkaService>,
+    service: EventLoggingService<RateLimit<KafkaService>>,
     topic: Template,
     key_field: Option<OwnedTargetPath>,
     headers_key: Option<OwnedTargetPath>,
@@ -56,16 +57,18 @@ impl KafkaSink {
         let serializer = config.encoding.build()?;
         let encoder = Encoder::<()>::new(serializer);
 
+        let rate_limited_service = ServiceBuilder::new()
+            .rate_limit(
+                config.rate_limit_num,
+                Duration::from_secs(config.rate_limit_duration_secs),
+            )
+            .service(KafkaService::new(producer));
+
         Ok(KafkaSink {
             headers_key: config.headers_key.map(|key| key.0),
             transformer,
             encoder,
-            service: ServiceBuilder::new()
-                .rate_limit(
-                    config.rate_limit_num,
-                    Duration::from_secs(config.rate_limit_duration_secs),
-                )
-                .service(KafkaService::new(producer)),
+            service: EventLoggingService::new(rate_limited_service),
             topic: config.topic,
             key_field: config.key_field.map(|key| key.0),
         })
