@@ -111,3 +111,4 @@ This lists custom changes merged in Databricks fork of Vector.
 110. Fix incorrect protobuf type mappings for Delta DATE and TIMESTAMP columns in the Zerobus sink https://github.com/databricks-eng/vector/pull/463
 111. Add shared Kubernetes API watcher registry for `kubernetes_logs` source to deduplicate watch connections across multiple source instances with identical watcher parameters https://github.com/databricks-eng/vector/pull/467
 112. Instrument `azure_blob` and native `kafka` sinks with VECTOR_LOG_DELIVERY_EVENT / VECTOR_FILE_SEND_EVENT emissions (via EventLoggingService wrapper)
+113. Skip `emptyDir` path enumeration in `kubernetes_logs` source for pods that do not declare an `emptyDir` volume, eliminating ENOENT-triggered `reader_failed`/`command_failed` errors for infrastructure DaemonSets (e.g. `netmon`, `kube-proxy`) when `extract_databricks_logs` is enabled https://github.com/databricks-eng/vector/pull/475
