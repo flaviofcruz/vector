@@ -36,6 +36,7 @@ use std::fmt::Debug;
 
 #[cfg(test)]
 use quickcheck::{Arbitrary, Gen};
+pub use vector_common::flush_signal::FlushSignal;
 use vector_common::{byte_size_of::ByteSizeOf, finalization::AddBatchNotifier};
 
 /// Event handling behavior when a buffer is full.

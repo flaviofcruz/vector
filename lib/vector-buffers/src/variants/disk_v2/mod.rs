@@ -203,7 +203,7 @@ pub use self::{
     writer::{BufferWriter, WriterError},
 };
 use crate::{
-    Bufferable,
+    Bufferable, FlushSignal,
     buffer_usage_data::BufferUsageHandle,
     topology::{
         builder::IntoBuffer,
@@ -260,8 +260,9 @@ where
             .context(WriterSeekFailedSnafu)?;
 
         let finalizer = Arc::clone(&ledger).spawn_finalizer();
+        let flush_signal = FlushSignal::new();
 
-        let mut reader = BufferReader::new(Arc::clone(&ledger), finalizer);
+        let mut reader = BufferReader::new(Arc::clone(&ledger), finalizer, flush_signal);
         reader
             .seek_to_next_record()
             .await

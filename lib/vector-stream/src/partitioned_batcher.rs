@@ -11,7 +11,10 @@ use futures::stream::{Fuse, Stream, StreamExt};
 use pin_project::pin_project;
 use tokio_util::time::{DelayQueue, delay_queue::Key};
 use twox_hash::XxHash64;
-use vector_common::byte_size_of::ByteSizeOf;
+use vector_common::{
+    byte_size_of::ByteSizeOf,
+    flush_signal::{self, FlushSignal},
+};
 use vector_core::{partition::Partitioner, time::KeyedTimer};
 
 use crate::batcher::{
@@ -202,6 +205,9 @@ where
     #[pin]
     /// The stream this `Batcher` wraps
     stream: Fuse<St>,
+    /// Optional signal from the buffer reader to flush all open batches
+    /// without terminating the stream.
+    flush_signal: Option<FlushSignal>,
 }
 
 impl<St, Prt, C, F, B> PartitionedBatcher<St, Prt, ExpirationQueue<Prt::Key>, C, F, B>
@@ -222,6 +228,7 @@ where
             timer: ExpirationQueue::new(timeout),
             partitioner,
             stream: stream.fuse(),
+            flush_signal: flush_signal::get_task_flush_signal(),
         }
     }
 }
@@ -244,6 +251,7 @@ where
             timer,
             partitioner,
             stream: stream.fuse(),
+            flush_signal: None,
         }
     }
 }
@@ -271,18 +279,37 @@ where
                 return Poll::Ready(this.closed_batches.pop());
             }
             match this.stream.as_mut().poll_next(cx) {
-                Poll::Pending => match this.timer.poll_expired(cx) {
-                    // Unlike normal streams, `DelayQueue` can return `None`
-                    // here but still be usable later if more entries are added.
-                    Poll::Pending | Poll::Ready(None) => return Poll::Pending,
-                    Poll::Ready(Some(item_key)) => {
-                        let mut batch = this
-                            .batches
-                            .remove(&item_key)
-                            .expect("batch should exist if it is set to expire");
-                        this.closed_batches.push((item_key, batch.take_batch()));
+                Poll::Pending => {
+                    // Check if the buffer reader has signaled us to flush all
+                    // open batches. This happens during shutdown when the writer
+                    // is done but there are still unacknowledged records — flushing
+                    // batches lets the sink process them and send acks back so the
+                    // buffer can fully drain.
+                    if let Some(signal) = this.flush_signal.as_ref() {
+                        if signal.take() && !this.batches.is_empty() {
+                            this.timer.clear();
+                            this.closed_batches.extend(
+                                this.batches
+                                    .drain()
+                                    .map(|(key, mut batch)| (key, batch.take_batch())),
+                            );
+                            continue;
+                        }
                     }
-                },
+
+                    match this.timer.poll_expired(cx) {
+                        // Unlike normal streams, `DelayQueue` can return `None`
+                        // here but still be usable later if more entries are added.
+                        Poll::Pending | Poll::Ready(None) => return Poll::Pending,
+                        Poll::Ready(Some(item_key)) => {
+                            let mut batch = this
+                                .batches
+                                .remove(&item_key)
+                                .expect("batch should exist if it is set to expire");
+                            this.closed_batches.push((item_key, batch.take_batch()));
+                        }
+                    }
+                }
                 Poll::Ready(None) => {
                     // Now that the underlying stream is closed, we need to
                     // clear out our batches, including all expiration

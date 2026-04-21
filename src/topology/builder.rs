@@ -692,10 +692,16 @@ impl<'a> Builder<'a> {
                     .take()
                     .expect("Task started but input has been taken.");
 
+                // Extract the flush signal from the buffer receiver stream
+                // (present when backed by a disk buffer) so that any
+                // PartitionedBatcher created within the sink task
+                // automatically picks it up via task-local storage.
+                let flush_signal = rx.flush_signal();
+
                 let mut rx = wrap(utilization_sender, component_key.clone(), rx);
 
                 let events_received = register!(EventsReceived);
-                sink.run(
+                let run_sink = sink.run(
                     rx.by_ref()
                         .filter(|events: &EventArray| ready(filter_events_type(events, input_type)))
                         .inspect(|events| {
@@ -705,16 +711,23 @@ impl<'a> Builder<'a> {
                             ))
                         })
                         .take_until_if(tripwire),
-                )
-                .await
-                .map(|_| {
-                    debug!("Sink finished normally.");
-                    TaskOutput::Sink(rx)
-                })
-                .map_err(|_| {
-                    debug!("Sink finished with an error.");
-                    TaskError::Opaque
-                })
+                );
+
+                let result = if let Some(signal) = flush_signal {
+                    vector_common::flush_signal::with_flush_signal(signal, run_sink).await
+                } else {
+                    run_sink.await
+                };
+
+                result
+                    .map(|_| {
+                        debug!("Sink finished normally.");
+                        TaskOutput::Sink(rx)
+                    })
+                    .map_err(|_| {
+                        debug!("Sink finished with an error.");
+                        TaskError::Opaque
+                    })
             };
 
             let task = Task::new(key.clone(), typetag, sink);

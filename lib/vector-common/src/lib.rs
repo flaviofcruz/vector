@@ -60,6 +60,7 @@ pub mod shutdown;
 pub mod sensitive_string;
 
 pub mod atomic;
+pub mod flush_signal;
 pub mod stats;
 pub mod trigger;
 

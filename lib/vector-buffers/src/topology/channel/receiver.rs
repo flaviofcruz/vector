@@ -12,7 +12,7 @@ use vector_common::internal_event::emit;
 
 use super::limited_queue::LimitedReceiver;
 use crate::{
-    Bufferable,
+    Bufferable, FlushSignal,
     buffer_usage_data::BufferUsageHandle,
     variants::disk_v2::{self, ProductionFilesystem},
 };
@@ -25,7 +25,10 @@ pub enum ReceiverAdapter<T: Bufferable> {
     InMemory(LimitedReceiver<T>),
 
     /// The disk v2 buffer.
-    DiskV2(disk_v2::BufferReader<T, ProductionFilesystem>),
+    DiskV2 {
+        reader: disk_v2::BufferReader<T, ProductionFilesystem>,
+        flush_signal: FlushSignal,
+    },
 }
 
 impl<T: Bufferable> From<LimitedReceiver<T>> for ReceiverAdapter<T> {
@@ -36,7 +39,11 @@ impl<T: Bufferable> From<LimitedReceiver<T>> for ReceiverAdapter<T> {
 
 impl<T: Bufferable> From<disk_v2::BufferReader<T, ProductionFilesystem>> for ReceiverAdapter<T> {
     fn from(v: disk_v2::BufferReader<T, ProductionFilesystem>) -> Self {
-        Self::DiskV2(v)
+        let flush_signal = v.flush_signal();
+        Self::DiskV2 {
+            reader: v,
+            flush_signal,
+        }
     }
 }
 
@@ -47,7 +54,7 @@ where
     pub(crate) async fn next(&mut self) -> Option<T> {
         match self {
             ReceiverAdapter::InMemory(rx) => rx.next().await,
-            ReceiverAdapter::DiskV2(reader) => loop {
+            ReceiverAdapter::DiskV2 { reader, .. } => loop {
                 match reader.next().await {
                     Ok(result) => break result,
                     Err(e) => match e.as_recoverable_error() {
@@ -60,6 +67,14 @@ where
                     },
                 }
             },
+        }
+    }
+
+    /// Returns the flush signal if this adapter is backed by a disk buffer.
+    pub fn flush_signal(&self) -> Option<FlushSignal> {
+        match self {
+            ReceiverAdapter::InMemory(_) => None,
+            ReceiverAdapter::DiskV2 { flush_signal, .. } => Some(flush_signal.clone()),
         }
     }
 }
@@ -152,6 +167,11 @@ impl<T: Bufferable> BufferReceiver<T> {
         Some(item)
     }
 
+    /// Returns the flush signal if the base receiver is backed by a disk buffer.
+    pub fn flush_signal(&self) -> Option<FlushSignal> {
+        self.base.flush_signal()
+    }
+
     pub fn into_stream(self) -> BufferReceiverStream<T> {
         BufferReceiverStream::new(self)
     }
@@ -167,14 +187,22 @@ enum StreamState<T: Bufferable> {
 pub struct BufferReceiverStream<T: Bufferable> {
     state: StreamState<T>,
     recv_fut: ReusableBoxFuture<'static, (Option<T>, BufferReceiver<T>)>,
+    flush_signal: Option<FlushSignal>,
 }
 
 impl<T: Bufferable> BufferReceiverStream<T> {
     pub fn new(receiver: BufferReceiver<T>) -> Self {
+        let flush_signal = receiver.flush_signal();
         Self {
             state: StreamState::Idle(receiver),
             recv_fut: ReusableBoxFuture::new(make_recv_future(None)),
+            flush_signal,
         }
+    }
+
+    /// Returns the flush signal if the underlying buffer is a disk buffer.
+    pub fn flush_signal(&self) -> Option<FlushSignal> {
+        self.flush_signal.clone()
     }
 }
 

@@ -114,3 +114,4 @@ This lists custom changes merged in Databricks fork of Vector.
 113. Skip `emptyDir` path enumeration in `kubernetes_logs` source for pods that do not declare an `emptyDir` volume, eliminating ENOENT-triggered `reader_failed`/`command_failed` errors for infrastructure DaemonSets (e.g. `netmon`, `kube-proxy`) when `extract_databricks_logs` is enabled https://github.com/databricks-eng/vector/pull/475
 114. Add host path key to kuberenetes log source for different host path
      mounths https://github.com/databricks-eng/vector/pull/473 
+115. flush and ack before closing sink and buffer https://github.com/databricks-eng/vector/pull/480

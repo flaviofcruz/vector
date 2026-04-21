@@ -20,7 +20,7 @@ use super::{
     record::{ArchivedRecord, Record, RecordStatus, validate_record_archive},
 };
 use crate::{
-    Bufferable,
+    Bufferable, FlushSignal,
     encoding::{AsMetadata, Encodable},
     internal_events::BufferReadError,
     topology::acks::{EligibleMarker, EligibleMarkerLength, MarkerError, OrderedAcknowledgements},
@@ -409,6 +409,7 @@ where
     record_acks: OrderedAcknowledgements<u64, u64>,
     data_file_acks: OrderedAcknowledgements<u64, (PathBuf, u64)>,
     finalizer: OrderedFinalizer<u64>,
+    flush_signal: FlushSignal,
     _t: PhantomData<T>,
 }
 
@@ -419,7 +420,11 @@ where
     FS::File: Unpin,
 {
     /// Creates a new [`BufferReader`] attached to the given [`Ledger`].
-    pub(crate) fn new(ledger: Arc<Ledger<FS>>, finalizer: OrderedFinalizer<u64>) -> Self {
+    pub(crate) fn new(
+        ledger: Arc<Ledger<FS>>,
+        finalizer: OrderedFinalizer<u64>,
+        flush_signal: FlushSignal,
+    ) -> Self {
         let ledger_last_reader_record_id = ledger.state().get_last_reader_record_id();
         let next_expected_record_id = ledger_last_reader_record_id.wrapping_add(1);
 
@@ -435,8 +440,14 @@ where
             record_acks: OrderedAcknowledgements::from_acked(next_expected_record_id),
             data_file_acks: OrderedAcknowledgements::from_acked(0),
             finalizer,
+            flush_signal,
             _t: PhantomData,
         }
+    }
+
+    /// Returns a clone of the flush signal associated with this reader.
+    pub fn flush_signal(&self) -> FlushSignal {
+        self.flush_signal.clone()
     }
 
     fn reset(&mut self) {
@@ -1086,17 +1097,19 @@ where
                 }
 
                 // We caught up with latest file and no more data is coming.
-                // The check on top about writer is done has issue when used with batched sink.
-                // This also has issue because sink will be terminated and acknowledgements from sink will not be processed.
-                // causing data to still remain in buffer and re-processed again if vector starts again with this buffer/sink configuration.
-                // So trade off is data loss vs data duplication.
-
-                // The comprehensive solution would be to be able to send different sentinel from this point signaling end of data to
-                // batch partitioner, which batch partitioner can use to flush but not signal termination to the sink.
-                // While sentinel passed from top of loop will be used by batch partitioner to signal termination to the sink.
-
+                // Instead of returning None (which would terminate the sink and
+                // prevent acknowledgements from being processed), we set a flush
+                // signal. The PartitionedBatcher checks this signal in its Pending
+                // branch and drains all open batches, allowing the sink to process
+                // them and send acknowledgements back. Once acks are processed and
+                // total_buffer_size reaches 0, the check at the top of this loop
+                // returns the real Ok(None) to terminate the stream.
+                //
+                // The finalizer calls notify_writer_waiters() when acks arrive,
+                // which wakes us from wait_for_writer() below, so we loop back,
+                // process acks, and eventually drain the buffer.
                 if self.ledger.is_writer_done() {
-                    return Ok(None);
+                    self.flush_signal.set();
                 }
 
                 self.ledger.wait_for_writer().await;
