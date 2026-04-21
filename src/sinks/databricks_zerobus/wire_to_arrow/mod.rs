@@ -40,6 +40,7 @@ use arrow::datatypes::{Fields, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use prost_reflect::MessageDescriptor;
+use vector_lib::event::{Event, Value};
 
 pub use errors::WireToArrowError;
 
@@ -47,6 +48,17 @@ use builders::{BuilderNodeList, TypedBuilder};
 use errors::Result;
 use plan::{MessagePlan, PlanSlot, ScalarKind};
 use scan::{decode_varint, read_fixed32, read_fixed64, skip_field, zigzag32, zigzag64};
+
+/// Log field name where upstream writers stash the original proto wire bytes.
+///
+/// Events that carry this field with a `Value::Bytes` value are eligible for
+/// the [`WireToArrowEncoder`] fast path. The sink falls back to the generic
+/// encoder chain when the field is absent or not `Bytes`-typed.
+///
+/// Upstream (VRL on VA) must preserve the original proto wire bytes in this
+/// field for tables that want the wire-to-Arrow optimization. Details in the
+/// sink-integration doc.
+pub const WIRE_BYTES_FIELD: &str = "_proto_wire_bytes";
 
 /// Streaming wire-format encoder. Build once per (proto message type,
 /// Arrow schema) pair, then call [`WireToArrowEncoder::encode_batch`]
@@ -67,6 +79,27 @@ impl WireToArrowEncoder {
             plan: Arc::new(plan),
             schema: Arc::new(schema),
         })
+    }
+
+    /// Try to pull proto wire bytes from [`WIRE_BYTES_FIELD`] on each event.
+    ///
+    /// Returns `Some(Vec<Bytes>)` only when every event carries the field as
+    /// a `Value::Bytes`. If any event is missing the field or has it under a
+    /// non-bytes type, returns `None` — the caller should fall back to the
+    /// generic encoder path.
+    ///
+    /// This is a stateless helper; it doesn't touch `self`. Provided on the
+    /// encoder type for convenient grouping.
+    pub fn try_extract_wire_bytes(events: &[Event]) -> Option<Vec<Bytes>> {
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            let log = event.as_log();
+            match log.get(WIRE_BYTES_FIELD) {
+                Some(Value::Bytes(b)) => out.push(b.clone()),
+                _ => return None,
+            }
+        }
+        Some(out)
     }
 
     /// Encode a batch of serialized proto messages into a single `RecordBatch`.
@@ -357,6 +390,83 @@ mod tests {
             batch.column(0).as_string::<i64>().value(0),
             "Alice"
         );
+    }
+
+    #[test]
+    fn extract_wire_bytes_all_present() {
+        let mut e1 = Event::from(vector_lib::event::LogEvent::default());
+        e1.as_mut_log()
+            .insert(WIRE_BYTES_FIELD, Bytes::from_static(b"one"));
+        let mut e2 = Event::from(vector_lib::event::LogEvent::default());
+        e2.as_mut_log()
+            .insert(WIRE_BYTES_FIELD, Bytes::from_static(b"two"));
+
+        let extracted = WireToArrowEncoder::try_extract_wire_bytes(&[e1, e2]);
+        assert!(extracted.is_some());
+        let bytes = extracted.unwrap();
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(&bytes[0][..], b"one");
+        assert_eq!(&bytes[1][..], b"two");
+    }
+
+    #[test]
+    fn extract_wire_bytes_missing_field_returns_none() {
+        let mut e1 = Event::from(vector_lib::event::LogEvent::default());
+        e1.as_mut_log()
+            .insert(WIRE_BYTES_FIELD, Bytes::from_static(b"one"));
+        // e2 has no _proto_wire_bytes field.
+        let e2 = Event::from(vector_lib::event::LogEvent::default());
+
+        assert!(WireToArrowEncoder::try_extract_wire_bytes(&[e1, e2]).is_none());
+    }
+
+    #[test]
+    fn extract_wire_bytes_wrong_type_returns_none() {
+        // Vector's `Value` represents plain strings as `Value::Bytes`, so a
+        // string IS a bytes value here — use an integer to get a non-bytes
+        // variant for the negative case.
+        let mut e1 = Event::from(vector_lib::event::LogEvent::default());
+        e1.as_mut_log().insert(WIRE_BYTES_FIELD, 42_i64);
+        assert!(WireToArrowEncoder::try_extract_wire_bytes(&[e1]).is_none());
+    }
+
+    #[test]
+    fn encode_from_extracted_matches_direct_encode() {
+        // End-to-end: build events with wire bytes in the field, extract,
+        // encode, compare against encoding the bytes directly.
+        let desc = scalar_descriptor();
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::LargeUtf8, true),
+            Field::new("id", DataType::Int32, true),
+            Field::new("email", DataType::LargeUtf8, true),
+        ]);
+        let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+        let mut wire_bytes_list = Vec::new();
+        let mut events = Vec::new();
+        for i in 0..5_i32 {
+            let mut msg = DynamicMessage::new(desc.clone());
+            msg.set_field_by_name("name", ProtoValue::String(format!("n-{i}")));
+            msg.set_field_by_name("id", ProtoValue::I32(i));
+            let mut buf = Vec::new();
+            msg.encode(&mut buf).unwrap();
+            let bytes = Bytes::from(buf);
+            wire_bytes_list.push(bytes.clone());
+
+            let mut e = Event::from(vector_lib::event::LogEvent::default());
+            e.as_mut_log().insert(WIRE_BYTES_FIELD, bytes);
+            events.push(e);
+        }
+
+        let extracted = WireToArrowEncoder::try_extract_wire_bytes(&events).unwrap();
+        let via_events = enc.encode_batch(&extracted).unwrap();
+        let via_bytes = enc.encode_batch(&wire_bytes_list).unwrap();
+
+        assert_eq!(via_events.num_rows(), via_bytes.num_rows());
+        assert_eq!(via_events.num_columns(), via_bytes.num_columns());
+        for i in 0..via_events.num_columns() {
+            assert_eq!(via_events.column(i).as_ref(), via_bytes.column(i).as_ref());
+        }
     }
 
     #[test]
