@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
-    LargeBinaryBuilder, LargeStringBuilder, ListArray, MapArray, StructArray, UInt32Builder,
-    UInt64Builder,
+    LargeBinaryBuilder, LargeStringBuilder, ListArray, MapArray, StructArray,
+    TimestampMicrosecondBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use super::errors::{Result, WireToArrowError};
 use super::plan::{MessagePlan, PlanSlot};
@@ -28,6 +28,12 @@ pub enum TypedBuilder {
     Boolean(BooleanBuilder),
     LargeUtf8(LargeStringBuilder),
     LargeBinary(LargeBinaryBuilder),
+    /// `TimestampMicrosecondBuilder` for the `_event_time` coercion and any
+    /// other proto int64 field whose Arrow column is declared as
+    /// `Timestamp(Microsecond, ...)`. The underlying i64 is written as
+    /// microseconds since Unix epoch — we don't transform values, only the
+    /// Arrow column type.
+    TimestampMicros(TimestampMicrosecondBuilder),
 }
 
 impl TypedBuilder {
@@ -51,6 +57,13 @@ impl TypedBuilder {
             DataType::LargeBinary => TypedBuilder::LargeBinary(
                 LargeBinaryBuilder::with_capacity(capacity, capacity * 16),
             ),
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+                let mut builder = TimestampMicrosecondBuilder::with_capacity(capacity);
+                if let Some(tz) = tz {
+                    builder = builder.with_timezone(tz.clone());
+                }
+                TypedBuilder::TimestampMicros(builder)
+            }
             other => panic!("unsupported leaf DataType {other:?} (PoC scope)"),
         }
     }
@@ -66,6 +79,7 @@ impl TypedBuilder {
             TypedBuilder::Boolean(b) => b.append_null(),
             TypedBuilder::LargeUtf8(b) => b.append_null(),
             TypedBuilder::LargeBinary(b) => b.append_null(),
+            TypedBuilder::TimestampMicros(b) => b.append_null(),
         }
     }
 
@@ -80,6 +94,7 @@ impl TypedBuilder {
             TypedBuilder::Boolean(b) => Arc::new(b.finish()),
             TypedBuilder::LargeUtf8(b) => Arc::new(b.finish()),
             TypedBuilder::LargeBinary(b) => Arc::new(b.finish()),
+            TypedBuilder::TimestampMicros(b) => Arc::new(b.finish()),
         }
     }
 }

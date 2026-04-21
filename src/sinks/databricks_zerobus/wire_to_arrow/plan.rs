@@ -111,6 +111,28 @@ impl MessagePlan {
     /// Fields in the Arrow schema must exist (by name) in the proto descriptor.
     /// Proto fields absent from the Arrow schema are treated as unknown and will
     /// be skipped at scan time.
+    ///
+    /// # Self-referential proto types
+    ///
+    /// Proto schemas can reference themselves (e.g. `message Tree { Tree left
+    /// = 1; }`), but Arrow schemas cannot carry a recursive type. Recursion
+    /// in this builder terminates because we only descend into
+    /// `Kind::Message(_)` fields when the Arrow target at that path is also
+    /// a nested type (`Struct` / `List<Struct>` / `Map`). Arrow schemas are
+    /// finite by construction (Unity Catalog schemas, for one, don't produce
+    /// cyclic Arrow types), so each recursion step strictly reduces the
+    /// remaining Arrow depth. Proto self-reference past the depth declared
+    /// in the Arrow schema is treated as an unknown field and skipped at
+    /// scan time.
+    ///
+    /// # Oneof
+    ///
+    /// Proto `oneof` is purely an annotation; on the wire each variant is a
+    /// normal singular field with its own tag, and the receiver takes
+    /// whichever variant appeared last in the bytes. No special handling is
+    /// needed at the plan level — each variant becomes its own `PlanSlot`
+    /// (Scalar / Struct / etc.) and the normal "absent slot => null"
+    /// machinery produces the correct Arrow output.
     pub fn build(descriptor: &MessageDescriptor, fields: &Fields) -> Result<Self> {
         let mut slots = Vec::with_capacity(fields.len());
         let mut max_field_num = 0u32;

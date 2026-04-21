@@ -271,6 +271,13 @@ fn append_scalar(
         (ScalarKind::Int64, TypedBuilder::Int64(b)) => {
             b.append_value(decode_varint(bytes, pos)? as i64)
         }
+        // `int64` -> `Timestamp(Microsecond, _)` coercion. Proto carries the
+        // value as a plain varint; the Arrow column interprets it as
+        // microseconds since Unix epoch. Used primarily for `_event_time` on
+        // LP tables (matching `proto_descriptor_to_arrow_schema`).
+        (ScalarKind::Int64, TypedBuilder::TimestampMicros(b)) => {
+            b.append_value(decode_varint(bytes, pos)? as i64)
+        }
         (ScalarKind::UInt32, TypedBuilder::UInt32(b)) => {
             b.append_value(decode_varint(bytes, pos)? as u32)
         }
@@ -283,6 +290,9 @@ fn append_scalar(
         (ScalarKind::SInt64, TypedBuilder::Int64(b)) => {
             b.append_value(zigzag64(decode_varint(bytes, pos)?))
         }
+        (ScalarKind::SInt64, TypedBuilder::TimestampMicros(b)) => {
+            b.append_value(zigzag64(decode_varint(bytes, pos)?))
+        }
         (ScalarKind::Fixed32, TypedBuilder::UInt32(b)) => b.append_value(read_fixed32(bytes, pos)?),
         (ScalarKind::SFixed32, TypedBuilder::Int32(b)) => {
             b.append_value(read_fixed32(bytes, pos)? as i32)
@@ -292,6 +302,9 @@ fn append_scalar(
         }
         (ScalarKind::Fixed64, TypedBuilder::UInt64(b)) => b.append_value(read_fixed64(bytes, pos)?),
         (ScalarKind::SFixed64, TypedBuilder::Int64(b)) => {
+            b.append_value(read_fixed64(bytes, pos)? as i64)
+        }
+        (ScalarKind::SFixed64, TypedBuilder::TimestampMicros(b)) => {
             b.append_value(read_fixed64(bytes, pos)? as i64)
         }
         (ScalarKind::Double, TypedBuilder::Float64(b)) => {
@@ -332,6 +345,7 @@ mod tests {
     use prost_reflect::prost_types::field_descriptor_proto::{Label, Type as ProtoType};
     use prost_reflect::prost_types::{
         DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        OneofDescriptorProto,
     };
     use prost_reflect::{DescriptorPool, DynamicMessage, Value as ProtoValue};
     use std::path::PathBuf;
@@ -717,6 +731,150 @@ mod tests {
             value >>= 7;
         }
         buf.push(value as u8);
+    }
+
+    /// `message Ts { int64 event_time = 1; }` — for the timestamp coercion test.
+    fn timestamp_descriptor() -> MessageDescriptor {
+        let fd = FileDescriptorProto {
+            name: Some("wire_to_arrow_poc_ts.proto".into()),
+            package: Some("wire_to_arrow_poc_test".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Ts".into()),
+                field: vec![FieldDescriptorProto {
+                    name: Some("event_time".into()),
+                    number: Some(1),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ProtoType::Int64 as i32),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let set = FileDescriptorSet { file: vec![fd] };
+        let mut bytes = Vec::new();
+        set.encode(&mut bytes).unwrap();
+        DescriptorPool::decode(bytes.as_slice())
+            .unwrap()
+            .get_message_by_name("wire_to_arrow_poc_test.Ts")
+            .unwrap()
+    }
+
+    /// `message Choice { oneof x { int32 a = 1; string b = 2; } }`
+    fn oneof_descriptor() -> MessageDescriptor {
+        let fd = FileDescriptorProto {
+            name: Some("wire_to_arrow_poc_oneof.proto".into()),
+            package: Some("wire_to_arrow_poc_test".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Choice".into()),
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("a".into()),
+                        number: Some(1),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::Int32 as i32),
+                        oneof_index: Some(0),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("b".into()),
+                        number: Some(2),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::String as i32),
+                        oneof_index: Some(0),
+                        ..Default::default()
+                    },
+                ],
+                oneof_decl: vec![OneofDescriptorProto {
+                    name: Some("x".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let set = FileDescriptorSet { file: vec![fd] };
+        let mut bytes = Vec::new();
+        set.encode(&mut bytes).unwrap();
+        DescriptorPool::decode(bytes.as_slice())
+            .unwrap()
+            .get_message_by_name("wire_to_arrow_poc_test.Choice")
+            .unwrap()
+    }
+
+    #[test]
+    fn int64_to_timestamp_micros_coercion() {
+        // proto int64 field with the Arrow column declared as Timestamp(Micro, UTC).
+        let desc = timestamp_descriptor();
+        let schema = Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]);
+        let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+        // Two rows, plus one with the field absent (should produce null).
+        let mut row0 = Vec::new();
+        row0.push((1u8 << 3) | 0); // tag 1, varint
+        encode_varint_into(&mut row0, 1_700_000_000_000_000_u64);
+        let mut row1 = Vec::new();
+        row1.push((1u8 << 3) | 0);
+        encode_varint_into(&mut row1, 1_800_000_000_000_000_u64);
+
+        let batch = enc
+            .encode_batch(&[
+                Bytes::from(row0),
+                Bytes::from(row1),
+                Bytes::new(), // absent -> null
+            ])
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 3);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("TimestampMicrosecondArray");
+        assert_eq!(col.value(0), 1_700_000_000_000_000);
+        assert_eq!(col.value(1), 1_800_000_000_000_000);
+        assert!(col.is_null(2));
+    }
+
+    #[test]
+    fn oneof_variants_map_to_separate_columns() {
+        // With the wire-format identity (oneof variants look like regular
+        // singular fields), the encoder should populate whichever variant
+        // appears in the bytes and leave the others null.
+        let desc = oneof_descriptor();
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::LargeUtf8, true),
+        ]);
+        let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+        // Row 0: only `a = 42`.
+        let mut row0 = Vec::new();
+        row0.push((1u8 << 3) | 0); // field 1, varint
+        encode_varint_into(&mut row0, 42);
+
+        // Row 1: only `b = "hello"`.
+        let mut row1 = Vec::new();
+        row1.push((2u8 << 3) | 2); // field 2, length-delimited
+        encode_varint_into(&mut row1, 5);
+        row1.extend_from_slice(b"hello");
+
+        let batch = enc
+            .encode_batch(&[Bytes::from(row0), Bytes::from(row1)])
+            .unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let a = batch.column(0).as_primitive::<arrow::datatypes::Int32Type>();
+        assert_eq!(a.value(0), 42);
+        assert!(a.is_null(1));
+
+        let b = batch.column(1).as_string::<i64>();
+        assert!(batch.column(1).is_null(0));
+        assert_eq!(b.value(1), "hello");
     }
 
     #[test]
