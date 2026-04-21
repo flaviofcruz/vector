@@ -82,6 +82,14 @@ pub enum PlanSlot {
     Scalar(ScalarKind),
     Struct(Arc<MessagePlan>),
     RepeatedMessage(Arc<MessagePlan>),
+    /// Repeated scalar field (e.g. `repeated int32`) -> Arrow `List<primitive>`.
+    /// Handles both packed and unpacked wire encodings at scan time.
+    RepeatedScalar(ScalarKind),
+    /// Proto `map<K, V>` -> Arrow `Map<Struct(key, value)>`. On the wire, maps
+    /// are encoded as `repeated MapEntry` where `MapEntry` is a generated
+    /// message with field 1 = key and field 2 = value; we scan them the same
+    /// way as `RepeatedMessage` and assemble a `MapArray` at finish time.
+    Map(Arc<MessagePlan>),
 }
 
 /// Plan for encoding one proto message type into a set of Arrow column builders.
@@ -120,43 +128,93 @@ impl MessagePlan {
             let is_repeated = proto_field.cardinality() == Cardinality::Repeated;
             let kind = proto_field.kind();
 
-            let slot = match (&kind, arrow_field.data_type(), is_repeated) {
-                // Singular scalar.
-                (_, dt, false) if !matches!(dt, DataType::Struct(_) | DataType::List(_)) => {
-                    let sk = ScalarKind::from_proto_kind(&kind).ok_or_else(|| {
-                        WireToArrowError::UnsupportedKind {
+            // Maps take precedence: proto map fields have `is_map() == true` and
+            // cardinality Repeated, but we dispatch differently from a bare
+            // repeated-message field.
+            let slot = if proto_field.is_map() {
+                let entry_desc = match &kind {
+                    Kind::Message(m) => m,
+                    _ => {
+                        return Err(WireToArrowError::UnsupportedCombination {
                             name: arrow_field.name().to_string(),
                             kind: format!("{kind:?}"),
-                        }
-                    })?;
-                    PlanSlot::Scalar(sk)
-                }
-                // Singular nested message.
-                (Kind::Message(inner_desc), DataType::Struct(inner_fields), false) => {
-                    let sub = MessagePlan::build(inner_desc, inner_fields)?;
-                    PlanSlot::Struct(Arc::new(sub))
-                }
-                // Repeated nested message -> Arrow List<Struct>.
-                (Kind::Message(inner_desc), DataType::List(element_field), true) => {
-                    let inner_fields = match element_field.data_type() {
+                            arrow_type: format!("{:?}", arrow_field.data_type()),
+                            repeated: is_repeated,
+                        });
+                    }
+                };
+                let entry_fields = match arrow_field.data_type() {
+                    DataType::Map(entry_field, _keys_sorted) => match entry_field.data_type() {
                         DataType::Struct(fs) => fs,
                         other => {
-                            return Err(WireToArrowError::RepeatedNonStructList {
+                            return Err(WireToArrowError::UnsupportedCombination {
                                 name: arrow_field.name().to_string(),
-                                element: format!("{other:?}"),
+                                kind: format!("{kind:?}"),
+                                arrow_type: format!("Map(entry_type = {other:?})"),
+                                repeated: is_repeated,
                             });
                         }
-                    };
-                    let sub = MessagePlan::build(inner_desc, inner_fields)?;
-                    PlanSlot::RepeatedMessage(Arc::new(sub))
-                }
-                (k, dt, r) => {
-                    return Err(WireToArrowError::UnsupportedCombination {
-                        name: arrow_field.name().to_string(),
-                        kind: format!("{k:?}"),
-                        arrow_type: format!("{dt:?}"),
-                        repeated: r,
-                    });
+                    },
+                    other => {
+                        return Err(WireToArrowError::UnsupportedCombination {
+                            name: arrow_field.name().to_string(),
+                            kind: format!("{kind:?}"),
+                            arrow_type: format!("{other:?}"),
+                            repeated: is_repeated,
+                        });
+                    }
+                };
+                let sub = MessagePlan::build(entry_desc, entry_fields)?;
+                PlanSlot::Map(Arc::new(sub))
+            } else {
+                match (&kind, arrow_field.data_type(), is_repeated) {
+                    // Singular scalar.
+                    (_, dt, false) if !matches!(dt, DataType::Struct(_) | DataType::List(_)) => {
+                        let sk = ScalarKind::from_proto_kind(&kind).ok_or_else(|| {
+                            WireToArrowError::UnsupportedKind {
+                                name: arrow_field.name().to_string(),
+                                kind: format!("{kind:?}"),
+                            }
+                        })?;
+                        PlanSlot::Scalar(sk)
+                    }
+                    // Singular nested message.
+                    (Kind::Message(inner_desc), DataType::Struct(inner_fields), false) => {
+                        let sub = MessagePlan::build(inner_desc, inner_fields)?;
+                        PlanSlot::Struct(Arc::new(sub))
+                    }
+                    // Repeated nested message -> Arrow List<Struct>.
+                    (Kind::Message(inner_desc), DataType::List(element_field), true) => {
+                        let inner_fields = match element_field.data_type() {
+                            DataType::Struct(fs) => fs,
+                            other => {
+                                return Err(WireToArrowError::RepeatedNonStructList {
+                                    name: arrow_field.name().to_string(),
+                                    element: format!("{other:?}"),
+                                });
+                            }
+                        };
+                        let sub = MessagePlan::build(inner_desc, inner_fields)?;
+                        PlanSlot::RepeatedMessage(Arc::new(sub))
+                    }
+                    // Repeated scalar -> Arrow List<primitive>.
+                    (_, DataType::List(_), true) => {
+                        let sk = ScalarKind::from_proto_kind(&kind).ok_or_else(|| {
+                            WireToArrowError::UnsupportedKind {
+                                name: arrow_field.name().to_string(),
+                                kind: format!("{kind:?}"),
+                            }
+                        })?;
+                        PlanSlot::RepeatedScalar(sk)
+                    }
+                    (k, dt, r) => {
+                        return Err(WireToArrowError::UnsupportedCombination {
+                            name: arrow_field.name().to_string(),
+                            kind: format!("{k:?}"),
+                            arrow_type: format!("{dt:?}"),
+                            repeated: r,
+                        });
+                    }
                 }
             };
             slots.push(slot);

@@ -183,6 +183,14 @@ fn scan_message(
                     current_offset,
                     ..
                 },
+            )
+            | (
+                PlanSlot::Map(sub_plan),
+                builders::BuilderNode::Map {
+                    children,
+                    current_offset,
+                    ..
+                },
             ) => {
                 if wire_type != 2 {
                     return Err(WireToArrowError::WireTypeMismatch {
@@ -200,6 +208,47 @@ fn scan_message(
                 scan_message(sub_plan, sub_bytes, children, &mut sub_present)?;
                 children.finalize_row(sub_plan, &sub_present);
                 *current_offset += 1;
+                present[slot_idx] = true;
+            }
+            (
+                PlanSlot::RepeatedScalar(sk),
+                builders::BuilderNode::RepeatedScalar {
+                    values,
+                    current_offset,
+                    ..
+                },
+            ) => {
+                // Two wire encodings are possible for repeated scalars:
+                //
+                // * Unpacked — wire_type matches the scalar's native type, one
+                //   value per tag occurrence. Always used for strings/bytes
+                //   (whose native wire type is already 2), optional for others.
+                // * Packed   — wire_type 2 with a length-delimited blob holding
+                //   a run of concatenated scalar values of the same kind. Only
+                //   valid for scalars whose native wire type is 0/1/5.
+                let native_wt = sk.wire_type();
+                if wire_type == native_wt {
+                    append_scalar(*sk, bytes, &mut pos, values)?;
+                    *current_offset += 1;
+                } else if wire_type == 2 && native_wt != 2 {
+                    let len = decode_varint(bytes, &mut pos)? as usize;
+                    if pos + len > bytes.len() {
+                        return Err(WireToArrowError::UnexpectedEof);
+                    }
+                    let end = pos + len;
+                    while pos < end {
+                        append_scalar(*sk, bytes, &mut pos, values)?;
+                        *current_offset += 1;
+                    }
+                    if pos != end {
+                        return Err(WireToArrowError::UnexpectedEof);
+                    }
+                } else {
+                    return Err(WireToArrowError::WireTypeMismatch {
+                        expected: native_wt,
+                        actual: wire_type,
+                    });
+                }
                 present[slot_idx] = true;
             }
             _ => return Err(WireToArrowError::PlanBuilderMismatch),
@@ -278,10 +327,15 @@ fn append_scalar(
 mod tests {
     use super::*;
     use arrow::array::{Array, AsArray};
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::{DataType, Field, Fields as ArrowFields};
     use prost_reflect::prost::Message as _;
+    use prost_reflect::prost_types::field_descriptor_proto::{Label, Type as ProtoType};
+    use prost_reflect::prost_types::{
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+    };
     use prost_reflect::{DescriptorPool, DynamicMessage, Value as ProtoValue};
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn descriptor_pool(file: &str) -> DescriptorPool {
         let desc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -294,6 +348,41 @@ mod tests {
     fn scalar_descriptor() -> MessageDescriptor {
         descriptor_pool("test_protobuf.desc")
             .get_message_by_name("test_protobuf.Person")
+            .unwrap()
+    }
+
+    fn rich_descriptor() -> MessageDescriptor {
+        descriptor_pool("test_protobuf3.desc")
+            .get_message_by_name("test_protobuf3.Person")
+            .unwrap()
+    }
+
+    /// Build an ad-hoc `message Bag { repeated int32 numbers = 1; }` descriptor
+    /// programmatically, since none of the checked-in test protos have a bare
+    /// repeated scalar field.
+    fn repeated_int32_descriptor() -> MessageDescriptor {
+        let fd = FileDescriptorProto {
+            name: Some("wire_to_arrow_poc_test.proto".into()),
+            package: Some("wire_to_arrow_poc_test".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Bag".into()),
+                field: vec![FieldDescriptorProto {
+                    name: Some("numbers".into()),
+                    number: Some(1),
+                    label: Some(Label::Repeated as i32),
+                    r#type: Some(ProtoType::Int32 as i32),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let set = FileDescriptorSet { file: vec![fd] };
+        let mut bytes = Vec::new();
+        set.encode(&mut bytes).unwrap();
+        DescriptorPool::decode(bytes.as_slice())
+            .unwrap()
+            .get_message_by_name("wire_to_arrow_poc_test.Bag")
             .unwrap()
     }
 
@@ -467,6 +556,167 @@ mod tests {
         for i in 0..via_events.num_columns() {
             assert_eq!(via_events.column(i).as_ref(), via_bytes.column(i).as_ref());
         }
+    }
+
+    #[test]
+    fn repeated_scalar_unpacked_roundtrip() {
+        // Unpacked: emit each element with its own tag. For proto3, this is
+        // the default for non-packed repeated scalars when the writer chooses
+        // not to pack (which can happen for proto2 as well).
+        let desc = repeated_int32_descriptor();
+        let schema = Schema::new(vec![Field::new(
+            "numbers",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]);
+        let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+        // Hand-craft wire bytes for two rows:
+        //   row 0: numbers = [1, 2, 3] (unpacked: 3 tag+value pairs)
+        //   row 1: numbers = [42]      (single tag+value)
+        let tag = (1u8 << 3) | 0; // field 1, wire type 0 (varint)
+        let mut row0 = Vec::new();
+        for v in [1i32, 2, 3] {
+            row0.push(tag);
+            encode_varint_into(&mut row0, v as u64);
+        }
+        let mut row1 = Vec::new();
+        row1.push(tag);
+        encode_varint_into(&mut row1, 42);
+
+        let batch = enc
+            .encode_batch(&[Bytes::from(row0), Bytes::from(row1)])
+            .unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let list = batch.column(0).as_list::<i32>();
+        assert_eq!(list.value_length(0), 3);
+        assert_eq!(list.value_length(1), 1);
+        let values = list
+            .values()
+            .as_primitive::<arrow::datatypes::Int32Type>();
+        assert_eq!(values.len(), 4);
+        assert_eq!(values.value(0), 1);
+        assert_eq!(values.value(1), 2);
+        assert_eq!(values.value(2), 3);
+        assert_eq!(values.value(3), 42);
+    }
+
+    #[test]
+    fn repeated_scalar_packed_roundtrip() {
+        // Packed: one length-delimited blob with concatenated varints. proto3
+        // repeated scalars default to this encoding.
+        let desc = repeated_int32_descriptor();
+        let schema = Schema::new(vec![Field::new(
+            "numbers",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]);
+        let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+        // Tag for field 1 with wire_type 2 (length-delimited).
+        let tag = (1u8 << 3) | 2;
+        let mut payload = Vec::new();
+        for v in [10i32, 20, 30, 40] {
+            encode_varint_into(&mut payload, v as u64);
+        }
+        let mut row = Vec::new();
+        row.push(tag);
+        encode_varint_into(&mut row, payload.len() as u64);
+        row.extend_from_slice(&payload);
+
+        let batch = enc.encode_batch(&[Bytes::from(row)]).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let list = batch.column(0).as_list::<i32>();
+        assert_eq!(list.value_length(0), 4);
+        let values = list
+            .values()
+            .as_primitive::<arrow::datatypes::Int32Type>();
+        assert_eq!(
+            (0..4).map(|i| values.value(i)).collect::<Vec<_>>(),
+            vec![10, 20, 30, 40]
+        );
+    }
+
+    #[test]
+    fn repeated_scalar_empty_row_produces_empty_list() {
+        // A row with no tag occurrences produces an empty list, not null.
+        let desc = repeated_int32_descriptor();
+        let schema = Schema::new(vec![Field::new(
+            "numbers",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]);
+        let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+        let batch = enc.encode_batch(&[Bytes::new()]).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let list = batch.column(0).as_list::<i32>();
+        assert_eq!(list.value_length(0), 0);
+        assert!(!list.is_null(0), "list column itself should never be null");
+    }
+
+    #[test]
+    fn map_roundtrip() {
+        // Proto: test_protobuf3.Person.data = map<string, PhoneType>
+        // where PhoneType is an enum (int32-encoded on the wire).
+        //
+        // Arrow side: Map<Struct(key: LargeUtf8, value: Int32)> with entry
+        // field named "key_value" per the sink's existing convention.
+        let desc = rich_descriptor();
+        let entry_fields = ArrowFields::from(vec![
+            Field::new("key", DataType::LargeUtf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]);
+        let entry_field = Arc::new(Field::new("key_value", DataType::Struct(entry_fields), false));
+        let schema = Schema::new(vec![Field::new(
+            "data",
+            DataType::Map(entry_field, false),
+            true,
+        )]);
+        let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+        // Populate a row with 2 map entries.
+        let mut msg = DynamicMessage::new(desc.clone());
+        let mut entries: std::collections::HashMap<prost_reflect::MapKey, ProtoValue> =
+            std::collections::HashMap::new();
+        entries.insert(
+            prost_reflect::MapKey::String("alpha".into()),
+            ProtoValue::EnumNumber(1),
+        );
+        entries.insert(
+            prost_reflect::MapKey::String("beta".into()),
+            ProtoValue::EnumNumber(2),
+        );
+        msg.set_field_by_name("data", ProtoValue::Map(entries));
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+
+        let batch = enc.encode_batch(&[Bytes::from(buf)]).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let map = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::MapArray>()
+            .expect("column should be MapArray");
+        assert_eq!(map.value_length(0), 2, "expected 2 map entries");
+        let keys = map.keys().as_string::<i64>();
+        let values = map
+            .values()
+            .as_primitive::<arrow::datatypes::Int32Type>();
+        // Map entry iteration order is not guaranteed — collect then compare.
+        let pairs: std::collections::HashMap<String, i32> = (0..2)
+            .map(|i| (keys.value(i).to_string(), values.value(i)))
+            .collect();
+        assert_eq!(pairs.get("alpha").copied(), Some(1));
+        assert_eq!(pairs.get("beta").copied(), Some(2));
+    }
+
+    fn encode_varint_into(buf: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            buf.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        buf.push(value as u8);
     }
 
     #[test]

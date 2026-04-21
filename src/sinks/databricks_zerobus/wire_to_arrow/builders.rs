@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
-    LargeBinaryBuilder, LargeStringBuilder, ListArray, StructArray, UInt32Builder, UInt64Builder,
+    LargeBinaryBuilder, LargeStringBuilder, ListArray, MapArray, StructArray, UInt32Builder,
+    UInt64Builder,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field};
@@ -104,6 +105,23 @@ pub enum BuilderNode {
         offsets: Vec<i32>,
         current_offset: i32,
     },
+    /// Repeated scalar -> Arrow `List<primitive>`. Same offset+current_offset
+    /// bookkeeping as `RepeatedMessage`, but the child is a single typed
+    /// primitive builder rather than a tree.
+    RepeatedScalar {
+        values: TypedBuilder,
+        offsets: Vec<i32>,
+        current_offset: i32,
+    },
+    /// Proto map -> Arrow `Map<Struct(key, value)>`. Wire-level handling is
+    /// identical to `RepeatedMessage` (proto maps are `repeated MapEntry`),
+    /// but the finish step assembles a `MapArray` with `key_value` entry name
+    /// matching the zerobus sink's existing convention.
+    Map {
+        children: BuilderNodeList,
+        offsets: Vec<i32>,
+        current_offset: i32,
+    },
 }
 
 impl BuilderNodeList {
@@ -124,6 +142,30 @@ impl BuilderNodeList {
                     offsets.push(0);
                     BuilderNode::RepeatedMessage {
                         // List lengths tend to be small; 2x rows is a rough guess.
+                        children: BuilderNodeList::with_capacity(sub_plan, capacity * 2),
+                        offsets,
+                        current_offset: 0,
+                    }
+                }
+                PlanSlot::RepeatedScalar(_) => {
+                    let element_type = match field.data_type() {
+                        DataType::List(element_field) => element_field.data_type(),
+                        other => {
+                            panic!("RepeatedScalar slot requires List Arrow type, got {other:?}")
+                        }
+                    };
+                    let mut offsets = Vec::with_capacity(capacity + 1);
+                    offsets.push(0);
+                    BuilderNode::RepeatedScalar {
+                        values: TypedBuilder::new(element_type, capacity * 2),
+                        offsets,
+                        current_offset: 0,
+                    }
+                }
+                PlanSlot::Map(sub_plan) => {
+                    let mut offsets = Vec::with_capacity(capacity + 1);
+                    offsets.push(0);
+                    BuilderNode::Map {
                         children: BuilderNodeList::with_capacity(sub_plan, capacity * 2),
                         offsets,
                         current_offset: 0,
@@ -159,7 +201,20 @@ impl BuilderNodeList {
                         children.fill_null_row();
                     }
                 }
+                // All list-flavored slots push an offsets marker per row.
+                // For proto repeated fields (including maps), the outer list
+                // itself is never null — absent just means empty list.
                 (_, BuilderNode::RepeatedMessage {
+                    offsets,
+                    current_offset,
+                    ..
+                })
+                | (_, BuilderNode::RepeatedScalar {
+                    offsets,
+                    current_offset,
+                    ..
+                })
+                | (_, BuilderNode::Map {
                     offsets,
                     current_offset,
                     ..
@@ -185,6 +240,16 @@ impl BuilderNodeList {
                     offsets,
                     current_offset,
                     ..
+                }
+                | BuilderNode::RepeatedScalar {
+                    offsets,
+                    current_offset,
+                    ..
+                }
+                | BuilderNode::Map {
+                    offsets,
+                    current_offset,
+                    ..
                 } => {
                     offsets.push(*current_offset);
                 }
@@ -195,7 +260,13 @@ impl BuilderNodeList {
     /// Finalize this level and return the resulting Arrow arrays in schema order.
     pub fn finish(&mut self, plan: &MessagePlan) -> Result<Vec<ArrayRef>> {
         let mut out: Vec<ArrayRef> = Vec::with_capacity(plan.slots.len());
-        for (slot, node) in plan.slots.iter().zip(self.nodes.iter_mut()) {
+        for (idx, (slot, node)) in plan
+            .slots
+            .iter()
+            .zip(self.nodes.iter_mut())
+            .enumerate()
+        {
+            let arrow_field = &plan.arrow_fields[idx];
             let arr: ArrayRef = match (slot, node) {
                 (PlanSlot::Scalar(_), BuilderNode::Scalar(tb)) => tb.finish(),
                 (PlanSlot::Struct(sub_plan), BuilderNode::Struct { children, validity }) => {
@@ -245,6 +316,76 @@ impl BuilderNodeList {
                         )
                         .map_err(|e| WireToArrowError::ArrayAssembly {
                             kind: "list",
+                            source: e,
+                        })?,
+                    )
+                }
+                (
+                    PlanSlot::RepeatedScalar(_),
+                    BuilderNode::RepeatedScalar {
+                        values, offsets, ..
+                    },
+                ) => {
+                    let values_array = values.finish();
+                    let offset_buffer =
+                        OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
+                    // Preserve the element field the schema declared (name
+                    // typically "item", but follow the caller's choice).
+                    let element_field = match arrow_field.data_type() {
+                        DataType::List(f) => Arc::clone(f),
+                        other => {
+                            return Err(WireToArrowError::UnsupportedCombination {
+                                name: arrow_field.name().to_string(),
+                                kind: "RepeatedScalar".to_string(),
+                                arrow_type: format!("{other:?}"),
+                                repeated: true,
+                            });
+                        }
+                    };
+                    Arc::new(
+                        ListArray::try_new(element_field, offset_buffer, values_array, None)
+                            .map_err(|e| WireToArrowError::ArrayAssembly {
+                                kind: "list (scalar)",
+                                source: e,
+                            })?,
+                    )
+                }
+                (
+                    PlanSlot::Map(sub_plan),
+                    BuilderNode::Map {
+                        children, offsets, ..
+                    },
+                ) => {
+                    let child_arrays = children.finish(sub_plan)?;
+                    let struct_arr = StructArray::try_new(
+                        sub_plan.arrow_fields.clone(),
+                        child_arrays,
+                        None,
+                    )
+                    .map_err(|e| WireToArrowError::ArrayAssembly {
+                        kind: "map entry struct",
+                        source: e,
+                    })?;
+                    let offset_buffer =
+                        OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
+                    // Match zerobus's `proto_descriptor_to_arrow_schema` convention:
+                    // entry field is named "key_value" and carries the sub-plan's
+                    // struct fields (key at position 0, value at position 1).
+                    let entry_field = Arc::new(Field::new(
+                        "key_value",
+                        DataType::Struct(sub_plan.arrow_fields.clone()),
+                        false,
+                    ));
+                    Arc::new(
+                        MapArray::try_new(
+                            entry_field,
+                            offset_buffer,
+                            struct_arr,
+                            None,
+                            false,
+                        )
+                        .map_err(|e| WireToArrowError::ArrayAssembly {
+                            kind: "map",
                             source: e,
                         })?,
                     )
