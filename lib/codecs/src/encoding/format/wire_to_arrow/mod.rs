@@ -27,7 +27,6 @@
 mod builders;
 mod errors;
 mod plan;
-mod scan;
 
 use std::sync::Arc;
 
@@ -49,7 +48,6 @@ use zeroparser::wire::{WireValue, decode_zigzag32, decode_zigzag64, try_parse_fi
 use builders::{BuilderNodeList, TypedBuilder};
 use errors::Result;
 use plan::{MessagePlan, PlanSlot, ScalarKind};
-use scan::{decode_varint, map_parse_error, read_fixed32, read_fixed64};
 
 /// Configuration for the wire-to-Arrow batch serializer.
 ///
@@ -208,7 +206,7 @@ fn scan_message(
     present: &mut [bool],
 ) -> Result<()> {
     while !bytes.is_empty() {
-        let (field, rest) = try_parse_field(bytes).map_err(map_parse_error)?;
+        let (field, rest) = try_parse_field(bytes)?;
         bytes = rest;
         let field_number = field.field_num as usize;
 
@@ -436,6 +434,58 @@ fn read_packed_element<'a>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tagless readers for the packed-scalar inner loop.
+//
+// The outer scan uses `try_parse_field`, which expects tag-prefixed fields.
+// Packed repeated scalars live inside a single `WireValue::Len(inner)` blob
+// whose contents are raw values with no tags. Proto-parser doesn't expose
+// tagless readers, so we keep these here until a follow-up integration
+// removes the packed inner loop entirely.
+// ---------------------------------------------------------------------------
+
+/// Read a single varint and advance `pos`. Caps at 10 bytes per proto spec.
+#[inline]
+fn decode_varint(bytes: &[u8], pos: &mut usize) -> Result<u64> {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    for _ in 0..10 {
+        if *pos >= bytes.len() {
+            return Err(WireToArrowError::UnexpectedEof);
+        }
+        let b = bytes[*pos];
+        *pos += 1;
+        value |= u64::from(b & 0x7f) << shift;
+        if b < 0x80 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+    Err(WireToArrowError::VarintOverflow)
+}
+
+/// Read 8 little-endian bytes and advance `pos`.
+#[inline]
+fn read_fixed64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
+    if *pos + 8 > bytes.len() {
+        return Err(WireToArrowError::UnexpectedEof);
+    }
+    let v = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+    *pos += 8;
+    Ok(v)
+}
+
+/// Read 4 little-endian bytes and advance `pos`.
+#[inline]
+fn read_fixed32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
+    if *pos + 4 > bytes.len() {
+        return Err(WireToArrowError::UnexpectedEof);
+    }
+    let v = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
+    *pos += 4;
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +500,62 @@ mod tests {
     use prost_reflect::{DescriptorPool, DynamicMessage, Value as ProtoValue};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn encode_varint_for_test(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+        out
+    }
+
+    #[test]
+    fn packed_readers_decode_varint_roundtrip() {
+        for v in [0u64, 1, 127, 128, 255, 16384, u32::MAX as u64, u64::MAX] {
+            let encoded = encode_varint_for_test(v);
+            let mut pos = 0;
+            let decoded = decode_varint(&encoded, &mut pos).unwrap();
+            assert_eq!(v, decoded, "mismatch on {v}");
+            assert_eq!(pos, encoded.len(), "position not advanced");
+        }
+    }
+
+    #[test]
+    fn packed_readers_decode_varint_eof() {
+        let mut pos = 0;
+        assert!(matches!(
+            decode_varint(&[0x80u8], &mut pos),
+            Err(WireToArrowError::UnexpectedEof)
+        ));
+    }
+
+    #[test]
+    fn packed_readers_decode_varint_overflow() {
+        let mut pos = 0;
+        assert!(matches!(
+            decode_varint(&[0xffu8; 11], &mut pos),
+            Err(WireToArrowError::VarintOverflow)
+        ));
+    }
+
+    #[test]
+    fn packed_readers_fixed32_roundtrip() {
+        let bytes = 0x12345678u32.to_le_bytes();
+        let mut pos = 0;
+        assert_eq!(read_fixed32(&bytes, &mut pos).unwrap(), 0x12345678u32);
+        assert_eq!(pos, 4);
+    }
+
+    #[test]
+    fn packed_readers_fixed64_roundtrip() {
+        let v: u64 = 0x0011_2233_4455_6677;
+        let bytes = v.to_le_bytes();
+        let mut pos = 0;
+        assert_eq!(read_fixed64(&bytes, &mut pos).unwrap(), v);
+        assert_eq!(pos, 8);
+    }
 
     fn descriptor_pool(file: &str) -> DescriptorPool {
         let desc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

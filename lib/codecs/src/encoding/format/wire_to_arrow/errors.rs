@@ -134,9 +134,27 @@ pub enum WireToArrowError {
 /// Result alias for wire-to-Arrow encoder operations.
 pub type Result<T> = std::result::Result<T, WireToArrowError>;
 
+impl From<zeroparser::ParseError> for WireToArrowError {
+    /// Collapse most `zeroparser::ParseError`s onto this crate's pre-existing
+    /// variants; the long tail falls through into [`WireToArrowError::ProtoParser`].
+    fn from(err: zeroparser::ParseError) -> Self {
+        use zeroparser::ParseError;
+        match err {
+            ParseError::TruncatedVarint | ParseError::BufferTooShort { .. } => {
+                WireToArrowError::UnexpectedEof
+            }
+            ParseError::VarintTooLong => WireToArrowError::VarintOverflow,
+            ParseError::InvalidWireType(wt) => WireToArrowError::InvalidWireType { wire_type: wt },
+            ParseError::InvalidUtf8 { .. } => WireToArrowError::InvalidUtf8,
+            _ => WireToArrowError::ProtoParser { source: err },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroparser::ParseError;
 
     #[test]
     fn error_display_is_informative() {
@@ -155,5 +173,21 @@ mod tests {
         };
         let msg = format!("{e}");
         assert!(msg.contains("2") && msg.contains("0"), "got: {msg}");
+    }
+
+    #[test]
+    fn from_parse_error_truncated_varint() {
+        assert!(matches!(
+            WireToArrowError::from(ParseError::TruncatedVarint),
+            WireToArrowError::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn from_parse_error_invalid_wire_type() {
+        assert!(matches!(
+            WireToArrowError::from(ParseError::InvalidWireType(7)),
+            WireToArrowError::InvalidWireType { wire_type: 7 }
+        ));
     }
 }
