@@ -44,10 +44,12 @@ use vector_core::{
 
 pub use errors::WireToArrowError;
 
+use zeroparser::wire::{WireValue, decode_zigzag32, decode_zigzag64, try_parse_field};
+
 use builders::{BuilderNodeList, TypedBuilder};
 use errors::Result;
 use plan::{MessagePlan, PlanSlot, ScalarKind};
-use scan::{decode_varint, read_fixed32, read_fixed64, skip_field, zigzag32, zigzag64};
+use scan::{decode_varint, map_parse_error, read_fixed32, read_fixed64};
 
 /// Configuration for the wire-to-Arrow batch serializer.
 ///
@@ -201,52 +203,31 @@ impl WireToArrowEncoder {
 /// message.
 fn scan_message(
     plan: &MessagePlan,
-    bytes: &[u8],
+    mut bytes: &[u8],
     builders: &mut BuilderNodeList,
     present: &mut [bool],
 ) -> Result<()> {
-    let mut pos = 0usize;
-    while pos < bytes.len() {
-        let tag = decode_varint(bytes, &mut pos)?;
-        let field_number = (tag >> 3) as usize;
-        let wire_type = (tag & 0x7) as u8;
+    while !bytes.is_empty() {
+        let (field, rest) = try_parse_field(bytes).map_err(map_parse_error)?;
+        bytes = rest;
+        let field_number = field.field_num as usize;
 
-        let slot_idx = plan.slot_by_proto_field.get(field_number).and_then(|s| *s);
-        let slot_idx = match slot_idx {
-            None => {
-                skip_field(wire_type, bytes, &mut pos)?;
-                continue;
-            }
-            Some(idx) => idx as usize,
+        let Some(Some(slot_idx)) = plan.slot_by_proto_field.get(field_number).copied() else {
+            // Unknown field — `try_parse_field` already consumed it.
+            continue;
         };
+        let slot_idx = slot_idx as usize;
 
         let slot = &plan.slots[slot_idx];
         let node = &mut builders.nodes[slot_idx];
 
         match (slot, node) {
             (PlanSlot::Scalar(sk), builders::BuilderNode::Scalar(tb)) => {
-                if wire_type != sk.wire_type() {
-                    return Err(WireToArrowError::WireTypeMismatch {
-                        expected: sk.wire_type(),
-                        actual: wire_type,
-                    });
-                }
-                append_scalar(*sk, bytes, &mut pos, tb)?;
+                append_scalar_from_wire(*sk, &field.value, tb)?;
                 present[slot_idx] = true;
             }
             (PlanSlot::Struct(sub_plan), builders::BuilderNode::Struct { children, .. }) => {
-                if wire_type != 2 {
-                    return Err(WireToArrowError::WireTypeMismatch {
-                        expected: 2,
-                        actual: wire_type,
-                    });
-                }
-                let len = decode_varint(bytes, &mut pos)? as usize;
-                if pos + len > bytes.len() {
-                    return Err(WireToArrowError::UnexpectedEof);
-                }
-                let sub_bytes = &bytes[pos..pos + len];
-                pos += len;
+                let sub_bytes = expect_len(&field.value)?;
                 let mut sub_present = vec![false; sub_plan.slots.len()];
                 scan_message(sub_plan, sub_bytes, children, &mut sub_present)?;
                 children.finalize_row(sub_plan, &sub_present);
@@ -268,18 +249,7 @@ fn scan_message(
                     ..
                 },
             ) => {
-                if wire_type != 2 {
-                    return Err(WireToArrowError::WireTypeMismatch {
-                        expected: 2,
-                        actual: wire_type,
-                    });
-                }
-                let len = decode_varint(bytes, &mut pos)? as usize;
-                if pos + len > bytes.len() {
-                    return Err(WireToArrowError::UnexpectedEof);
-                }
-                let sub_bytes = &bytes[pos..pos + len];
-                pos += len;
+                let sub_bytes = expect_len(&field.value)?;
                 let mut sub_present = vec![false; sub_plan.slots.len()];
                 scan_message(sub_plan, sub_bytes, children, &mut sub_present)?;
                 children.finalize_row(sub_plan, &sub_present);
@@ -294,37 +264,7 @@ fn scan_message(
                     ..
                 },
             ) => {
-                // Two wire encodings are possible for repeated scalars:
-                //
-                // * Unpacked — wire_type matches the scalar's native type, one
-                //   value per tag occurrence. Always used for strings/bytes
-                //   (whose native wire type is already 2), optional for others.
-                // * Packed   — wire_type 2 with a length-delimited blob holding
-                //   a run of concatenated scalar values of the same kind. Only
-                //   valid for scalars whose native wire type is 0/1/5.
-                let native_wt = sk.wire_type();
-                if wire_type == native_wt {
-                    append_scalar(*sk, bytes, &mut pos, values)?;
-                    *current_offset += 1;
-                } else if wire_type == 2 && native_wt != 2 {
-                    let len = decode_varint(bytes, &mut pos)? as usize;
-                    if pos + len > bytes.len() {
-                        return Err(WireToArrowError::UnexpectedEof);
-                    }
-                    let end = pos + len;
-                    while pos < end {
-                        append_scalar(*sk, bytes, &mut pos, values)?;
-                        *current_offset += 1;
-                    }
-                    if pos != end {
-                        return Err(WireToArrowError::UnexpectedEof);
-                    }
-                } else {
-                    return Err(WireToArrowError::WireTypeMismatch {
-                        expected: native_wt,
-                        actual: wire_type,
-                    });
-                }
+                append_repeated_scalar(*sk, &field.value, values, current_offset)?;
                 present[slot_idx] = true;
             }
             _ => return Err(WireToArrowError::PlanBuilderMismatch),
@@ -333,83 +273,167 @@ fn scan_message(
     Ok(())
 }
 
-/// Append one scalar value from `bytes` (starting at `pos`) into `tb`.
-fn append_scalar(
+/// Extract the inner bytes from a length-delimited `WireValue`, or error.
+#[inline]
+fn expect_len<'a>(wv: &'a WireValue<'a>) -> Result<&'a [u8]> {
+    match wv {
+        WireValue::Len(b) => Ok(b),
+        other => Err(WireToArrowError::WireTypeMismatch {
+            expected: 2,
+            actual: wire_type_byte(other),
+        }),
+    }
+}
+
+/// Proto wire type numeric code for a `WireValue`. Used for error reporting.
+#[inline]
+fn wire_type_byte(wv: &WireValue) -> u8 {
+    match wv {
+        WireValue::Varint(_) => 0,
+        WireValue::I64(_) => 1,
+        WireValue::Len(_) => 2,
+        WireValue::I32(_) => 5,
+    }
+}
+
+/// Append one scalar `WireValue` into the matching typed Arrow builder.
+fn append_scalar_from_wire(
     kind: ScalarKind,
-    bytes: &[u8],
-    pos: &mut usize,
+    wv: &WireValue,
     tb: &mut TypedBuilder,
 ) -> Result<()> {
-    match (kind, tb) {
-        (ScalarKind::Int32, TypedBuilder::Int32(b)) => {
-            b.append_value(decode_varint(bytes, pos)? as i32)
+    match (kind, tb, wv) {
+        (ScalarKind::Int32, TypedBuilder::Int32(b), WireValue::Varint(v)) => {
+            b.append_value(*v as i32);
         }
-        (ScalarKind::Int64, TypedBuilder::Int64(b)) => {
-            b.append_value(decode_varint(bytes, pos)? as i64)
+        (ScalarKind::Int64, TypedBuilder::Int64(b), WireValue::Varint(v)) => {
+            b.append_value(*v as i64);
         }
         // `int64` -> `Timestamp(Microsecond, _)` coercion. Proto carries the
         // value as a plain varint; the Arrow column interprets it as
         // microseconds since Unix epoch. Used primarily for `_event_time` on
         // LP tables (matching `proto_descriptor_to_arrow_schema`).
-        (ScalarKind::Int64, TypedBuilder::TimestampMicros(b)) => {
-            b.append_value(decode_varint(bytes, pos)? as i64)
+        (ScalarKind::Int64, TypedBuilder::TimestampMicros(b), WireValue::Varint(v)) => {
+            b.append_value(*v as i64);
         }
-        (ScalarKind::UInt32, TypedBuilder::UInt32(b)) => {
-            b.append_value(decode_varint(bytes, pos)? as u32)
+        (ScalarKind::UInt32, TypedBuilder::UInt32(b), WireValue::Varint(v)) => {
+            b.append_value(*v as u32);
         }
-        (ScalarKind::UInt64, TypedBuilder::UInt64(b)) => {
-            b.append_value(decode_varint(bytes, pos)?)
+        (ScalarKind::UInt64, TypedBuilder::UInt64(b), WireValue::Varint(v)) => {
+            b.append_value(*v);
         }
-        (ScalarKind::SInt32, TypedBuilder::Int32(b)) => {
-            b.append_value(zigzag32(decode_varint(bytes, pos)? as u32))
+        (ScalarKind::SInt32, TypedBuilder::Int32(b), WireValue::Varint(v)) => {
+            b.append_value(decode_zigzag32(*v as u32));
         }
-        (ScalarKind::SInt64, TypedBuilder::Int64(b)) => {
-            b.append_value(zigzag64(decode_varint(bytes, pos)?))
+        (ScalarKind::SInt64, TypedBuilder::Int64(b), WireValue::Varint(v)) => {
+            b.append_value(decode_zigzag64(*v));
         }
-        (ScalarKind::SInt64, TypedBuilder::TimestampMicros(b)) => {
-            b.append_value(zigzag64(decode_varint(bytes, pos)?))
+        (ScalarKind::SInt64, TypedBuilder::TimestampMicros(b), WireValue::Varint(v)) => {
+            b.append_value(decode_zigzag64(*v));
         }
-        (ScalarKind::Fixed32, TypedBuilder::UInt32(b)) => b.append_value(read_fixed32(bytes, pos)?),
-        (ScalarKind::SFixed32, TypedBuilder::Int32(b)) => {
-            b.append_value(read_fixed32(bytes, pos)? as i32)
+        (ScalarKind::Fixed32, TypedBuilder::UInt32(b), WireValue::I32(v)) => {
+            b.append_value(*v);
         }
-        (ScalarKind::Float, TypedBuilder::Float32(b)) => {
-            b.append_value(f32::from_bits(read_fixed32(bytes, pos)?))
+        (ScalarKind::SFixed32, TypedBuilder::Int32(b), WireValue::I32(v)) => {
+            b.append_value(*v as i32);
         }
-        (ScalarKind::Fixed64, TypedBuilder::UInt64(b)) => b.append_value(read_fixed64(bytes, pos)?),
-        (ScalarKind::SFixed64, TypedBuilder::Int64(b)) => {
-            b.append_value(read_fixed64(bytes, pos)? as i64)
+        (ScalarKind::Float, TypedBuilder::Float32(b), WireValue::I32(v)) => {
+            b.append_value(f32::from_bits(*v));
         }
-        (ScalarKind::SFixed64, TypedBuilder::TimestampMicros(b)) => {
-            b.append_value(read_fixed64(bytes, pos)? as i64)
+        (ScalarKind::Fixed64, TypedBuilder::UInt64(b), WireValue::I64(v)) => {
+            b.append_value(*v);
         }
-        (ScalarKind::Double, TypedBuilder::Float64(b)) => {
-            b.append_value(f64::from_bits(read_fixed64(bytes, pos)?))
+        (ScalarKind::SFixed64, TypedBuilder::Int64(b), WireValue::I64(v)) => {
+            b.append_value(*v as i64);
         }
-        (ScalarKind::Bool, TypedBuilder::Boolean(b)) => {
-            b.append_value(decode_varint(bytes, pos)? != 0)
+        (ScalarKind::SFixed64, TypedBuilder::TimestampMicros(b), WireValue::I64(v)) => {
+            b.append_value(*v as i64);
         }
-        (ScalarKind::String, TypedBuilder::LargeUtf8(b)) => {
-            let len = decode_varint(bytes, pos)? as usize;
-            if *pos + len > bytes.len() {
-                return Err(WireToArrowError::UnexpectedEof);
-            }
-            let s = std::str::from_utf8(&bytes[*pos..*pos + len])
-                .map_err(|_| WireToArrowError::InvalidUtf8)?;
+        (ScalarKind::Double, TypedBuilder::Float64(b), WireValue::I64(v)) => {
+            b.append_value(f64::from_bits(*v));
+        }
+        (ScalarKind::Bool, TypedBuilder::Boolean(b), WireValue::Varint(v)) => {
+            b.append_value(*v != 0);
+        }
+        (ScalarKind::String, TypedBuilder::LargeUtf8(b), WireValue::Len(bytes)) => {
+            let s = std::str::from_utf8(bytes).map_err(|_| WireToArrowError::InvalidUtf8)?;
             b.append_value(s);
-            *pos += len;
         }
-        (ScalarKind::Bytes, TypedBuilder::LargeBinary(b)) => {
-            let len = decode_varint(bytes, pos)? as usize;
-            if *pos + len > bytes.len() {
-                return Err(WireToArrowError::UnexpectedEof);
-            }
-            b.append_value(&bytes[*pos..*pos + len]);
-            *pos += len;
+        (ScalarKind::Bytes, TypedBuilder::LargeBinary(b), WireValue::Len(bytes)) => {
+            b.append_value(bytes);
         }
-        _ => return Err(WireToArrowError::PlanBuilderMismatch),
+        // Any other combination is either a wire-type mismatch (wire bytes
+        // don't match the declared schema) or — much less likely — a plan
+        // that disagrees with its builder tree. Report as a wire-type
+        // mismatch since that's the real-world failure mode.
+        (_, _, wv) => {
+            return Err(WireToArrowError::WireTypeMismatch {
+                expected: kind.wire_type(),
+                actual: wire_type_byte(wv),
+            });
+        }
     }
     Ok(())
+}
+
+/// Append a repeated-scalar occurrence (either a single unpacked value or a
+/// full packed blob) into `values`.
+fn append_repeated_scalar(
+    kind: ScalarKind,
+    wv: &WireValue,
+    values: &mut TypedBuilder,
+    current_offset: &mut i32,
+) -> Result<()> {
+    // Unpacked form: the `WireValue` variant matches the scalar's native
+    // wire type. Single append, regardless of scalar kind.
+    if wire_type_byte(wv) == kind.wire_type() {
+        append_scalar_from_wire(kind, wv, values)?;
+        *current_offset += 1;
+        return Ok(());
+    }
+
+    // Packed form: a `Len` blob holding a run of raw scalar values. Only
+    // valid when the scalar's native wire type is 0/1/5 (packable).
+    let WireValue::Len(inner) = wv else {
+        return Err(WireToArrowError::WireTypeMismatch {
+            expected: kind.wire_type(),
+            actual: wire_type_byte(wv),
+        });
+    };
+    if kind.wire_type() == 2 {
+        return Err(WireToArrowError::WireTypeMismatch {
+            expected: kind.wire_type(),
+            actual: wire_type_byte(wv),
+        });
+    }
+    let mut pos = 0usize;
+    while pos < inner.len() {
+        let decoded = read_packed_element(kind, inner, &mut pos)?;
+        append_scalar_from_wire(kind, &decoded, values)?;
+        *current_offset += 1;
+    }
+    if pos != inner.len() {
+        return Err(WireToArrowError::UnexpectedEof);
+    }
+    Ok(())
+}
+
+/// Read one raw scalar value from a packed blob and yield it as a
+/// `WireValue` so we can reuse [`append_scalar_from_wire`] for the append.
+#[inline]
+fn read_packed_element<'a>(
+    kind: ScalarKind,
+    bytes: &'a [u8],
+    pos: &mut usize,
+) -> Result<WireValue<'a>> {
+    match kind.wire_type() {
+        0 => Ok(WireValue::Varint(decode_varint(bytes, pos)?)),
+        1 => Ok(WireValue::I64(read_fixed64(bytes, pos)?)),
+        5 => Ok(WireValue::I32(read_fixed32(bytes, pos)?)),
+        // Wire type 2 would be string/bytes — unreachable per the caller's
+        // guard. Any other value indicates a plan build bug.
+        _ => Err(WireToArrowError::PlanBuilderMismatch),
+    }
 }
 
 #[cfg(test)]

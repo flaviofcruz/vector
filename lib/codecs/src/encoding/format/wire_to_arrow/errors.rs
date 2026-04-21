@@ -121,6 +121,14 @@ pub enum WireToArrowError {
         /// The underlying Arrow error from the array constructor.
         source: arrow::error::ArrowError,
     },
+
+    /// A `zeroparser` error the encoder doesn't model as one of the
+    /// variants above.
+    #[snafu(display("zeroparser error: {source}"))]
+    ProtoParser {
+        /// The underlying `zeroparser::ParseError`.
+        source: zeroparser::ParseError,
+    },
 }
 
 /// Result alias for wire-to-Arrow encoder operations.

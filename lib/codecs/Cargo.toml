@@ -33,6 +33,7 @@ opentelemetry-proto = { path = "../opentelemetry-proto", optional = true }
 ordered-float.workspace = true
 prost.workspace = true
 prost-reflect.workspace = true
+zeroparser = { path = "../zeroparser", optional = true }
 rand.workspace = true
 regex.workspace = true
 serde.workspace = true
@@ -68,7 +69,7 @@ uuid.workspace = true
 vrl.workspace = true
 
 [features]
-arrow = []
+arrow = ["dep:zeroparser"]
 opentelemetry = ["dep:opentelemetry-proto"]
 syslog = ["dep:syslog_loose", "dep:strum", "dep:derive_more", "dep:serde-aux", "dep:toml"]
 test = []

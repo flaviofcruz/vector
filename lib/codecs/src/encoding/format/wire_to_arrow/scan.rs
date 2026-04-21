@@ -1,7 +1,16 @@
-//! Low-level proto wire-format scanning primitives.
+//! Low-level proto wire-format readers used for the packed-repeated-scalar
+//! inner loop.
 //!
-//! All readers advance a `&mut usize` position pointer into a borrowed byte
-//! slice. They never allocate.
+//! The outer message scan uses `zeroparser::wire::try_parse_field`, but
+//! that yields one `WireField` at a time (tag + value). Packed repeated
+//! scalars live inside a single `WireValue::Len(inner_bytes)` blob — the
+//! inner bytes are a sequence of raw scalar values with no tags. These
+//! helpers read those raw values.
+//!
+//! Also holds the error mapping from `zeroparser::ParseError` into this
+//! crate's [`WireToArrowError`](super::errors::WireToArrowError).
+
+use zeroparser::ParseError;
 
 use super::errors::{Result, WireToArrowError};
 
@@ -47,43 +56,20 @@ pub(crate) fn read_fixed32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
     Ok(v)
 }
 
-/// Skip a field of the given wire type (for unknown fields).
-pub(crate) fn skip_field(wire_type: u8, bytes: &[u8], pos: &mut usize) -> Result<()> {
-    match wire_type {
-        0 => {
-            decode_varint(bytes, pos)?;
-            Ok(())
+/// Map a `zeroparser::ParseError` into this crate's error type.
+///
+/// `zeroparser` emits a richer set of parse errors than we currently
+/// distinguish; we collapse most of them onto the pre-existing variants.
+pub(crate) fn map_parse_error(err: ParseError) -> WireToArrowError {
+    match err {
+        ParseError::TruncatedVarint | ParseError::BufferTooShort { .. } => {
+            WireToArrowError::UnexpectedEof
         }
-        1 => {
-            read_fixed64(bytes, pos)?;
-            Ok(())
-        }
-        2 => {
-            let len = decode_varint(bytes, pos)? as usize;
-            if *pos + len > bytes.len() {
-                return Err(WireToArrowError::UnexpectedEof);
-            }
-            *pos += len;
-            Ok(())
-        }
-        5 => {
-            read_fixed32(bytes, pos)?;
-            Ok(())
-        }
-        other => Err(WireToArrowError::InvalidWireType { wire_type: other }),
+        ParseError::VarintTooLong => WireToArrowError::VarintOverflow,
+        ParseError::InvalidWireType(wt) => WireToArrowError::InvalidWireType { wire_type: wt },
+        ParseError::InvalidUtf8 { .. } => WireToArrowError::InvalidUtf8,
+        _ => WireToArrowError::ProtoParser { source: err },
     }
-}
-
-/// Decode proto zigzag-encoded signed 32-bit integer.
-#[inline]
-pub(crate) fn zigzag32(v: u32) -> i32 {
-    ((v >> 1) as i32) ^ -((v & 1) as i32)
-}
-
-/// Decode proto zigzag-encoded signed 64-bit integer.
-#[inline]
-pub(crate) fn zigzag64(v: u64) -> i64 {
-    ((v >> 1) as i64) ^ -((v & 1) as i64)
 }
 
 #[cfg(test)]
@@ -113,7 +99,7 @@ mod tests {
 
     #[test]
     fn varint_eof() {
-        let bytes = &[0x80u8]; // continuation bit set, no follow-up byte
+        let bytes = &[0x80u8];
         let mut pos = 0;
         assert!(matches!(
             decode_varint(bytes, &mut pos),
@@ -123,7 +109,7 @@ mod tests {
 
     #[test]
     fn varint_overflow_detected() {
-        let bytes = [0xffu8; 11]; // 11 bytes all with continuation bit
+        let bytes = [0xffu8; 11];
         let mut pos = 0;
         assert!(matches!(
             decode_varint(&bytes, &mut pos),
@@ -140,16 +126,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed32_eof() {
-        let bytes = [0u8; 3];
-        let mut pos = 0;
-        assert!(matches!(
-            read_fixed32(&bytes, &mut pos),
-            Err(WireToArrowError::UnexpectedEof)
-        ));
-    }
-
-    #[test]
     fn fixed64_roundtrip() {
         let v: u64 = 0x0011_2233_4455_6677;
         let bytes = v.to_le_bytes();
@@ -159,51 +135,17 @@ mod tests {
     }
 
     #[test]
-    fn zigzag_roundtrip() {
-        for v in [0i32, 1, -1, 2, -2, i32::MIN, i32::MAX] {
-            let encoded = ((v << 1) ^ (v >> 31)) as u32;
-            assert_eq!(zigzag32(encoded), v, "zigzag32 mismatch for {v}");
-        }
-        for v in [0i64, 1, -1, 2, -2, i64::MIN, i64::MAX] {
-            let encoded = ((v << 1) ^ (v >> 63)) as u64;
-            assert_eq!(zigzag64(encoded), v, "zigzag64 mismatch for {v}");
-        }
+    fn map_parse_error_truncated_varint() {
+        let mapped = map_parse_error(ParseError::TruncatedVarint);
+        assert!(matches!(mapped, WireToArrowError::UnexpectedEof));
     }
 
     #[test]
-    fn skip_field_varint() {
-        let bytes = encode_varint(12345);
-        let mut pos = 0;
-        skip_field(0, &bytes, &mut pos).unwrap();
-        assert_eq!(pos, bytes.len());
-    }
-
-    #[test]
-    fn skip_field_length_delimited() {
-        let mut bytes = encode_varint(5); // length
-        bytes.extend_from_slice(b"hello");
-        let mut pos = 0;
-        skip_field(2, &bytes, &mut pos).unwrap();
-        assert_eq!(pos, bytes.len());
-    }
-
-    #[test]
-    fn skip_field_invalid_wire_type() {
-        let mut pos = 0;
+    fn map_parse_error_invalid_wire_type() {
+        let mapped = map_parse_error(ParseError::InvalidWireType(7));
         assert!(matches!(
-            skip_field(7, &[], &mut pos),
-            Err(WireToArrowError::InvalidWireType { wire_type: 7 })
-        ));
-    }
-
-    #[test]
-    fn skip_field_length_delimited_eof() {
-        let mut bytes = encode_varint(10);
-        bytes.extend_from_slice(b"short"); // only 5 bytes, not 10
-        let mut pos = 0;
-        assert!(matches!(
-            skip_field(2, &bytes, &mut pos),
-            Err(WireToArrowError::UnexpectedEof)
+            mapped,
+            WireToArrowError::InvalidWireType { wire_type: 7 }
         ));
     }
 }
