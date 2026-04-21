@@ -5,7 +5,10 @@ use vector_config::configurable_component;
 use vector_core::{config::DataType, event::Event, schema};
 
 #[cfg(feature = "arrow")]
-use super::format::{ArrowStreamSerializer, ArrowStreamSerializerConfig};
+use super::format::{
+    ArrowStreamSerializer, ArrowStreamSerializerConfig, WireToArrowSerializer,
+    WireToArrowSerializerConfig,
+};
 #[cfg(feature = "opentelemetry")]
 use super::format::{OtlpSerializer, OtlpSerializerConfig};
 use super::format::{ProtoBatchSerializer, ProtoBatchSerializerConfig};
@@ -170,6 +173,20 @@ pub enum BatchSerializerConfig {
     /// [protobuf]: https://protobuf.dev/
     #[serde(rename = "proto_batch")]
     ProtoBatch(ProtoBatchSerializerConfig),
+
+    /// Decodes proto wire bytes from each event's `message` field directly
+    /// into an [Apache Arrow][apache_arrow] `RecordBatch`, bypassing the
+    /// generic `ProtobufDeserializer -> Event -> ArrowStreamSerializer`
+    /// chain. All-or-nothing — a batch is rejected if any event lacks a
+    /// `Bytes`-typed `message` or the wire decode fails.
+    ///
+    /// Requires the sink to inject a proto `MessageDescriptor` and Arrow
+    /// `Schema` into the config before building.
+    ///
+    /// [apache_arrow]: https://arrow.apache.org/
+    #[cfg(feature = "arrow")]
+    #[serde(rename = "wire_to_arrow")]
+    WireToArrow(WireToArrowSerializerConfig),
 }
 
 impl BatchSerializerConfig {
@@ -187,6 +204,11 @@ impl BatchSerializerConfig {
                 let serializer = ProtoBatchSerializer::new(proto_config.clone())?;
                 Ok(super::BatchSerializer::ProtoBatch(serializer))
             }
+            #[cfg(feature = "arrow")]
+            BatchSerializerConfig::WireToArrow(config) => {
+                let serializer = WireToArrowSerializer::new(config.clone())?;
+                Ok(super::BatchSerializer::WireToArrow(serializer))
+            }
         }
     }
 
@@ -196,6 +218,8 @@ impl BatchSerializerConfig {
             #[cfg(feature = "arrow")]
             BatchSerializerConfig::ArrowStream(arrow_config) => arrow_config.input_type(),
             BatchSerializerConfig::ProtoBatch(proto_config) => proto_config.input_type(),
+            #[cfg(feature = "arrow")]
+            BatchSerializerConfig::WireToArrow(config) => config.input_type(),
         }
     }
 
@@ -205,6 +229,8 @@ impl BatchSerializerConfig {
             #[cfg(feature = "arrow")]
             BatchSerializerConfig::ArrowStream(arrow_config) => arrow_config.schema_requirement(),
             BatchSerializerConfig::ProtoBatch(proto_config) => proto_config.schema_requirement(),
+            #[cfg(feature = "arrow")]
+            BatchSerializerConfig::WireToArrow(config) => config.schema_requirement(),
         }
     }
 }

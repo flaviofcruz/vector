@@ -264,7 +264,7 @@ mod tests {
 
     fn load_person_descriptor() -> MessageDescriptor {
         let desc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("lib/codecs/tests/data/protobuf/protos/test_protobuf.desc");
+            .join("tests/data/protobuf/protos/test_protobuf.desc");
         let bytes = std::fs::read(&desc_path).expect("read desc");
         DescriptorPool::decode(bytes.as_slice())
             .expect("decode pool")

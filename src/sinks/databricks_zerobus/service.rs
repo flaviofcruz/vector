@@ -516,7 +516,6 @@ mod tests {
             batch: Default::default(),
             request: Default::default(),
             acknowledgements: Default::default(),
-            enable_wire_to_arrow: false,
         }
     }
 

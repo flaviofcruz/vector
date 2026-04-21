@@ -205,24 +205,6 @@ pub struct ZerobusSinkConfig {
         skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
-
-    /// Use the streaming wire-to-Arrow encoder when events carry original
-    /// proto wire bytes in the `_proto_wire_bytes` field.
-    ///
-    /// When enabled, the sink bypasses the generic
-    /// `ProtobufDeserializer -> Event -> ArrowStreamSerializer` chain for
-    /// batches where every event has the field populated. Falls back to the
-    /// generic path (with a warning log) when the field is absent or the
-    /// schema isn't yet supported by the wire encoder.
-    ///
-    /// Only takes effect when `batch_encoding` is `ArrowStream` and the
-    /// `codecs-arrow` build feature is enabled.
-    ///
-    /// Upstream (VRL on VA) must preserve the original proto wire bytes in
-    /// the `_proto_wire_bytes` field for tables routed through this sink.
-    /// With no upstream writers populating the field, this setting is a no-op.
-    #[serde(default)]
-    pub enable_wire_to_arrow: bool,
 }
 
 impl GenerateConfig for ZerobusSinkConfig {
@@ -241,7 +223,6 @@ impl GenerateConfig for ZerobusSinkConfig {
             batch: BatchConfig::default(),
             request: TowerRequestConfig::default(),
             acknowledgements: AcknowledgementsConfig::default(),
-            enable_wire_to_arrow: false,
         })
         .unwrap()
     }
@@ -254,8 +235,6 @@ impl SinkConfig for ZerobusSinkConfig {
         let descriptor = ZerobusService::resolve_descriptor(self).await?;
 
         let mut batch_encoding = self.batch_encoding.clone();
-        #[cfg(feature = "codecs-arrow")]
-        let mut resolved_arrow_schema: Option<arrow::datatypes::Schema> = None;
         let stream_mode = match &mut batch_encoding {
             BatchSerializerConfig::ProtoBatch(config) => {
                 config.descriptor = Some(descriptor.clone());
@@ -268,7 +247,16 @@ impl SinkConfig for ZerobusSinkConfig {
                 let arrow_schema =
                     super::proto_to_arrow::proto_descriptor_to_arrow_schema(&descriptor)?;
                 arrow_config.schema = Some(arrow_schema.clone());
-                resolved_arrow_schema = Some(arrow_schema.clone());
+                StreamMode::Arrow {
+                    arrow_schema: std::sync::Arc::new(arrow_schema),
+                }
+            }
+            #[cfg(feature = "codecs-arrow")]
+            BatchSerializerConfig::WireToArrow(config) => {
+                let arrow_schema =
+                    super::proto_to_arrow::proto_descriptor_to_arrow_schema(&descriptor)?;
+                config.descriptor = Some(descriptor.clone());
+                config.schema = Some(arrow_schema.clone());
                 StreamMode::Arrow {
                     arrow_schema: std::sync::Arc::new(arrow_schema),
                 }
@@ -279,49 +267,13 @@ impl SinkConfig for ZerobusSinkConfig {
             .map_err(|e| format!("Failed to build batch serializer: {}", e))?;
         let encoder = BatchEncoder::new(batch_serializer);
 
-        // Optionally build the wire-to-Arrow fast-path encoder. Only relevant
-        // when we are encoding to Arrow in the first place; with ProtoBatch
-        // the sink already writes row-oriented proto bytes and there is no
-        // Arrow column builder to bypass. A schema the encoder can't
-        // represent (e.g. maps or oneofs) causes a config-time build error
-        // we surface here — callers can disable `enable_wire_to_arrow` if
-        // their schema isn't ready.
-        #[cfg(feature = "codecs-arrow")]
-        let wire_encoder: Option<std::sync::Arc<super::wire_to_arrow::WireToArrowEncoder>> =
-            if self.enable_wire_to_arrow {
-                match resolved_arrow_schema {
-                    Some(schema) => Some(std::sync::Arc::new(
-                        super::wire_to_arrow::WireToArrowEncoder::new(&descriptor, schema)
-                            .map_err(|e| {
-                                format!("Failed to build wire-to-Arrow encoder: {e}")
-                            })?,
-                    )),
-                    None => {
-                        return Err(format!(
-                            "enable_wire_to_arrow requires batch_encoding = arrow_stream; \
-                             got {:?}",
-                            self.batch_encoding
-                        )
-                        .into());
-                    }
-                }
-            } else {
-                None
-            };
         let service =
             ZerobusService::new(self.clone(), stream_mode, self.acknowledgements.enabled()).await?;
         let healthcheck_service = service.clone();
 
         let request_limits = self.request.into_settings();
 
-        let sink = ZerobusSink::new(
-            service,
-            request_limits,
-            self.batch.clone(),
-            encoder,
-            #[cfg(feature = "codecs-arrow")]
-            wire_encoder,
-        )?;
+        let sink = ZerobusSink::new(service, request_limits, self.batch.clone(), encoder)?;
 
         let healthcheck = async move {
             healthcheck_service
@@ -440,7 +392,6 @@ mod tests {
             batch: Default::default(),
             request: Default::default(),
             acknowledgements: Default::default(),
-            enable_wire_to_arrow: false,
         }
     }
 

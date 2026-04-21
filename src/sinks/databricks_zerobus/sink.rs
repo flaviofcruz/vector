@@ -15,8 +15,6 @@ use crate::sinks::util::request_builder::default_request_builder_concurrency_lim
 use crate::sinks::util::{RealtimeSizeBasedDefaultBatchSettings, TowerRequestSettings};
 
 use super::service::{ZerobusPayload, ZerobusRequest, ZerobusRetryLogic, ZerobusService};
-#[cfg(feature = "codecs-arrow")]
-use super::wire_to_arrow::WireToArrowEncoder;
 
 /// The main Zerobus sink.
 pub struct ZerobusSink {
@@ -24,11 +22,6 @@ pub struct ZerobusSink {
     request_limits: TowerRequestSettings,
     batch_settings: BatcherSettings,
     encoder: BatchEncoder,
-    /// Optional streaming wire-to-Arrow encoder used when events carry
-    /// original proto wire bytes in `wire_to_arrow::WIRE_BYTES_FIELD`.
-    /// Falls back to the generic `encoder` on a per-batch basis.
-    #[cfg(feature = "codecs-arrow")]
-    wire_encoder: Option<Arc<WireToArrowEncoder>>,
 }
 
 impl ZerobusSink {
@@ -37,7 +30,6 @@ impl ZerobusSink {
         request_limits: TowerRequestSettings,
         batch_config: BatchConfig<RealtimeSizeBasedDefaultBatchSettings>,
         encoder: BatchEncoder,
-        #[cfg(feature = "codecs-arrow")] wire_encoder: Option<Arc<WireToArrowEncoder>>,
     ) -> Result<Self, crate::Error> {
         let batch_settings = batch_config.into_batcher_settings()?;
 
@@ -46,56 +38,15 @@ impl ZerobusSink {
             request_limits,
             batch_settings,
             encoder,
-            #[cfg(feature = "codecs-arrow")]
-            wire_encoder,
         })
     }
 
     fn encode_batch(
         encoder: &BatchEncoder,
-        #[cfg(feature = "codecs-arrow")] wire_encoder: Option<&WireToArrowEncoder>,
         mut events: Vec<Event>,
     ) -> Result<ZerobusRequest, String> {
         let finalizers = events.take_finalizers();
         let metadata_builder = RequestMetadataBuilder::from_events(&events);
-
-        // Fast path: wire-to-Arrow encoder, used when every event in the batch
-        // carries original proto wire bytes. Any miss (field absent, wrong
-        // type, or encoder error) falls back to the generic path below.
-        #[cfg(feature = "codecs-arrow")]
-        if let Some(wire_enc) = wire_encoder {
-            if let Some(wire_bytes) = WireToArrowEncoder::try_extract_wire_bytes(&events) {
-                match wire_enc.encode_batch(&wire_bytes) {
-                    Ok(record_batch) => {
-                        let byte_size = record_batch.get_array_memory_size();
-                        let request_size =
-                            NonZeroUsize::new(byte_size).unwrap_or(NonZeroUsize::MIN);
-                        let metadata = metadata_builder.with_request_size(request_size);
-                        return Ok(ZerobusRequest {
-                            payload: ZerobusPayload::Arrow(record_batch),
-                            metadata,
-                            finalizers,
-                        });
-                    }
-                    Err(e) => {
-                        // TODO: rate-limit. Falling back is correct, but we
-                        // want visibility into how often it happens so we can
-                        // drive the rate toward zero as VRL upstream catches up.
-                        warn!(
-                            message = "wire-to-Arrow encoding failed; falling back to generic path",
-                            error = %e,
-                        );
-                    }
-                }
-            } else {
-                // Field absent on at least one event — fall through to the
-                // generic path. Same TODO re: rate-limited metric.
-                warn!(
-                    message = "wire-to-Arrow field missing on at least one event in batch; \
-                               falling back to generic path"
-                );
-            }
-        }
 
         let batch_output = match encoder.encode_batch(&events) {
             Ok(output) => output,
@@ -134,8 +85,6 @@ impl ZerobusSink {
 
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         let encoder = Arc::new(self.encoder.clone());
-        #[cfg(feature = "codecs-arrow")]
-        let wire_encoder = self.wire_encoder.clone();
 
         let result = {
             let tower_service = ServiceBuilder::new()
@@ -146,16 +95,7 @@ impl ZerobusSink {
                 .batched(self.batch_settings.as_byte_size_config())
                 .concurrent_map(default_request_builder_concurrency_limit(), move |events| {
                     let encoder = Arc::clone(&encoder);
-                    #[cfg(feature = "codecs-arrow")]
-                    let wire_encoder = wire_encoder.clone();
-                    Box::pin(async move {
-                        Self::encode_batch(
-                            &encoder,
-                            #[cfg(feature = "codecs-arrow")]
-                            wire_encoder.as_deref(),
-                            events,
-                        )
-                    })
+                    Box::pin(async move { Self::encode_batch(&encoder, events) })
                 })
                 .filter_map(|result| async move {
                     match result {

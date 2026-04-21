@@ -1,33 +1,28 @@
-//! Streaming wire-format to Arrow encoder for the `databricks_zerobus` sink.
+//! Streaming wire-format to Arrow encoder.
 //!
 //! Parses proto wire bytes in a single pass and appends values directly into
 //! Arrow `RecordBatch` column builders, skipping the `DynamicMessage` /
 //! `LogEvent` intermediate representations used by the generic
 //! `ProtobufDeserializer` + `ArrowStreamSerializer` path.
 //!
+//! Used as a [`BatchSerializerConfig`] variant — upstream is expected to
+//! stash original proto wire bytes in the event's `message` field (Vector
+//! convention). The serializer is all-or-nothing: a batch fails if any event
+//! lacks a `Bytes`-typed message or the wire decode errors.
+//!
 //! ## Supported today
 //!
-//! - Scalar proto fields (int32/int64/uint32/uint64/sint32/sint64/fixed*/float/double/bool/string/bytes/enum).
-//! - Singular nested messages -> Arrow `Struct`.
-//! - Repeated nested messages -> Arrow `List<Struct>`.
+//! - Scalar proto fields (int32/int64/uint32/uint64/sint32/sint64/fixed*/float/double/bool/string/bytes/enum)
+//! - Singular nested messages -> Arrow `Struct`
+//! - Repeated nested messages -> Arrow `List<Struct>`
+//! - Repeated scalars (packed and unpacked) -> Arrow `List<primitive>`
+//! - Proto maps (`map<K, V>`) -> Arrow `Map<Struct(key, value)>`
+//! - Oneof variants
+//! - `int64 -> Timestamp(Microsecond, tz)` coercion
 //!
-//! ## Not yet supported
+//! Benchmarks live at `benches/codecs/wire_to_arrow_bench.rs`.
 //!
-//! - Repeated scalars (packed or unpacked)
-//! - Maps (proto `map<k, v>` / Arrow `Map`)
-//! - Oneof
-//! - Self-referential message types (plan building would stack-overflow)
-//! - `unsafe from_utf8_unchecked` string fast-path
-//!
-//! ## Typical use
-//!
-//! ```ignore
-//! let encoder = WireToArrowEncoder::new(&descriptor, arrow_schema)?;
-//! let record_batch = encoder.encode_batch(&wire_bytes_per_row)?;
-//! ```
-//!
-//! Benchmarks live at `benches/codecs/wire_to_arrow_bench.rs`; see the bench
-//! for head-to-head comparison against the reference encoder chain.
+//! [`BatchSerializerConfig`]: crate::encoding::BatchSerializerConfig
 
 mod builders;
 mod errors;
@@ -40,7 +35,12 @@ use arrow::datatypes::{Fields, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use prost_reflect::MessageDescriptor;
-use vector_lib::event::{Event, Value};
+use vector_config::configurable_component;
+use vector_core::{
+    config::DataType,
+    event::{Event, Value},
+    schema,
+};
 
 pub use errors::WireToArrowError;
 
@@ -49,16 +49,105 @@ use errors::Result;
 use plan::{MessagePlan, PlanSlot, ScalarKind};
 use scan::{decode_varint, read_fixed32, read_fixed64, skip_field, zigzag32, zigzag64};
 
-/// Log field name where upstream writers stash the original proto wire bytes.
+/// Configuration for the wire-to-Arrow batch serializer.
 ///
-/// Events that carry this field with a `Value::Bytes` value are eligible for
-/// the [`WireToArrowEncoder`] fast path. The sink falls back to the generic
-/// encoder chain when the field is absent or not `Bytes`-typed.
-///
-/// Upstream (VRL on VA) must preserve the original proto wire bytes in this
-/// field for tables that want the wire-to-Arrow optimization. Details in the
-/// sink-integration doc.
-pub const WIRE_BYTES_FIELD: &str = "_proto_wire_bytes";
+/// Requires both a proto `MessageDescriptor` (to interpret the wire bytes)
+/// and an Arrow `Schema` (to lay out the output `RecordBatch`). The sink is
+/// responsible for resolving both from its own schema source and injecting
+/// them into the config before calling [`Self::build`](BatchSerializerConfig::build).
+#[configurable_component]
+#[derive(Clone, Default)]
+pub struct WireToArrowSerializerConfig {
+    /// The proto message descriptor describing the wire bytes in `message`.
+    #[serde(skip)]
+    #[configurable(derived)]
+    pub descriptor: Option<MessageDescriptor>,
+
+    /// The Arrow schema of the output `RecordBatch`.
+    #[serde(skip)]
+    #[configurable(derived)]
+    pub schema: Option<arrow::datatypes::Schema>,
+}
+
+impl std::fmt::Debug for WireToArrowSerializerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireToArrowSerializerConfig")
+            .field(
+                "descriptor",
+                &self.descriptor.as_ref().map(|d| d.full_name().to_string()),
+            )
+            .field(
+                "schema",
+                &self
+                    .schema
+                    .as_ref()
+                    .map(|s| format!("{} fields", s.fields().len())),
+            )
+            .finish()
+    }
+}
+
+impl WireToArrowSerializerConfig {
+    /// Create a config with both descriptor and schema present.
+    pub fn new(descriptor: MessageDescriptor, schema: arrow::datatypes::Schema) -> Self {
+        Self {
+            descriptor: Some(descriptor),
+            schema: Some(schema),
+        }
+    }
+
+    /// The data type of events accepted by this serializer.
+    pub fn input_type(&self) -> DataType {
+        DataType::Log
+    }
+
+    /// The schema required by the serializer.
+    pub fn schema_requirement(&self) -> schema::Requirement {
+        schema::Requirement::empty()
+    }
+}
+
+/// Batch serializer that decodes proto wire bytes directly into an Arrow
+/// `RecordBatch`, bypassing the generic `ProtobufDeserializer` chain.
+#[derive(Clone, Debug)]
+pub struct WireToArrowSerializer {
+    encoder: Arc<WireToArrowEncoder>,
+}
+
+impl WireToArrowSerializer {
+    /// Build a serializer from the given configuration.
+    pub fn new(config: WireToArrowSerializerConfig) -> Result<Self> {
+        let descriptor = config
+            .descriptor
+            .ok_or_else(|| WireToArrowError::ConfigurationMissing { field: "descriptor" })?;
+        let schema = config
+            .schema
+            .ok_or_else(|| WireToArrowError::ConfigurationMissing { field: "schema" })?;
+        let encoder = WireToArrowEncoder::new(&descriptor, schema)?;
+        Ok(Self {
+            encoder: Arc::new(encoder),
+        })
+    }
+
+    /// Encode a batch of events into a single Arrow `RecordBatch`.
+    ///
+    /// Every event must carry a `Value::Bytes`-typed `message` field holding
+    /// the original proto wire bytes; any miss rejects the batch.
+    pub fn encode_to_record_batch(&self, events: &[Event]) -> Result<RecordBatch> {
+        if events.is_empty() {
+            return Err(WireToArrowError::NoEvents);
+        }
+        let mut wire_bytes = Vec::with_capacity(events.len());
+        for event in events {
+            match event.as_log().get_message() {
+                Some(Value::Bytes(b)) => wire_bytes.push(b.clone()),
+                Some(_) => return Err(WireToArrowError::MessageBytesWrongType),
+                None => return Err(WireToArrowError::MessageBytesMissing),
+            }
+        }
+        self.encoder.encode_batch(&wire_bytes)
+    }
+}
 
 /// Streaming wire-format encoder. Build once per (proto message type,
 /// Arrow schema) pair, then call [`WireToArrowEncoder::encode_batch`]
@@ -66,6 +155,14 @@ pub const WIRE_BYTES_FIELD: &str = "_proto_wire_bytes";
 pub struct WireToArrowEncoder {
     plan: Arc<MessagePlan>,
     schema: Arc<Schema>,
+}
+
+impl std::fmt::Debug for WireToArrowEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireToArrowEncoder")
+            .field("schema_fields", &self.schema.fields().len())
+            .finish()
+    }
 }
 
 impl WireToArrowEncoder {
@@ -79,27 +176,6 @@ impl WireToArrowEncoder {
             plan: Arc::new(plan),
             schema: Arc::new(schema),
         })
-    }
-
-    /// Try to pull proto wire bytes from [`WIRE_BYTES_FIELD`] on each event.
-    ///
-    /// Returns `Some(Vec<Bytes>)` only when every event carries the field as
-    /// a `Value::Bytes`. If any event is missing the field or has it under a
-    /// non-bytes type, returns `None` — the caller should fall back to the
-    /// generic encoder path.
-    ///
-    /// This is a stateless helper; it doesn't touch `self`. Provided on the
-    /// encoder type for convenient grouping.
-    pub fn try_extract_wire_bytes(events: &[Event]) -> Option<Vec<Bytes>> {
-        let mut out = Vec::with_capacity(events.len());
-        for event in events {
-            let log = event.as_log();
-            match log.get(WIRE_BYTES_FIELD) {
-                Some(Value::Bytes(b)) => out.push(b.clone()),
-                _ => return None,
-            }
-        }
-        Some(out)
     }
 
     /// Encode a batch of serialized proto messages into a single `RecordBatch`.
@@ -353,7 +429,7 @@ mod tests {
 
     fn descriptor_pool(file: &str) -> DescriptorPool {
         let desc_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("lib/codecs/tests/data/protobuf/protos")
+            .join("tests/data/protobuf/protos")
             .join(file);
         let bytes = std::fs::read(&desc_path).unwrap();
         DescriptorPool::decode(bytes.as_slice()).unwrap()
@@ -495,54 +571,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_wire_bytes_all_present() {
-        let mut e1 = Event::from(vector_lib::event::LogEvent::default());
-        e1.as_mut_log()
-            .insert(WIRE_BYTES_FIELD, Bytes::from_static(b"one"));
-        let mut e2 = Event::from(vector_lib::event::LogEvent::default());
-        e2.as_mut_log()
-            .insert(WIRE_BYTES_FIELD, Bytes::from_static(b"two"));
+    fn serializer_for(desc: &MessageDescriptor, schema: Schema) -> WireToArrowSerializer {
+        WireToArrowSerializer::new(WireToArrowSerializerConfig::new(desc.clone(), schema))
+            .expect("serializer build")
+    }
 
-        let extracted = WireToArrowEncoder::try_extract_wire_bytes(&[e1, e2]);
-        assert!(extracted.is_some());
-        let bytes = extracted.unwrap();
-        assert_eq!(bytes.len(), 2);
-        assert_eq!(&bytes[0][..], b"one");
-        assert_eq!(&bytes[1][..], b"two");
+    fn event_with_message_bytes(bytes: Bytes) -> Event {
+        let mut e = Event::from(vector_core::event::LogEvent::default());
+        e.as_mut_log().insert("message", bytes);
+        e
     }
 
     #[test]
-    fn extract_wire_bytes_missing_field_returns_none() {
-        let mut e1 = Event::from(vector_lib::event::LogEvent::default());
-        e1.as_mut_log()
-            .insert(WIRE_BYTES_FIELD, Bytes::from_static(b"one"));
-        // e2 has no _proto_wire_bytes field.
-        let e2 = Event::from(vector_lib::event::LogEvent::default());
+    fn serializer_requires_descriptor_and_schema() {
+        let desc = scalar_descriptor();
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
 
-        assert!(WireToArrowEncoder::try_extract_wire_bytes(&[e1, e2]).is_none());
+        let missing_desc = WireToArrowSerializer::new(WireToArrowSerializerConfig {
+            descriptor: None,
+            schema: Some(schema.clone()),
+        });
+        assert!(matches!(
+            missing_desc,
+            Err(WireToArrowError::ConfigurationMissing { field: "descriptor" })
+        ));
+
+        let missing_schema = WireToArrowSerializer::new(WireToArrowSerializerConfig {
+            descriptor: Some(desc),
+            schema: None,
+        });
+        assert!(matches!(
+            missing_schema,
+            Err(WireToArrowError::ConfigurationMissing { field: "schema" })
+        ));
     }
 
     #[test]
-    fn extract_wire_bytes_wrong_type_returns_none() {
-        // Vector's `Value` represents plain strings as `Value::Bytes`, so a
-        // string IS a bytes value here — use an integer to get a non-bytes
-        // variant for the negative case.
-        let mut e1 = Event::from(vector_lib::event::LogEvent::default());
-        e1.as_mut_log().insert(WIRE_BYTES_FIELD, 42_i64);
-        assert!(WireToArrowEncoder::try_extract_wire_bytes(&[e1]).is_none());
+    fn serializer_empty_batch_errors() {
+        let desc = scalar_descriptor();
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let serializer = serializer_for(&desc, schema);
+        assert!(matches!(
+            serializer.encode_to_record_batch(&[]),
+            Err(WireToArrowError::NoEvents)
+        ));
     }
 
     #[test]
-    fn encode_from_extracted_matches_direct_encode() {
-        // End-to-end: build events with wire bytes in the field, extract,
-        // encode, compare against encoding the bytes directly.
+    fn serializer_missing_message_field_errors() {
+        let desc = scalar_descriptor();
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let serializer = serializer_for(&desc, schema);
+
+        let e1 = event_with_message_bytes(Bytes::from_static(b""));
+        let e2 = Event::from(vector_core::event::LogEvent::default()); // no message
+
+        assert!(matches!(
+            serializer.encode_to_record_batch(&[e1, e2]),
+            Err(WireToArrowError::MessageBytesMissing)
+        ));
+    }
+
+    #[test]
+    fn serializer_wrong_type_message_errors() {
+        let desc = scalar_descriptor();
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let serializer = serializer_for(&desc, schema);
+
+        // Plain strings are represented as `Value::Bytes`, so use an integer
+        // to get a non-bytes variant for this negative case.
+        let mut e = Event::from(vector_core::event::LogEvent::default());
+        e.as_mut_log().insert("message", 42_i64);
+        assert!(matches!(
+            serializer.encode_to_record_batch(&[e]),
+            Err(WireToArrowError::MessageBytesWrongType)
+        ));
+    }
+
+    #[test]
+    fn serializer_end_to_end_matches_direct_encode() {
+        // Build events with wire bytes on `message`, encode via the
+        // serializer, and compare against calling the lower-level encoder
+        // directly.
         let desc = scalar_descriptor();
         let schema = Schema::new(vec![
             Field::new("name", DataType::LargeUtf8, true),
             Field::new("id", DataType::Int32, true),
             Field::new("email", DataType::LargeUtf8, true),
         ]);
+        let serializer = serializer_for(&desc, schema.clone());
         let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
 
         let mut wire_bytes_list = Vec::new();
@@ -555,16 +672,11 @@ mod tests {
             msg.encode(&mut buf).unwrap();
             let bytes = Bytes::from(buf);
             wire_bytes_list.push(bytes.clone());
-
-            let mut e = Event::from(vector_lib::event::LogEvent::default());
-            e.as_mut_log().insert(WIRE_BYTES_FIELD, bytes);
-            events.push(e);
+            events.push(event_with_message_bytes(bytes));
         }
 
-        let extracted = WireToArrowEncoder::try_extract_wire_bytes(&events).unwrap();
-        let via_events = enc.encode_batch(&extracted).unwrap();
+        let via_events = serializer.encode_to_record_batch(&events).unwrap();
         let via_bytes = enc.encode_batch(&wire_bytes_list).unwrap();
-
         assert_eq!(via_events.num_rows(), via_bytes.num_rows());
         assert_eq!(via_events.num_columns(), via_bytes.num_columns());
         for i in 0..via_events.num_columns() {

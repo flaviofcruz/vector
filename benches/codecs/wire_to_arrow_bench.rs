@@ -1,9 +1,9 @@
-//! Benchmarks for the `wire_to_arrow` module in the `databricks_zerobus` sink.
+//! Benchmarks for the `wire_to_arrow` codec module.
 //!
 //! Compares two paths over identical proto wire bytes:
 //!
 //! * `new_wire_to_arrow` — `WireToArrowEncoder` from
-//!   `vector::sinks::databricks_zerobus::wire_to_arrow` (direct wire -> Arrow).
+//!   `vector_lib::codecs::encoding` (direct wire -> Arrow).
 //! * `old_chain`         — reference pipeline used elsewhere in Vector:
 //!   `ProtobufDeserializer::parse` -> `Vec<Event>` -> `ArrowStreamSerializer::encode_to_record_batch`.
 //!
@@ -33,10 +33,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use prost_reflect::prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, Value as ProtoValue};
 use vector::event::Event;
-use vector::sinks::databricks_zerobus::wire_to_arrow::WireToArrowEncoder;
 use vector_lib::codecs::{
     decoding::{ProtobufDeserializer, format::Deserializer},
-    encoding::{ArrowStreamSerializer, ArrowStreamSerializerConfig},
+    encoding::{ArrowStreamSerializer, ArrowStreamSerializerConfig, WireToArrowEncoder},
 };
 use vector_lib::config::LogNamespace;
 

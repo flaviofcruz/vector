@@ -4,7 +4,7 @@ use vector_common::internal_event::emit;
 use vector_core::event::Event;
 
 #[cfg(feature = "arrow")]
-use crate::encoding::ArrowStreamSerializer;
+use crate::encoding::{ArrowStreamSerializer, WireToArrowSerializer};
 use crate::{
     encoding::{Error, Framer, ProtoBatchSerializer, Serializer},
     internal_events::{EncoderFramingError, EncoderSerializeError},
@@ -32,6 +32,9 @@ pub enum BatchSerializer {
     Arrow(ArrowStreamSerializer),
     /// Protobuf batch serializer that encodes each event individually.
     ProtoBatch(ProtoBatchSerializer),
+    /// Streaming wire-format to Arrow serializer.
+    #[cfg(feature = "arrow")]
+    WireToArrow(WireToArrowSerializer),
 }
 
 /// An encoder that encodes batches of events.
@@ -72,6 +75,13 @@ impl BatchEncoder {
                     .encode_batch(events)
                     .map_err(|err| Error::SerializingError(Box::new(err)))?;
                 Ok(BatchOutput::Records(records))
+            }
+            #[cfg(feature = "arrow")]
+            BatchSerializer::WireToArrow(serializer) => {
+                let record_batch = serializer
+                    .encode_to_record_batch(events)
+                    .map_err(|err| Error::SerializingError(Box::new(err)))?;
+                Ok(BatchOutput::Arrow(record_batch))
             }
         }
     }

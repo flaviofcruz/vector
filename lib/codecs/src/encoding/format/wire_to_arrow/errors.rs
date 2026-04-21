@@ -6,15 +6,43 @@ use snafu::Snafu;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum WireToArrowError {
+    /// Required serializer-config field (`descriptor` or `schema`) was not
+    /// populated before `build()`. Sinks inject these at config build time.
+    #[snafu(display("wire-to-Arrow serializer requires a {field}"))]
+    ConfigurationMissing {
+        /// Which config field was missing.
+        field: &'static str,
+    },
+
+    /// The batch had no events to encode.
+    #[snafu(display("cannot encode an empty batch"))]
+    NoEvents,
+
+    /// An event in the batch had no `message` field.
+    #[snafu(display("event is missing a `message` field"))]
+    MessageBytesMissing,
+
+    /// An event's `message` field was not a `Value::Bytes`.
+    #[snafu(display("event `message` is not bytes-typed"))]
+    MessageBytesWrongType,
+
     /// Proto descriptor is missing a field named in the Arrow schema.
     #[snafu(display("proto field '{name}' not found in descriptor"))]
-    MissingProtoField { name: String },
+    MissingProtoField {
+        /// The Arrow field name that wasn't found in the proto descriptor.
+        name: String,
+    },
 
     /// The proto field's Kind cannot be represented by any supported scalar.
     #[snafu(display(
         "unsupported proto kind for field '{name}': {kind} (scalar PoC only)"
     ))]
-    UnsupportedKind { name: String, kind: String },
+    UnsupportedKind {
+        /// The proto field name.
+        name: String,
+        /// The proto kind that isn't supported.
+        kind: String,
+    },
 
     /// The combination of proto kind, Arrow type, and cardinality isn't supported.
     #[snafu(display(
@@ -22,9 +50,13 @@ pub enum WireToArrowError {
          proto kind {kind} / arrow type {arrow_type} / repeated {repeated}"
     ))]
     UnsupportedCombination {
+        /// The proto field name.
         name: String,
+        /// The proto kind involved.
         kind: String,
+        /// The Arrow data type involved.
         arrow_type: String,
+        /// Whether the proto field was repeated.
         repeated: bool,
     },
 
@@ -32,7 +64,12 @@ pub enum WireToArrowError {
     #[snafu(display(
         "field '{name}': repeated message requires List<Struct>, got List<{element}>"
     ))]
-    RepeatedNonStructList { name: String, element: String },
+    RepeatedNonStructList {
+        /// The proto field name.
+        name: String,
+        /// The Arrow list-element type that was found (expected Struct).
+        element: String,
+    },
 
     /// Ran out of wire bytes before finishing a tag/field.
     #[snafu(display("unexpected end of wire input"))]
@@ -44,13 +81,21 @@ pub enum WireToArrowError {
 
     /// Unknown proto wire type (should be 0, 1, 2, or 5).
     #[snafu(display("invalid proto wire type {wire_type}"))]
-    InvalidWireType { wire_type: u8 },
+    InvalidWireType {
+        /// The unrecognized wire-type value from the tag.
+        wire_type: u8,
+    },
 
     /// Wire type for a field doesn't match the plan's expectation.
     #[snafu(display(
         "wire type mismatch: plan expected {expected}, wire bytes had {actual}"
     ))]
-    WireTypeMismatch { expected: u8, actual: u8 },
+    WireTypeMismatch {
+        /// The wire type the plan expected for this field.
+        expected: u8,
+        /// The wire type actually present in the bytes.
+        actual: u8,
+    },
 
     /// String field contained non-UTF-8 bytes.
     #[snafu(display("invalid UTF-8 in proto string field"))]
@@ -63,6 +108,7 @@ pub enum WireToArrowError {
     /// `arrow::record_batch::RecordBatch::try_new` rejected the assembled arrays.
     #[snafu(display("failed to assemble RecordBatch: {source}"))]
     RecordBatchAssembly {
+        /// The underlying Arrow error from `RecordBatch::try_new`.
         source: arrow::error::ArrowError,
     },
 
@@ -70,11 +116,14 @@ pub enum WireToArrowError {
     /// the assembled arrays.
     #[snafu(display("failed to assemble {kind} array: {source}"))]
     ArrayAssembly {
+        /// Which kind of array failed to assemble (e.g. "struct", "list").
         kind: &'static str,
+        /// The underlying Arrow error from the array constructor.
         source: arrow::error::ArrowError,
     },
 }
 
+/// Result alias for wire-to-Arrow encoder operations.
 pub type Result<T> = std::result::Result<T, WireToArrowError>;
 
 #[cfg(test)]
