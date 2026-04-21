@@ -10,5 +10,7 @@ mod proto_to_arrow;
 mod service;
 mod sink;
 mod unity_catalog_schema;
+#[cfg(feature = "codecs-arrow")]
+pub mod wire_to_arrow;
 
 pub use config::ZerobusSinkConfig;
