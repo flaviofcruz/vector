@@ -115,3 +115,4 @@ This lists custom changes merged in Databricks fork of Vector.
 114. Add host path key to kuberenetes log source for different host path
      mounths https://github.com/databricks-eng/vector/pull/473 
 115. flush and ack before closing sink and buffer https://github.com/databricks-eng/vector/pull/480
+116. avoid fingerprinting archieve file https://github.com/databricks-eng/vector/pull/481
