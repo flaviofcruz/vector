@@ -230,7 +230,13 @@ impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
                             pod_ip = %ip,
                             error = %e,
                         );
-                        remove_endpoint(&guard.shared, &guard.discover_tx, ip, generation, &e.to_string());
+                        remove_endpoint(
+                            &guard.shared,
+                            &guard.discover_tx,
+                            ip,
+                            generation,
+                            &e.to_string(),
+                        );
                     } else {
                         debug!(
                             message = "Non-connection error on ClickHouse pod (endpoint kept).",

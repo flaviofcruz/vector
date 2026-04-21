@@ -243,7 +243,10 @@ mod tests {
                     other => panic!("Expected Struct inside Map, got {:?}", other),
                 }
             }
-            other => panic!("Expected Map type for boolean_config_access, got {:?}", other),
+            other => panic!(
+                "Expected Map type for boolean_config_access, got {:?}",
+                other
+            ),
         }
     }
 

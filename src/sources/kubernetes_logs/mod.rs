@@ -19,8 +19,8 @@ use kube::{
     Client, Config as ClientConfig,
     api::Api,
     config::{self, KubeConfigOptions},
-    runtime::{WatchStreamExt, reflector, watcher},
     runtime::reflector::store::Store,
+    runtime::{WatchStreamExt, reflector, watcher},
 };
 use lifecycle::Lifecycle;
 use serde_with::serde_as;
@@ -1012,13 +1012,16 @@ impl Source {
             insert_namespace_fields,
             extract_databricks_logs: config.extract_databricks_logs,
             // New field takes precedence; fall back to legacy boolean for backwards compat.
-            hostpath_logging_annotation_key: config.hostpath_logging_annotation_key.clone().or_else(|| {
-                if config.use_hostpath_logging_annotation_override {
-                    Some("logging.databricks.com/dblet-logs-path".to_string())
-                } else {
-                    None
-                }
-            }),
+            hostpath_logging_annotation_key: config
+                .hostpath_logging_annotation_key
+                .clone()
+                .or_else(|| {
+                    if config.use_hostpath_logging_annotation_override {
+                        Some("logging.databricks.com/dblet-logs-path".to_string())
+                    } else {
+                        None
+                    }
+                }),
             ttl_removal_config: config.ttl_removal_config.clone(),
             self_node_name,
             pod_logs_glob_patterns,

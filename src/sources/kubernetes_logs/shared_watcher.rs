@@ -394,7 +394,11 @@ mod tests {
         .await
         .expect("second acquire should succeed");
 
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "create_fn should NOT have been called a second time");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "create_fn should NOT have been called a second time"
+        );
         assert_eq!(consumer_count(&key), Some(2));
 
         // Drop first guard — count goes to 1.
@@ -597,8 +601,9 @@ mod tests {
                 // Simulate another source winning the race by inserting directly.
                 let winner = mock_created_watcher();
                 {
-                    let mut registry =
-                        SHARED_WATCHERS.lock().expect("shared watcher registry poisoned");
+                    let mut registry = SHARED_WATCHERS
+                        .lock()
+                        .expect("shared watcher registry poisoned");
                     registry.insert(
                         race_key,
                         SharedWatcherEntry {

@@ -899,9 +899,8 @@ fn build_map_array(
     let key_array = build_map_value_array(&flat_keys, key_field)?;
     let value_array = build_map_value_array(&flat_values, value_field)?;
 
-    let entries_array =
-        StructArray::try_new(kv_fields.clone(), vec![key_array, value_array], None)
-            .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+    let entries_array = StructArray::try_new(kv_fields.clone(), vec![key_array, value_array], None)
+        .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
 
     let null_buffer = validity
         .iter()
@@ -989,10 +988,7 @@ fn build_list_array(
 /// Delegates to `build_map_value_array` for scalar types.  For `Struct`, each
 /// item must be a `Value::Object`; child fields are extracted by name.
 /// For nested `List`, each item must be a `Value::Array`.
-fn build_list_item_array(
-    items: &[Value],
-    field: &Field,
-) -> Result<ArrayRef, ArrowEncodingError> {
+fn build_list_item_array(items: &[Value], field: &Field) -> Result<ArrayRef, ArrowEncodingError> {
     match field.data_type() {
         DataType::Struct(fields) => {
             let child_arrays: Vec<ArrayRef> = fields
@@ -1125,10 +1121,7 @@ fn build_list_item_array(
 }
 
 /// Builds a flat value array for Map entries from pre-collected Vector values.
-fn build_map_value_array(
-    values: &[Value],
-    field: &Field,
-) -> Result<ArrayRef, ArrowEncodingError> {
+fn build_map_value_array(values: &[Value], field: &Field) -> Result<ArrayRef, ArrowEncodingError> {
     let nullable = field.is_nullable();
     match field.data_type() {
         DataType::LargeUtf8 => {
@@ -2388,7 +2381,11 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "meta",
-            DataType::Struct(Fields::from(vec![Field::new("key", DataType::LargeUtf8, true)])),
+            DataType::Struct(Fields::from(vec![Field::new(
+                "key",
+                DataType::LargeUtf8,
+                true,
+            )])),
             true, // nullable
         )]));
 
@@ -2443,10 +2440,7 @@ mod tests {
         );
 
         let mut log1 = LogEvent::default();
-        log1.insert(
-            "hashes",
-            Value::Array(vec![Value::Integer(999)]),
-        );
+        log1.insert("hashes", Value::Array(vec![Value::Integer(999)]));
 
         let events = vec![Event::Log(log0), Event::Log(log1)];
         let item_field = Field::new("item", DataType::Int64, true);
@@ -2523,7 +2517,10 @@ mod tests {
             .downcast_ref::<ListArray>()
             .unwrap();
         let row0_val = list_col.value(0);
-        let row0 = row0_val.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let row0 = row0_val
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         assert_eq!(row0.value(0), "qpl-abc");
         assert_eq!(row0.value(1), "qpl-def");
     }
@@ -2609,11 +2606,7 @@ mod tests {
         log1.insert("rule_stats", Value::Array(vec![]));
 
         let events = vec![Event::Log(log0), Event::Log(log1)];
-        let item_field = Field::new(
-            "item",
-            DataType::Struct(item_struct_fields.clone()),
-            true,
-        );
+        let item_field = Field::new("item", DataType::Struct(item_struct_fields.clone()), true);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "rule_stats",
             DataType::List(Arc::new(item_field)),
@@ -2730,11 +2723,7 @@ mod tests {
         assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
         let batch = result.unwrap();
 
-        let map_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .unwrap();
+        let map_col = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
         assert!(!map_col.is_null(0));
 
         // The map for row 0 has 2 entries.
@@ -2776,11 +2765,7 @@ mod tests {
         assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
         let batch = result.unwrap();
 
-        let map_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .unwrap();
+        let map_col = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
 
         let entries = map_col.value(0);
         assert_eq!(entries.len(), 2);
@@ -2822,11 +2807,7 @@ mod tests {
         assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
         let batch = result.unwrap();
 
-        let map_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .unwrap();
+        let map_col = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
         assert!(!map_col.is_null(0), "row 0 should be non-null");
         assert!(map_col.is_null(1), "row 1 should be null");
         assert_eq!(map_col.value(0).len(), 1);
@@ -2911,11 +2892,7 @@ mod tests {
         assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
         let batch = result.unwrap();
 
-        let map_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .unwrap();
+        let map_col = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
         assert!(!map_col.is_null(0));
 
         let entries = map_col.value(0);
@@ -2963,11 +2940,7 @@ mod tests {
         assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
         let batch = result.unwrap();
 
-        let map_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .unwrap();
+        let map_col = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
         let entries = map_col.value(0);
         assert_eq!(entries.len(), 2);
 
@@ -3162,7 +3135,11 @@ mod tests {
             Field::new("field_6", DataType::Int64, true),
             Field::new("field_8", DataType::Struct(field_8_fields.clone()), true),
             Field::new("field_9", DataType::Struct(field_9_fields.clone()), true),
-            Field::new("field_10", DataType::List(Arc::new(Field::new("item", DataType::Int64, true))), true),
+            Field::new(
+                "field_10",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
             Field::new("field_11", DataType::Boolean, true),
             Field::new("field_12", DataType::LargeUtf8, true),
             Field::new("field_13", DataType::LargeUtf8, true),
@@ -3186,7 +3163,10 @@ mod tests {
         // field_9.sub_4 absent → null
         log0.insert("field_9.sub_5", 2i64);
         log0.insert("field_9.sub_6", 0i64);
-        log0.insert("field_10", Value::Array(vec![Value::Integer(111), Value::Integer(222)]));
+        log0.insert(
+            "field_10",
+            Value::Array(vec![Value::Integer(111), Value::Integer(222)]),
+        );
         log0.insert("field_11", false);
         log0.insert("field_12", "val_c");
         log0.insert("field_13", "val_d");
@@ -3221,60 +3201,105 @@ mod tests {
         assert_eq!(batch.num_columns(), 14);
 
         // Scalar fields.
-        let f1 = batch.column_by_name("field_1").unwrap()
-            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let f1 = batch
+            .column_by_name("field_1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         assert_eq!(f1.value(0), "val_a");
         assert_eq!(f1.value(1), "val_f");
 
-        let f4 = batch.column_by_name("field_4").unwrap()
-            .as_any().downcast_ref::<Int32Array>().unwrap();
+        let f4 = batch
+            .column_by_name("field_4")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(f4.value(0), 1);
         assert_eq!(f4.value(1), 2);
 
-        let f6 = batch.column_by_name("field_6").unwrap()
-            .as_any().downcast_ref::<Int64Array>().unwrap();
+        let f6 = batch
+            .column_by_name("field_6")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(f6.value(0), 100);
         assert_eq!(f6.value(1), 200);
 
         // field_8 (Struct): row 0 non-null, row 1 null.
-        let f8 = batch.column_by_name("field_8").unwrap()
-            .as_any().downcast_ref::<StructArray>().unwrap();
+        let f8 = batch
+            .column_by_name("field_8")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
         assert!(!f8.is_null(0));
         assert!(f8.is_null(1));
-        let f8_sub1 = f8.column_by_name("sub_1").unwrap()
-            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let f8_sub1 = f8
+            .column_by_name("sub_1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         assert_eq!(f8_sub1.value(0), "sub_val_a");
 
         // field_9 (Struct): row 0 non-null, row 1 null.
-        let f9 = batch.column_by_name("field_9").unwrap()
-            .as_any().downcast_ref::<StructArray>().unwrap();
+        let f9 = batch
+            .column_by_name("field_9")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
         assert!(!f9.is_null(0));
         assert!(f9.is_null(1));
-        let f9_sub6 = f9.column_by_name("sub_6").unwrap()
-            .as_any().downcast_ref::<Int32Array>().unwrap();
+        let f9_sub6 = f9
+            .column_by_name("sub_6")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(f9_sub6.value(0), 0);
 
         // field_10 (List<Int64>): row 0 has [111, 222], row 1 null.
         use arrow::array::ListArray;
-        let f10 = batch.column_by_name("field_10").unwrap()
-            .as_any().downcast_ref::<ListArray>().unwrap();
+        let f10 = batch
+            .column_by_name("field_10")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
         assert!(!f10.is_null(0));
         assert!(f10.is_null(1));
-        let f10_vals: Vec<i64> = f10.value(0).as_any()
-            .downcast_ref::<Int64Array>().unwrap()
-            .iter().flatten().collect();
+        let f10_vals: Vec<i64> = f10
+            .value(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect();
         assert_eq!(f10_vals, vec![111, 222]);
 
         // Boolean fields.
-        let f14 = batch.column_by_name("field_14").unwrap()
-            .as_any().downcast_ref::<BooleanArray>().unwrap();
+        let f14 = batch
+            .column_by_name("field_14")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert!(!f14.value(0));
         assert!(f14.value(1));
 
         // field_16 (LargeBinary): row 0 non-null, row 1 null.
         use arrow::array::LargeBinaryArray;
-        let f16 = batch.column_by_name("field_16").unwrap()
-            .as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+        let f16 = batch
+            .column_by_name("field_16")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
         assert!(!f16.is_null(0));
         assert!(f16.is_null(1));
         assert_eq!(f16.value(0), b"\x0a\x05hello");
@@ -3317,7 +3342,11 @@ mod tests {
         log0.insert(
             "field_a",
             Value::Array(vec![
-                make_outer(1, 10, vec![make_inner(101, 500_000), make_inner(102, 300_000)]),
+                make_outer(
+                    1,
+                    10,
+                    vec![make_inner(101, 500_000), make_inner(102, 300_000)],
+                ),
                 make_outer(2, 5, vec![]),
             ]),
         );
@@ -3483,14 +3512,8 @@ mod tests {
         // Row 0: fully populated field_a.
         let mut log0 = LogEvent::default();
         log0.insert("field_a.sub_1", 42_000_i64);
-        log0.insert(
-            "field_a.sub_2",
-            json!({"100": true, "200": false}),
-        );
-        log0.insert(
-            "field_a.sub_3",
-            json!({"300": 1.5, "400": 2.0}),
-        );
+        log0.insert("field_a.sub_2", json!({"100": true, "200": false}));
+        log0.insert("field_a.sub_3", json!({"300": 1.5, "400": 2.0}));
 
         // Row 1: field_a absent → null struct.
         let log1 = LogEvent::default();
@@ -3596,19 +3619,13 @@ mod tests {
             ),
             true,
         );
-        let field5_fields = Fields::from(vec![
-            Field::new("sub_1", DataType::Int64, true),
-            field5_map,
-        ]);
+        let field5_fields =
+            Fields::from(vec![Field::new("sub_1", DataType::Int64, true), field5_map]);
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("field_1", DataType::LargeUtf8, true),
             Field::new("field_2", DataType::Boolean, true),
-            Field::new(
-                "field_3",
-                DataType::Struct(field3_fields),
-                true,
-            ),
+            Field::new("field_3", DataType::Struct(field3_fields), true),
             Field::new(
                 "field_4",
                 DataType::List(Arc::new(Field::new(
@@ -3618,11 +3635,7 @@ mod tests {
                 ))),
                 true,
             ),
-            Field::new(
-                "field_5",
-                DataType::Struct(field5_fields),
-                true,
-            ),
+            Field::new("field_5", DataType::Struct(field5_fields), true),
             Field::new(
                 "field_6",
                 DataType::List(Arc::new(Field::new("item", DataType::LargeUtf8, true))),
@@ -3667,14 +3680,8 @@ mod tests {
         log1.insert("field_3.sub_1", "err-a");
         log1.insert("field_3.sub_2", "err-sub-a");
         log1.insert("field_3.sub_3", "code-a");
-        log1.insert(
-            "field_6",
-            Value::Array(vec![Value::Bytes("rec-a".into())]),
-        );
-        log1.insert(
-            "field_7",
-            Value::Array(vec![Value::Bytes("tag-c".into())]),
-        );
+        log1.insert("field_6", Value::Array(vec![Value::Bytes("rec-a".into())]));
+        log1.insert("field_7", Value::Array(vec![Value::Bytes("tag-c".into())]));
 
         let events = vec![Event::Log(log0), Event::Log(log1)];
 
@@ -3696,9 +3703,7 @@ mod tests {
     /// Row 1: Struct populated, List fields populated with 1 entry each.
     #[test]
     fn test_encode_wide_schema_with_optional_struct_ipc_roundtrip() {
-        use arrow::array::{
-            BooleanArray, Int64Array, LargeStringArray, ListArray, StructArray,
-        };
+        use arrow::array::{BooleanArray, Int64Array, LargeStringArray, ListArray, StructArray};
         use arrow::ipc::reader::StreamReader;
         use std::io::Cursor;
 
@@ -3711,15 +3716,15 @@ mod tests {
         ]);
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("field_1",  DataType::LargeUtf8, true),
-            Field::new("field_2",  DataType::LargeUtf8, true),
-            Field::new("field_3",  DataType::LargeUtf8, true),
-            Field::new("field_4",  DataType::Int64, true),
-            Field::new("field_5",  DataType::Int64, true),
-            Field::new("field_6",  DataType::Boolean, true),
-            Field::new("field_7",  DataType::Boolean, true),
-            Field::new("field_8",  DataType::LargeUtf8, true),
-            Field::new("field_9",  DataType::Boolean, true),
+            Field::new("field_1", DataType::LargeUtf8, true),
+            Field::new("field_2", DataType::LargeUtf8, true),
+            Field::new("field_3", DataType::LargeUtf8, true),
+            Field::new("field_4", DataType::Int64, true),
+            Field::new("field_5", DataType::Int64, true),
+            Field::new("field_6", DataType::Boolean, true),
+            Field::new("field_7", DataType::Boolean, true),
+            Field::new("field_8", DataType::LargeUtf8, true),
+            Field::new("field_9", DataType::Boolean, true),
             Field::new("field_10", DataType::Boolean, true),
             Field::new("field_11", DataType::LargeUtf8, true),
             Field::new("field_12", DataType::LargeUtf8, true),
@@ -3743,15 +3748,15 @@ mod tests {
 
         // Row 0: field_17 and field_18 absent → null.
         let mut log0 = LogEvent::default();
-        log0.insert("field_1",  "rec-a");
-        log0.insert("field_2",  "app-test");
-        log0.insert("field_3",  "exec-a");
-        log0.insert("field_4",  1700000000000_i64);
-        log0.insert("field_5",  1700000001523_i64);
-        log0.insert("field_6",  false);
-        log0.insert("field_7",  true);
-        log0.insert("field_8",  "entry-a");
-        log0.insert("field_9",  true);
+        log0.insert("field_1", "rec-a");
+        log0.insert("field_2", "app-test");
+        log0.insert("field_3", "exec-a");
+        log0.insert("field_4", 1700000000000_i64);
+        log0.insert("field_5", 1700000001523_i64);
+        log0.insert("field_6", false);
+        log0.insert("field_7", true);
+        log0.insert("field_8", "entry-a");
+        log0.insert("field_9", true);
         log0.insert("field_10", false);
         log0.insert("field_11", "wh-a");
         log0.insert("field_12", "rec-a-date");
@@ -3771,28 +3776,22 @@ mod tests {
 
         // Row 1: field_18 struct populated, field_17 present.
         let mut log1 = LogEvent::default();
-        log1.insert("field_1",  "rec-b");
-        log1.insert("field_2",  "app-test");
-        log1.insert("field_3",  "exec-b");
-        log1.insert("field_4",  1700000010000_i64);
-        log1.insert("field_5",  1700000055230_i64);
-        log1.insert("field_6",  true);
-        log1.insert("field_7",  false);
-        log1.insert("field_8",  "entry-b");
-        log1.insert("field_9",  false);
+        log1.insert("field_1", "rec-b");
+        log1.insert("field_2", "app-test");
+        log1.insert("field_3", "exec-b");
+        log1.insert("field_4", 1700000010000_i64);
+        log1.insert("field_5", 1700000055230_i64);
+        log1.insert("field_6", true);
+        log1.insert("field_7", false);
+        log1.insert("field_8", "entry-b");
+        log1.insert("field_9", false);
         log1.insert("field_10", true);
         log1.insert("field_11", "wh-b");
         log1.insert("field_12", "rec-b-date");
         log1.insert("field_13", "op-b");
         log1.insert("field_14", "query-b");
-        log1.insert(
-            "field_15",
-            Value::Array(vec![Value::Bytes("rec-a".into())]),
-        );
-        log1.insert(
-            "field_16",
-            Value::Array(vec![Value::Bytes("tag-c".into())]),
-        );
+        log1.insert("field_15", Value::Array(vec![Value::Bytes("rec-a".into())]));
+        log1.insert("field_16", Value::Array(vec![Value::Bytes("tag-c".into())]));
         log1.insert("field_17", "err-type-a");
         log1.insert("field_18.sub_1", "err-a");
         log1.insert("field_18.sub_2", "err-sub-a");
@@ -3814,55 +3813,97 @@ mod tests {
         assert_eq!(batch.num_columns(), 20);
 
         // Spot-check scalar fields.
-        let f1 = batch.column_by_name("field_1").unwrap()
-            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let f1 = batch
+            .column_by_name("field_1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         assert_eq!(f1.value(0), "rec-a");
         assert_eq!(f1.value(1), "rec-b");
 
-        let f4 = batch.column_by_name("field_4").unwrap()
-            .as_any().downcast_ref::<Int64Array>().unwrap();
+        let f4 = batch
+            .column_by_name("field_4")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(f4.value(0), 1700000000000_i64);
         assert_eq!(f4.value(1), 1700000010000_i64);
 
-        let f7 = batch.column_by_name("field_7").unwrap()
-            .as_any().downcast_ref::<BooleanArray>().unwrap();
+        let f7 = batch
+            .column_by_name("field_7")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert!(f7.value(0));
         assert!(!f7.value(1));
 
         // field_15: row 0 empty list, row 1 has one entry.
-        let f15 = batch.column_by_name("field_15").unwrap()
-            .as_any().downcast_ref::<ListArray>().unwrap();
+        let f15 = batch
+            .column_by_name("field_15")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
         assert!(!f15.is_null(0));
         assert_eq!(f15.value(0).len(), 0);
         assert!(!f15.is_null(1));
         let f15_row1 = f15.value(1);
-        let f15_row1_str = f15_row1.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let f15_row1_str = f15_row1
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         assert_eq!(f15_row1_str.value(0), "rec-a");
 
         // field_16: row 0 has ["tag-a","tag-b"], row 1 has ["tag-c"].
-        let f16 = batch.column_by_name("field_16").unwrap()
-            .as_any().downcast_ref::<ListArray>().unwrap();
+        let f16 = batch
+            .column_by_name("field_16")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
         let f16_row0 = f16.value(0);
-        let f16_row0_str = f16_row0.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let f16_row0_str = f16_row0
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         assert_eq!(f16_row0_str.value(0), "tag-a");
         assert_eq!(f16_row0_str.value(1), "tag-b");
 
         // field_17: row 0 null, row 1 present.
-        let f17 = batch.column_by_name("field_17").unwrap()
-            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let f17 = batch
+            .column_by_name("field_17")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         assert!(f17.is_null(0));
         assert_eq!(f17.value(1), "err-type-a");
 
         // field_18 struct: row 0 null, row 1 non-null.
-        let f18 = batch.column_by_name("field_18").unwrap()
-            .as_any().downcast_ref::<StructArray>().unwrap();
+        let f18 = batch
+            .column_by_name("field_18")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
         assert!(f18.is_null(0));
         assert!(!f18.is_null(1));
-        let f18_sub1 = f18.column_by_name("sub_1").unwrap()
-            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let f18_sub1 = f18
+            .column_by_name("sub_1")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         assert_eq!(f18_sub1.value(1), "err-a");
-        let f18_sub3 = f18.column_by_name("sub_3").unwrap()
-            .as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let f18_sub3 = f18
+            .column_by_name("sub_3")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
         assert_eq!(f18_sub3.value(1), "code-a");
     }
 }

@@ -5,16 +5,16 @@ This program is meant to be exec'ed by a unit test so that the implementation ca
 
 import sys
 import json
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 
 class Request:
     def __init__(
         self,
         version: str,
-        secrets: list[str],
-        type: str | None = None,
-        config: dict[str, Any] | None = None,
+        secrets: List[str],
+        type: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
         self.version = version
         self.secrets = secrets
@@ -23,11 +23,11 @@ class Request:
 
 
 class Response:
-    def __init__(self, contents: dict[str, dict[str, str | None]]):
+    def __init__(self, contents: Dict[str, Dict[str, Optional[str]]]):
         self.contents = contents
 
 
-def parse_request(req: dict[str, Any]) -> Request:
+def parse_request(req: Dict[str, Any]) -> Request:
     """
     Validate the request by ensuring the correct keys exist per version, and that the types of the
     respective keys are as expected as well
@@ -76,7 +76,7 @@ def handle_request(req: Request) -> Response:
         if req.config is not None and "file_path" not in req.config:
             raise RuntimeError("File backend option file_path must be supplied")
 
-    def get_secret(fake_secret_name: str) -> dict[str, str | None]:
+    def get_secret(fake_secret_name: str) -> Dict[str, Optional[str]]:
         if fake_secret_name in static_fake_secrets_cache:
             return {"value": static_fake_secrets_cache[fake_secret_name], "error": None}
         else:

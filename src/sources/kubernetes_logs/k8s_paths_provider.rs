@@ -277,12 +277,10 @@ fn extract_databricks_pod_logs_directory_with_annotation(
     if use_hostpath_logging_annotation_override {
         // Use the hostPath logging annotation override to determine the Databricks logs directory.
         // If the annotation is not present, return None.
-        let hostpath_logging_annotation: Option<&str> =
-            metadata.annotations.as_ref().and_then(|annotations| {
-                annotations
-                    .get(annotation_key)
-                    .map(|value| value.as_str())
-            });
+        let hostpath_logging_annotation: Option<&str> = metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(annotation_key).map(|value| value.as_str()));
         match hostpath_logging_annotation {
             Some(value) => {
                 // If the annotation contains $POD_NAME but we don't have a pod name, skip this pod.
@@ -550,12 +548,12 @@ mod tests {
     };
 
     use super::{
-        build_container_exclusion_patterns, extract_databricks_pod_logs_directory,
-        extract_databricks_pod_logs_directory_with_annotation,
-        extract_excluded_containers_for_pod, extract_pod_logs_directory, filter_paths,
-        get_databricks_pod_logs_directories, list_pod_log_paths,
         DATABRICKS_HOSTPATH_CUSTOMER_LOGGING_ANNOTATION_KEY,
-        DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY,
+        DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY, build_container_exclusion_patterns,
+        extract_databricks_pod_logs_directory,
+        extract_databricks_pod_logs_directory_with_annotation, extract_excluded_containers_for_pod,
+        extract_pod_logs_directory, filter_paths, get_databricks_pod_logs_directories,
+        list_pod_log_paths,
     };
 
     fn pod_spec_with_empty_dir() -> PodSpec {
@@ -1055,8 +1053,11 @@ mod tests {
         ];
 
         for (pod, expected_directories_no_empty_dir, expected_directories_with_empty_dir) in cases {
-            let mut actual_directories_no_empty_dir =
-                get_databricks_pod_logs_directories(&pod, None, Some(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY));
+            let mut actual_directories_no_empty_dir = get_databricks_pod_logs_directories(
+                &pod,
+                None,
+                Some(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY),
+            );
             actual_directories_no_empty_dir.sort();
             let mut expected_directories_no_empty_dir = expected_directories_no_empty_dir;
             expected_directories_no_empty_dir.sort();
@@ -1064,8 +1065,11 @@ mod tests {
                 actual_directories_no_empty_dir,
                 expected_directories_no_empty_dir
             );
-            let mut actual_directories_with_empty_dir =
-                get_databricks_pod_logs_directories(&pod, Some(PathBuf::from(temp_dir_path)), Some(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY));
+            let mut actual_directories_with_empty_dir = get_databricks_pod_logs_directories(
+                &pod,
+                Some(PathBuf::from(temp_dir_path)),
+                Some(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY),
+            );
             actual_directories_with_empty_dir.sort();
             let mut expected_directories_with_empty_dir = expected_directories_with_empty_dir;
             expected_directories_with_empty_dir.sort();
