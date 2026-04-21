@@ -151,8 +151,18 @@ pub struct Config {
     /// HostPath logging-annotation-override directory.
     /// If set to `false`, we will assume the Databricks logs are located in the
     /// kubelet log directory.
+    /// Deprecated: use `hostpath_logging_annotation_key` instead.
     #[serde(default = "default_use_hostpath_logging_annotation_override")]
     use_hostpath_logging_annotation_override: bool,
+
+    /// When set, specifies the pod annotation key to read for hostPath-based log directory
+    /// discovery. The annotation value is resolved to `/databricks/host-root/{value}/` and
+    /// glob patterns are applied there. Overrides `use_hostpath_logging_annotation_override`.
+    /// Examples:
+    ///   "logging.databricks.com/dblet-logs-path" — internal/service logs
+    ///   "logging.databricks.com/dblet-customer-logs-path" — customer-sensitive logs
+    #[serde(default)]
+    hostpath_logging_annotation_key: Option<String>,
 
     /// Specifies the [file TTL removal config][file_ttl_removal_config] to use for the file source.
     /// TTL removal configuration for file management
@@ -441,6 +451,7 @@ impl Default for Config {
             insert_namespace_fields: true,
             extract_databricks_logs: false,
             use_hostpath_logging_annotation_override: false,
+            hostpath_logging_annotation_key: None,
             ttl_removal_config: None,
             self_node_name: default_self_node_name_env_template(),
             extra_field_selector: "".to_string(),
@@ -739,7 +750,7 @@ struct Source {
     node_field_spec: node_metadata_annotator::FieldsSpec,
     insert_namespace_fields: bool,
     extract_databricks_logs: bool,
-    use_hostpath_logging_annotation_override: bool,
+    hostpath_logging_annotation_key: Option<String>,
     ttl_removal_config: Option<TTLRemovalConfig>,
     self_node_name: String,
     pod_logs_glob_patterns: Vec<String>,
@@ -1000,8 +1011,14 @@ impl Source {
             node_field_spec: config.node_annotation_fields.clone(),
             insert_namespace_fields,
             extract_databricks_logs: config.extract_databricks_logs,
-            use_hostpath_logging_annotation_override: config
-                .use_hostpath_logging_annotation_override,
+            // New field takes precedence; fall back to legacy boolean for backwards compat.
+            hostpath_logging_annotation_key: config.hostpath_logging_annotation_key.clone().or_else(|| {
+                if config.use_hostpath_logging_annotation_override {
+                    Some("logging.databricks.com/dblet-logs-path".to_string())
+                } else {
+                    None
+                }
+            }),
             ttl_removal_config: config.ttl_removal_config.clone(),
             self_node_name,
             pod_logs_glob_patterns,
@@ -1049,7 +1066,7 @@ impl Source {
             node_field_spec,
             insert_namespace_fields,
             extract_databricks_logs,
-            use_hostpath_logging_annotation_override,
+            hostpath_logging_annotation_key,
             ttl_removal_config,
             self_node_name,
             pod_logs_glob_patterns,
@@ -1095,7 +1112,7 @@ impl Source {
             exclude_paths,
             insert_namespace_fields,
             extract_databricks_logs,
-            use_hostpath_logging_annotation_override,
+            hostpath_logging_annotation_key,
         );
         let annotator = PodMetadataAnnotator::new(pod_state, pod_fields_spec, log_namespace);
         let ns_annotator =

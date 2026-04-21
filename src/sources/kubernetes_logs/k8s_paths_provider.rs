@@ -25,7 +25,9 @@ pub struct K8sPathsProvider {
     exclude_paths: Vec<glob::Pattern>,
     insert_namespace_fields: bool,
     extract_databricks_logs: bool,
-    use_hostpath_logging_annotation_override: bool,
+    /// When set, the annotation key to read for hostPath-based log directory discovery.
+    /// None = use emptyDir-based discovery only.
+    hostpath_logging_annotation_key: Option<String>,
 }
 
 /// Extracts container name from a log file path.
@@ -49,7 +51,7 @@ fn extract_container_name_from_path(
 
 impl K8sPathsProvider {
     /// Create a new [`K8sPathsProvider`].
-    pub const fn new(
+    pub fn new(
         pod_state: Store<Pod>,
         namespace_state: Store<Namespace>,
         pod_logs_glob_patterns: Vec<String>,
@@ -57,7 +59,7 @@ impl K8sPathsProvider {
         exclude_paths: Vec<glob::Pattern>,
         insert_namespace_fields: bool,
         extract_databricks_logs: bool,
-        use_hostpath_logging_annotation_override: bool,
+        hostpath_logging_annotation_key: Option<String>,
     ) -> Self {
         Self {
             pod_state,
@@ -67,7 +69,7 @@ impl K8sPathsProvider {
             exclude_paths,
             insert_namespace_fields,
             extract_databricks_logs,
-            use_hostpath_logging_annotation_override,
+            hostpath_logging_annotation_key,
         }
     }
 }
@@ -104,7 +106,7 @@ impl PathsProvider for K8sPathsProvider {
                     self.pod_logs_glob_patterns.as_slice(),
                     pod.as_ref(),
                     self.extract_databricks_logs,
-                    self.use_hostpath_logging_annotation_override,
+                    self.hostpath_logging_annotation_key.as_deref(),
                 );
                 filter_paths(
                     filter_paths(paths_iter, &self.include_paths, true),
@@ -200,8 +202,11 @@ fn extract_pod_logs_directory(pod: &Pod) -> Option<PathBuf> {
     Some(build_pod_logs_directory(namespace, name, uid))
 }
 
-/// The annotation name for the Databricks hostPath logging override.
+/// The annotation name for the Databricks hostPath logging override (internal logs).
 const DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY: &str = "logging.databricks.com/dblet-logs-path";
+/// The annotation name for the Databricks hostPath customer logs directory.
+const DATABRICKS_HOSTPATH_CUSTOMER_LOGGING_ANNOTATION_KEY: &str =
+    "logging.databricks.com/dblet-customer-logs-path";
 const DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX: &str = "/databricks/host-root";
 
 // Given a pod spec, produce the Databricks-specific logs directory.
@@ -219,6 +224,21 @@ const POD_NAME_ANNOTATION_KEY: &str = "dblet.dev/pod-name";
 fn extract_databricks_pod_logs_directory(
     pod: &Pod,
     use_hostpath_logging_annotation_override: bool,
+) -> Option<PathBuf> {
+    extract_databricks_pod_logs_directory_with_annotation(
+        pod,
+        use_hostpath_logging_annotation_override,
+        DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY,
+    )
+}
+
+/// Core implementation: resolves a Databricks pod logs directory from either the kubelet emptyDir
+/// path or a hostPath annotation. The `annotation_key` parameter controls which annotation is read
+/// when `use_hostpath_logging_annotation_override` is true.
+fn extract_databricks_pod_logs_directory_with_annotation(
+    pod: &Pod,
+    use_hostpath_logging_annotation_override: bool,
+    annotation_key: &str,
 ) -> Option<PathBuf> {
     // Allow the hostPath logging annotation override to be used in place of the kubelet log directory.
     let metadata = &pod.metadata;
@@ -260,7 +280,7 @@ fn extract_databricks_pod_logs_directory(
         let hostpath_logging_annotation: Option<&str> =
             metadata.annotations.as_ref().and_then(|annotations| {
                 annotations
-                    .get(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY)
+                    .get(annotation_key)
                     .map(|value| value.as_str())
             });
         match hostpath_logging_annotation {
@@ -288,6 +308,7 @@ fn extract_databricks_pod_logs_directory(
                 trace!(
                     message = "Resolved hostpath logging annotation for pod.",
                     pod_name = ?pod_name,
+                    annotation_key = %annotation_key,
                     annotation_value = %value,
                     resolved_path = %resolved_path.display(),
                 );
@@ -297,7 +318,7 @@ fn extract_databricks_pod_logs_directory(
                 trace!(
                     message = "Skipping pod: missing hostpath logging annotation.",
                     pod_name = ?pod_name,
-                    annotation_key = %DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY,
+                    annotation_key = %annotation_key,
                 );
                 None
             }
@@ -356,7 +377,7 @@ const VALID_LOG_VOLUME_NAMES: &[&str] = &["logs", "data", "container-build", "ev
 fn get_databricks_pod_logs_directories(
     pod: &Pod,
     empty_dir_pod_logs_directory: Option<PathBuf>,
-    use_hostpath_logging_annotation_override: bool,
+    hostpath_logging_annotation_key: Option<&str>,
 ) -> Vec<PathBuf> {
     let mut log_dirs = Vec::new();
     if let Some(empty_dir_pod_logs_directory) = empty_dir_pod_logs_directory {
@@ -391,13 +412,11 @@ fn get_databricks_pod_logs_directories(
             );
         }
     }
-    // If the hostpath logging annotation override is used, also include the hostpath logs directory
-    // in the list of paths.
-    if use_hostpath_logging_annotation_override {
-        let hostpath_logs_directory = extract_databricks_pod_logs_directory(
-            pod, /*use_hostpath_logging_annotation_override=*/ true,
-        );
-        if let Some(hostpath_logs_directory) = hostpath_logs_directory {
+    // If a hostpath annotation key is configured, resolve the annotation and include its directory.
+    if let Some(annotation_key) = hostpath_logging_annotation_key {
+        if let Some(hostpath_logs_directory) =
+            extract_databricks_pod_logs_directory_with_annotation(pod, true, annotation_key)
+        {
             log_dirs.push(hostpath_logs_directory);
         }
     }
@@ -409,7 +428,7 @@ fn list_pod_log_paths<'a, G, GI>(
     pod_logs_glob_patterns: &'a [String],
     pod: &'a Pod,
     extract_databricks_logs: bool,
-    use_hostpath_logging_annotation_override: bool,
+    hostpath_logging_annotation_key: Option<&str>,
 ) -> impl Iterator<Item = PathBuf> + 'a
 where
     G: FnMut(&str) -> GI + 'a,
@@ -417,8 +436,8 @@ where
 {
     // Extract log file paths from the pod logs directory of the logging empty-dir volume associated
     // with the pod.
-    // If the use_hostpath_logging_annotation_override flag is set, also extract log file paths from
-    // the hostPath logging annotation override and merge the two sets of paths.
+    // If hostpath_logging_annotation_key is set, also extract log file paths from
+    // the hostPath logging annotation and merge the two sets of paths.
     let log_dirs = if extract_databricks_logs {
         let empty_dir_pod_logs_directory = extract_databricks_pod_logs_directory(
             pod, /*use_hostpath_logging_annotation_override=*/ false,
@@ -426,7 +445,7 @@ where
         get_databricks_pod_logs_directories(
             pod,
             empty_dir_pod_logs_directory,
-            use_hostpath_logging_annotation_override,
+            hostpath_logging_annotation_key,
         )
     } else {
         extract_pod_logs_directory(pod)
@@ -532,8 +551,11 @@ mod tests {
 
     use super::{
         build_container_exclusion_patterns, extract_databricks_pod_logs_directory,
+        extract_databricks_pod_logs_directory_with_annotation,
         extract_excluded_containers_for_pod, extract_pod_logs_directory, filter_paths,
         get_databricks_pod_logs_directories, list_pod_log_paths,
+        DATABRICKS_HOSTPATH_CUSTOMER_LOGGING_ANNOTATION_KEY,
+        DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY,
     };
 
     fn pod_spec_with_empty_dir() -> PodSpec {
@@ -728,6 +750,55 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_databricks_pod_logs_directory_customer_annotation() {
+        // No customer-logs annotation present -> None
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("test-pod".to_owned()),
+                uid: Some("test-uid".to_owned()),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        };
+        assert_eq!(
+            extract_databricks_pod_logs_directory_with_annotation(
+                &pod,
+                true,
+                DATABRICKS_HOSTPATH_CUSTOMER_LOGGING_ANNOTATION_KEY,
+            ),
+            None,
+        );
+
+        // Customer-logs annotation present -> resolved path
+        let pod_with_annotation = Pod {
+            metadata: ObjectMeta {
+                name: Some("test-pod".to_owned()),
+                uid: Some("test-uid".to_owned()),
+                annotations: Some(
+                    vec![(
+                        "logging.databricks.com/dblet-customer-logs-path".to_owned(),
+                        "/local_disk0/serverless-logs/customer/mosaic_test-pod".to_owned(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        };
+        assert_eq!(
+            extract_databricks_pod_logs_directory_with_annotation(
+                &pod_with_annotation,
+                true,
+                DATABRICKS_HOSTPATH_CUSTOMER_LOGGING_ANNOTATION_KEY,
+            ),
+            Some(PathBuf::from(
+                "/databricks/host-root/local_disk0/serverless-logs/customer/mosaic_test-pod"
+            )),
+        );
+    }
+
+    #[test]
     fn test_extract_excluded_containers_for_pod() {
         let cases = vec![
             // No annotations.
@@ -916,7 +987,7 @@ mod tests {
                 pod_logs_glob_patterns.as_slice(),
                 &pod,
                 false,
-                false,
+                None,
             )
             .collect();
             let expected_paths: Vec<_> = expected_paths.into_iter().map(PathBuf::from).collect();
@@ -985,7 +1056,7 @@ mod tests {
 
         for (pod, expected_directories_no_empty_dir, expected_directories_with_empty_dir) in cases {
             let mut actual_directories_no_empty_dir =
-                get_databricks_pod_logs_directories(&pod, None, true);
+                get_databricks_pod_logs_directories(&pod, None, Some(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY));
             actual_directories_no_empty_dir.sort();
             let mut expected_directories_no_empty_dir = expected_directories_no_empty_dir;
             expected_directories_no_empty_dir.sort();
@@ -994,7 +1065,7 @@ mod tests {
                 expected_directories_no_empty_dir
             );
             let mut actual_directories_with_empty_dir =
-                get_databricks_pod_logs_directories(&pod, Some(PathBuf::from(temp_dir_path)), true);
+                get_databricks_pod_logs_directories(&pod, Some(PathBuf::from(temp_dir_path)), Some(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY));
             actual_directories_with_empty_dir.sort();
             let mut expected_directories_with_empty_dir = expected_directories_with_empty_dir;
             expected_directories_with_empty_dir.sort();
@@ -1113,7 +1184,7 @@ mod tests {
                 pod_logs_glob_patterns.as_slice(),
                 &pod,
                 true,
-                true,
+                Some(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY),
             )
             .collect();
             let expected_paths: Vec<_> = expected_paths.into_iter().map(PathBuf::from).collect();
