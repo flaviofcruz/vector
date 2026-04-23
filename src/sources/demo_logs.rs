@@ -223,12 +223,17 @@ async fn demo_logs_source(
     let events_received = register!(EventsReceived);
 
     for n in 0..count {
-        if matches!(futures::poll!(&mut shutdown), Poll::Ready(_)) {
-            break;
-        }
-
+        // Race the interval tick against `shutdown` so the source reacts to
+        // SIGTERM within its configured interval. Without this, a large
+        // `interval` blocks `interval.tick().await` for up to that many
+        // seconds before the next top-of-loop shutdown check.
         if let Some(interval) = &mut interval {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = &mut shutdown => break,
+            }
+        } else if matches!(futures::poll!(&mut shutdown), Poll::Ready(_)) {
+            break;
         }
         bytes_received.emit(ByteSize(0));
 
@@ -484,6 +489,52 @@ mod tests {
 
         let duration = start.elapsed();
         assert!(duration >= Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_interval_wait() {
+        // Spawn the source with a 60s interval and count=2. Without racing the
+        // interval tick against shutdown, the second tick would block for 60s
+        // and only notice cancellation at the top of the next loop iteration.
+        let (trigger, shutdown, _done) = ShutdownSignal::new_wired();
+        let (tx, _rx) = SourceSender::new_test();
+        let decoder = DecodingConfig::new(
+            default_framing_message_based(),
+            default_decoding(),
+            LogNamespace::Legacy,
+        )
+        .build()
+        .unwrap();
+        let config: DemoLogsConfig = toml::from_str(
+            r#"format = "shuffle"
+               lines = ["hello"]
+               count = 2
+               interval = 60.0"#,
+        )
+        .unwrap();
+
+        let source = tokio::spawn(demo_logs_source(
+            config.interval,
+            config.count,
+            config.format,
+            decoder,
+            shutdown,
+            tx,
+            LogNamespace::Legacy,
+        ));
+
+        // The first tick fires immediately; let the first event emit, then trip
+        // shutdown while the source is parked on the second 60s interval tick.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let start = Instant::now();
+        drop(trigger);
+
+        source.await.unwrap().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "source took {:?} to honor shutdown; expected <5s",
+            start.elapsed(),
+        );
     }
 
     #[tokio::test]

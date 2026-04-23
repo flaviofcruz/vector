@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures::{Future, FutureExt, future};
+use itertools::Itertools;
 use snafu::Snafu;
 use stream_cancel::Trigger;
 use tokio::{
@@ -228,11 +229,7 @@ impl RunningTopology {
                     retain(handles, |handle| handle.peek().is_none());
                     !handles.is_empty()
                 });
-                let remaining_components = check_handles2
-                    .keys()
-                    .map(|item| item.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let remaining_components = check_handles2.keys().sorted().join(", ");
 
                 error!(
                     components = ?remaining_components,
@@ -249,6 +246,16 @@ impl RunningTopology {
         // internal_logs never shuts down.
         let suppress_reporter = Arc::new(AtomicBool::new(false));
         let suppress_reporter_check = Arc::clone(&suppress_reporter);
+
+        // Snapshot of check_handles for logging still-active components at wave 2 start.
+        // The reporter closure below takes ownership of the original.
+        let mut wave2_start_check_handles = check_handles.clone();
+
+        // Separate snapshot of check_handles used only if the wave 1 drain exceeds
+        // data_source_deadline, to name the still-active exclusively-non-deferred
+        // components in a warn log. Must be cloned before `reporter` takes ownership of
+        // the original `check_handles`.
+        let wave1_straggler_check_handles = check_handles.clone();
 
         // Reports in intervals which components are still running.
         let mut interval = interval(Duration::from_secs(5));
@@ -268,11 +275,7 @@ impl RunningTopology {
                     retain(handles, |handle| handle.peek().is_none());
                     !handles.is_empty()
                 });
-                let remaining_components = check_handles
-                    .keys()
-                    .map(|item| item.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let remaining_components = check_handles.keys().sorted().join(", ");
 
                 let (deadline_passed, time_remaining) = match deadline {
                     Some(d) => match d.checked_duration_since(Instant::now()) {
@@ -322,8 +325,26 @@ impl RunningTopology {
             // (including any with mixed inputs) close naturally as the remaining input
             // channels drop.
 
+            // Snapshot the component classifications now so they're available for logging
+            // inside source_shutdown_complete after deferred_shutdowns is consumed. Sort so
+            // log output is stable across runs (HashSet iteration order otherwise shuffles).
+            let non_deferred_components_str =
+                exclusively_non_deferred_keys.iter().sorted().join(", ");
+            let deferred_components_str = deferred_shutdowns
+                .deferred_keys()
+                .iter()
+                .sorted()
+                .join(", ");
+
+            // exclusively_non_deferred_keys is also consumed by source_shutdown_complete
+            // (for filtering the wave 1 straggler snapshot below), so clone it here — the
+            // snapshot above already borrowed it for non_deferred_components_str.
+            let wave1_straggler_keys = exclusively_non_deferred_keys.clone();
+
             let source_shutdown_complete = async move {
                 info!(
+                    non_deferred_components = ?non_deferred_components_str,
+                    deferred_components = ?deferred_components_str,
                     message = "Wave 1: Shutting down data sources.",
                     internal_log_rate_limit = false,
                 );
@@ -334,15 +355,57 @@ impl RunningTopology {
                     message = "Wave 1 complete. Waiting for exclusively-non-deferred transforms and sinks to drain.",
                     internal_log_rate_limit = false,
                 );
-                futures::future::join_all(wave1_wait_handles).await;
+                // Bound the wait by data_source_deadline. wave1_complete is already bounded
+                // by this deadline inside the shutdown coordinator, but without a matching
+                // bound here a stuck downstream sink (e.g., a Kafka producer that can't
+                // flush) would block wave 2 indefinitely. On timeout, proceed to wave 2
+                // anyway: the straggling components will be cancelled naturally when their
+                // upstream channels close as wave 2 shuts down deferred sources.
+                if let Some(data_deadline) = data_source_deadline {
+                    let mut wave1_straggler_check_handles = wave1_straggler_check_handles;
+                    match tokio::time::timeout_at(
+                        data_deadline,
+                        futures::future::join_all(wave1_wait_handles),
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(_) => {
+                            // Compute the straggler list using the same peek-based filter
+                            // as the reporter, restricted to exclusively-non-deferred keys
+                            // so the warn log only names components that were actually
+                            // blocking wave 2.
+                            wave1_straggler_check_handles.retain(|key, handles| {
+                                if !wave1_straggler_keys.contains(key) {
+                                    return false;
+                                }
+                                retain(handles, |handle| handle.peek().is_none());
+                                !handles.is_empty()
+                            });
+                            let stragglers =
+                                wave1_straggler_check_handles.keys().sorted().join(", ");
+                            warn!(
+                                components = ?stragglers,
+                                message = "Wave 1 drain deadline exceeded; proceeding to wave 2.",
+                                internal_log_rate_limit = false,
+                            );
+                        }
+                    }
+                } else {
+                    // Defensive: use_two_wave implies data_source_deadline.is_some(), but
+                    // fall back to the original unbounded wait if that invariant changes.
+                    futures::future::join_all(wave1_wait_handles).await;
+                }
 
                 // Emit a VEL event indicating all data components have been closed.
                 // This must happen before wave 2 shuts down internal sources (including
                 // internal_logs), so the event can still be delivered through the pipeline.
                 info!(
                     message = "All Vector data components have been closed.",
-                    vector_event_type = "VECTOR_SERVICE_EVENT",
-                    service_event = "VECTOR_PROCESS_COMPONENTS_CLOSED",
+                    // VECTOR_SERVICE_EVENT
+                    vector_event_type = 2,
+                    // VECTOR_PROCESS_COMPONENTS_CLOSED
+                    service_event = 5,
                     internal_log_rate_limit = false,
                 );
 
@@ -351,6 +414,27 @@ impl RunningTopology {
                 // prevents internal_logs from shutting down. Stopping the reporter breaks
                 // this cycle and allows a clean wave 2 shutdown.
                 suppress_reporter.store(true, Ordering::Relaxed);
+
+                // Snapshot still-active components as wave 2 begins. Mirrors the periodic
+                // reporter's format so the wave-boundary state shows up in the same log
+                // stream readers already parse.
+                wave2_start_check_handles.retain(|_key, handles| {
+                    retain(handles, |handle| handle.peek().is_none());
+                    !handles.is_empty()
+                });
+                let remaining_components = wave2_start_check_handles.keys().sorted().join(", ");
+                let time_remaining = match deadline {
+                    Some(d) => match d.checked_duration_since(Instant::now()) {
+                        Some(remaining) => format!("{} seconds left", remaining.as_secs()),
+                        None => "overdue".to_string(),
+                    },
+                    None => "no time limit".to_string(),
+                };
+                info!(
+                    remaining_components = ?remaining_components,
+                    time_remaining = ?time_remaining,
+                    "Wave 2 starting. Components still active."
+                );
 
                 // Wave 2: Shut down deferred (internal) sources with remaining main deadline.
                 info!(
@@ -373,8 +457,10 @@ impl RunningTopology {
                 // (if present as a deferred source) can still deliver the event.
                 info!(
                     message = "All Vector data components have been closed.",
-                    vector_event_type = "VECTOR_SERVICE_EVENT",
-                    service_event = "VECTOR_PROCESS_COMPONENTS_CLOSED",
+                    // VECTOR_SERVICE_EVENT
+                    vector_event_type = 2,
+                    // VECTOR_PROCESS_COMPONENTS_CLOSED
+                    service_event = 5,
                     internal_log_rate_limit = false,
                 );
 
