@@ -322,24 +322,8 @@ fn extract_databricks_pod_logs_directory_with_annotation(
             }
         }
     } else {
-        // Only return a path if the pod actually declares an emptyDir volume.
-        // Pods without one (e.g. netmon DaemonSet) have no emptyDir directory to
-        // enumerate, and producing a path triggers ENOENT on readdir.
-        let has_empty_dir = pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.volumes.as_ref())
-            .map(|vols| vols.iter().any(|v| v.empty_dir.is_some()))
-            .unwrap_or(false);
-        if has_empty_dir {
-            Some(build_databricks_k8s_pod_logs_directory(uid))
-        } else {
-            trace!(
-                message = "Skipping pod: no emptyDir volume declared.",
-                pod_name = ?pod_name,
-            );
-            None
-        }
+        // Use the kubelet log directory to determine the Databricks logs directory.
+        Some(build_databricks_k8s_pod_logs_directory(uid))
     }
 }
 
@@ -402,7 +386,7 @@ fn get_databricks_pod_logs_directories(
                     .and_then(|entry| entry.is_dir().then_some(entry))
             }));
         } else {
-            warn!(
+            trace!(
                 message = "Failed to read subdirectories of emptyDir pod logs directory.",
                 pod = ?pod.metadata.name,
                 log_directory = ?empty_dir_pod_logs_directory.to_str(),
@@ -542,10 +526,7 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    use k8s_openapi::{
-        api::core::v1::{EmptyDirVolumeSource, Pod, PodSpec, Volume},
-        apimachinery::pkg::apis::meta::v1::ObjectMeta,
-    };
+    use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::ObjectMeta};
 
     use super::{
         DATABRICKS_HOSTPATH_CUSTOMER_LOGGING_ANNOTATION_KEY,
@@ -555,17 +536,6 @@ mod tests {
         extract_pod_logs_directory, filter_paths, get_databricks_pod_logs_directories,
         list_pod_log_paths,
     };
-
-    fn pod_spec_with_empty_dir() -> PodSpec {
-        PodSpec {
-            volumes: Some(vec![Volume {
-                name: "logs".to_owned(),
-                empty_dir: Some(EmptyDirVolumeSource::default()),
-                ..Volume::default()
-            }]),
-            ..PodSpec::default()
-        }
-    }
 
     #[test]
     fn test_extract_pod_logs_directory() {
@@ -657,7 +627,7 @@ mod tests {
         let cases = vec![
             // Empty pod.
             (Pod::default(), false, None),
-            // Happy path: pod declares an emptyDir volume.
+            // Happy path.
             (
                 Pod {
                     metadata: ObjectMeta {
@@ -666,25 +636,10 @@ mod tests {
                         uid: Some("sandbox0-uid".to_owned()),
                         ..ObjectMeta::default()
                     },
-                    spec: Some(pod_spec_with_empty_dir()),
                     ..Pod::default()
                 },
                 false,
                 Some("/var/lib/kubelet/pods/sandbox0-uid/volumes/kubernetes.io~empty-dir"),
-            ),
-            // Pod with no emptyDir volume declared (e.g. netmon DaemonSet): skip.
-            (
-                Pod {
-                    metadata: ObjectMeta {
-                        namespace: Some("sandbox0-ns".to_owned()),
-                        name: Some("sandbox0-name".to_owned()),
-                        uid: Some("sandbox0-uid".to_owned()),
-                        ..ObjectMeta::default()
-                    },
-                    ..Pod::default()
-                },
-                false,
-                None,
             ),
             // No uid.
             (
@@ -694,7 +649,6 @@ mod tests {
                         name: Some("sandbox0-name".to_owned()),
                         ..ObjectMeta::default()
                     },
-                    spec: Some(pod_spec_with_empty_dir()),
                     ..Pod::default()
                 },
                 false,
@@ -1107,7 +1061,6 @@ mod tests {
                         ),
                         ..ObjectMeta::default()
                     },
-                    spec: Some(pod_spec_with_empty_dir()),
                     ..Pod::default()
                 },
                 // Calls to the glob mock.

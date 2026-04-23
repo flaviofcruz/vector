@@ -116,3 +116,4 @@ This lists custom changes merged in Databricks fork of Vector.
      mounths https://github.com/databricks-eng/vector/pull/473 
 115. flush and ack before closing sink and buffer https://github.com/databricks-eng/vector/pull/480
 116. avoid fingerprinting archieve file https://github.com/databricks-eng/vector/pull/481
+117. Revert https://github.com/databricks-eng/vector/pull/475 and instead downgrade the `emptyDir` `read_dir` failure log in `get_databricks_pod_logs_directories` from `warn!` to `trace!` to silence ENOENT noise for pods without an `emptyDir` volume
