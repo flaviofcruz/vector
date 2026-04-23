@@ -1,5 +1,5 @@
 use chrono::Utc;
-use futures::{StreamExt, stream};
+use futures::{FutureExt, StreamExt, stream};
 use vector_lib::{
     codecs::BytesDeserializerConfig,
     config::{LegacyKey, LogNamespace, log_schema},
@@ -147,7 +147,7 @@ async fn run(
     pid_key: Option<OwnedValuePath>,
     mut subscription: TraceSubscription,
     mut out: SourceSender,
-    shutdown: ShutdownSignal,
+    mut shutdown: ShutdownSignal,
     log_namespace: LogNamespace,
 ) -> Result<(), ()> {
     let hostname = crate::get_hostname();
@@ -156,14 +156,34 @@ async fn run(
     // Chain any log events that were captured during early buffering to the front,
     // and then continue with the normal stream of internal log events.
     let buffered_events = subscription.buffered_events().await;
-    let mut rx = stream::iter(buffered_events.into_iter().flatten())
-        .chain(subscription.into_stream())
-        .take_until(shutdown);
+    let mut rx =
+        stream::iter(buffered_events.into_iter().flatten()).chain(subscription.into_stream());
+    let mut draining = false;
 
     // Note: This loop, or anything called within it, MUST NOT generate
     // any logs that don't break the loop, as that could cause an
     // infinite loop since it receives all such logs.
-    while let Some(mut log) = rx.next().await {
+    //
+    // After `shutdown` fires, drain events already buffered in the
+    // broadcast channel before exiting. Plain `take_until(shutdown)`
+    // would drop them — that's how `VECTOR_PROCESS_COMPONENTS_CLOSED`
+    // was being lost: it's emitted microseconds before wave 2 cancels
+    // this source, with no `.await` between the `info!` and the cancel,
+    // so this loop has to pick the event up after shutdown resolves.
+    loop {
+        let next = if draining {
+            rx.next().now_or_never().flatten()
+        } else {
+            tokio::select! {
+                item = rx.next() => item,
+                _ = &mut shutdown => {
+                    draining = true;
+                    continue;
+                }
+            }
+        };
+        let Some(mut log) = next else { break };
+
         // TODO: Should this actually be in memory size?
         let byte_size = log.estimated_json_encoded_size_of().get();
         let json_byte_size = log.estimated_json_encoded_size_of();
@@ -221,6 +241,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::ComponentKey,
         event::Event,
         test_util::{
             collect_ready,
@@ -346,6 +367,49 @@ mod tests {
         sleep(Duration::from_millis(1)).await;
         trace::stop_early_buffering();
         rx
+    }
+
+    /// Regression test for the wave 1 → wave 2 VEL drop.
+    ///
+    /// Emits several tracing events and then synchronously fires shutdown in
+    /// the same scheduler tick, with no `.await` in between. That is the same
+    /// shape as the `info!` → `deferred_shutdowns.shutdown_all()` sequence in
+    /// `topology::running::shutdown`: the events are queued in the tracing
+    /// broadcast channel and the source's `ShutdownSignal` fires before the
+    /// source task has a chance to wake up and consume them. The drain loop
+    /// must yield those queued events before exiting; the previous
+    /// `take_until(shutdown)` implementation would drop them.
+    #[tokio::test]
+    #[serial]
+    async fn drains_buffered_events_on_shutdown() {
+        trace::init(false, false, "error", 10);
+        trace::reset_early_buffer();
+
+        let (tx, rx) = SourceSender::new_test();
+        let key = ComponentKey::from("internal_logs_drain_test");
+        let (cx, coordinator) = SourceContext::new_shutdown(&key, tx);
+        let source = InternalLogsConfig::default().build(cx).await.unwrap();
+        tokio::spawn(source);
+        sleep(Duration::from_millis(1)).await;
+        trace::stop_early_buffering();
+
+        // Events and shutdown in the same tick — no `.await` between them.
+        for i in 0..5u8 {
+            error!(drain_test_id = i, "event before shutdown");
+        }
+        coordinator.shutdown_all(None).await;
+
+        let events = collect_ready(rx).await;
+        let drain_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.as_log().get("drain_test_id").is_some())
+            .collect();
+        assert_eq!(
+            drain_events.len(),
+            5,
+            "expected all 5 buffered events to be drained on shutdown, got {}",
+            drain_events.len(),
+        );
     }
 
     // NOTE: This test requires #[serial] because it directly interacts with global tracing state.

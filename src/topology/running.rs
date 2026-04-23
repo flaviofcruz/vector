@@ -441,6 +441,12 @@ impl RunningTopology {
                     message = "Wave 2: Shutting down deferred (internal) sources.",
                     internal_log_rate_limit = false,
                 );
+                // Give `internal_logs` (and its downstream transforms/sinks) a
+                // scheduler window to consume the two tracing events we just
+                // emitted before we cancel the source. Paired with the drain-
+                // on-shutdown behavior in `internal_logs`; either alone closes
+                // the common case, but together they tolerate scheduler jitter.
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 deferred_shutdowns.shutdown_all(deadline).await;
             };
 
@@ -464,6 +470,8 @@ impl RunningTopology {
                     internal_log_rate_limit = false,
                 );
 
+                // See the matching comment in the two-wave branch above.
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 deferred_shutdowns.shutdown_all(deadline).await;
             };
 

@@ -135,6 +135,16 @@ pub fn init(color: bool, json: bool, levels: &str, internal_log_rate_limit: u64)
 
 #[cfg(test)]
 pub fn reset_early_buffer() -> Option<Vec<LogEvent>> {
+    // Restore the full early-buffering state so test ordering doesn't matter:
+    // once any test calls `stop_early_buffering()` (directly or via a helper
+    // like `start_source`), `SHOULD_BUFFER` flips to false and the subscriber
+    // list is drained to `None`. That breaks any later test that emits events
+    // before its source subscribes — the events bypass the buffer and no new
+    // oneshot subscription can be registered.
+    SHOULD_BUFFER.store(true, Ordering::Release);
+    *SUBSCRIBERS
+        .lock()
+        .expect("Couldn't acquire lock on trace subscribers") = Some(Vec::new());
     get_early_buffer().replace(Vec::new())
 }
 
