@@ -10,21 +10,16 @@
 //! convention). The serializer is all-or-nothing: a batch fails if any event
 //! lacks a `Bytes`-typed message or the wire decode errors.
 //!
-//! ## Scope: single-descriptor, no wrappers
+//! ## Scope
 //!
-//! The encoder takes one proto descriptor and assumes the bytes in
-//! `event.message` match it directly. That fits direct-ingest pipelines where
-//! the producer emits target-table proto bytes. It does **not** cover the
-//! Lumberjack Prime path where wire bytes are actually `LogDaemonWrapper`
-//! (optionally zstd-compressed, optionally wrapping a `logging.LogEntry`
-//! which in turn wraps the target proto). Configuring
-//! [`WireToArrowSerializerConfig`] with `LogDaemonWrapper` would produce Arrow
-//! columns for the wrapper's fields, not the target table's columns;
-//! configuring it with the target type would fail to decode because the
-//! incoming tags are LogDaemonWrapper's. Multi-frame unwrap (plus optional
-//! zstd, plus column projection from multiple proto frames, plus sink-time
-//! metadata stamps) is a phase-2 scope expansion — track it against the
-//! existing `TransformLumberjackPrime` VRL if that's your migration target.
+//! The encoder takes one `MessageDescriptor` and decodes the bytes in
+//! `event.message` against it, emitting one `RecordBatch` row per event. It
+//! is agnostic to how the caller produced those bytes and to what any
+//! particular schema represents. If the incoming payload requires any
+//! pre-processing — multi-frame unwrapping, decompression, merging bytes from
+//! multiple sources, sink-time / build-time stamps — perform it upstream (in
+//! VRL or a custom transform) so that `event.message` holds a single
+//! self-contained byte stream that matches the configured descriptor.
 //!
 //! ## Supported today
 //!
@@ -35,14 +30,6 @@
 //! - Proto maps (`map<K, V>`) -> Arrow `Map<Struct(key, value)>`
 //! - Oneof variants
 //! - `int64 -> Timestamp(Microsecond, tz)` coercion
-//!
-//! ## Not supported (out of scope for phase 1)
-//!
-//! - Multi-level proto wrappers (`LogDaemonWrapper` → `LogEntry` → target)
-//! - zstd or other inner-byte decompression
-//! - Columns sourced from multiple proto frames
-//! - Sink-time stamps (`now()`, `get_hostname()`) or build-time env-var
-//!   injections — anything currently produced by VRL before the sink
 //!
 //! Benchmarks live at `benches/codecs/wire_to_arrow_bench.rs`.
 //!
@@ -82,18 +69,14 @@ use plan::{MessagePlan, PlanSlot};
 
 /// Configuration for the wire-to-Arrow batch serializer.
 ///
-/// `desc_file` + `message_type` identify the proto descriptor for the *incoming*
-/// wire bytes — the user must supply them directly, mirroring
+/// `desc_file` + `message_type` identify the proto descriptor for the
+/// *incoming* wire bytes — the user must supply them directly, mirroring
 /// [`ProtobufSerializerOptions`]. The sink injects the output Arrow `schema`
 /// at build time (typically derived from its own schema source).
 ///
-/// **The descriptor must describe the bytes actually present in
-/// `event.message`, not a wrapper around them.** The encoder decodes the
-/// wire bytes directly against this descriptor; if the bytes are a different
-/// proto type (e.g. a `LogDaemonWrapper` wrapping the target payload),
-/// decoding will mis-align tags or produce Arrow columns for the wrapper's
-/// fields instead of the target's. See the module-level doc for the full
-/// scope limitation.
+/// The descriptor must describe the exact bytes present in `event.message`;
+/// decoding uses the descriptor's field numbers as-is. If the payload needs
+/// any pre-processing before it matches the descriptor, do it upstream.
 ///
 /// [`ProtobufSerializerOptions`]: crate::encoding::format::ProtobufSerializerOptions
 #[configurable_component]
@@ -101,14 +84,13 @@ use plan::{MessagePlan, PlanSlot};
 pub struct WireToArrowSerializerConfig {
     /// Path to the protobuf descriptor set file describing the incoming wire bytes.
     ///
-    /// Must correspond to the exact proto type serialized in `event.message`
-    /// — not an outer wrapper. Typically the output of
-    /// `protoc -I <include path> -o <desc output path> <proto>`.
+    /// Must correspond to the exact proto type serialized in `event.message`.
+    /// Typically the output of `protoc -I <include path> -o <desc output path> <proto>`.
     #[configurable(metadata(docs::examples = "/etc/vector/protobuf_descriptor_set.desc"))]
     pub desc_file: PathBuf,
 
     /// The fully-qualified message type within the descriptor file. Must name
-    /// the type of the bytes in `event.message` (not a wrapper type).
+    /// the type of the bytes in `event.message`.
     #[configurable(metadata(docs::examples = "package.Message"))]
     pub message_type: String,
 
