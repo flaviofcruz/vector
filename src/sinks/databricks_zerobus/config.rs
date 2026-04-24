@@ -253,9 +253,15 @@ impl SinkConfig for ZerobusSinkConfig {
             }
             #[cfg(feature = "codecs-arrow")]
             BatchSerializerConfig::WireToArrow(config) => {
+                // `descriptor` from `resolve_descriptor` describes the *output*
+                // table shape and is used solely to derive the Arrow schema.
+                // The wire descriptor (for decoding incoming bytes) is loaded
+                // separately by the encoder from `batch_encoding.desc_file` +
+                // `batch_encoding.message_type` — under `SchemaSource::UnityCatalog`
+                // the UC-synthesized descriptor's field numbers don't match
+                // real wire tags, so the two descriptors must be distinct.
                 let arrow_schema =
                     super::proto_to_arrow::proto_descriptor_to_arrow_schema(&descriptor)?;
-                config.descriptor = Some(descriptor.clone());
                 config.schema = Some(arrow_schema.clone());
                 StreamMode::Arrow {
                     arrow_schema: std::sync::Arc::new(arrow_schema),

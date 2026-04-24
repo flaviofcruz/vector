@@ -6,12 +6,19 @@ use snafu::Snafu;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum WireToArrowError {
-    /// Required serializer-config field (`descriptor` or `schema`) was not
-    /// populated before `build()`. Sinks inject these at config build time.
+    /// Required serializer-config field (`schema`) was not populated before
+    /// `build()`. Sinks inject this at config build time.
     #[snafu(display("wire-to-Arrow serializer requires a {field}"))]
     ConfigurationMissing {
         /// Which config field was missing.
         field: &'static str,
+    },
+
+    /// Failed to load the proto descriptor from `desc_file` / `message_type`.
+    #[snafu(display("failed to load proto descriptor: {message}"))]
+    DescriptorLoad {
+        /// The underlying error message from `get_message_descriptor`.
+        message: String,
     },
 
     /// The batch had no events to encode.

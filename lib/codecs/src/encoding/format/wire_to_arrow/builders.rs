@@ -36,6 +36,13 @@ pub enum TypedBuilder {
     TimestampMicros(TimestampMicrosecondBuilder),
 }
 
+/// Rough per-value byte-length hint used to pre-size the data buffer for
+/// `LargeStringBuilder` / `LargeBinaryBuilder`. The builder grows on overflow,
+/// so this only avoids the first few reallocations — picked to be in the right
+/// order of magnitude for typical log-field values (short ids, short strings)
+/// without over-allocating for columns that turn out to be mostly empty.
+const AVG_VARLEN_BYTES_PER_VALUE: usize = 16;
+
 impl TypedBuilder {
     /// Construct a typed builder matching the given Arrow DataType.
     ///
@@ -51,12 +58,14 @@ impl TypedBuilder {
             DataType::Float32 => TypedBuilder::Float32(Float32Builder::with_capacity(capacity)),
             DataType::Float64 => TypedBuilder::Float64(Float64Builder::with_capacity(capacity)),
             DataType::Boolean => TypedBuilder::Boolean(BooleanBuilder::with_capacity(capacity)),
-            DataType::LargeUtf8 => TypedBuilder::LargeUtf8(
-                LargeStringBuilder::with_capacity(capacity, capacity * 16),
-            ),
-            DataType::LargeBinary => TypedBuilder::LargeBinary(
-                LargeBinaryBuilder::with_capacity(capacity, capacity * 16),
-            ),
+            DataType::LargeUtf8 => TypedBuilder::LargeUtf8(LargeStringBuilder::with_capacity(
+                capacity,
+                capacity * AVG_VARLEN_BYTES_PER_VALUE,
+            )),
+            DataType::LargeBinary => TypedBuilder::LargeBinary(LargeBinaryBuilder::with_capacity(
+                capacity,
+                capacity * AVG_VARLEN_BYTES_PER_VALUE,
+            )),
             DataType::Timestamp(TimeUnit::Microsecond, tz) => {
                 let mut builder = TimestampMicrosecondBuilder::with_capacity(capacity);
                 if let Some(tz) = tz {
@@ -186,6 +195,7 @@ impl BuilderNodeList {
                         current_offset: 0,
                     }
                 }
+                PlanSlot::Absent => build_absent_node(field, capacity),
             };
             nodes.push(node);
         }
@@ -204,7 +214,10 @@ impl BuilderNodeList {
             .enumerate()
         {
             match (slot, node) {
-                (PlanSlot::Scalar(_), BuilderNode::Scalar(tb)) => {
+                // Scalar builders (PlanSlot::Scalar or PlanSlot::Absent paired
+                // with a scalar Arrow type). Both produce a primitive column
+                // that just needs null-padding when the row didn't touch it.
+                (_, BuilderNode::Scalar(tb)) => {
                     if !present[idx] {
                         tb.append_null();
                     }
@@ -236,7 +249,6 @@ impl BuilderNodeList {
                 }) => {
                     offsets.push(*current_offset);
                 }
-                _ => unreachable!("plan/builder tree mismatch (build bug)"),
             }
         }
     }
@@ -405,11 +417,178 @@ impl BuilderNodeList {
                         })?,
                     )
                 }
+                // Absent columns: the builder tree was shaped to match the
+                // Arrow type and stays fully null-filled. `finish` assembles
+                // the same Arrow type as the regular path but every row is
+                // null / empty list.
+                (PlanSlot::Absent, BuilderNode::Scalar(tb)) => tb.finish(),
+                (PlanSlot::Absent, BuilderNode::Struct { children, validity }) => {
+                    let inner_fields = match arrow_field.data_type() {
+                        DataType::Struct(fs) => fs.clone(),
+                        _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                    };
+                    let sub_plan = MessagePlan::all_absent(&inner_fields);
+                    let child_arrays = children.finish(&sub_plan)?;
+                    let null_buf = NullBuffer::from(std::mem::take(validity));
+                    Arc::new(
+                        StructArray::try_new(inner_fields, child_arrays, Some(null_buf))
+                            .map_err(|e| WireToArrowError::ArrayAssembly {
+                                kind: "struct",
+                                source: e,
+                            })?,
+                    )
+                }
+                (
+                    PlanSlot::Absent,
+                    BuilderNode::RepeatedMessage {
+                        children, offsets, ..
+                    },
+                ) => {
+                    let inner_fields = match arrow_field.data_type() {
+                        DataType::List(element_field) => match element_field.data_type() {
+                            DataType::Struct(fs) => fs.clone(),
+                            _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                        },
+                        _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                    };
+                    let sub_plan = MessagePlan::all_absent(&inner_fields);
+                    let child_arrays = children.finish(&sub_plan)?;
+                    let struct_arr =
+                        StructArray::try_new(inner_fields.clone(), child_arrays, None).map_err(
+                            |e| WireToArrowError::ArrayAssembly {
+                                kind: "list element struct",
+                                source: e,
+                            },
+                        )?;
+                    let offset_buffer =
+                        OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
+                    let element_field =
+                        Arc::new(Field::new("item", DataType::Struct(inner_fields), true));
+                    Arc::new(
+                        ListArray::try_new(
+                            element_field,
+                            offset_buffer,
+                            Arc::new(struct_arr),
+                            None,
+                        )
+                        .map_err(|e| WireToArrowError::ArrayAssembly {
+                            kind: "list",
+                            source: e,
+                        })?,
+                    )
+                }
+                (
+                    PlanSlot::Absent,
+                    BuilderNode::RepeatedScalar {
+                        values, offsets, ..
+                    },
+                ) => {
+                    let values_array = values.finish();
+                    let offset_buffer =
+                        OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
+                    let element_field = match arrow_field.data_type() {
+                        DataType::List(f) => Arc::clone(f),
+                        _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                    };
+                    Arc::new(
+                        ListArray::try_new(element_field, offset_buffer, values_array, None)
+                            .map_err(|e| WireToArrowError::ArrayAssembly {
+                                kind: "list (scalar)",
+                                source: e,
+                            })?,
+                    )
+                }
+                (
+                    PlanSlot::Absent,
+                    BuilderNode::Map {
+                        children, offsets, ..
+                    },
+                ) => {
+                    let inner_fields = match arrow_field.data_type() {
+                        DataType::Map(entry_field, _) => match entry_field.data_type() {
+                            DataType::Struct(fs) => fs.clone(),
+                            _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                        },
+                        _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                    };
+                    let sub_plan = MessagePlan::all_absent(&inner_fields);
+                    let child_arrays = children.finish(&sub_plan)?;
+                    let struct_arr =
+                        StructArray::try_new(inner_fields.clone(), child_arrays, None).map_err(
+                            |e| WireToArrowError::ArrayAssembly {
+                                kind: "map entry struct",
+                                source: e,
+                            },
+                        )?;
+                    let offset_buffer =
+                        OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
+                    let entry_field =
+                        Arc::new(Field::new("key_value", DataType::Struct(inner_fields), false));
+                    Arc::new(
+                        MapArray::try_new(entry_field, offset_buffer, struct_arr, None, false)
+                            .map_err(|e| WireToArrowError::ArrayAssembly {
+                                kind: "map",
+                                source: e,
+                            })?,
+                    )
+                }
                 _ => return Err(WireToArrowError::PlanBuilderMismatch),
             };
             out.push(arr);
         }
         Ok(out)
+    }
+}
+
+/// Build a null-filled builder tree matching the Arrow `field`'s shape, used
+/// for [`PlanSlot::Absent`] columns. The builder is the same shape as a normal
+/// column of that Arrow type, but no wire tags ever dispatch to it so it stays
+/// fully null-padded by `finalize_row` / `fill_null_row`.
+fn build_absent_node(field: &Field, capacity: usize) -> BuilderNode {
+    match field.data_type() {
+        DataType::Struct(inner_fields) => {
+            let sub_plan = MessagePlan::all_absent(inner_fields);
+            BuilderNode::Struct {
+                children: BuilderNodeList::with_capacity(&sub_plan, capacity),
+                validity: Vec::with_capacity(capacity),
+            }
+        }
+        DataType::List(element_field) => {
+            let mut offsets = Vec::with_capacity(capacity + 1);
+            offsets.push(0);
+            match element_field.data_type() {
+                DataType::Struct(inner_fields) => {
+                    let sub_plan = MessagePlan::all_absent(inner_fields);
+                    BuilderNode::RepeatedMessage {
+                        children: BuilderNodeList::with_capacity(&sub_plan, capacity * 2),
+                        offsets,
+                        current_offset: 0,
+                    }
+                }
+                _ => BuilderNode::RepeatedScalar {
+                    values: TypedBuilder::new(element_field.data_type(), capacity * 2),
+                    offsets,
+                    current_offset: 0,
+                },
+            }
+        }
+        DataType::Map(entry_field, _) => {
+            let inner_fields = match entry_field.data_type() {
+                DataType::Struct(fs) => fs,
+                other => panic!("Map entry must be a Struct, got {other:?}"),
+            };
+            let sub_plan = MessagePlan::all_absent(inner_fields);
+            let mut offsets = Vec::with_capacity(capacity + 1);
+            offsets.push(0);
+            BuilderNode::Map {
+                children: BuilderNodeList::with_capacity(&sub_plan, capacity * 2),
+                offsets,
+                current_offset: 0,
+            }
+        }
+        // Scalar Arrow types — build a primitive builder; `TypedBuilder::new`
+        // already panics on unsupported types.
+        _ => BuilderNode::Scalar(TypedBuilder::new(field.data_type(), capacity)),
     }
 }
 

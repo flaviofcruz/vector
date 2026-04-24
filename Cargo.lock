@@ -2974,6 +2974,7 @@ dependencies = [
  "ordered-float 4.6.0",
  "prost 0.12.6",
  "prost-reflect",
+ "proto-parser",
  "rand 0.9.2",
  "regex",
  "rstest",
@@ -9355,6 +9356,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
 dependencies = [
  "prost 0.13.5",
+]
+
+[[package]]
+name = "proto-parser"
+version = "0.1.0"
+dependencies = [
+ "prost-types 0.12.6",
+ "strum 0.26.3",
 ]
 
 [[package]]

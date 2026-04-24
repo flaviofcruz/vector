@@ -90,6 +90,13 @@ pub enum PlanSlot {
     /// message with field 1 = key and field 2 = value; we scan them the same
     /// way as `RepeatedMessage` and assemble a `MapArray` at finish time.
     Map(Arc<MessagePlan>),
+    /// Arrow column has no matching proto field — always emits null (or empty
+    /// list / all-null struct). Happens when the Arrow schema (from UC) has
+    /// more columns than the producer's proto — typically because a field was
+    /// deleted from the proto schema but UC hasn't been updated yet, or the
+    /// producer is running an older version. The scanner never dispatches to
+    /// these slots; `finalize_row` null-pads them for every row.
+    Absent,
 }
 
 /// Plan for encoding one proto message type into a set of Arrow column builders.
@@ -136,16 +143,35 @@ impl MessagePlan {
     pub fn build(descriptor: &MessageDescriptor, fields: &Fields) -> Result<Self> {
         let mut slots = Vec::with_capacity(fields.len());
         let mut max_field_num = 0u32;
-        let mut slot_proto_numbers: Vec<u32> = Vec::with_capacity(fields.len());
+        // `slot_proto_numbers[i] = Some(n)` means slot i maps to proto field n;
+        // `None` means slot i is `Absent` (no proto tag maps here) and is skipped
+        // by the reverse-index build below.
+        let mut slot_proto_numbers: Vec<Option<u32>> = Vec::with_capacity(fields.len());
 
         for arrow_field in fields.iter() {
-            let proto_field = descriptor.get_field_by_name(arrow_field.name()).ok_or_else(
-                || WireToArrowError::MissingProtoField {
-                    name: arrow_field.name().to_string(),
-                },
-            )?;
+            let Some(proto_field) = descriptor.get_field_by_name(arrow_field.name()) else {
+                // Schema drift: the Arrow column exists but the proto doesn't
+                // carry it. Log + metric + keep going — the column becomes
+                // always-null. Typical cause: a field was removed from the
+                // proto before the UC table schema was updated.
+                tracing::warn!(
+                    message = "proto descriptor is missing a field declared in the Arrow schema; \
+                               the column will be emitted as all-null",
+                    field = %arrow_field.name(),
+                    descriptor = %descriptor.full_name(),
+                );
+                metrics::counter!(
+                    "wire_to_arrow_missing_proto_field",
+                    "field" => arrow_field.name().to_string(),
+                    "descriptor" => descriptor.full_name().to_string(),
+                )
+                .increment(1);
+                slots.push(PlanSlot::Absent);
+                slot_proto_numbers.push(None);
+                continue;
+            };
             max_field_num = max_field_num.max(proto_field.number());
-            slot_proto_numbers.push(proto_field.number());
+            slot_proto_numbers.push(Some(proto_field.number()));
 
             let is_repeated = proto_field.cardinality() == Cardinality::Repeated;
             let kind = proto_field.kind();
@@ -244,7 +270,34 @@ impl MessagePlan {
 
         let mut slot_by_proto_field = vec![None; (max_field_num as usize) + 1];
         for (slot_idx, pn) in slot_proto_numbers.iter().enumerate() {
-            slot_by_proto_field[*pn as usize] = Some(slot_idx as u32);
+            if let Some(pn) = pn {
+                slot_by_proto_field[*pn as usize] = Some(slot_idx as u32);
+            }
+        }
+
+        // Opposite-direction drift: proto fields the Arrow schema doesn't
+        // carry. These would be silently skipped at scan time (matching
+        // proto's standard "ignore unknown fields" behavior), but if the
+        // descriptor reflects the current producer schema, it signals
+        // "producer emits this field but UC hasn't caught up." Log + count
+        // once at plan build so operators notice.
+        let arrow_field_names: std::collections::HashSet<&str> =
+            fields.iter().map(|f| f.name().as_str()).collect();
+        for proto_field in descriptor.fields() {
+            if !arrow_field_names.contains(proto_field.name()) {
+                tracing::warn!(
+                    message = "proto descriptor has a field not declared in the Arrow schema; \
+                               occurrences on the wire will be silently skipped",
+                    field = %proto_field.name(),
+                    descriptor = %descriptor.full_name(),
+                );
+                metrics::counter!(
+                    "wire_to_arrow_extra_proto_field",
+                    "field" => proto_field.name().to_string(),
+                    "descriptor" => descriptor.full_name().to_string(),
+                )
+                .increment(1);
+            }
         }
 
         Ok(MessagePlan {
@@ -252,6 +305,18 @@ impl MessagePlan {
             slot_by_proto_field,
             arrow_fields: fields.clone(),
         })
+    }
+
+    /// Build a plan whose slots are all `Absent`. Used by the builder layer to
+    /// shape a null-filled sub-tree when an outer Arrow Struct / List / Map
+    /// column is itself `Absent` (so every nested child has to null-pad per row).
+    pub(crate) fn all_absent(fields: &Fields) -> Self {
+        let slots = (0..fields.len()).map(|_| PlanSlot::Absent).collect();
+        MessagePlan {
+            slots,
+            slot_by_proto_field: Vec::new(),
+            arrow_fields: fields.clone(),
+        }
     }
 }
 
@@ -288,15 +353,28 @@ mod tests {
     }
 
     #[test]
-    fn missing_proto_field_errors() {
+    fn missing_proto_field_yields_absent_slot() {
+        // Schema-drift tolerance: if the Arrow schema declares a column the
+        // proto descriptor doesn't carry, the plan builder logs + increments
+        // a metric and emits a `PlanSlot::Absent` so the column comes out as
+        // all-null rather than failing the batch. Typical cause: a field was
+        // removed from the proto but the UC table still has the column.
         let desc = load_person_descriptor();
-        let schema = Schema::new(vec![Field::new("not_a_field", DataType::Int32, true)]);
-        let err = MessagePlan::build(&desc, &Fields::from(schema.fields().clone()))
-            .expect_err("should fail");
-        assert!(matches!(
-            err,
-            WireToArrowError::MissingProtoField { name } if name == "not_a_field"
-        ));
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::LargeUtf8, true),
+            Field::new("deleted_in_proto", DataType::Int32, true),
+            Field::new("id", DataType::Int32, true),
+        ]);
+        let plan = MessagePlan::build(&desc, &Fields::from(schema.fields().clone())).unwrap();
+        assert!(matches!(plan.slots[0], PlanSlot::Scalar(ScalarKind::String)));
+        assert!(matches!(plan.slots[1], PlanSlot::Absent));
+        assert!(matches!(plan.slots[2], PlanSlot::Scalar(ScalarKind::Int32)));
+        // No proto tag for slot 1 — so the reverse index never points at it.
+        assert!(
+            plan.slot_by_proto_field
+                .iter()
+                .all(|entry| *entry != Some(1))
+        );
     }
 
     #[test]
