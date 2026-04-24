@@ -163,6 +163,17 @@ where
             | ReaderError::PartialWrite => Some(BufferReadError { error_code, error }),
         }
     }
+
+    /// Returns `true` if this error represents the reader's async file-read
+    /// task being cancelled during topology teardown, rather than a real
+    /// filesystem error. Callers should treat it as end-of-stream.
+    ///
+    /// Detected by matching tokio's `JoinError::Cancelled` → `io::Error`
+    /// message verbatim; that string has a single origin in the dependency
+    /// tree so it is a stable signal.
+    pub fn is_cancellation(&self) -> bool {
+        matches!(self, ReaderError::Io { source } if source.to_string() == "task was cancelled")
+    }
 }
 
 impl<T: Bufferable> PartialEq for ReaderError<T> {

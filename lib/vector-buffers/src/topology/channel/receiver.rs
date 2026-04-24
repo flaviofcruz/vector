@@ -57,6 +57,13 @@ where
             ReceiverAdapter::DiskV2 { reader, .. } => loop {
                 match reader.next().await {
                     Ok(result) => break result,
+                    Err(e) if e.is_cancellation() => {
+                        // The reader's async file-read task was cancelled
+                        // during topology teardown. Treat as end-of-stream
+                        // rather than panicking, which would cascade through
+                        // `handle_errors` and abort other tasks mid-drain.
+                        break None;
+                    }
                     Err(e) => match e.as_recoverable_error() {
                         Some(re) => {
                             // If we've hit a recoverable error, we'll emit an event to indicate as much but we'll still
