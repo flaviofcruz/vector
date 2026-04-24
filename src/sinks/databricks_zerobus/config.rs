@@ -513,4 +513,180 @@ mod tests {
         assert_eq!(sdk_options.recovery, true);
         assert_eq!(sdk_options.recovery_retries, 4);
     }
+
+    /// Exercises the `WireToArrow` branch of `ZerobusSinkConfig::build`
+    /// (config.rs:255-269) end-to-end, short of the Zerobus stream handshake.
+    ///
+    /// Under `SchemaSource::UnityCatalog`, `resolve_descriptor` returns a
+    /// descriptor synthesized from UC columns with position-based field
+    /// numbers. That descriptor is used *only* to shape the Arrow output
+    /// schema; the wire descriptor used for decoding is loaded independently
+    /// from `desc_file` + `message_type`. This test proves the two descriptors
+    /// are independent at runtime by constructing a wire descriptor whose tag
+    /// numbers (1001/1002/1003) don't overlap with the UC-synthesized tags
+    /// (1/2/3). A successful round-trip demonstrates that the UC descriptor
+    /// never touches wire bytes — if it did, wire tags would miss the lookup
+    /// table and every column would be null.
+    #[cfg(feature = "codecs-arrow")]
+    #[test]
+    fn wire_to_arrow_uc_source_decouples_arrow_schema_from_wire_descriptor() {
+        use super::super::proto_to_arrow::proto_descriptor_to_arrow_schema;
+        use super::super::unity_catalog_schema::{
+            UnityCatalogColumn, UnityCatalogTableSchema, generate_descriptor_from_schema,
+        };
+        use arrow::array::AsArray;
+        use bytes::Bytes;
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::prost_types::field_descriptor_proto::{Label, Type as ProtoType};
+        use prost_reflect::prost_types::{
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        };
+        use prost_reflect::{DescriptorPool, DynamicMessage, Value as ProtoValue};
+        use vector_lib::codecs::encoding::{
+            BatchSerializer, BatchSerializerConfig, WireToArrowSerializerConfig,
+        };
+        use vector_lib::event::{Event, LogEvent};
+
+        // --- UC side: stand in for `ZerobusService::resolve_descriptor` under
+        //     `SchemaSource::UnityCatalog`. `generate_descriptor_from_schema`
+        //     assigns field numbers as `position + 1`, so columns at positions
+        //     0/1/2 yield tags 1/2/3.
+        let uc_schema = UnityCatalogTableSchema {
+            name: "test_table".into(),
+            catalog_name: "test_cat".into(),
+            schema_name: "test_sch".into(),
+            columns: vec![
+                UnityCatalogColumn {
+                    name: "name".into(),
+                    type_text: "string".into(),
+                    type_name: "STRING".into(),
+                    position: 0,
+                    nullable: true,
+                    type_json: String::new(),
+                },
+                UnityCatalogColumn {
+                    name: "id".into(),
+                    type_text: "int".into(),
+                    type_name: "INT".into(),
+                    position: 1,
+                    nullable: true,
+                    type_json: String::new(),
+                },
+                UnityCatalogColumn {
+                    name: "email".into(),
+                    type_text: "string".into(),
+                    type_name: "STRING".into(),
+                    position: 2,
+                    nullable: true,
+                    type_json: String::new(),
+                },
+            ],
+        };
+        let uc_descriptor = generate_descriptor_from_schema(&uc_schema).unwrap();
+        let arrow_schema = proto_descriptor_to_arrow_schema(&uc_descriptor).unwrap();
+        // Sanity: UC-synthesized tags are the small, position-based ones. If
+        // these ever leaked into wire decode, the assertion below would fail
+        // because the wire bytes carry tags 1001+.
+        for (i, field) in uc_descriptor.fields().enumerate() {
+            assert_eq!(field.number() as usize, i + 1, "UC tag = position + 1");
+        }
+
+        // --- Wire side: a completely separate descriptor, written to a
+        //     tempfile so we exercise the `desc_file` → `get_message_descriptor`
+        //     path that `BatchSerializerConfig::build` invokes. Field names
+        //     intentionally match UC column names so the name-based pairing
+        //     at plan build has something to work with; tag numbers are
+        //     deliberately disjoint from the UC-synthesized ones.
+        let wire_fd = FileDescriptorProto {
+            name: Some("wire_to_arrow_uc_split_test.proto".into()),
+            package: Some("wire_to_arrow_uc_split_test".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Row".into()),
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("name".into()),
+                        number: Some(1001),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::String as i32),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("id".into()),
+                        number: Some(1002),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::Int32 as i32),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("email".into()),
+                        number: Some(1003),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::String as i32),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let set = FileDescriptorSet {
+            file: vec![wire_fd],
+        };
+        let mut set_bytes = Vec::new();
+        set.encode(&mut set_bytes).unwrap();
+        let desc_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(desc_file.path(), &set_bytes).unwrap();
+
+        // --- Replay the WireToArrow branch of `ZerobusSinkConfig::build`
+        //     (config.rs:255-269): inject the UC-derived Arrow schema into a
+        //     `WireToArrowSerializerConfig`, then run `BatchSerializerConfig::build`.
+        let wire_config = WireToArrowSerializerConfig {
+            desc_file: desc_file.path().to_path_buf(),
+            message_type: "wire_to_arrow_uc_split_test.Row".into(),
+            schema: Some(arrow_schema),
+        };
+        let batch_serializer = BatchSerializerConfig::WireToArrow(wire_config)
+            .build()
+            .expect("build should succeed with separate UC + wire descriptors");
+
+        // --- Round-trip: encode a Row using the wire descriptor (tags 1001+).
+        let wire_desc = DescriptorPool::decode(set_bytes.as_slice())
+            .unwrap()
+            .get_message_by_name("wire_to_arrow_uc_split_test.Row")
+            .unwrap();
+        let mut msg = DynamicMessage::new(wire_desc);
+        msg.set_field_by_name("name", ProtoValue::String("alice".into()));
+        msg.set_field_by_name("id", ProtoValue::I32(42));
+        msg.set_field_by_name("email", ProtoValue::String("alice@example.com".into()));
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+        let mut log = LogEvent::default();
+        log.insert("message", Bytes::from(buf));
+        let events = [Event::from(log)];
+
+        let batch = match batch_serializer {
+            BatchSerializer::WireToArrow(ser) => ser
+                .encode_to_record_batch(&events)
+                .expect("wire decode with real wire tags"),
+            other => panic!("expected WireToArrow serializer, got {other:?}"),
+        };
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 3, "UC-derived arrow schema shape");
+        assert_eq!(batch.schema().field(0).name(), "name");
+        assert_eq!(batch.schema().field(1).name(), "id");
+        assert_eq!(batch.schema().field(2).name(), "email");
+        assert_eq!(batch.column(0).as_string::<i64>().value(0), "alice");
+        assert_eq!(
+            batch
+                .column(1)
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .value(0),
+            42
+        );
+        assert_eq!(
+            batch.column(2).as_string::<i64>().value(0),
+            "alice@example.com"
+        );
+    }
 }

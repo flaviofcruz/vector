@@ -717,3 +717,95 @@ fn multiple_rows_preserve_order() {
         assert_eq!(ids.value(i), (i as i32) * 10);
     }
 }
+
+#[test]
+fn wire_descriptor_tags_drive_decode_regardless_of_arrow_schema_source() {
+    // The two mappings the encoder relies on:
+    //   (a) Arrow schema ↔ proto descriptor — by name, at plan-build time.
+    //   (b) Proto descriptor ↔ wire bytes — by tag number, at scan time.
+    // They are independent. An Arrow schema derived from any other
+    // descriptor (e.g. the UC-synthesized one with position-based tags) must
+    // not leak its tag numbers into the scan. Tags on the wire come from
+    // whatever descriptor the *wire* side was encoded with, and that's the
+    // only descriptor the serializer is told about.
+    //
+    // Here: wire descriptor uses tags 1001/1002/1003. If the scanner ever
+    // fell back to a position-based or otherwise-synthesized tag space
+    // (1/2/3), every wire tag would miss and the batch columns would be
+    // all-null. Full population proves decode uses the wire descriptor's
+    // tag numbers exclusively.
+    let wire_fd = FileDescriptorProto {
+        name: Some("wire_tag_divergence_test.proto".into()),
+        package: Some("wire_tag_divergence_test".into()),
+        message_type: vec![DescriptorProto {
+            name: Some("Row".into()),
+            field: vec![
+                FieldDescriptorProto {
+                    name: Some("name".into()),
+                    number: Some(1001),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ProtoType::String as i32),
+                    ..Default::default()
+                },
+                FieldDescriptorProto {
+                    name: Some("id".into()),
+                    number: Some(1002),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ProtoType::Int32 as i32),
+                    ..Default::default()
+                },
+                FieldDescriptorProto {
+                    name: Some("email".into()),
+                    number: Some(1003),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ProtoType::String as i32),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet {
+        file: vec![wire_fd],
+    };
+    let mut set_bytes = Vec::new();
+    set.encode(&mut set_bytes).unwrap();
+    let wire_desc = DescriptorPool::decode(set_bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_tag_divergence_test.Row")
+        .unwrap();
+
+    let arrow_schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+        Field::new("email", DataType::LargeUtf8, true),
+    ]);
+    let serializer = WireToArrowSerializer::from_descriptor(wire_desc.clone(), arrow_schema)
+        .expect("serializer build");
+
+    let mut msg = DynamicMessage::new(wire_desc);
+    msg.set_field_by_name("name", ProtoValue::String("alice".into()));
+    msg.set_field_by_name("id", ProtoValue::I32(42));
+    msg.set_field_by_name("email", ProtoValue::String("alice@example.com".into()));
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = serializer
+        .encode_to_record_batch(&[event_with_message_bytes(Bytes::from(buf))])
+        .expect("encode");
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.num_columns(), 3);
+    assert_eq!(batch.column(0).as_string::<i64>().value(0), "alice");
+    assert_eq!(
+        batch
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(0),
+        42
+    );
+    assert_eq!(
+        batch.column(2).as_string::<i64>().value(0),
+        "alice@example.com"
+    );
+}
