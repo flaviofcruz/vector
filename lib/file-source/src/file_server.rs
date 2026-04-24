@@ -651,9 +651,31 @@ where
                         .close()
                         .await
                         .expect("error closing file_server data channel.");
-                    let checkpointer = checkpoint_task_handle
-                        .await
-                        .expect("checkpoint task has panicked");
+                    // Await the checkpoint writer task. On clean shutdown it
+                    // returns the `Arc<Checkpointer>` so we can do one final
+                    // pre-shutdown write. If the task was cancelled by the
+                    // runtime during topology teardown, or panicked, log and
+                    // skip the final write rather than panicking ourselves --
+                    // panicking here cascades through `handle_errors` and
+                    // forces unnecessary container restarts.
+                    let checkpointer = match checkpoint_task_handle.await {
+                        Ok(checkpointer) => checkpointer,
+                        Err(e) if e.is_cancelled() => {
+                            warn!(
+                                "checkpoint writer task cancelled during shutdown; \
+                                 skipping final checkpoint write"
+                            );
+                            return Ok(Shutdown);
+                        }
+                        Err(e) => {
+                            error!(
+                                error = ?e,
+                                "checkpoint writer task panicked; \
+                                 skipping final checkpoint write"
+                            );
+                            return Ok(Shutdown);
+                        }
+                    };
                     if let Err(error) = checkpointer.write_checkpoints().await {
                         error!(?error, "Error writing checkpoints before shutdown");
                     }
