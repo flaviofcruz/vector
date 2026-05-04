@@ -211,12 +211,11 @@ impl WireToArrowEncoder {
     pub fn encode_batch(&self, messages: &[Bytes]) -> Result<RecordBatch> {
         let capacity = messages.len();
         let mut builders = BuilderNodeList::with_capacity(&self.plan, capacity);
-        let mut present = vec![false; self.plan.slots.len()];
 
         for msg_bytes in messages {
-            present.iter_mut().for_each(|p| *p = false);
-            scan_message(&self.plan, msg_bytes, &mut builders, &mut present)?;
-            builders.finalize_row(&self.plan, &present);
+            builders.reset_present();
+            scan_message(&self.plan, msg_bytes, &mut builders)?;
+            builders.finalize_row(&self.plan);
         }
 
         let arrays = builders.finish(&self.plan)?;
@@ -226,13 +225,17 @@ impl WireToArrowEncoder {
 }
 
 /// Scan one proto message's wire bytes, appending values into `builders`.
-/// `present[i]` is set to `true` if slot `i` was touched by any tag in this
-/// message.
+///
+/// Sets `builders.present[i] = true` for each slot `i` touched by any tag in
+/// this message. The caller is responsible for resetting `present` (via
+/// [`BuilderNodeList::reset_present`]) before invoking, and for calling
+/// [`BuilderNodeList::finalize_row`] afterwards. Sub-messages reuse their own
+/// level's `present` buffer, so no per-occurrence allocation happens on the
+/// hot path.
 fn scan_message(
     plan: &MessagePlan,
     mut bytes: &[u8],
     builders: &mut BuilderNodeList,
-    present: &mut [bool],
 ) -> Result<()> {
     while !bytes.is_empty() {
         let (field, rest) = try_parse_field(bytes)?;
@@ -246,7 +249,10 @@ fn scan_message(
         let slot_idx = slot_idx as usize;
 
         let slot = &plan.slots[slot_idx];
-        let node = &mut builders.nodes[slot_idx];
+        // Split-borrow `nodes` and `present` so we can mutate the dispatched
+        // node and flag `present[slot_idx]` in the same iteration.
+        let BuilderNodeList { nodes, present } = &mut *builders;
+        let node = &mut nodes[slot_idx];
 
         match (slot, node) {
             (PlanSlot::Scalar(sk), builders::BuilderNode::Scalar(tb)) => {
@@ -255,9 +261,9 @@ fn scan_message(
             }
             (PlanSlot::Struct(sub_plan), builders::BuilderNode::Struct { children, .. }) => {
                 let sub_bytes = expect_len(&field.value)?;
-                let mut sub_present = vec![false; sub_plan.slots.len()];
-                scan_message(sub_plan, sub_bytes, children, &mut sub_present)?;
-                children.finalize_row(sub_plan, &sub_present);
+                children.reset_present();
+                scan_message(sub_plan, sub_bytes, children)?;
+                children.finalize_row(sub_plan);
                 present[slot_idx] = true;
             }
             (
@@ -277,9 +283,9 @@ fn scan_message(
                 },
             ) => {
                 let sub_bytes = expect_len(&field.value)?;
-                let mut sub_present = vec![false; sub_plan.slots.len()];
-                scan_message(sub_plan, sub_bytes, children, &mut sub_present)?;
-                children.finalize_row(sub_plan, &sub_present);
+                children.reset_present();
+                scan_message(sub_plan, sub_bytes, children)?;
+                children.finalize_row(sub_plan);
                 *current_offset += 1;
                 present[slot_idx] = true;
             }

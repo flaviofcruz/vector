@@ -111,6 +111,12 @@ impl TypedBuilder {
 /// A tree of builders mirroring a `MessagePlan`.
 pub struct BuilderNodeList {
     pub(crate) nodes: Vec<BuilderNode>,
+    /// Per-row scratch: `present[i]` is `true` if slot `i` was touched while
+    /// scanning the current message at this level. Owned alongside `nodes` so
+    /// each sub-plan reuses its own buffer instead of allocating a fresh
+    /// `Vec<bool>` per nested-struct / list / map occurrence on the hot path.
+    /// Reset between rows / sub-rows via [`BuilderNodeList::reset_present`].
+    pub(crate) present: Vec<bool>,
 }
 
 pub enum BuilderNode {
@@ -150,6 +156,14 @@ pub enum BuilderNode {
 
 impl BuilderNodeList {
     /// Allocate a builder tree matching `plan`, with capacity for `capacity` rows.
+    ///
+    /// Called **once per batch** by [`WireToArrowEncoder::encode_batch`], not
+    /// once per sink — Arrow's `*Builder::finish()` consumes the internal
+    /// buffers to produce the output `ArrayRef`, so the tree is single-use.
+    /// The shared, immutable state (`Arc<MessagePlan>`, `Arc<Schema>`) lives
+    /// on the encoder and is what costs once per sink.
+    ///
+    /// [`WireToArrowEncoder::encode_batch`]: super::WireToArrowEncoder::encode_batch
     pub fn with_capacity(plan: &MessagePlan, capacity: usize) -> Self {
         let mut nodes = Vec::with_capacity(plan.slots.len());
         for (slot, field) in plan.slots.iter().zip(plan.arrow_fields.iter()) {
@@ -199,20 +213,27 @@ impl BuilderNodeList {
             };
             nodes.push(node);
         }
-        Self { nodes }
+        let present = vec![false; plan.slots.len()];
+        Self { nodes, present }
+    }
+
+    /// Zero `present` ahead of scanning a row / sub-row at this level. Cheap
+    /// in-place loop — buffer capacity is preserved across calls.
+    #[inline]
+    pub fn reset_present(&mut self) {
+        self.present.iter_mut().for_each(|p| *p = false);
     }
 
     /// After scanning one message, push per-row bookkeeping (struct validity,
     /// list offsets) and fill nulls for scalars whose tag wasn't seen.
     ///
-    /// `present[i]` = `true` if slot `i` saw at least one wire occurrence.
-    pub fn finalize_row(&mut self, plan: &MessagePlan, present: &[bool]) {
-        for (idx, (slot, node)) in plan
-            .slots
-            .iter()
-            .zip(self.nodes.iter_mut())
-            .enumerate()
-        {
+    /// Reads from `self.present`, which the caller must have populated via
+    /// [`reset_present`](Self::reset_present) + per-tag dispatch in
+    /// `scan_message`.
+    pub fn finalize_row(&mut self, plan: &MessagePlan) {
+        // Split-borrow so we can mutate `nodes` while reading `present`.
+        let Self { nodes, present } = self;
+        for (idx, (slot, node)) in plan.slots.iter().zip(nodes.iter_mut()).enumerate() {
             match (slot, node) {
                 // Scalar builders (PlanSlot::Scalar or PlanSlot::Absent paired
                 // with a scalar Arrow type). Both produce a primitive column

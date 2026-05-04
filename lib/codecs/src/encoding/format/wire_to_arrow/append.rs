@@ -10,7 +10,7 @@ use zeroparser::wire::{WireValue, decode_zigzag32, decode_zigzag64};
 
 use super::builders::TypedBuilder;
 use super::errors::{Result, WireToArrowError};
-use super::plan::ScalarKind;
+use super::plan::{ScalarKind, WT_I32, WT_I64, WT_LEN, WT_VARINT};
 
 /// Extract the inner bytes from a length-delimited `WireValue`, or error.
 #[inline]
@@ -18,7 +18,7 @@ pub(super) fn expect_len<'a>(wv: &'a WireValue<'a>) -> Result<&'a [u8]> {
     match wv {
         WireValue::Len(b) => Ok(b),
         other => Err(WireToArrowError::WireTypeMismatch {
-            expected: 2,
+            expected: WT_LEN,
             actual: wire_type_byte(other),
         }),
     }
@@ -28,10 +28,10 @@ pub(super) fn expect_len<'a>(wv: &'a WireValue<'a>) -> Result<&'a [u8]> {
 #[inline]
 pub(super) fn wire_type_byte(wv: &WireValue) -> u8 {
     match wv {
-        WireValue::Varint(_) => 0,
-        WireValue::I64(_) => 1,
-        WireValue::Len(_) => 2,
-        WireValue::I32(_) => 5,
+        WireValue::Varint(_) => WT_VARINT,
+        WireValue::I64(_) => WT_I64,
+        WireValue::Len(_) => WT_LEN,
+        WireValue::I32(_) => WT_I32,
     }
 }
 
@@ -117,6 +117,12 @@ pub(super) fn append_scalar_from_wire(
 
 /// Append a repeated-scalar occurrence (either a single unpacked value or a
 /// full packed blob) into `values`.
+///
+/// `current_offset` is the running cumulative element count for the parent
+/// Arrow `List<primitive>`: bumped by 1 per element appended here (1 for
+/// unpacked, N for a packed blob). The owning `BuilderNode::RepeatedScalar`
+/// later pushes it onto its `offsets` buffer at row finalization, which is
+/// how list lengths are recorded in Arrow's offsets-buffer layout.
 pub(super) fn append_repeated_scalar(
     kind: ScalarKind,
     wv: &WireValue,
@@ -139,7 +145,11 @@ pub(super) fn append_repeated_scalar(
             actual: wire_type_byte(wv),
         });
     };
-    if kind.wire_type() == 2 {
+    // Proto spec forbids packed encoding for length-delimited scalars
+    // (string/bytes) — there's no length-prefix per element inside a packed
+    // blob, so a `Len`-typed `string`/`bytes` must arrive as one unpacked
+    // occurrence per value. Reject the combo here.
+    if kind.wire_type() == WT_LEN {
         return Err(WireToArrowError::WireTypeMismatch {
             expected: kind.wire_type(),
             actual: wire_type_byte(wv),
@@ -166,11 +176,11 @@ fn read_packed_element<'a>(
     pos: &mut usize,
 ) -> Result<WireValue<'a>> {
     match kind.wire_type() {
-        0 => Ok(WireValue::Varint(decode_varint(bytes, pos)?)),
-        1 => Ok(WireValue::I64(read_fixed64(bytes, pos)?)),
-        5 => Ok(WireValue::I32(read_fixed32(bytes, pos)?)),
-        // Wire type 2 would be string/bytes — unreachable per the caller's
-        // guard. Any other value indicates a plan build bug.
+        WT_VARINT => Ok(WireValue::Varint(decode_varint(bytes, pos)?)),
+        WT_I64 => Ok(WireValue::I64(read_fixed64(bytes, pos)?)),
+        WT_I32 => Ok(WireValue::I32(read_fixed32(bytes, pos)?)),
+        // `WT_LEN` would be string/bytes — unreachable per the caller's guard.
+        // Any other value indicates a plan build bug.
         _ => Err(WireToArrowError::PlanBuilderMismatch),
     }
 }

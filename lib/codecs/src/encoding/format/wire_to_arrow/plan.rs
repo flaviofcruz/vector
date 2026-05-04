@@ -10,6 +10,17 @@ use prost_reflect::{Cardinality, Kind, MessageDescriptor};
 
 use super::errors::{Result, WireToArrowError};
 
+/// Proto wire-type codes (the low 3 bits of a tag).
+///
+/// The upstream `proto_parser::wire::WireType` enum is private to that crate,
+/// so we redeclare the codes here for use across this module's public-API
+/// surface (`ScalarKind::wire_type`, error fields, packed-scalar dispatch).
+/// Keep these in sync with the proto spec: <https://protobuf.dev/programming-guides/encoding/#structure>
+pub(super) const WT_VARINT: u8 = 0;
+pub(super) const WT_I64: u8 = 1;
+pub(super) const WT_LEN: u8 = 2;
+pub(super) const WT_I32: u8 = 5;
+
 /// Proto scalar kinds that this PoC can read off the wire and append to Arrow
 /// primitive builders. Proto enums map to `Int32` (matching the zerobus sink's
 /// `proto_descriptor_to_arrow_schema` convention).
@@ -42,10 +53,10 @@ impl ScalarKind {
             | ScalarKind::UInt64
             | ScalarKind::SInt32
             | ScalarKind::SInt64
-            | ScalarKind::Bool => 0,
-            ScalarKind::Fixed32 | ScalarKind::SFixed32 | ScalarKind::Float => 5,
-            ScalarKind::Fixed64 | ScalarKind::SFixed64 | ScalarKind::Double => 1,
-            ScalarKind::String | ScalarKind::Bytes => 2,
+            | ScalarKind::Bool => WT_VARINT,
+            ScalarKind::Fixed32 | ScalarKind::SFixed32 | ScalarKind::Float => WT_I32,
+            ScalarKind::Fixed64 | ScalarKind::SFixed64 | ScalarKind::Double => WT_I64,
+            ScalarKind::String | ScalarKind::Bytes => WT_LEN,
         }
     }
 
@@ -394,9 +405,9 @@ mod tests {
 
     #[test]
     fn wire_type_for_scalars() {
-        assert_eq!(ScalarKind::Int32.wire_type(), 0);
-        assert_eq!(ScalarKind::String.wire_type(), 2);
-        assert_eq!(ScalarKind::Double.wire_type(), 1);
-        assert_eq!(ScalarKind::Float.wire_type(), 5);
+        assert_eq!(ScalarKind::Int32.wire_type(), WT_VARINT);
+        assert_eq!(ScalarKind::String.wire_type(), WT_LEN);
+        assert_eq!(ScalarKind::Double.wire_type(), WT_I64);
+        assert_eq!(ScalarKind::Float.wire_type(), WT_I32);
     }
 }
