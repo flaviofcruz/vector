@@ -18,6 +18,11 @@ generate-desc:
 	       --descriptor_set_out=test_protobuf3/v1/test_protobuf3.desc \
 	       test_protobuf3/v1/test_protobuf3.proto
 
+	protoc --proto_path=. \
+	       --include_imports \
+	       --descriptor_set_out=test_protobuf_maps/v1/test_protobuf_maps.desc \
+	       test_protobuf_maps/v1/test_protobuf_maps.proto
+
 # Generates serialized binary .pb test files from .txt input
 generate-pb:
 	protoc --proto_path=. \
@@ -35,7 +40,12 @@ generate-pb:
 	       test_protobuf3/v1/test_protobuf3.proto \
 	       < test_protobuf3/v1/input/person_with_job.txt > test_protobuf3/v1/input/person_with_job.pb
 
+	protoc --proto_path=. \
+	       --encode=test_protobuf_maps.v1.ConfigMap \
+	       test_protobuf_maps/v1/test_protobuf_maps.proto \
+	       < test_protobuf_maps/v1/input/config_map.txt > test_protobuf_maps/v1/input/config_map.pb
+
 # Clean generated files
 clean:
-	rm -f test/**/*.desc test_protobuf/**/*.desc test_protobuf3/**/*.desc
-	rm -f test_protobuf/input/*.pb
+	rm -f test/**/*.desc test_protobuf/**/*.desc test_protobuf3/**/*.desc test_protobuf_maps/**/*.desc
+	rm -f test_protobuf/input/*.pb test_protobuf_maps/**/*.pb

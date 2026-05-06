@@ -81,15 +81,24 @@ pub fn proto_to_value(
                 Value::from(
                     v.iter()
                         .map(|kv| {
+                            // Proto map keys can be any scalar type (bool, int32, int64, uint32,
+                            // uint64, string). VRL's ObjectMap requires string keys, so we convert
+                            // non-string map keys to their decimal string representation.
+                            let key: KeyString = match &kv.0 {
+                                prost_reflect::MapKey::Bool(v) => v.to_string().into(),
+                                prost_reflect::MapKey::I32(v) => v.to_string().into(),
+                                prost_reflect::MapKey::I64(v) => v.to_string().into(),
+                                prost_reflect::MapKey::U32(v) => v.to_string().into(),
+                                prost_reflect::MapKey::U64(v) => v.to_string().into(),
+                                prost_reflect::MapKey::String(v) => v.clone().into(),
+                            };
                             Ok((
-                                kv.0.as_str()
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "Internal error while parsing protobuf map. Field descriptor: {field_descriptor:?}"
-                                        )
-                                    })?
-                                    .into(),
-                                proto_to_value(kv.1, Some(&message_desc.map_entry_value_field()), options)?,
+                                key,
+                                proto_to_value(
+                                    kv.1,
+                                    Some(&message_desc.map_entry_value_field()),
+                                    options,
+                                )?,
                             ))
                         })
                         .collect::<std::result::Result<ObjectMap, String>>()?,
@@ -162,6 +171,106 @@ mod tests {
         let value = value!({ name: "Someone",
                                     phones: [{number: "123-456", type: "PHONE_TYPE_MOBILE"}] });
         assert_eq!(value, parsed_value)
+    }
+
+    #[test]
+    fn test_proto_to_value_map_int64_keys() {
+        // Regression test: proto map<int64, bool> previously failed because
+        // proto_to_value called kv.0.as_str() which returns None for non-string
+        // MapKey variants. This verifies that integer keys are converted to their
+        // decimal string representations.
+        let path = test_data_dir().join("test_protobuf_maps/v1/test_protobuf_maps.desc");
+        let descriptor = get_message_descriptor(&path, "test_protobuf_maps.v1.ConfigMap").unwrap();
+        let pb_bytes =
+            std::fs::read(test_data_dir().join("test_protobuf_maps/v1/input/config_map.pb"))
+                .unwrap();
+        let parsed = parse_proto(&descriptor, Value::Bytes(pb_bytes.into()));
+        assert!(
+            parsed.is_ok(),
+            "Failed to parse proto with non-string map keys: {:?}",
+            parsed.unwrap_err()
+        );
+        let parsed = parsed.unwrap();
+
+        // bool_by_int64: {42: true, -1: false}
+        let bool_map = parsed
+            .get(&owned_value_path!("bool_by_int64"))
+            .expect("missing bool_by_int64");
+        assert_eq!(
+            bool_map.get(&owned_value_path!("42")),
+            Some(&Value::Boolean(true)),
+            "int64 key 42 should map to true"
+        );
+        assert_eq!(
+            bool_map.get(&owned_value_path!("-1")),
+            Some(&Value::Boolean(false)),
+            "int64 key -1 should map to false"
+        );
+
+        // string_by_bool: {true: "yes"}
+        let bool_key_map = parsed
+            .get(&owned_value_path!("string_by_bool"))
+            .expect("missing string_by_bool");
+        assert_eq!(
+            bool_key_map.get(&owned_value_path!("true")),
+            Some(&Value::from("yes")),
+            "bool key true should map to 'yes'"
+        );
+
+        // string_by_uint32: {100: "hundred"}
+        let uint_map = parsed
+            .get(&owned_value_path!("string_by_uint32"))
+            .expect("missing string_by_uint32");
+        assert_eq!(
+            uint_map.get(&owned_value_path!("100")),
+            Some(&Value::from("hundred")),
+            "uint32 key 100 should map to 'hundred'"
+        );
+
+        // string_by_int32: {-5: "neg_five"}
+        let int32_map = parsed
+            .get(&owned_value_path!("string_by_int32"))
+            .expect("missing string_by_int32");
+        assert_eq!(
+            int32_map.get(&owned_value_path!("-5")),
+            Some(&Value::from("neg_five")),
+            "int32 key -5 should map to 'neg_five'"
+        );
+
+        // int32_by_int64: {100: 7, -200: -3}
+        let int32_by_int64 = parsed
+            .get(&owned_value_path!("int32_by_int64"))
+            .expect("missing int32_by_int64");
+        assert_eq!(
+            int32_by_int64.get(&owned_value_path!("100")),
+            Some(&Value::Integer(7)),
+            "int64 key 100 should map to int32 value 7"
+        );
+        assert_eq!(
+            int32_by_int64.get(&owned_value_path!("-200")),
+            Some(&Value::Integer(-3)),
+            "int64 key -200 should map to int32 value -3"
+        );
+
+        // int64_by_int32: {1: 9999999999}
+        let int64_by_int32 = parsed
+            .get(&owned_value_path!("int64_by_int32"))
+            .expect("missing int64_by_int32");
+        assert_eq!(
+            int64_by_int32.get(&owned_value_path!("1")),
+            Some(&Value::Integer(9_999_999_999)),
+            "int32 key 1 should map to int64 value 9999999999"
+        );
+
+        // uint64_by_uint32: {255: 1000000000000}
+        let uint64_by_uint32 = parsed
+            .get(&owned_value_path!("uint64_by_uint32"))
+            .expect("missing uint64_by_uint32");
+        assert_eq!(
+            uint64_by_uint32.get(&owned_value_path!("255")),
+            Some(&Value::Integer(1_000_000_000_000)),
+            "uint32 key 255 should map to uint64 value 1000000000000"
+        );
     }
 
     #[test]

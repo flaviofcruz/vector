@@ -1,0 +1,36 @@
+bool_by_int64: {
+  key: 42
+  value: true
+}
+bool_by_int64: {
+  key: -1
+  value: false
+}
+string_by_bool: {
+  key: true
+  value: "yes"
+}
+string_by_uint32: {
+  key: 100
+  value: "hundred"
+}
+string_by_int32: {
+  key: -5
+  value: "neg_five"
+}
+int32_by_int64: {
+  key: 100
+  value: 7
+}
+int32_by_int64: {
+  key: -200
+  value: -3
+}
+int64_by_int32: {
+  key: 1
+  value: 9999999999
+}
+uint64_by_uint32: {
+  key: 255
+  value: 1000000000000
+}
