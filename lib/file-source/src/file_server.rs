@@ -1052,7 +1052,7 @@ mod tests {
 
         // Collect lines non-blocking since the channel is already closed.
         let mut received = Vec::new();
-        while let Ok(Some(batch)) = rx.try_next() {
+        while let Ok(batch) = rx.try_recv() {
             received.extend(batch);
         }
 
