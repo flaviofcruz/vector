@@ -467,7 +467,11 @@ impl BuilderNodeList {
                 (PlanSlot::Absent, BuilderNode::Struct { children, validity }) => {
                     let inner_fields = match arrow_field.data_type() {
                         DataType::Struct(fs) => fs.clone(),
-                        _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                        _ => {
+                            return Err(WireToArrowError::PlanBuilderMismatch {
+                                site: "finish:absent_struct_non_struct_arrow",
+                            });
+                        }
                     };
                     let sub_plan = MessagePlan::all_absent(&inner_fields);
                     let child_arrays = children.finish(&sub_plan)?;
@@ -489,9 +493,17 @@ impl BuilderNodeList {
                     let inner_fields = match arrow_field.data_type() {
                         DataType::List(element_field) => match element_field.data_type() {
                             DataType::Struct(fs) => fs.clone(),
-                            _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                            _ => {
+                                return Err(WireToArrowError::PlanBuilderMismatch {
+                                    site: "finish:absent_repeated_message_inner_non_struct",
+                                });
+                            }
                         },
-                        _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                        _ => {
+                            return Err(WireToArrowError::PlanBuilderMismatch {
+                                site: "finish:absent_repeated_message_non_list",
+                            });
+                        }
                     };
                     let sub_plan = MessagePlan::all_absent(&inner_fields);
                     let child_arrays = children.finish(&sub_plan)?;
@@ -530,7 +542,11 @@ impl BuilderNodeList {
                         OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
                     let element_field = match arrow_field.data_type() {
                         DataType::List(f) => Arc::clone(f),
-                        _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                        _ => {
+                            return Err(WireToArrowError::PlanBuilderMismatch {
+                                site: "finish:absent_repeated_scalar_non_list",
+                            });
+                        }
                     };
                     Arc::new(
                         ListArray::try_new(element_field, offset_buffer, values_array, None)
@@ -549,9 +565,17 @@ impl BuilderNodeList {
                     let inner_fields = match arrow_field.data_type() {
                         DataType::Map(entry_field, _) => match entry_field.data_type() {
                             DataType::Struct(fs) => fs.clone(),
-                            _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                            _ => {
+                                return Err(WireToArrowError::PlanBuilderMismatch {
+                                    site: "finish:absent_map_entry_non_struct",
+                                });
+                            }
                         },
-                        _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                        _ => {
+                            return Err(WireToArrowError::PlanBuilderMismatch {
+                                site: "finish:absent_map_non_map",
+                            });
+                        }
                     };
                     let sub_plan = MessagePlan::all_absent(&inner_fields);
                     let child_arrays = children.finish(&sub_plan)?;
@@ -574,7 +598,11 @@ impl BuilderNodeList {
                             })?,
                     )
                 }
-                _ => return Err(WireToArrowError::PlanBuilderMismatch),
+                _ => {
+                    return Err(WireToArrowError::PlanBuilderMismatch {
+                        site: "finish:slot_builder_mismatch",
+                    });
+                }
             };
             out.push(arr);
         }

@@ -250,7 +250,9 @@ pub(super) fn read_packed_element<'a>(
         WT_I32 => Ok(WireValue::I32(read_fixed32(bytes, pos)?)),
         // `WT_LEN` would be string/bytes — unreachable per the caller's guard.
         // Any other value indicates a plan build bug.
-        _ => Err(WireToArrowError::PlanBuilderMismatch),
+        _ => Err(WireToArrowError::PlanBuilderMismatch {
+            site: "read_packed_element:non_packable_wire_type",
+        }),
     }
 }
 

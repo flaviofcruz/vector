@@ -347,7 +347,11 @@ fn scan_message(
                 append_repeated_scalar(*sk, &field.value, values, current_offset)?;
                 present[slot_idx] = true;
             }
-            _ => return Err(WireToArrowError::PlanBuilderMismatch),
+            _ => {
+                return Err(WireToArrowError::PlanBuilderMismatch {
+                    site: "scan_message:slot_builder_mismatch",
+                });
+            }
         }
     }
     Ok(())
@@ -395,7 +399,11 @@ fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<()> {
             // slots are Arrow columns the proto descriptor lacks), so this
             // arm is unreachable in practice. Mirror `scan_message`'s
             // fall-through and surface it as a code-bug signal.
-            PlanSlot::Absent => return Err(WireToArrowError::PlanBuilderMismatch),
+            PlanSlot::Absent => {
+                return Err(WireToArrowError::PlanBuilderMismatch {
+                    site: "validate_message:absent_slot_unreachable",
+                });
+            }
         }
     }
     Ok(())

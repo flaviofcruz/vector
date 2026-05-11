@@ -108,9 +108,18 @@ pub enum WireToArrowError {
     #[snafu(display("invalid UTF-8 in proto string field"))]
     InvalidUtf8,
 
-    /// Plan and builder trees diverged during scan (build bug).
-    #[snafu(display("internal: plan/builder tree mismatch"))]
-    PlanBuilderMismatch,
+    /// Plan and builder trees diverged during scan / finish, or a code
+    /// path the encoder considers structurally impossible was reached.
+    /// Always a code bug — never user input. `site` is a short label
+    /// identifying which emit site fired so a bug report points at the
+    /// right path without needing a backtrace.
+    #[snafu(display("internal: plan/builder tree mismatch at {site}"))]
+    PlanBuilderMismatch {
+        /// Short label naming the emit site (e.g. `"scan_message"`,
+        /// `"finish:absent_struct_non_struct_arrow"`). Free-form but
+        /// expected to be a `&'static str` literal at the call site.
+        site: &'static str,
+    },
 
     /// `arrow::record_batch::RecordBatch::try_new` rejected the assembled arrays.
     #[snafu(display("failed to assemble RecordBatch: {source}"))]
