@@ -68,7 +68,7 @@ use vrl::protobuf::descriptor::get_message_descriptor;
 
 pub use errors::WireToArrowError;
 
-use zeroparser::wire::{WireValue, decode_zigzag32, decode_zigzag64, try_parse_field};
+use zeroparser::wire::try_parse_field;
 
 use append::{
     append_repeated_scalar, append_scalar_from_wire, expect_len, validate_repeated_scalar,

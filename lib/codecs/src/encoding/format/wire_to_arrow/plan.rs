@@ -24,7 +24,7 @@ pub const MAX_NESTING_DEPTH: usize = 64;
 
 /// Proto wire-type codes (the low 3 bits of a tag).
 ///
-/// The upstream `proto_parser::wire::WireType` enum is private to that crate,
+/// The upstream `zeroparser::wire::WireType` enum is private to that crate,
 /// so we redeclare the codes here for use across this module's public-API
 /// surface (`ScalarKind::wire_type`, error fields, packed-scalar dispatch).
 /// Keep these in sync with the proto spec: <https://protobuf.dev/programming-guides/encoding/#structure>
