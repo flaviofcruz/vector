@@ -33,6 +33,9 @@ pub(super) const WT_I64: u8 = 1;
 pub(super) const WT_LEN: u8 = 2;
 pub(super) const WT_I32: u8 = 5;
 
+/// "No slot maps to this proto field number" in [`MessagePlan::slot_by_proto_field`].
+pub(crate) const SLOT_UNKNOWN: u32 = u32::MAX;
+
 /// Proto scalar kinds that this PoC can read off the wire and append to Arrow
 /// primitive builders. Proto enums map to `Int32` (matching the zerobus sink's
 /// `proto_descriptor_to_arrow_schema` convention).
@@ -127,10 +130,10 @@ pub enum PlanSlot {
 pub struct MessagePlan {
     /// One entry per Arrow field at this level, in schema order.
     pub(crate) slots: Vec<PlanSlot>,
-    /// Reverse index: `slot_by_proto_field[proto_field_number]` is `Some(slot_idx)`
-    /// for known fields, `None` for unknown fields (which get skipped). Dense
-    /// vector indexed directly by proto field number — no hashing on the hot path.
-    pub(crate) slot_by_proto_field: Vec<Option<u32>>,
+    /// Reverse index from proto field number to slot index, with
+    /// [`SLOT_UNKNOWN`] marking unknown / out-of-range fields. Dense vector,
+    /// no hashing on the hot path.
+    pub(crate) slot_by_proto_field: Vec<u32>,
     /// Arrow `Fields` at this level, kept for assembly of `StructArray` / `ListArray`.
     pub(crate) arrow_fields: Fields,
 }
@@ -379,10 +382,10 @@ impl MessagePlan {
             slots.push(slot);
         }
 
-        let mut slot_by_proto_field = vec![None; (max_field_num as usize) + 1];
+        let mut slot_by_proto_field = vec![SLOT_UNKNOWN; (max_field_num as usize) + 1];
         for (slot_idx, pn) in slot_proto_numbers.iter().enumerate() {
             if let Some(pn) = pn {
-                slot_by_proto_field[*pn as usize] = Some(slot_idx as u32);
+                slot_by_proto_field[*pn as usize] = slot_idx as u32;
             }
         }
 
@@ -520,11 +523,7 @@ mod tests {
         assert!(matches!(plan.slots[1], PlanSlot::Absent));
         assert!(matches!(plan.slots[2], PlanSlot::Scalar(ScalarKind::Int32)));
         // No proto tag for slot 1 — so the reverse index never points at it.
-        assert!(
-            plan.slot_by_proto_field
-                .iter()
-                .all(|entry| *entry != Some(1))
-        );
+        assert!(plan.slot_by_proto_field.iter().all(|entry| *entry != 1));
     }
 
     #[test]

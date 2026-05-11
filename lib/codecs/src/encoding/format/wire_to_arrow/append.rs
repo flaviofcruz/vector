@@ -14,7 +14,7 @@ use super::errors::{Result, WireToArrowError};
 use super::plan::{ScalarKind, WT_I32, WT_I64, WT_LEN, WT_VARINT};
 
 /// Extract the inner bytes from a length-delimited `WireValue`, or error.
-#[inline]
+#[inline(always)]
 pub(super) fn expect_len<'a>(wv: &'a WireValue<'a>) -> Result<&'a [u8]> {
     match wv {
         WireValue::Len(b) => Ok(b),
@@ -37,83 +37,185 @@ pub(super) fn wire_type_byte(wv: &WireValue) -> u8 {
 }
 
 /// Append one scalar `WireValue` into the matching typed Arrow builder.
+/// The only runtime error is a wire-type disagreement; (kind, builder)
+/// pairing is enforced when the plan is built.
+#[inline(always)]
 pub(super) fn append_scalar_from_wire(
     kind: ScalarKind,
     wv: &WireValue,
     tb: &mut TypedBuilder,
 ) -> Result<()> {
-    match (kind, tb, wv) {
-        (ScalarKind::Int32, TypedBuilder::Int32(b), WireValue::Varint(v)) => {
-            b.append_value(*v as i32);
+    match kind {
+        ScalarKind::Int32 => {
+            let v = expect_varint(kind, wv)?;
+            if let TypedBuilder::Int32(b) = tb {
+                b.append_value(v as i32);
+                return Ok(());
+            }
         }
-        (ScalarKind::Int64, TypedBuilder::Int64(b), WireValue::Varint(v)) => {
-            b.append_value(*v as i64);
+        ScalarKind::Int64 => {
+            let v = expect_varint(kind, wv)?;
+            match tb {
+                TypedBuilder::Int64(b) => {
+                    b.append_value(v as i64);
+                    return Ok(());
+                }
+                TypedBuilder::TimestampMicros(b) => {
+                    b.append_value(v as i64);
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
-        // `int64` -> `Timestamp(Microsecond, _)` coercion. Proto carries the
-        // value as a plain varint; the Arrow column interprets it as
-        // microseconds since Unix epoch. Used primarily for `_event_time` on
-        // LP tables (matching `proto_descriptor_to_arrow_schema`).
-        (ScalarKind::Int64, TypedBuilder::TimestampMicros(b), WireValue::Varint(v)) => {
-            b.append_value(*v as i64);
+        ScalarKind::UInt32 => {
+            let v = expect_varint(kind, wv)?;
+            if let TypedBuilder::UInt32(b) = tb {
+                b.append_value(v as u32);
+                return Ok(());
+            }
         }
-        (ScalarKind::UInt32, TypedBuilder::UInt32(b), WireValue::Varint(v)) => {
-            b.append_value(*v as u32);
+        ScalarKind::UInt64 => {
+            let v = expect_varint(kind, wv)?;
+            if let TypedBuilder::UInt64(b) = tb {
+                b.append_value(v);
+                return Ok(());
+            }
         }
-        (ScalarKind::UInt64, TypedBuilder::UInt64(b), WireValue::Varint(v)) => {
-            b.append_value(*v);
+        ScalarKind::SInt32 => {
+            let v = expect_varint(kind, wv)?;
+            if let TypedBuilder::Int32(b) = tb {
+                b.append_value(decode_zigzag32(v as u32));
+                return Ok(());
+            }
         }
-        (ScalarKind::SInt32, TypedBuilder::Int32(b), WireValue::Varint(v)) => {
-            b.append_value(decode_zigzag32(*v as u32));
+        ScalarKind::SInt64 => {
+            let v = expect_varint(kind, wv)?;
+            match tb {
+                TypedBuilder::Int64(b) => {
+                    b.append_value(decode_zigzag64(v));
+                    return Ok(());
+                }
+                TypedBuilder::TimestampMicros(b) => {
+                    b.append_value(decode_zigzag64(v));
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
-        (ScalarKind::SInt64, TypedBuilder::Int64(b), WireValue::Varint(v)) => {
-            b.append_value(decode_zigzag64(*v));
+        ScalarKind::Fixed32 => {
+            let v = expect_i32(kind, wv)?;
+            if let TypedBuilder::UInt32(b) = tb {
+                b.append_value(v);
+                return Ok(());
+            }
         }
-        (ScalarKind::SInt64, TypedBuilder::TimestampMicros(b), WireValue::Varint(v)) => {
-            b.append_value(decode_zigzag64(*v));
+        ScalarKind::SFixed32 => {
+            let v = expect_i32(kind, wv)?;
+            if let TypedBuilder::Int32(b) = tb {
+                b.append_value(v as i32);
+                return Ok(());
+            }
         }
-        (ScalarKind::Fixed32, TypedBuilder::UInt32(b), WireValue::I32(v)) => {
-            b.append_value(*v);
+        ScalarKind::Float => {
+            let v = expect_i32(kind, wv)?;
+            if let TypedBuilder::Float32(b) = tb {
+                b.append_value(f32::from_bits(v));
+                return Ok(());
+            }
         }
-        (ScalarKind::SFixed32, TypedBuilder::Int32(b), WireValue::I32(v)) => {
-            b.append_value(*v as i32);
+        ScalarKind::Fixed64 => {
+            let v = expect_i64(kind, wv)?;
+            if let TypedBuilder::UInt64(b) = tb {
+                b.append_value(v);
+                return Ok(());
+            }
         }
-        (ScalarKind::Float, TypedBuilder::Float32(b), WireValue::I32(v)) => {
-            b.append_value(f32::from_bits(*v));
+        ScalarKind::SFixed64 => {
+            let v = expect_i64(kind, wv)?;
+            match tb {
+                TypedBuilder::Int64(b) => {
+                    b.append_value(v as i64);
+                    return Ok(());
+                }
+                TypedBuilder::TimestampMicros(b) => {
+                    b.append_value(v as i64);
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
-        (ScalarKind::Fixed64, TypedBuilder::UInt64(b), WireValue::I64(v)) => {
-            b.append_value(*v);
+        ScalarKind::Double => {
+            let v = expect_i64(kind, wv)?;
+            if let TypedBuilder::Float64(b) = tb {
+                b.append_value(f64::from_bits(v));
+                return Ok(());
+            }
         }
-        (ScalarKind::SFixed64, TypedBuilder::Int64(b), WireValue::I64(v)) => {
-            b.append_value(*v as i64);
+        ScalarKind::Bool => {
+            let v = expect_varint(kind, wv)?;
+            if let TypedBuilder::Boolean(b) = tb {
+                b.append_value(v != 0);
+                return Ok(());
+            }
         }
-        (ScalarKind::SFixed64, TypedBuilder::TimestampMicros(b), WireValue::I64(v)) => {
-            b.append_value(*v as i64);
+        ScalarKind::String => {
+            let bytes = expect_len(wv)?;
+            if let TypedBuilder::LargeUtf8(b) = tb {
+                let s = std::str::from_utf8(bytes).map_err(|_| WireToArrowError::InvalidUtf8)?;
+                b.append_value(s);
+                return Ok(());
+            }
         }
-        (ScalarKind::Double, TypedBuilder::Float64(b), WireValue::I64(v)) => {
-            b.append_value(f64::from_bits(*v));
-        }
-        (ScalarKind::Bool, TypedBuilder::Boolean(b), WireValue::Varint(v)) => {
-            b.append_value(*v != 0);
-        }
-        (ScalarKind::String, TypedBuilder::LargeUtf8(b), WireValue::Len(bytes)) => {
-            let s = std::str::from_utf8(bytes).map_err(|_| WireToArrowError::InvalidUtf8)?;
-            b.append_value(s);
-        }
-        (ScalarKind::Bytes, TypedBuilder::LargeBinary(b), WireValue::Len(bytes)) => {
-            b.append_value(bytes);
-        }
-        // Any other combination is either a wire-type mismatch (wire bytes
-        // don't match the declared schema) or — much less likely — a plan
-        // that disagrees with its builder tree. Report as a wire-type
-        // mismatch since that's the real-world failure mode.
-        (_, _, wv) => {
-            return Err(WireToArrowError::WireTypeMismatch {
-                expected: kind.wire_type(),
-                actual: wire_type_byte(wv),
-            });
+        ScalarKind::Bytes => {
+            let bytes = expect_len(wv)?;
+            if let TypedBuilder::LargeBinary(b) = tb {
+                b.append_value(bytes);
+                return Ok(());
+            }
         }
     }
-    Ok(())
+    // Wire bytes don't match the schema, or (defensively) the plan builder
+    // paired a scalar kind with a builder it can't write to.
+    Err(WireToArrowError::WireTypeMismatch {
+        expected: kind.wire_type(),
+        actual: wire_type_byte(wv),
+    })
+}
+
+#[inline(always)]
+fn expect_varint(kind: ScalarKind, wv: &WireValue) -> Result<u64> {
+    if let WireValue::Varint(v) = wv {
+        Ok(*v)
+    } else {
+        Err(WireToArrowError::WireTypeMismatch {
+            expected: kind.wire_type(),
+            actual: wire_type_byte(wv),
+        })
+    }
+}
+
+#[inline(always)]
+fn expect_i32(kind: ScalarKind, wv: &WireValue) -> Result<u32> {
+    if let WireValue::I32(v) = wv {
+        Ok(*v)
+    } else {
+        Err(WireToArrowError::WireTypeMismatch {
+            expected: kind.wire_type(),
+            actual: wire_type_byte(wv),
+        })
+    }
+}
+
+#[inline(always)]
+fn expect_i64(kind: ScalarKind, wv: &WireValue) -> Result<u64> {
+    if let WireValue::I64(v) = wv {
+        Ok(*v)
+    } else {
+        Err(WireToArrowError::WireTypeMismatch {
+            expected: kind.wire_type(),
+            actual: wire_type_byte(wv),
+        })
+    }
 }
 
 /// Append a repeated-scalar occurrence (either a single unpacked value or a

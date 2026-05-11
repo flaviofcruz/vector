@@ -15,7 +15,7 @@ use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use super::errors::{Result, WireToArrowError};
-use super::plan::{MessagePlan, PlanSlot};
+use super::plan::{MessagePlan, PlanSlot, ScalarKind};
 
 /// Leaf builder: one Arrow primitive column. Type-specific, no dyn dispatch.
 pub enum TypedBuilder {
@@ -140,11 +140,19 @@ pub struct BuilderNodeList {
     pub(crate) present: Vec<bool>,
 }
 
+/// One Arrow column's builder plus the dispatch info `scan_message` needs:
+/// scalar kind for primitive variants, sub-plan for nested ones. Carrying it
+/// here lets the scan loop dispatch on the node alone without re-indexing
+/// `plan.slots`.
 pub enum BuilderNode {
-    Scalar(TypedBuilder),
+    Scalar {
+        kind: ScalarKind,
+        builder: TypedBuilder,
+    },
     /// Singular nested message. `validity[i]` tells whether row `i` had this
     /// field present (true) or absent (false — child values are null-filled).
     Struct {
+        sub_plan: Arc<MessagePlan>,
         children: BuilderNodeList,
         validity: Vec<bool>,
     },
@@ -152,6 +160,7 @@ pub enum BuilderNode {
     /// `offsets[i]` = total element count after row `i`. `offsets[0] = 0`.
     /// `current_offset` tracks the running count across scan.
     RepeatedMessage {
+        sub_plan: Arc<MessagePlan>,
         children: BuilderNodeList,
         offsets: Vec<i32>,
         current_offset: i32,
@@ -160,6 +169,7 @@ pub enum BuilderNode {
     /// bookkeeping as `RepeatedMessage`, but the child is a single typed
     /// primitive builder rather than a tree.
     RepeatedScalar {
+        kind: ScalarKind,
         values: TypedBuilder,
         offsets: Vec<i32>,
         current_offset: i32,
@@ -169,6 +179,7 @@ pub enum BuilderNode {
     /// but the finish step assembles a `MapArray` with `key_value` entry name
     /// matching the zerobus sink's existing convention.
     Map {
+        sub_plan: Arc<MessagePlan>,
         children: BuilderNodeList,
         offsets: Vec<i32>,
         current_offset: i32,
@@ -189,10 +200,12 @@ impl BuilderNodeList {
         let mut nodes = Vec::with_capacity(plan.slots.len());
         for (slot, field) in plan.slots.iter().zip(plan.arrow_fields.iter()) {
             let node = match slot {
-                PlanSlot::Scalar(_) => {
-                    BuilderNode::Scalar(TypedBuilder::new(field.data_type(), capacity))
-                }
+                PlanSlot::Scalar(kind) => BuilderNode::Scalar {
+                    kind: *kind,
+                    builder: TypedBuilder::new(field.data_type(), capacity),
+                },
                 PlanSlot::Struct(sub_plan) => BuilderNode::Struct {
+                    sub_plan: Arc::clone(sub_plan),
                     children: BuilderNodeList::with_capacity(sub_plan, capacity)?,
                     validity: Vec::with_capacity(capacity),
                 },
@@ -200,13 +213,14 @@ impl BuilderNodeList {
                     let mut offsets = Vec::with_capacity(capacity + 1);
                     offsets.push(0);
                     BuilderNode::RepeatedMessage {
+                        sub_plan: Arc::clone(sub_plan),
                         // List lengths tend to be small; 2x rows is a rough guess.
                         children: BuilderNodeList::with_capacity(sub_plan, capacity * 2)?,
                         offsets,
                         current_offset: 0,
                     }
                 }
-                PlanSlot::RepeatedScalar(_) => {
+                PlanSlot::RepeatedScalar(kind) => {
                     let element_type = match field.data_type() {
                         DataType::List(element_field) => element_field.data_type(),
                         _ => {
@@ -218,6 +232,7 @@ impl BuilderNodeList {
                     let mut offsets = Vec::with_capacity(capacity + 1);
                     offsets.push(0);
                     BuilderNode::RepeatedScalar {
+                        kind: *kind,
                         values: TypedBuilder::new(element_type, capacity * 2),
                         offsets,
                         current_offset: 0,
@@ -227,11 +242,14 @@ impl BuilderNodeList {
                     let mut offsets = Vec::with_capacity(capacity + 1);
                     offsets.push(0);
                     BuilderNode::Map {
+                        sub_plan: Arc::clone(sub_plan),
                         children: BuilderNodeList::with_capacity(sub_plan, capacity * 2)?,
                         offsets,
                         current_offset: 0,
                     }
                 }
+                // No proto tag points here, so the slot is null-padded each
+                // row by `finalize_row`'s "tag wasn't seen" branch.
                 PlanSlot::Absent => build_absent_node(field, capacity)?,
             };
             nodes.push(node);
@@ -240,34 +258,31 @@ impl BuilderNodeList {
         Ok(Self { nodes, present })
     }
 
-    /// Zero `present` ahead of scanning a row / sub-row at this level. Cheap
-    /// in-place loop — buffer capacity is preserved across calls.
+    /// Zero `present` ahead of scanning a row / sub-row. `slice::fill(false)`
+    /// lowers to memset.
     #[inline]
     pub fn reset_present(&mut self) {
-        self.present.iter_mut().for_each(|p| *p = false);
+        self.present.fill(false);
     }
 
     /// After scanning one message, push per-row bookkeeping (struct validity,
-    /// list offsets) and fill nulls for scalars whose tag wasn't seen.
-    ///
-    /// Reads from `self.present`, which the caller must have populated via
-    /// [`reset_present`](Self::reset_present) + per-tag dispatch in
-    /// `scan_message`.
+    /// list offsets) and null-pad scalars whose tag wasn't seen. `plan` is
+    /// only consulted in debug builds for a length sanity-check.
+    #[inline]
     pub fn finalize_row(&mut self, plan: &MessagePlan) {
-        // Split-borrow so we can mutate `nodes` while reading `present`.
         let Self { nodes, present } = self;
-        for (idx, (slot, node)) in plan.slots.iter().zip(nodes.iter_mut()).enumerate() {
-            match (slot, node) {
-                // Scalar builders (PlanSlot::Scalar or PlanSlot::Absent paired
-                // with a scalar Arrow type). Both produce a primitive column
-                // that just needs null-padding when the row didn't touch it.
-                (_, BuilderNode::Scalar(tb)) => {
-                    if !present[idx] {
-                        tb.append_null();
+        debug_assert_eq!(plan.slots.len(), nodes.len());
+        debug_assert_eq!(plan.slots.len(), present.len());
+        for (node, &was_present) in nodes.iter_mut().zip(present.iter()) {
+            match node {
+                BuilderNode::Scalar { builder, .. } => {
+                    if !was_present {
+                        builder.append_null();
                     }
                 }
-                (_, BuilderNode::Struct { children, validity }) => {
-                    let was_present = present[idx];
+                BuilderNode::Struct {
+                    children, validity, ..
+                } => {
                     validity.push(was_present);
                     if !was_present {
                         children.fill_null_row();
@@ -276,21 +291,21 @@ impl BuilderNodeList {
                 // All list-flavored slots push an offsets marker per row.
                 // For proto repeated fields (including maps), the outer list
                 // itself is never null — absent just means empty list.
-                (_, BuilderNode::RepeatedMessage {
+                BuilderNode::RepeatedMessage {
                     offsets,
                     current_offset,
                     ..
-                })
-                | (_, BuilderNode::RepeatedScalar {
+                }
+                | BuilderNode::RepeatedScalar {
                     offsets,
                     current_offset,
                     ..
-                })
-                | (_, BuilderNode::Map {
+                }
+                | BuilderNode::Map {
                     offsets,
                     current_offset,
                     ..
-                }) => {
+                } => {
                     offsets.push(*current_offset);
                 }
             }
@@ -302,8 +317,10 @@ impl BuilderNodeList {
     pub fn fill_null_row(&mut self) {
         for node in self.nodes.iter_mut() {
             match node {
-                BuilderNode::Scalar(tb) => tb.append_null(),
-                BuilderNode::Struct { children, validity } => {
+                BuilderNode::Scalar { builder, .. } => builder.append_null(),
+                BuilderNode::Struct {
+                    children, validity, ..
+                } => {
                     validity.push(false);
                     children.fill_null_row();
                 }
@@ -328,19 +345,20 @@ impl BuilderNodeList {
         }
     }
 
-    /// Finalize this level and return the resulting Arrow arrays in schema order.
+    /// Finalize this level and return the Arrow arrays in schema order.
+    /// `Absent` slots fall through to the same per-variant branches: the
+    /// builders are already null-filled by `finalize_row`.
     pub fn finish(&mut self, plan: &MessagePlan) -> Result<Vec<ArrayRef>> {
         let mut out: Vec<ArrayRef> = Vec::with_capacity(plan.slots.len());
-        for (idx, (slot, node)) in plan
-            .slots
-            .iter()
-            .zip(self.nodes.iter_mut())
-            .enumerate()
-        {
+        for (idx, node) in self.nodes.iter_mut().enumerate() {
             let arrow_field = &plan.arrow_fields[idx];
-            let arr: ArrayRef = match (slot, node) {
-                (PlanSlot::Scalar(_), BuilderNode::Scalar(tb)) => tb.finish(),
-                (PlanSlot::Struct(sub_plan), BuilderNode::Struct { children, validity }) => {
+            let arr: ArrayRef = match node {
+                BuilderNode::Scalar { builder, .. } => builder.finish(),
+                BuilderNode::Struct {
+                    sub_plan,
+                    children,
+                    validity,
+                } => {
                     let child_arrays = children.finish(sub_plan)?;
                     let null_buf = NullBuffer::from(std::mem::take(validity));
                     Arc::new(
@@ -355,22 +373,19 @@ impl BuilderNodeList {
                         })?,
                     )
                 }
-                (
-                    PlanSlot::RepeatedMessage(sub_plan),
-                    BuilderNode::RepeatedMessage {
-                        children, offsets, ..
-                    },
-                ) => {
+                BuilderNode::RepeatedMessage {
+                    sub_plan,
+                    children,
+                    offsets,
+                    ..
+                } => {
                     let child_arrays = children.finish(sub_plan)?;
-                    let struct_arr = StructArray::try_new(
-                        sub_plan.arrow_fields.clone(),
-                        child_arrays,
-                        None,
-                    )
-                    .map_err(|e| WireToArrowError::ArrayAssembly {
-                        kind: "list element struct",
-                        source: e,
-                    })?;
+                    let struct_arr =
+                        StructArray::try_new(sub_plan.arrow_fields.clone(), child_arrays, None)
+                            .map_err(|e| WireToArrowError::ArrayAssembly {
+                                kind: "list element struct",
+                                source: e,
+                            })?;
                     let offset_buffer =
                         OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
                     let element_field = Arc::new(Field::new(
@@ -391,12 +406,7 @@ impl BuilderNodeList {
                         })?,
                     )
                 }
-                (
-                    PlanSlot::RepeatedScalar(_),
-                    BuilderNode::RepeatedScalar {
-                        values, offsets, ..
-                    },
-                ) => {
+                BuilderNode::RepeatedScalar { values, offsets, .. } => {
                     let values_array = values.finish();
                     let offset_buffer =
                         OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
@@ -421,22 +431,19 @@ impl BuilderNodeList {
                             })?,
                     )
                 }
-                (
-                    PlanSlot::Map(sub_plan),
-                    BuilderNode::Map {
-                        children, offsets, ..
-                    },
-                ) => {
+                BuilderNode::Map {
+                    sub_plan,
+                    children,
+                    offsets,
+                    ..
+                } => {
                     let child_arrays = children.finish(sub_plan)?;
-                    let struct_arr = StructArray::try_new(
-                        sub_plan.arrow_fields.clone(),
-                        child_arrays,
-                        None,
-                    )
-                    .map_err(|e| WireToArrowError::ArrayAssembly {
-                        kind: "map entry struct",
-                        source: e,
-                    })?;
+                    let struct_arr =
+                        StructArray::try_new(sub_plan.arrow_fields.clone(), child_arrays, None)
+                            .map_err(|e| WireToArrowError::ArrayAssembly {
+                                kind: "map entry struct",
+                                source: e,
+                            })?;
                     let offset_buffer =
                         OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
                     // Match zerobus's `proto_descriptor_to_arrow_schema` convention:
@@ -448,162 +455,12 @@ impl BuilderNodeList {
                         false,
                     ));
                     Arc::new(
-                        MapArray::try_new(
-                            entry_field,
-                            offset_buffer,
-                            struct_arr,
-                            None,
-                            false,
-                        )
-                        .map_err(|e| WireToArrowError::ArrayAssembly {
-                            kind: "map",
-                            source: e,
-                        })?,
-                    )
-                }
-                // Absent columns: the builder tree was shaped to match the
-                // Arrow type and stays fully null-filled. `finish` assembles
-                // the same Arrow type as the regular path but every row is
-                // null / empty list.
-                (PlanSlot::Absent, BuilderNode::Scalar(tb)) => tb.finish(),
-                (PlanSlot::Absent, BuilderNode::Struct { children, validity }) => {
-                    let inner_fields = match arrow_field.data_type() {
-                        DataType::Struct(fs) => fs.clone(),
-                        _ => {
-                            return Err(WireToArrowError::PlanBuilderMismatch {
-                                site: "finish:absent_struct_non_struct_arrow",
-                            });
-                        }
-                    };
-                    let sub_plan = MessagePlan::all_absent(&inner_fields);
-                    let child_arrays = children.finish(&sub_plan)?;
-                    let null_buf = NullBuffer::from(std::mem::take(validity));
-                    Arc::new(
-                        StructArray::try_new(inner_fields, child_arrays, Some(null_buf))
-                            .map_err(|e| WireToArrowError::ArrayAssembly {
-                                kind: "struct",
-                                source: e,
-                            })?,
-                    )
-                }
-                (
-                    PlanSlot::Absent,
-                    BuilderNode::RepeatedMessage {
-                        children, offsets, ..
-                    },
-                ) => {
-                    let inner_fields = match arrow_field.data_type() {
-                        DataType::List(element_field) => match element_field.data_type() {
-                            DataType::Struct(fs) => fs.clone(),
-                            _ => {
-                                return Err(WireToArrowError::PlanBuilderMismatch {
-                                    site: "finish:absent_repeated_message_inner_non_struct",
-                                });
-                            }
-                        },
-                        _ => {
-                            return Err(WireToArrowError::PlanBuilderMismatch {
-                                site: "finish:absent_repeated_message_non_list",
-                            });
-                        }
-                    };
-                    let sub_plan = MessagePlan::all_absent(&inner_fields);
-                    let child_arrays = children.finish(&sub_plan)?;
-                    let struct_arr =
-                        StructArray::try_new(inner_fields.clone(), child_arrays, None).map_err(
-                            |e| WireToArrowError::ArrayAssembly {
-                                kind: "list element struct",
-                                source: e,
-                            },
-                        )?;
-                    let offset_buffer =
-                        OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
-                    let element_field =
-                        Arc::new(Field::new("item", DataType::Struct(inner_fields), true));
-                    Arc::new(
-                        ListArray::try_new(
-                            element_field,
-                            offset_buffer,
-                            Arc::new(struct_arr),
-                            None,
-                        )
-                        .map_err(|e| WireToArrowError::ArrayAssembly {
-                            kind: "list",
-                            source: e,
-                        })?,
-                    )
-                }
-                (
-                    PlanSlot::Absent,
-                    BuilderNode::RepeatedScalar {
-                        values, offsets, ..
-                    },
-                ) => {
-                    let values_array = values.finish();
-                    let offset_buffer =
-                        OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
-                    let element_field = match arrow_field.data_type() {
-                        DataType::List(f) => Arc::clone(f),
-                        _ => {
-                            return Err(WireToArrowError::PlanBuilderMismatch {
-                                site: "finish:absent_repeated_scalar_non_list",
-                            });
-                        }
-                    };
-                    Arc::new(
-                        ListArray::try_new(element_field, offset_buffer, values_array, None)
-                            .map_err(|e| WireToArrowError::ArrayAssembly {
-                                kind: "list (scalar)",
-                                source: e,
-                            })?,
-                    )
-                }
-                (
-                    PlanSlot::Absent,
-                    BuilderNode::Map {
-                        children, offsets, ..
-                    },
-                ) => {
-                    let inner_fields = match arrow_field.data_type() {
-                        DataType::Map(entry_field, _) => match entry_field.data_type() {
-                            DataType::Struct(fs) => fs.clone(),
-                            _ => {
-                                return Err(WireToArrowError::PlanBuilderMismatch {
-                                    site: "finish:absent_map_entry_non_struct",
-                                });
-                            }
-                        },
-                        _ => {
-                            return Err(WireToArrowError::PlanBuilderMismatch {
-                                site: "finish:absent_map_non_map",
-                            });
-                        }
-                    };
-                    let sub_plan = MessagePlan::all_absent(&inner_fields);
-                    let child_arrays = children.finish(&sub_plan)?;
-                    let struct_arr =
-                        StructArray::try_new(inner_fields.clone(), child_arrays, None).map_err(
-                            |e| WireToArrowError::ArrayAssembly {
-                                kind: "map entry struct",
-                                source: e,
-                            },
-                        )?;
-                    let offset_buffer =
-                        OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
-                    let entry_field =
-                        Arc::new(Field::new("key_value", DataType::Struct(inner_fields), false));
-                    Arc::new(
                         MapArray::try_new(entry_field, offset_buffer, struct_arr, None, false)
                             .map_err(|e| WireToArrowError::ArrayAssembly {
                                 kind: "map",
                                 source: e,
                             })?,
                     )
-                }
-                _ => {
-                    return Err(WireToArrowError::PlanBuilderMismatch {
-                        site: "finish:slot_builder_mismatch",
-                    });
                 }
             };
             out.push(arr);
@@ -617,11 +474,15 @@ impl BuilderNodeList {
 /// column of that Arrow type, but no wire tags ever dispatch to it so it stays
 /// fully null-padded by `finalize_row` / `fill_null_row`.
 fn build_absent_node(field: &Field, capacity: usize) -> Result<BuilderNode> {
+    // Inert `kind` for variants that carry one — the slot is never
+    // dispatched, so the value never matters.
+    const ABSENT_KIND: ScalarKind = ScalarKind::Int32;
     Ok(match field.data_type() {
         DataType::Struct(inner_fields) => {
-            let sub_plan = MessagePlan::all_absent(inner_fields);
+            let sub_plan = Arc::new(MessagePlan::all_absent(inner_fields));
             BuilderNode::Struct {
                 children: BuilderNodeList::with_capacity(&sub_plan, capacity)?,
+                sub_plan,
                 validity: Vec::with_capacity(capacity),
             }
         }
@@ -630,14 +491,16 @@ fn build_absent_node(field: &Field, capacity: usize) -> Result<BuilderNode> {
             offsets.push(0);
             match element_field.data_type() {
                 DataType::Struct(inner_fields) => {
-                    let sub_plan = MessagePlan::all_absent(inner_fields);
+                    let sub_plan = Arc::new(MessagePlan::all_absent(inner_fields));
                     BuilderNode::RepeatedMessage {
                         children: BuilderNodeList::with_capacity(&sub_plan, capacity * 2)?,
+                        sub_plan,
                         offsets,
                         current_offset: 0,
                     }
                 }
                 _ => BuilderNode::RepeatedScalar {
+                    kind: ABSENT_KIND,
                     values: TypedBuilder::new(element_field.data_type(), capacity * 2),
                     offsets,
                     current_offset: 0,
@@ -653,11 +516,12 @@ fn build_absent_node(field: &Field, capacity: usize) -> Result<BuilderNode> {
                     });
                 }
             };
-            let sub_plan = MessagePlan::all_absent(inner_fields);
+            let sub_plan = Arc::new(MessagePlan::all_absent(inner_fields));
             let mut offsets = Vec::with_capacity(capacity + 1);
             offsets.push(0);
             BuilderNode::Map {
                 children: BuilderNodeList::with_capacity(&sub_plan, capacity * 2)?,
+                sub_plan,
                 offsets,
                 current_offset: 0,
             }
@@ -666,7 +530,10 @@ fn build_absent_node(field: &Field, capacity: usize) -> Result<BuilderNode> {
         // still has an internal `unsupported leaf DataType` panic, but it's
         // a build-bug-only path: `validate_arrow_leaf_types` rejects
         // unsupported leaves at plan-build, so this call can't see one.
-        _ => BuilderNode::Scalar(TypedBuilder::new(field.data_type(), capacity)),
+        _ => BuilderNode::Scalar {
+            kind: ABSENT_KIND,
+            builder: TypedBuilder::new(field.data_type(), capacity),
+        },
     })
 }
 

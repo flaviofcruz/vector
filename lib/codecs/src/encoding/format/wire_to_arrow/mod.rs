@@ -76,7 +76,7 @@ use append::{
 };
 use builders::BuilderNodeList;
 use errors::Result;
-use plan::{MessagePlan, PlanSlot};
+use plan::{MessagePlan, PlanSlot, SLOT_UNKNOWN};
 
 /// Configuration for the wire-to-Arrow batch serializer.
 ///
@@ -284,51 +284,49 @@ fn scan_message(
     mut bytes: &[u8],
     builders: &mut BuilderNodeList,
 ) -> Result<()> {
+    let dispatch_table = plan.slot_by_proto_field.as_slice();
     while !bytes.is_empty() {
         let (field, rest) = try_parse_field(bytes)?;
         bytes = rest;
         let field_number = field.field_num as usize;
 
-        let Some(Some(slot_idx)) = plan.slot_by_proto_field.get(field_number).copied() else {
-            // Unknown field — `try_parse_field` already consumed it.
+        // Out-of-range or unknown field number — skip; `try_parse_field`
+        // already consumed the value.
+        let Some(&slot_idx) = dispatch_table.get(field_number) else {
             continue;
         };
+        if slot_idx == SLOT_UNKNOWN {
+            continue;
+        }
         let slot_idx = slot_idx as usize;
 
-        let slot = &plan.slots[slot_idx];
-        // Split-borrow `nodes` and `present` so we can mutate the dispatched
-        // node and flag `present[slot_idx]` in the same iteration.
         let BuilderNodeList { nodes, present } = &mut *builders;
-        let node = &mut nodes[slot_idx];
-
-        match (slot, node) {
-            (PlanSlot::Scalar(sk), builders::BuilderNode::Scalar(tb)) => {
-                append_scalar_from_wire(*sk, &field.value, tb)?;
+        match &mut nodes[slot_idx] {
+            builders::BuilderNode::Scalar { kind, builder } => {
+                append_scalar_from_wire(*kind, &field.value, builder)?;
                 present[slot_idx] = true;
             }
-            (PlanSlot::Struct(sub_plan), builders::BuilderNode::Struct { children, .. }) => {
+            builders::BuilderNode::Struct {
+                sub_plan, children, ..
+            } => {
                 let sub_bytes = expect_len(&field.value)?;
                 children.reset_present();
                 scan_message(sub_plan, sub_bytes, children)?;
                 children.finalize_row(sub_plan);
                 present[slot_idx] = true;
             }
-            (
-                PlanSlot::RepeatedMessage(sub_plan),
-                builders::BuilderNode::RepeatedMessage {
-                    children,
-                    current_offset,
-                    ..
-                },
-            )
-            | (
-                PlanSlot::Map(sub_plan),
-                builders::BuilderNode::Map {
-                    children,
-                    current_offset,
-                    ..
-                },
-            ) => {
+            builders::BuilderNode::RepeatedMessage {
+                sub_plan,
+                children,
+                current_offset,
+                ..
+            }
+            | builders::BuilderNode::Map {
+                sub_plan,
+                children,
+                current_offset,
+                ..
+            } => {
                 let sub_bytes = expect_len(&field.value)?;
                 children.reset_present();
                 scan_message(sub_plan, sub_bytes, children)?;
@@ -336,21 +334,14 @@ fn scan_message(
                 *current_offset += 1;
                 present[slot_idx] = true;
             }
-            (
-                PlanSlot::RepeatedScalar(sk),
-                builders::BuilderNode::RepeatedScalar {
-                    values,
-                    current_offset,
-                    ..
-                },
-            ) => {
-                append_repeated_scalar(*sk, &field.value, values, current_offset)?;
+            builders::BuilderNode::RepeatedScalar {
+                kind,
+                values,
+                current_offset,
+                ..
+            } => {
+                append_repeated_scalar(*kind, &field.value, values, current_offset)?;
                 present[slot_idx] = true;
-            }
-            _ => {
-                return Err(WireToArrowError::PlanBuilderMismatch {
-                    site: "scan_message:slot_builder_mismatch",
-                });
             }
         }
     }
@@ -380,9 +371,12 @@ fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<()> {
         bytes = rest;
         let field_number = field.field_num as usize;
 
-        let Some(Some(slot_idx)) = plan.slot_by_proto_field.get(field_number).copied() else {
+        let Some(&slot_idx) = plan.slot_by_proto_field.get(field_number) else {
             continue;
         };
+        if slot_idx == SLOT_UNKNOWN {
+            continue;
+        }
         let slot_idx = slot_idx as usize;
         let slot = &plan.slots[slot_idx];
 
