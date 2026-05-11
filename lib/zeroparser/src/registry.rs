@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 
-use prost_types::{field_descriptor_proto, DescriptorProto};
+use prost_types::{DescriptorProto, field_descriptor_proto};
 
-use crate::sparse_field_map::{SparseFieldMap, MAX_INLINE_CAPACITY};
+use crate::sparse_field_map::{MAX_INLINE_CAPACITY, SparseFieldMap};
 
 /// LABEL_REPEATED = 3 in protobuf.
 const LABEL_REPEATED: i32 = 3;

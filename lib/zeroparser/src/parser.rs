@@ -7,18 +7,11 @@ use prost_types::field_descriptor_proto::Type;
 use crate::errors::{ParseError, ParseResult};
 use crate::registry::{DescriptorWithFieldCache, FieldInfo, MessageRegistry};
 use crate::types::{
-    convert_scalar_value,
+    ComplexType, FieldValueRef, MAP_ENTRY_KEY_FIELD_NUM, MAP_ENTRY_VALUE_FIELD_NUM,
+    MAX_NESTING_DEPTH, MapKeyRef, PackedField, ParsedMapValue, convert_scalar_value,
     default_value_for_type,
-    ComplexType,
-    FieldValueRef,
-    MapKeyRef,
-    PackedField,
-    ParsedMapValue,
-    MAP_ENTRY_KEY_FIELD_NUM,
-    MAP_ENTRY_VALUE_FIELD_NUM,
-    MAX_NESTING_DEPTH,
 };
-use crate::wire::{try_parse_field, WireValue};
+use crate::wire::{WireValue, try_parse_field};
 
 /// Pre-parsed message with all nested messages recursively parsed in a single pass.
 /// Uses separate storage for scalars (hot path) vs complex fields.
@@ -493,10 +486,7 @@ impl<'a, 'b> std::ops::Deref for ParsedFieldValue<'a, 'b> {
 pub mod tests {
     use prost_types::field_descriptor_proto::Type;
     use prost_types::{
-        DescriptorProto,
-        FieldDescriptorProto,
-        MessageOptions,
-        OneofDescriptorProto,
+        DescriptorProto, FieldDescriptorProto, MessageOptions, OneofDescriptorProto,
     };
 
     use super::*;
