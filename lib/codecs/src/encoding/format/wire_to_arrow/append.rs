@@ -1,12 +1,13 @@
-//! Wire-value → Arrow builder append dispatch and tagless packed-scalar readers.
+//! Wire-value → Arrow builder append dispatch.
 //!
 //! The outer scan in `mod.rs` walks proto bytes tag-by-tag and hands each
 //! decoded `WireValue` to one of the `append_*` functions here. For packed
-//! repeated scalars the tagless readers (`decode_varint`, `read_fixed32`,
-//! `read_fixed64`) are used to walk the inner blob; `try_parse_field` expects
-//! tag-prefixed fields and can't traverse that.
+//! repeated scalars the inner blob is walked tagless: `try_parse_field`
+//! expects tag-prefixed fields and can't traverse it, so varints are read
+//! via `zeroparser::wire::try_read_varint` and the two fixed-width wire
+//! types are read inline (3-line LE chunk reads — not worth a helper).
 
-use zeroparser::wire::{WireValue, decode_zigzag32, decode_zigzag64};
+use zeroparser::wire::{WireValue, decode_zigzag32, decode_zigzag64, try_read_varint};
 
 use super::builders::TypedBuilder;
 use super::errors::{Result, WireToArrowError};
@@ -155,14 +156,12 @@ pub(super) fn append_repeated_scalar(
             actual: wire_type_byte(wv),
         });
     }
-    let mut pos = 0usize;
-    while pos < inner.len() {
-        let decoded = read_packed_element(kind, inner, &mut pos)?;
+    let mut remaining: &[u8] = inner;
+    while !remaining.is_empty() {
+        let decoded;
+        (decoded, remaining) = read_packed_element(kind, remaining)?;
         append_scalar_from_wire(kind, &decoded, values)?;
         *current_offset += 1;
-    }
-    if pos != inner.len() {
-        return Err(WireToArrowError::UnexpectedEof);
     }
     Ok(())
 }
@@ -223,31 +222,45 @@ pub(super) fn validate_repeated_scalar(kind: ScalarKind, wv: &WireValue) -> Resu
             actual: wire_type_byte(wv),
         });
     }
-    let mut pos = 0usize;
-    while pos < inner.len() {
+    let mut remaining: &[u8] = inner;
+    while !remaining.is_empty() {
         // Packed scalars are always varint / fixed32 / fixed64; the decoded
         // `WireValue` is always shape-compatible with `kind`, so no further
         // per-element validation is needed.
-        read_packed_element(kind, inner, &mut pos)?;
-    }
-    if pos != inner.len() {
-        return Err(WireToArrowError::UnexpectedEof);
+        (_, remaining) = read_packed_element(kind, remaining)?;
     }
     Ok(())
 }
 
 /// Read one raw scalar value from a packed blob and yield it as a
-/// `WireValue` so we can reuse [`append_scalar_from_wire`] for the append.
+/// `WireValue` alongside the remaining bytes. The caller reuses
+/// [`append_scalar_from_wire`] for the actual append.
+///
+/// Tagless: the inner blob of a packed-repeated field has no per-element
+/// tags, so we dispatch on the scalar's wire type directly into zeroparser's
+/// tagless readers.
 #[inline]
 pub(super) fn read_packed_element<'a>(
     kind: ScalarKind,
     bytes: &'a [u8],
-    pos: &mut usize,
-) -> Result<WireValue<'a>> {
+) -> Result<(WireValue<'a>, &'a [u8])> {
     match kind.wire_type() {
-        WT_VARINT => Ok(WireValue::Varint(decode_varint(bytes, pos)?)),
-        WT_I64 => Ok(WireValue::I64(read_fixed64(bytes, pos)?)),
-        WT_I32 => Ok(WireValue::I32(read_fixed32(bytes, pos)?)),
+        WT_VARINT => {
+            let (v, rest) = try_read_varint(bytes)?;
+            Ok((WireValue::Varint(v), rest))
+        }
+        WT_I64 => {
+            let Some((b, rest)) = bytes.split_first_chunk::<8>() else {
+                return Err(WireToArrowError::UnexpectedEof);
+            };
+            Ok((WireValue::I64(u64::from_le_bytes(*b)), rest))
+        }
+        WT_I32 => {
+            let Some((b, rest)) = bytes.split_first_chunk::<4>() else {
+                return Err(WireToArrowError::UnexpectedEof);
+            };
+            Ok((WireValue::I32(u32::from_le_bytes(*b)), rest))
+        }
         // `WT_LEN` would be string/bytes — unreachable per the caller's guard.
         // Any other value indicates a plan build bug.
         _ => Err(WireToArrowError::PlanBuilderMismatch {
@@ -256,53 +269,3 @@ pub(super) fn read_packed_element<'a>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tagless readers for the packed-scalar inner loop.
-//
-// `try_parse_field` expects tag-prefixed fields. Packed repeated scalars live
-// inside a single `WireValue::Len(inner)` blob whose contents are raw values
-// with no tags. Proto-parser doesn't expose tagless readers, so we keep these
-// here until a follow-up integration removes the packed inner loop entirely.
-// ---------------------------------------------------------------------------
-
-/// Read a single varint and advance `pos`. Caps at 10 bytes per proto spec.
-#[inline]
-pub(super) fn decode_varint(bytes: &[u8], pos: &mut usize) -> Result<u64> {
-    let mut value: u64 = 0;
-    let mut shift: u32 = 0;
-    for _ in 0..10 {
-        if *pos >= bytes.len() {
-            return Err(WireToArrowError::UnexpectedEof);
-        }
-        let b = bytes[*pos];
-        *pos += 1;
-        value |= u64::from(b & 0x7f) << shift;
-        if b < 0x80 {
-            return Ok(value);
-        }
-        shift += 7;
-    }
-    Err(WireToArrowError::VarintOverflow)
-}
-
-/// Read 8 little-endian bytes and advance `pos`.
-#[inline]
-pub(super) fn read_fixed64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
-    if *pos + 8 > bytes.len() {
-        return Err(WireToArrowError::UnexpectedEof);
-    }
-    let v = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
-    *pos += 8;
-    Ok(v)
-}
-
-/// Read 4 little-endian bytes and advance `pos`.
-#[inline]
-pub(super) fn read_fixed32(bytes: &[u8], pos: &mut usize) -> Result<u32> {
-    if *pos + 4 > bytes.len() {
-        return Err(WireToArrowError::UnexpectedEof);
-    }
-    let v = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
-    *pos += 4;
-    Ok(v)
-}

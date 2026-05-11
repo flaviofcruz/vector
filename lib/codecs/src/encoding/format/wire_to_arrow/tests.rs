@@ -1,4 +1,5 @@
-use super::append::{decode_varint, read_fixed32, read_fixed64};
+use super::append::read_packed_element;
+use super::plan::ScalarKind;
 use super::{
     WireToArrowEncoder, WireToArrowError, WireToArrowSerializer, WireToArrowSerializerConfig,
 };
@@ -19,6 +20,7 @@ use prost_reflect::{DescriptorPool, DynamicMessage, Value as ProtoValue};
 use std::path::PathBuf;
 use std::sync::Arc;
 use vector_core::event::Event;
+use zeroparser::wire::WireValue;
 
 fn encode_varint_for_test(mut value: u64) -> Vec<u8> {
     let mut out = Vec::new();
@@ -31,49 +33,46 @@ fn encode_varint_for_test(mut value: u64) -> Vec<u8> {
 }
 
 #[test]
-fn packed_readers_decode_varint_roundtrip() {
+fn packed_element_varint_roundtrip() {
     for v in [0u64, 1, 127, 128, 255, 16384, u32::MAX as u64, u64::MAX] {
         let encoded = encode_varint_for_test(v);
-        let mut pos = 0;
-        let decoded = decode_varint(&encoded, &mut pos).unwrap();
-        assert_eq!(v, decoded, "mismatch on {v}");
-        assert_eq!(pos, encoded.len(), "position not advanced");
+        let (decoded, rest) = read_packed_element(ScalarKind::Int64, &encoded).unwrap();
+        assert!(matches!(decoded, WireValue::Varint(d) if d == v), "mismatch on {v}");
+        assert!(rest.is_empty(), "buffer not fully consumed for {v}");
     }
 }
 
 #[test]
-fn packed_readers_decode_varint_eof() {
-    let mut pos = 0;
+fn packed_element_varint_eof_maps_to_unexpected_eof() {
     assert!(matches!(
-        decode_varint(&[0x80u8], &mut pos),
+        read_packed_element(ScalarKind::Int64, &[0x80u8]),
         Err(WireToArrowError::UnexpectedEof)
     ));
 }
 
 #[test]
-fn packed_readers_decode_varint_overflow() {
-    let mut pos = 0;
+fn packed_element_varint_overflow_maps_to_varint_overflow() {
     assert!(matches!(
-        decode_varint(&[0xffu8; 11], &mut pos),
+        read_packed_element(ScalarKind::Int64, &[0xffu8; 11]),
         Err(WireToArrowError::VarintOverflow)
     ));
 }
 
 #[test]
-fn packed_readers_fixed32_roundtrip() {
+fn packed_element_fixed32_roundtrip() {
     let bytes = 0x12345678u32.to_le_bytes();
-    let mut pos = 0;
-    assert_eq!(read_fixed32(&bytes, &mut pos).unwrap(), 0x12345678u32);
-    assert_eq!(pos, 4);
+    let (decoded, rest) = read_packed_element(ScalarKind::Fixed32, &bytes).unwrap();
+    assert!(matches!(decoded, WireValue::I32(v) if v == 0x12345678));
+    assert!(rest.is_empty());
 }
 
 #[test]
-fn packed_readers_fixed64_roundtrip() {
+fn packed_element_fixed64_roundtrip() {
     let v: u64 = 0x0011_2233_4455_6677;
     let bytes = v.to_le_bytes();
-    let mut pos = 0;
-    assert_eq!(read_fixed64(&bytes, &mut pos).unwrap(), v);
-    assert_eq!(pos, 8);
+    let (decoded, rest) = read_packed_element(ScalarKind::Fixed64, &bytes).unwrap();
+    assert!(matches!(decoded, WireValue::I64(d) if d == v));
+    assert!(rest.is_empty());
 }
 
 fn descriptor_pool(file: &str) -> DescriptorPool {
