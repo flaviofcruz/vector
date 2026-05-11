@@ -1,17 +1,18 @@
 [package]
-name = "proto-parser"
+name = "zeroparser"
 version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
 publish = false
 
-# Vendored from `databricks-eng/universe` at `shinkansen/core/proto-parser`.
+# Vendored from `databricks-eng/universe` at `shinkansen/core/zeroparser`.
 # Kept as a sibling workspace crate so the boundary is explicit; the plan is
 # to swap to a `git` dependency once the upstream crate is extracted to its
 # own repository.
 
 [dependencies]
 prost-types.workspace = true
+self_cell.workspace = true
 
 [dev-dependencies]
 strum = { version = "0.26.3", features = ["derive"] }
