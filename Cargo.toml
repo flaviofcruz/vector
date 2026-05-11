@@ -115,7 +115,7 @@ members = [
   "lib/loki-logproto",
   "lib/prometheus-parser",
   "lib/opentelemetry-proto",
-  "lib/proto-parser",
+  "lib/zeroparser",
   "lib/tracing-limit",
   "lib/vector-api-client",
   "lib/vector-buffers",
@@ -187,6 +187,7 @@ regex = { version = "1.11.2", default-features = false, features = ["std", "perf
 regex-automata = { version = "0.4.13", default-features = false, features = ["std", "perf"] }
 reqwest = { version = "0.11.26", features = ["json"] }
 rust_decimal = { version = "1.37.0", default-features = false, features = ["std"] }
+self_cell = { version = "1.2.2", default-features = false }
 semver = { version = "1.0.26", default-features = false, features = ["serde", "std"] }
 serde = { version = "1.0.219", default-features = false, features = ["alloc", "derive", "rc"] }
 serde_json = { version = "1.0.143", default-features = false, features = ["raw_value", "std"] }

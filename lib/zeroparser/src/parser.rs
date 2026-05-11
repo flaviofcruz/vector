@@ -419,14 +419,12 @@ impl<'a> ParsedMessage<'a> {
                         if field_info.field_type == Type::Message {
                             let nested_bytes =
                                 parsed_field.value.try_as_bytes(parsed_field.field_num)?;
-                            let nested_type_name = field_info.type_name.as_deref().unwrap_or("");
-                            let nested = ParsedMessage::parse_internal(
+                            value = Some(Self::parse_map_message_value(
+                                field_info.type_name.as_deref().unwrap_or(""),
                                 nested_bytes,
-                                Some(nested_type_name),
                                 registry,
                                 depth,
-                            )?;
-                            value = Some(ParsedMapValue::Message(nested));
+                            )?);
                         } else {
                             let v = convert_scalar_value(
                                 field_info.field_type,
@@ -445,14 +443,35 @@ impl<'a> ParsedMessage<'a> {
         let value_type = value_info.map(|f| f.field_type).unwrap_or(Type::Bytes);
 
         let key_field_value = key.unwrap_or_else(|| default_value_for_type(key_type));
-        let value =
-            value.unwrap_or_else(|| ParsedMapValue::Scalar(default_value_for_type(value_type)));
+        let value = match value {
+            Some(v) => v,
+            // An absent value on a message-typed map must materialize as an
+            // empty ParsedMessage; a scalar default would be misclassified as
+            // bytes by downstream validators.
+            None if value_type == Type::Message => {
+                let type_name = value_info
+                    .and_then(|f| f.type_name.as_deref())
+                    .unwrap_or_default();
+                Self::parse_map_message_value(type_name, &[], registry, depth)?
+            }
+            None => ParsedMapValue::Scalar(default_value_for_type(value_type)),
+        };
         let map_key =
             MapKeyRef::from_field_value(key_field_value).ok_or(ParseError::InvalidMapKeyType {
                 field_num: MAP_ENTRY_KEY_FIELD_NUM,
             })?;
 
         Ok((map_key, value))
+    }
+
+    fn parse_map_message_value(
+        type_name: &str,
+        bytes: &'a [u8],
+        registry: &'a MessageRegistry,
+        depth: usize,
+    ) -> ParseResult<ParsedMapValue<'a>> {
+        let nested = ParsedMessage::parse_internal(bytes, Some(type_name), registry, depth)?;
+        Ok(ParsedMapValue::Message(nested))
     }
 }
 
@@ -985,6 +1004,30 @@ pub mod tests {
                 assert_eq!(m.get_scalar(1), Some(&FieldValueRef::Int32(99)))
             }
             _ => panic!("Expected message value"),
+        }
+
+        // Entry with the message-valued field omitted must still materialize
+        // as an empty ParsedMessage, not a scalar default.
+        let wire_missing_value = &[10, 3, 10, 1, b'k'];
+        let parsed = ParsedMessage::parse(wire_missing_value, &registry).unwrap();
+        assert_eq!(parsed.get_map_entries_count(1), 1);
+        let entries: Vec<_> = parsed.get_map_entries(1).collect();
+        assert_eq!(*entries[0].0, MapKeyRef::String("k"));
+        match entries[0].1 {
+            ParsedMapValue::Message(m) => assert_eq!(m.get_scalar(1), None),
+            other => panic!("Expected empty message value, got {:?}", other),
+        }
+
+        // Entry with both key and value omitted: key defaults to "" and
+        // value still materializes as an empty ParsedMessage.
+        let wire_empty_entry = &[10, 0];
+        let parsed = ParsedMessage::parse(wire_empty_entry, &registry).unwrap();
+        assert_eq!(parsed.get_map_entries_count(1), 1);
+        let entries: Vec<_> = parsed.get_map_entries(1).collect();
+        assert_eq!(*entries[0].0, MapKeyRef::String(""));
+        match entries[0].1 {
+            ParsedMapValue::Message(m) => assert_eq!(m.get_scalar(1), None),
+            other => panic!("Expected empty message value, got {:?}", other),
         }
     }
 
