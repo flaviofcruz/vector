@@ -167,10 +167,79 @@ pub(super) fn append_repeated_scalar(
     Ok(())
 }
 
+/// Mirror of [`append_scalar_from_wire`] that runs the wire-type / UTF-8
+/// checks without touching a builder. Used by the encoder's pre-validate
+/// pass so a malformed row can be detected and dropped before any column
+/// builder is mutated (Arrow's `*Builder` types expose no rollback API, so
+/// rejecting the row up front is how we keep per-row isolation).
+///
+/// Must stay in lock-step with [`append_scalar_from_wire`]: every (kind, wv)
+/// combination that succeeds here must also succeed there, and vice versa.
+pub(super) fn validate_scalar_from_wire(kind: ScalarKind, wv: &WireValue) -> Result<()> {
+    match (kind, wv) {
+        (ScalarKind::Int32, WireValue::Varint(_))
+        | (ScalarKind::Int64, WireValue::Varint(_))
+        | (ScalarKind::UInt32, WireValue::Varint(_))
+        | (ScalarKind::UInt64, WireValue::Varint(_))
+        | (ScalarKind::SInt32, WireValue::Varint(_))
+        | (ScalarKind::SInt64, WireValue::Varint(_))
+        | (ScalarKind::Bool, WireValue::Varint(_))
+        | (ScalarKind::Fixed32, WireValue::I32(_))
+        | (ScalarKind::SFixed32, WireValue::I32(_))
+        | (ScalarKind::Float, WireValue::I32(_))
+        | (ScalarKind::Fixed64, WireValue::I64(_))
+        | (ScalarKind::SFixed64, WireValue::I64(_))
+        | (ScalarKind::Double, WireValue::I64(_))
+        | (ScalarKind::Bytes, WireValue::Len(_)) => Ok(()),
+        (ScalarKind::String, WireValue::Len(bytes)) => std::str::from_utf8(bytes)
+            .map(|_| ())
+            .map_err(|_| WireToArrowError::InvalidUtf8),
+        (_, wv) => Err(WireToArrowError::WireTypeMismatch {
+            expected: kind.wire_type(),
+            actual: wire_type_byte(wv),
+        }),
+    }
+}
+
+/// Mirror of [`append_repeated_scalar`] that walks the value (or packed
+/// blob) without appending. Used by the pre-validate pass — the packed-blob
+/// inner loop in [`append_repeated_scalar`] is the one site in the encoder
+/// where a partial append is possible (an EOF on element N leaves N-1
+/// values already in the builder), so dropping the row up front here is how
+/// we keep per-row isolation for repeated scalars.
+pub(super) fn validate_repeated_scalar(kind: ScalarKind, wv: &WireValue) -> Result<()> {
+    if wire_type_byte(wv) == kind.wire_type() {
+        return validate_scalar_from_wire(kind, wv);
+    }
+    let WireValue::Len(inner) = wv else {
+        return Err(WireToArrowError::WireTypeMismatch {
+            expected: kind.wire_type(),
+            actual: wire_type_byte(wv),
+        });
+    };
+    if kind.wire_type() == WT_LEN {
+        return Err(WireToArrowError::WireTypeMismatch {
+            expected: kind.wire_type(),
+            actual: wire_type_byte(wv),
+        });
+    }
+    let mut pos = 0usize;
+    while pos < inner.len() {
+        // Packed scalars are always varint / fixed32 / fixed64; the decoded
+        // `WireValue` is always shape-compatible with `kind`, so no further
+        // per-element validation is needed.
+        read_packed_element(kind, inner, &mut pos)?;
+    }
+    if pos != inner.len() {
+        return Err(WireToArrowError::UnexpectedEof);
+    }
+    Ok(())
+}
+
 /// Read one raw scalar value from a packed blob and yield it as a
 /// `WireValue` so we can reuse [`append_scalar_from_wire`] for the append.
 #[inline]
-fn read_packed_element<'a>(
+pub(super) fn read_packed_element<'a>(
     kind: ScalarKind,
     bytes: &'a [u8],
     pos: &mut usize,

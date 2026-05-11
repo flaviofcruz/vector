@@ -1023,6 +1023,127 @@ fn wire_descriptor_tags_drive_decode_regardless_of_arrow_schema_source() {
 }
 
 // -------------------------------------------------------------------------
+// Per-row isolation: a single malformed message in a batch must not poison
+// the whole batch. The encoder pre-validates each message and drops bad
+// rows from the output `RecordBatch`, counting them via the
+// `wire_to_arrow_rows_dropped` metric.
+// -------------------------------------------------------------------------
+
+#[test]
+fn encode_batch_drops_malformed_row_in_mixed_batch() {
+    // A single malformed message in the middle of an otherwise-valid batch
+    // must not fail the batch. The bad row is dropped; the valid rows still
+    // appear in the output `RecordBatch` in original order.
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut a = DynamicMessage::new(desc.clone());
+    a.set_field_by_name("name", ProtoValue::String("alice".into()));
+    a.set_field_by_name("id", ProtoValue::I32(1));
+    let mut buf_a = Vec::new();
+    a.encode(&mut buf_a).unwrap();
+
+    let mut b = DynamicMessage::new(desc.clone());
+    b.set_field_by_name("name", ProtoValue::String("bob".into()));
+    b.set_field_by_name("id", ProtoValue::I32(2));
+    let mut buf_b = Vec::new();
+    b.encode(&mut buf_b).unwrap();
+
+    // Tag = (1 << 3) | 2 = 0x0a (`name`, LEN); declared length 5, only 2
+    // payload bytes follow → BufferTooShort inside `try_parse_field`,
+    // which the encoder maps to `UnexpectedEof`.
+    let bad = vec![0x0a, 0x05, 0x01, 0x02];
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(buf_a), Bytes::from(bad), Bytes::from(buf_b)])
+        .expect("malformed row must not fail the batch");
+    assert_eq!(batch.num_rows(), 2);
+    let names = batch.column(0).as_string::<i64>();
+    assert_eq!(names.value(0), "alice");
+    assert_eq!(names.value(1), "bob");
+    let ids = batch.column(1).as_primitive::<arrow::datatypes::Int32Type>();
+    assert_eq!(ids.value(0), 1);
+    assert_eq!(ids.value(1), 2);
+}
+
+#[test]
+fn encode_batch_drops_invalid_utf8_row() {
+    // String field with non-UTF-8 payload — the pre-validate pass catches
+    // this via the `from_utf8` check in `validate_scalar_from_wire`.
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![Field::new("name", DataType::LargeUtf8, true)]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // Tag = (1 << 3) | 2 = 0x0a (`name`, LEN); length = 1; payload = 0xff
+    // (lone continuation byte, not a valid UTF-8 sequence).
+    let bad = vec![0x0a, 0x01, 0xff];
+
+    let mut ok = DynamicMessage::new(desc.clone());
+    ok.set_field_by_name("name", ProtoValue::String("ok".into()));
+    let mut ok_buf = Vec::new();
+    ok.encode(&mut ok_buf).unwrap();
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(bad), Bytes::from(ok_buf)])
+        .expect("invalid-UTF-8 row must not fail the batch");
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.column(0).as_string::<i64>().value(0), "ok");
+}
+
+#[test]
+fn encode_batch_all_malformed_returns_empty_batch() {
+    // Every row malformed → empty `RecordBatch` (schema preserved, zero
+    // rows). Surfacing the situation is the metric's job; the serializer
+    // doesn't conflate "every row was bad" with "configuration broken".
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![Field::new("name", DataType::LargeUtf8, true)]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let bad1 = vec![0x0a, 0x05, 0x00, 0x01]; // truncated LEN value
+    let bad2 = vec![0x0a, 0x01, 0xff]; // invalid UTF-8
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(bad1), Bytes::from(bad2)])
+        .expect("all-malformed batch must still return an empty RecordBatch");
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.num_columns(), 1);
+}
+
+#[test]
+fn encode_batch_drops_packed_scalar_eof_row() {
+    // Packed repeated int32 with a truncated varint in the inner blob —
+    // the one site (`append_repeated_scalar`'s packed loop) where the
+    // real scan could otherwise leave half the elements committed before
+    // erroring. Pre-validate sees the EOF and drops the row before any
+    // append.
+    let desc = repeated_int32_descriptor();
+    let schema = Schema::new(vec![Field::new(
+        "numbers",
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // Tag = (1 << 3) | 2 = 0x0a (`numbers`, LEN — packed form); length 2;
+    // inner = [0x80, 0x80] — a varint with continuation bits and no
+    // terminator → EOF inside the packed walk.
+    let bad = vec![0x0a, 0x02, 0x80, 0x80];
+    // Packed encoding of `numbers = [7]`: one varint (7) inside a LEN blob.
+    let good = vec![0x0a, 0x01, 0x07];
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(bad), Bytes::from(good)])
+        .expect("packed EOF row must not fail the batch");
+    assert_eq!(batch.num_rows(), 1);
+    let list = batch.column(0).as_list::<i32>();
+    assert_eq!(list.value_length(0), 1);
+}
+
+// -------------------------------------------------------------------------
 // Fuzz: random wire bytes through `encode_batch` must not panic. Any
 // `Result` outcome is acceptable — we only care that bad input is reported
 // as a normal error and that the scan-time recursion (which the depth cap

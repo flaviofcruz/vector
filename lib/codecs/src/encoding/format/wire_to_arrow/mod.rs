@@ -7,8 +7,16 @@
 //!
 //! Used as a [`BatchSerializerConfig`] variant — upstream is expected to
 //! stash original proto wire bytes in the event's `message` field (Vector
-//! convention). The serializer is all-or-nothing: a batch fails if any event
-//! lacks a `Bytes`-typed message or the wire decode errors.
+//! convention).
+//!
+//! Failure semantics are split:
+//!   * Event-shape problems (missing `message` field, non-`Bytes` value) fail
+//!     the batch — the pipeline is misconfigured if any event reaches here in
+//!     the wrong shape.
+//!   * Wire-format decode errors are isolated to the offending row: the row
+//!     is dropped from the output `RecordBatch`, counted via the
+//!     `wire_to_arrow_rows_dropped` metric, and a sample error is logged.
+//!     One poison message can't poison the whole batch.
 //!
 //! ## Scope
 //!
@@ -62,7 +70,10 @@ pub use errors::WireToArrowError;
 
 use zeroparser::wire::{WireValue, decode_zigzag32, decode_zigzag64, try_parse_field};
 
-use append::{append_repeated_scalar, append_scalar_from_wire, expect_len};
+use append::{
+    append_repeated_scalar, append_scalar_from_wire, expect_len, validate_repeated_scalar,
+    validate_scalar_from_wire,
+};
 use builders::BuilderNodeList;
 use errors::Result;
 use plan::{MessagePlan, PlanSlot};
@@ -208,14 +219,50 @@ impl WireToArrowEncoder {
     }
 
     /// Encode a batch of serialized proto messages into a single `RecordBatch`.
+    ///
+    /// Per-row isolation: each message is pre-validated via
+    /// [`validate_message`] before any builder is touched. Rows that fail
+    /// validation are dropped from the output batch and counted via the
+    /// `wire_to_arrow_rows_dropped` metric (plus a rate-limit-friendly
+    /// warn log carrying a sample error). Returning an empty `RecordBatch`
+    /// is acceptable when every row was malformed.
+    ///
+    /// Errors out of this method are reserved for batch-level failures
+    /// that aren't attributable to a single row: a code-bug surface
+    /// (`PlanBuilderMismatch`, scan-vs-validate divergence) or a
+    /// `RecordBatchAssembly` rejection from Arrow.
     pub fn encode_batch(&self, messages: &[Bytes]) -> Result<RecordBatch> {
         let capacity = messages.len();
         let mut builders = BuilderNodeList::with_capacity(&self.plan, capacity);
+        let mut dropped = 0u64;
+        let mut sample_err: Option<WireToArrowError> = None;
 
         for msg_bytes in messages {
+            // Pre-validate so a malformed row drops without poisoning any
+            // builder. Arrow `*Builder` has no public rollback API, and
+            // nested-struct `finalize_row` calls inside `scan_message` are
+            // not reversible, so an upfront validation pass is how we
+            // isolate per-row decode failures.
+            if let Err(err) = validate_message(&self.plan, msg_bytes) {
+                dropped += 1;
+                if sample_err.is_none() {
+                    sample_err = Some(err);
+                }
+                continue;
+            }
             builders.reset_present();
             scan_message(&self.plan, msg_bytes, &mut builders)?;
             builders.finalize_row(&self.plan);
+        }
+
+        if dropped > 0 {
+            metrics::counter!("wire_to_arrow_rows_dropped").increment(dropped);
+            tracing::warn!(
+                message = "wire-to-Arrow dropped malformed rows from batch",
+                dropped,
+                batch_size = messages.len(),
+                sample_error = ?sample_err,
+            );
         }
 
         let arrays = builders.finish(&self.plan)?;
@@ -301,6 +348,54 @@ fn scan_message(
                 present[slot_idx] = true;
             }
             _ => return Err(WireToArrowError::PlanBuilderMismatch),
+        }
+    }
+    Ok(())
+}
+
+/// Walk one proto message's wire bytes without touching any builders, surfacing
+/// every decode error that [`scan_message`] would produce for the same input.
+/// [`WireToArrowEncoder::encode_batch`] runs this as a pre-pass per message so
+/// rows that fail can be dropped from the batch cleanly — no half-appended
+/// leaves, no finalized nested sub-rows — and replaced with a `dropped`
+/// counter instead of failing the entire batch.
+///
+/// The two-pass cost is acceptable because (a) the parse walk is small
+/// relative to value appends + buffer growth on the real scan, and (b) Arrow
+/// `*Builder` types expose no public rollback API, so an in-place
+/// "snapshot + truncate on error" alternative isn't viable.
+///
+/// Must stay in lock-step with [`scan_message`]: any wire byte sequence that
+/// is accepted here must also be accepted there, and vice versa. If the two
+/// diverge (validate accepts but scan errors), the real scan's `?` in
+/// `encode_batch` will bubble it out as a batch-level failure — that's a
+/// clear signal of a code bug rather than user input.
+fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<()> {
+    while !bytes.is_empty() {
+        let (field, rest) = try_parse_field(bytes)?;
+        bytes = rest;
+        let field_number = field.field_num as usize;
+
+        let Some(Some(slot_idx)) = plan.slot_by_proto_field.get(field_number).copied() else {
+            continue;
+        };
+        let slot_idx = slot_idx as usize;
+        let slot = &plan.slots[slot_idx];
+
+        match slot {
+            PlanSlot::Scalar(sk) => validate_scalar_from_wire(*sk, &field.value)?,
+            PlanSlot::Struct(sub_plan)
+            | PlanSlot::RepeatedMessage(sub_plan)
+            | PlanSlot::Map(sub_plan) => {
+                let sub_bytes = expect_len(&field.value)?;
+                validate_message(sub_plan, sub_bytes)?;
+            }
+            PlanSlot::RepeatedScalar(sk) => validate_repeated_scalar(*sk, &field.value)?,
+            // No proto field number ever points at an Absent slot (Absent
+            // slots are Arrow columns the proto descriptor lacks), so this
+            // arm is unreachable in practice. Mirror `scan_message`'s
+            // fall-through and surface it as a code-bug signal.
+            PlanSlot::Absent => return Err(WireToArrowError::PlanBuilderMismatch),
         }
     }
     Ok(())
