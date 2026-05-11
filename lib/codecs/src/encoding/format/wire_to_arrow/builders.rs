@@ -44,11 +44,32 @@ pub enum TypedBuilder {
 const AVG_VARLEN_BYTES_PER_VALUE: usize = 16;
 
 impl TypedBuilder {
+    /// True iff `dt` is one of the Arrow leaf data types this encoder can
+    /// build. Used at plan-build to reject unsupported types up front
+    /// instead of panicking in [`TypedBuilder::new`] on the first batch.
+    pub fn supports(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Int32
+                | DataType::Int64
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Boolean
+                | DataType::LargeUtf8
+                | DataType::LargeBinary
+                | DataType::Timestamp(TimeUnit::Microsecond, _)
+        )
+    }
+
     /// Construct a typed builder matching the given Arrow DataType.
     ///
     /// # Panics
-    /// Panics on unsupported primitive types. PoC scope only covers the
-    /// DataTypes listed in the `TypedBuilder` variants.
+    /// Panics on unsupported primitive types. Plan-build validates the
+    /// Arrow leaf types via [`supports`](Self::supports) before any
+    /// builder is constructed, so reaching the panic here indicates a
+    /// plan/builder mismatch (build bug, not user-controllable input).
     pub fn new(dt: &DataType, capacity: usize) -> Self {
         match dt {
             DataType::Int32 => TypedBuilder::Int32(Int32Builder::with_capacity(capacity)),

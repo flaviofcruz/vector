@@ -136,6 +136,59 @@ pub enum WireToArrowError {
         /// The underlying `zeroparser::ParseError`.
         source: zeroparser::ParseError,
     },
+
+    /// Plan-build recursion exceeded [`MAX_NESTING_DEPTH`]. Caps both the
+    /// build-time walk over the Arrow schema and the scan-time walk over
+    /// wire bytes (which can't recurse deeper than the plan).
+    ///
+    /// [`MAX_NESTING_DEPTH`]: super::plan::MAX_NESTING_DEPTH
+    #[snafu(display(
+        "wire-to-Arrow plan exceeds max nesting depth of {limit}"
+    ))]
+    SchemaTooDeep {
+        /// The configured maximum depth.
+        limit: usize,
+    },
+
+    /// The Arrow schema declares a primitive leaf type the encoder can't
+    /// build a column for (e.g. `Date32`, `Time64`, decimal). Caught at
+    /// plan-build so the failure surfaces at serializer init rather than
+    /// panicking inside `TypedBuilder::new` on the first batch.
+    #[snafu(display(
+        "Arrow field '{name}' has unsupported leaf data type {arrow_type}"
+    ))]
+    UnsupportedArrowLeafType {
+        /// The Arrow field name carrying the unsupported leaf type.
+        name: String,
+        /// The unsupported Arrow data type (debug form).
+        arrow_type: String,
+    },
+
+    /// The Arrow schema declares a singular column as non-nullable, but the
+    /// encoder cannot guarantee a value will be present on every row.
+    ///
+    /// Proto3 omits default-valued singular fields on the wire, so the
+    /// encoder writes a null whenever a tag is absent. A non-nullable
+    /// declaration would then trip a generic `RecordBatch::try_new`
+    /// "non-nullable contains nulls" failure deep in `encode_batch`,
+    /// dropping the entire batch with no row context. We reject the
+    /// mismatch at plan-build time so it surfaces clearly at serializer
+    /// init.
+    ///
+    /// `List<…>` and `Map<…>` outer columns are exempt: the encoder always
+    /// emits at least an empty list / empty map per row, so the outer
+    /// column never contains a null.
+    #[snafu(display(
+        "Arrow field '{name}' is declared non-nullable but {reason}; \
+         declare the column nullable in the schema or change the proto"
+    ))]
+    NonNullableNotGuaranteed {
+        /// The Arrow field name.
+        name: String,
+        /// Short explanation of why the encoder can't guarantee non-null
+        /// (e.g. "proto3 singular fields are omitted at default value").
+        reason: &'static str,
+    },
 }
 
 /// Result alias for wire-to-Arrow encoder operations.

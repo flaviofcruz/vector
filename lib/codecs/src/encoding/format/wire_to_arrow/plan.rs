@@ -8,7 +8,19 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Fields};
 use prost_reflect::{Cardinality, Kind, MessageDescriptor};
 
+use super::builders::TypedBuilder;
 use super::errors::{Result, WireToArrowError};
+
+/// Maximum nesting depth permitted in a plan. Arrow schemas can in principle
+/// nest arbitrarily deep, but the build walk recurses 1:1 with structural
+/// depth and would blow the Rust call stack on pathological input. Real-world
+/// schemas are well under this; the cap exists to keep DoS-shaped input
+/// (deep schema at plan-build time, or deep wire-bytes nesting at scan time)
+/// from running to stack overflow.
+///
+/// `scan_message` recursion is bounded by the plan, so capping the plan caps
+/// both paths.
+pub const MAX_NESTING_DEPTH: usize = 64;
 
 /// Proto wire-type codes (the low 3 bits of a tag).
 ///
@@ -143,6 +155,12 @@ impl MessagePlan {
     /// in the Arrow schema is treated as an unknown field and skipped at
     /// scan time.
     ///
+    /// A hard depth cap of [`MAX_NESTING_DEPTH`] guards against pathological
+    /// schemas that would otherwise overflow the Rust call stack at build
+    /// time. `scan_message`'s recursion is bounded by the plan, so this cap
+    /// also bounds the scan-time recursion driven by attacker-controlled
+    /// wire bytes.
+    ///
     /// # Oneof
     ///
     /// Proto `oneof` is purely an annotation; on the wire each variant is a
@@ -152,6 +170,27 @@ impl MessagePlan {
     /// (Scalar / Struct / etc.) and the normal "absent slot => null"
     /// machinery produces the correct Arrow output.
     pub fn build(descriptor: &MessageDescriptor, fields: &Fields) -> Result<Self> {
+        Self::build_at_depth(descriptor, fields, 0, /* inside_map_entry */ false)
+    }
+
+    /// Recursive helper for [`build`]; `depth` is the current nesting level
+    /// (0 at the top), `inside_map_entry` is true when called for a Map's
+    /// entry sub-plan. Map entries have Arrow-spec-mandated nullability
+    /// (key non-nullable, value typically nullable), so the singular-field
+    /// nullability check is suppressed inside that recursion to avoid
+    /// false positives. Returns [`WireToArrowError::SchemaTooDeep`] once
+    /// the level being built would exceed [`MAX_NESTING_DEPTH`].
+    fn build_at_depth(
+        descriptor: &MessageDescriptor,
+        fields: &Fields,
+        depth: usize,
+        inside_map_entry: bool,
+    ) -> Result<Self> {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(WireToArrowError::SchemaTooDeep {
+                limit: MAX_NESTING_DEPTH,
+            });
+        }
         let mut slots = Vec::with_capacity(fields.len());
         let mut max_field_num = 0u32;
         // `slot_proto_numbers[i] = Some(n)` means slot i maps to proto field n;
@@ -162,7 +201,25 @@ impl MessagePlan {
         for arrow_field in fields.iter() {
             let Some(proto_field) = descriptor.get_field_by_name(arrow_field.name()) else {
                 // Schema drift: the Arrow column exists but the proto doesn't
-                // carry it. Log + metric + keep going — the column becomes
+                // carry it. We can only emit all-null for such a column, so
+                // a non-nullable declaration is a hard mismatch — error
+                // early before any data flows. (Skipped inside Map entry
+                // sub-plans, where Arrow's Map type itself dictates the
+                // non-null key contract.)
+                if !arrow_field.is_nullable() && !inside_map_entry {
+                    return Err(WireToArrowError::NonNullableNotGuaranteed {
+                        name: arrow_field.name().to_string(),
+                        reason: "the proto descriptor does not carry this field, \
+                                 so the column would be all-null",
+                    });
+                }
+                // Absent slots get their builders constructed via
+                // `build_absent_node` -> `TypedBuilder::new` for every
+                // primitive leaf in the Arrow type. Validate them at
+                // plan-build so an unsupported leaf type surfaces here
+                // instead of panicking on the first batch.
+                validate_arrow_leaf_types(arrow_field.name(), arrow_field.data_type())?;
+                // Log + metric + keep going — the column becomes
                 // always-null. Typical cause: a field was removed from the
                 // proto before the UC table schema was updated.
                 tracing::warn!(
@@ -223,12 +280,18 @@ impl MessagePlan {
                         });
                     }
                 };
-                let sub = MessagePlan::build(entry_desc, entry_fields)?;
+                let sub = MessagePlan::build_at_depth(
+                    entry_desc,
+                    entry_fields,
+                    depth + 1,
+                    /* inside_map_entry */ true,
+                )?;
                 PlanSlot::Map(Arc::new(sub))
             } else {
                 match (&kind, arrow_field.data_type(), is_repeated) {
                     // Singular scalar.
                     (_, dt, false) if !matches!(dt, DataType::Struct(_) | DataType::List(_)) => {
+                        validate_arrow_leaf_types(arrow_field.name(), dt)?;
                         let sk = ScalarKind::from_proto_kind(&kind).ok_or_else(|| {
                             WireToArrowError::UnsupportedKind {
                                 name: arrow_field.name().to_string(),
@@ -239,7 +302,12 @@ impl MessagePlan {
                     }
                     // Singular nested message.
                     (Kind::Message(inner_desc), DataType::Struct(inner_fields), false) => {
-                        let sub = MessagePlan::build(inner_desc, inner_fields)?;
+                        let sub = MessagePlan::build_at_depth(
+                            inner_desc,
+                            inner_fields,
+                            depth + 1,
+                            /* inside_map_entry */ false,
+                        )?;
                         PlanSlot::Struct(Arc::new(sub))
                     }
                     // Repeated nested message -> Arrow List<Struct>.
@@ -253,11 +321,17 @@ impl MessagePlan {
                                 });
                             }
                         };
-                        let sub = MessagePlan::build(inner_desc, inner_fields)?;
+                        let sub = MessagePlan::build_at_depth(
+                            inner_desc,
+                            inner_fields,
+                            depth + 1,
+                            /* inside_map_entry */ false,
+                        )?;
                         PlanSlot::RepeatedMessage(Arc::new(sub))
                     }
                     // Repeated scalar -> Arrow List<primitive>.
-                    (_, DataType::List(_), true) => {
+                    (_, DataType::List(item_field), true) => {
+                        validate_arrow_leaf_types(item_field.name(), item_field.data_type())?;
                         let sk = ScalarKind::from_proto_kind(&kind).ok_or_else(|| {
                             WireToArrowError::UnsupportedKind {
                                 name: arrow_field.name().to_string(),
@@ -276,6 +350,32 @@ impl MessagePlan {
                     }
                 }
             };
+            // Singular slots (Scalar, Struct) emit a null whenever the
+            // tag is absent from the wire — which proto3 does by default
+            // for default-valued fields. A non-nullable Arrow declaration
+            // would trip a generic `RecordBatch::try_new` failure deep in
+            // encode_batch and drop the whole batch with no row context.
+            // Reject the mismatch up front. List<…>/Map<…> outer columns
+            // are exempt: the encoder always emits at least an empty
+            // list / empty map per row, so the outer column never holds
+            // a null. Map entry sub-plans are also exempt: Arrow's Map
+            // type itself dictates the non-null key contract, so the
+            // check would be a false positive there.
+            if !arrow_field.is_nullable() && !inside_map_entry {
+                match slot {
+                    PlanSlot::Scalar(_) | PlanSlot::Struct(_) => {
+                        return Err(WireToArrowError::NonNullableNotGuaranteed {
+                            name: arrow_field.name().to_string(),
+                            reason: "proto3 singular fields are omitted at default value, \
+                                     so the column may contain nulls",
+                        });
+                    }
+                    PlanSlot::RepeatedMessage(_)
+                    | PlanSlot::RepeatedScalar(_)
+                    | PlanSlot::Map(_)
+                    | PlanSlot::Absent => {}
+                }
+            }
             slots.push(slot);
         }
 
@@ -318,6 +418,45 @@ impl MessagePlan {
         })
     }
 
+}
+
+/// Recursively walk an Arrow `DataType` tree and verify every primitive
+/// leaf is supported by [`TypedBuilder`]. Plan-build calls this so an
+/// unsupported leaf (e.g. `Date32`) surfaces as a clean
+/// [`WireToArrowError::UnsupportedArrowLeafType`] at serializer init,
+/// instead of panicking in `TypedBuilder::new` on the first batch.
+///
+/// `Struct` / `List` / `Map` are structural; recurse through them. The
+/// terminal case is a primitive leaf that either passes
+/// [`TypedBuilder::supports`] or fails the check.
+pub(super) fn validate_arrow_leaf_types(field_name: &str, dt: &DataType) -> Result<()> {
+    match dt {
+        DataType::Struct(inner_fields) => {
+            for f in inner_fields.iter() {
+                validate_arrow_leaf_types(f.name(), f.data_type())?;
+            }
+            Ok(())
+        }
+        DataType::List(item_field) => {
+            validate_arrow_leaf_types(item_field.name(), item_field.data_type())
+        }
+        DataType::Map(entry_field, _) => {
+            if let DataType::Struct(entry_fields) = entry_field.data_type() {
+                for f in entry_fields.iter() {
+                    validate_arrow_leaf_types(f.name(), f.data_type())?;
+                }
+            }
+            Ok(())
+        }
+        leaf if TypedBuilder::supports(leaf) => Ok(()),
+        leaf => Err(WireToArrowError::UnsupportedArrowLeafType {
+            name: field_name.to_string(),
+            arrow_type: format!("{leaf:?}"),
+        }),
+    }
+}
+
+impl MessagePlan {
     /// Build a plan whose slots are all `Absent`. Used by the builder layer to
     /// shape a null-filled sub-tree when an outer Arrow Struct / List / Map
     /// column is itself `Absent` (so every nested child has to null-pad per row).

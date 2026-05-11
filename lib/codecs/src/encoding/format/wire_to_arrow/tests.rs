@@ -3,6 +3,8 @@ use super::{
     WireToArrowEncoder, WireToArrowError, WireToArrowSerializer, WireToArrowSerializerConfig,
 };
 
+use proptest::prelude::*;
+
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Fields as ArrowFields, Schema};
 use bytes::Bytes;
@@ -695,6 +697,216 @@ fn oneof_variants_map_to_separate_columns() {
     assert_eq!(b.value(1), "hello");
 }
 
+/// `message Tree { Tree next = 1; int32 leaf = 2; }` — a proto that's
+/// self-referential by construction, used to drive deep plan/scan recursion.
+fn self_referential_descriptor() -> MessageDescriptor {
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_poc_tree.proto".into()),
+        package: Some("wire_to_arrow_poc_test".into()),
+        message_type: vec![DescriptorProto {
+            name: Some("Tree".into()),
+            field: vec![
+                FieldDescriptorProto {
+                    name: Some("next".into()),
+                    number: Some(1),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ProtoType::Message as i32),
+                    type_name: Some(".wire_to_arrow_poc_test.Tree".into()),
+                    ..Default::default()
+                },
+                FieldDescriptorProto {
+                    name: Some("leaf".into()),
+                    number: Some(2),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ProtoType::Int32 as i32),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes).unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_poc_test.Tree")
+        .unwrap()
+}
+
+/// Build an Arrow Struct nested `levels` deep along a single `next` field,
+/// with an `Int32` `leaf` at every level. Used to drive `MessagePlan::build`
+/// recursion to a known depth.
+fn nested_tree_struct(levels: usize) -> DataType {
+    if levels == 0 {
+        // Innermost level: just the leaf scalar, no `next`.
+        return DataType::Struct(ArrowFields::from(vec![Field::new(
+            "leaf",
+            DataType::Int32,
+            true,
+        )]));
+    }
+    DataType::Struct(ArrowFields::from(vec![
+        Field::new("next", nested_tree_struct(levels - 1), true),
+        Field::new("leaf", DataType::Int32, true),
+    ]))
+}
+
+#[test]
+fn plan_build_rejects_schema_deeper_than_cap() {
+    use super::plan::MAX_NESTING_DEPTH;
+
+    let desc = self_referential_descriptor();
+    // One level over the cap. The wrapper Schema counts as depth 0, so we
+    // need MAX_NESTING_DEPTH levels of nested struct to step over the limit.
+    let deep_struct = nested_tree_struct(MAX_NESTING_DEPTH);
+    let schema = Schema::new(vec![Field::new("next", deep_struct, true)]);
+    let err = WireToArrowEncoder::new(&desc, schema).expect_err("should reject");
+    assert!(
+        matches!(err, WireToArrowError::SchemaTooDeep { limit } if limit == MAX_NESTING_DEPTH),
+        "expected SchemaTooDeep, got {err:?}"
+    );
+}
+
+#[test]
+fn plan_build_accepts_moderately_deep_schema() {
+    // A reasonably deep but legal schema must build without error. Pick a
+    // depth far below the cap so any reasonable real-world nesting is fine.
+    let desc = self_referential_descriptor();
+    let deep_struct = nested_tree_struct(8);
+    let schema = Schema::new(vec![Field::new("next", deep_struct, true)]);
+    let enc = WireToArrowEncoder::new(&desc, schema).expect("8-deep schema should build");
+    // And it should be able to encode an empty payload (every level absent).
+    let batch = enc.encode_batch(&[Bytes::new()]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+}
+
+#[test]
+fn plan_build_rejects_non_nullable_singular_scalar() {
+    // proto3 omits default-valued singular scalars on the wire, so a
+    // column declared non-nullable would fail RecordBatch::try_new with
+    // a generic Arrow error deep in encode_batch — dropping the whole
+    // batch. The plan builder should reject this at init.
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, /* nullable */ false),
+        Field::new("email", DataType::LargeUtf8, true),
+    ]);
+    let err = WireToArrowEncoder::new(&desc, schema).expect_err("should reject");
+    assert!(
+        matches!(
+            &err,
+            WireToArrowError::NonNullableNotGuaranteed { name, .. } if name == "id"
+        ),
+        "expected NonNullableNotGuaranteed for 'id', got {err:?}"
+    );
+}
+
+#[test]
+fn plan_build_allows_non_nullable_outer_list_and_map() {
+    // Repeated and map outer columns are always-present (the encoder
+    // emits an empty list / empty map for an absent occurrence), so a
+    // non-nullable declaration on the outer column is safe and must
+    // build without error.
+    let desc = rich_descriptor();
+    let phone_struct = DataType::Struct(ArrowFields::from(vec![Field::new(
+        "number",
+        DataType::LargeUtf8,
+        true,
+    )]));
+    let phones_field = Field::new("item", phone_struct, true);
+    let entry_fields = ArrowFields::from(vec![
+        // Arrow Map keys are mandated non-nullable by the Map type
+        // contract; the carve-out for Map entry sub-plans must let this
+        // through.
+        Field::new("key", DataType::LargeUtf8, false),
+        Field::new("value", DataType::Int32, true),
+    ]);
+    let entry_field = Arc::new(Field::new(
+        "key_value",
+        DataType::Struct(entry_fields),
+        false,
+    ));
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        // Outer list non-nullable: OK, the encoder writes empty-list, not null.
+        Field::new(
+            "phones",
+            DataType::List(Arc::new(phones_field)),
+            /* nullable */ false,
+        ),
+        // Outer map non-nullable: OK, same reason.
+        Field::new("data", DataType::Map(entry_field, false), /* nullable */ false),
+    ]);
+    WireToArrowEncoder::new(&desc, schema).expect("should build");
+}
+
+#[test]
+fn plan_build_rejects_non_nullable_absent_column() {
+    // Schema-drift case: Arrow schema has a column the proto descriptor
+    // doesn't carry. The encoder fills it with all nulls; a non-nullable
+    // declaration is a hard mismatch that must be rejected at init.
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("dropped_from_proto", DataType::Int64, /* nullable */ false),
+    ]);
+    let err = WireToArrowEncoder::new(&desc, schema).expect_err("should reject");
+    assert!(
+        matches!(
+            &err,
+            WireToArrowError::NonNullableNotGuaranteed { name, .. }
+                if name == "dropped_from_proto"
+        ),
+        "expected NonNullableNotGuaranteed for absent column, got {err:?}"
+    );
+}
+
+#[test]
+fn plan_build_rejects_unsupported_arrow_leaf_in_scalar_slot() {
+    // proto says `id: int32`, Arrow says `id: Date32`. Date32 isn't in
+    // `TypedBuilder::supports`, so plan-build must reject up front
+    // rather than letting the first batch panic inside `TypedBuilder::new`.
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Date32, true),
+        Field::new("email", DataType::LargeUtf8, true),
+    ]);
+    let err = WireToArrowEncoder::new(&desc, schema).expect_err("should reject Date32");
+    assert!(
+        matches!(
+            &err,
+            WireToArrowError::UnsupportedArrowLeafType { name, .. } if name == "id"
+        ),
+        "expected UnsupportedArrowLeafType for 'id', got {err:?}"
+    );
+}
+
+#[test]
+fn plan_build_rejects_unsupported_arrow_leaf_in_absent_slot() {
+    // `created_at` doesn't exist in test_protobuf.Person, so it becomes
+    // PlanSlot::Absent. The Absent path builds via `build_absent_node`,
+    // which also calls `TypedBuilder::new` for leaves. Plan-build must
+    // validate the Arrow leaf type on absent slots too.
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("created_at", DataType::Date32, true),
+    ]);
+    let err = WireToArrowEncoder::new(&desc, schema)
+        .expect_err("should reject Date32 on absent slot");
+    assert!(
+        matches!(
+            &err,
+            WireToArrowError::UnsupportedArrowLeafType { name, .. } if name == "created_at"
+        ),
+        "expected UnsupportedArrowLeafType for 'created_at', got {err:?}"
+    );
+}
+
 #[test]
 fn multiple_rows_preserve_order() {
     let desc = scalar_descriptor();
@@ -808,4 +1020,58 @@ fn wire_descriptor_tags_drive_decode_regardless_of_arrow_schema_source() {
         batch.column(2).as_string::<i64>().value(0),
         "alice@example.com"
     );
+}
+
+// -------------------------------------------------------------------------
+// Fuzz: random wire bytes through `encode_batch` must not panic. Any
+// `Result` outcome is acceptable — we only care that bad input is reported
+// as a normal error and that the scan-time recursion (which the depth cap
+// also bounds) doesn't overflow the stack.
+// -------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        // Per-case timeout in ms; bounds CI cost if a future change makes
+        // the scan path much slower for some inputs.
+        timeout: 2_000,
+        ..ProptestConfig::default()
+    })]
+
+    /// Encoder must never panic on adversarial wire bytes against a scalar
+    /// schema. Most random byte sequences will hit `UnexpectedEof`,
+    /// `InvalidWireType`, or `WireTypeMismatch`; a few will parse but
+    /// produce nonsense values. All paths are fine as long as no panic.
+    #[test]
+    fn encode_batch_does_not_panic_on_random_bytes_scalar(
+        bytes in proptest::collection::vec(any::<u8>(), 0..256),
+    ) {
+        let desc = scalar_descriptor();
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::LargeUtf8, true),
+            Field::new("id", DataType::Int32, true),
+            Field::new("email", DataType::LargeUtf8, true),
+        ]);
+        let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+        // Any Result is acceptable — the assertion is "no panic".
+        let _ = enc.encode_batch(&[Bytes::from(bytes)]);
+    }
+
+    /// Same property against a deeply-nestable self-referential descriptor.
+    /// This is the wire-side stack-overflow surface Flavio called out:
+    /// attacker-controlled bytes try to drive `scan_message` recursion
+    /// down to the plan's maximum depth. With the depth cap in place,
+    /// scanning bounded by the plan stays within the safe limit.
+    #[test]
+    fn encode_batch_does_not_panic_on_random_bytes_nested(
+        bytes in proptest::collection::vec(any::<u8>(), 0..512),
+    ) {
+        let desc = self_referential_descriptor();
+        // Modest nesting in the Arrow schema — well under the cap, but
+        // enough that adversarial bytes have a real `next` field to chase.
+        let deep_struct = nested_tree_struct(8);
+        let schema = Schema::new(vec![Field::new("next", deep_struct, true)]);
+        let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+        let _ = enc.encode_batch(&[Bytes::from(bytes)]);
+    }
 }
