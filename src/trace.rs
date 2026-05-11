@@ -197,7 +197,11 @@ fn consume_early_buffer() -> Vec<LogEvent> {
 
 /// Gets or creates a trace sender for sending internal log events.
 fn get_trace_sender() -> &'static broadcast::Sender<LogEvent> {
-    SENDER.get_or_init(|| broadcast::channel(99).0)
+    let capacity = std::env::var("VECTOR_INTERNAL_LOG_BROADCAST_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512);
+    SENDER.get_or_init(|| broadcast::channel(capacity).0)
 }
 
 /// Attempts to get the trace sender for sending internal log events.
@@ -306,9 +310,13 @@ impl TraceSubscription {
 
     /// Converts this subscription into a raw stream of log events.
     pub fn into_stream(self) -> impl Stream<Item = LogEvent> + Unpin {
-        // We ignore errors because the only error we get is when the broadcast receiver lags, and there's nothing we
-        // can actually do about that so there's no reason to force callers to even deal with it.
-        BroadcastStream::new(self.trace_rx).filter_map(|event| ready(event.ok()))
+        BroadcastStream::new(self.trace_rx).filter_map(|event| match event {
+            Ok(log_event) => ready(Some(log_event)),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                metrics::counter!("discarded_internal_logs_total").increment(n);
+                ready(None)
+            }
+        })
     }
 }
 
