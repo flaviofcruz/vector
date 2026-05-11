@@ -185,7 +185,7 @@ impl BuilderNodeList {
     /// on the encoder and is what costs once per sink.
     ///
     /// [`WireToArrowEncoder::encode_batch`]: super::WireToArrowEncoder::encode_batch
-    pub fn with_capacity(plan: &MessagePlan, capacity: usize) -> Self {
+    pub fn with_capacity(plan: &MessagePlan, capacity: usize) -> Result<Self> {
         let mut nodes = Vec::with_capacity(plan.slots.len());
         for (slot, field) in plan.slots.iter().zip(plan.arrow_fields.iter()) {
             let node = match slot {
@@ -193,7 +193,7 @@ impl BuilderNodeList {
                     BuilderNode::Scalar(TypedBuilder::new(field.data_type(), capacity))
                 }
                 PlanSlot::Struct(sub_plan) => BuilderNode::Struct {
-                    children: BuilderNodeList::with_capacity(sub_plan, capacity),
+                    children: BuilderNodeList::with_capacity(sub_plan, capacity)?,
                     validity: Vec::with_capacity(capacity),
                 },
                 PlanSlot::RepeatedMessage(sub_plan) => {
@@ -201,7 +201,7 @@ impl BuilderNodeList {
                     offsets.push(0);
                     BuilderNode::RepeatedMessage {
                         // List lengths tend to be small; 2x rows is a rough guess.
-                        children: BuilderNodeList::with_capacity(sub_plan, capacity * 2),
+                        children: BuilderNodeList::with_capacity(sub_plan, capacity * 2)?,
                         offsets,
                         current_offset: 0,
                     }
@@ -209,8 +209,10 @@ impl BuilderNodeList {
                 PlanSlot::RepeatedScalar(_) => {
                     let element_type = match field.data_type() {
                         DataType::List(element_field) => element_field.data_type(),
-                        other => {
-                            panic!("RepeatedScalar slot requires List Arrow type, got {other:?}")
+                        _ => {
+                            return Err(WireToArrowError::PlanBuilderMismatch {
+                                site: "with_capacity:repeated_scalar_non_list",
+                            });
                         }
                     };
                     let mut offsets = Vec::with_capacity(capacity + 1);
@@ -225,17 +227,17 @@ impl BuilderNodeList {
                     let mut offsets = Vec::with_capacity(capacity + 1);
                     offsets.push(0);
                     BuilderNode::Map {
-                        children: BuilderNodeList::with_capacity(sub_plan, capacity * 2),
+                        children: BuilderNodeList::with_capacity(sub_plan, capacity * 2)?,
                         offsets,
                         current_offset: 0,
                     }
                 }
-                PlanSlot::Absent => build_absent_node(field, capacity),
+                PlanSlot::Absent => build_absent_node(field, capacity)?,
             };
             nodes.push(node);
         }
         let present = vec![false; plan.slots.len()];
-        Self { nodes, present }
+        Ok(Self { nodes, present })
     }
 
     /// Zero `present` ahead of scanning a row / sub-row at this level. Cheap
@@ -614,12 +616,12 @@ impl BuilderNodeList {
 /// for [`PlanSlot::Absent`] columns. The builder is the same shape as a normal
 /// column of that Arrow type, but no wire tags ever dispatch to it so it stays
 /// fully null-padded by `finalize_row` / `fill_null_row`.
-fn build_absent_node(field: &Field, capacity: usize) -> BuilderNode {
-    match field.data_type() {
+fn build_absent_node(field: &Field, capacity: usize) -> Result<BuilderNode> {
+    Ok(match field.data_type() {
         DataType::Struct(inner_fields) => {
             let sub_plan = MessagePlan::all_absent(inner_fields);
             BuilderNode::Struct {
-                children: BuilderNodeList::with_capacity(&sub_plan, capacity),
+                children: BuilderNodeList::with_capacity(&sub_plan, capacity)?,
                 validity: Vec::with_capacity(capacity),
             }
         }
@@ -630,7 +632,7 @@ fn build_absent_node(field: &Field, capacity: usize) -> BuilderNode {
                 DataType::Struct(inner_fields) => {
                     let sub_plan = MessagePlan::all_absent(inner_fields);
                     BuilderNode::RepeatedMessage {
-                        children: BuilderNodeList::with_capacity(&sub_plan, capacity * 2),
+                        children: BuilderNodeList::with_capacity(&sub_plan, capacity * 2)?,
                         offsets,
                         current_offset: 0,
                     }
@@ -645,21 +647,27 @@ fn build_absent_node(field: &Field, capacity: usize) -> BuilderNode {
         DataType::Map(entry_field, _) => {
             let inner_fields = match entry_field.data_type() {
                 DataType::Struct(fs) => fs,
-                other => panic!("Map entry must be a Struct, got {other:?}"),
+                _ => {
+                    return Err(WireToArrowError::PlanBuilderMismatch {
+                        site: "build_absent_node:map_entry_non_struct",
+                    });
+                }
             };
             let sub_plan = MessagePlan::all_absent(inner_fields);
             let mut offsets = Vec::with_capacity(capacity + 1);
             offsets.push(0);
             BuilderNode::Map {
-                children: BuilderNodeList::with_capacity(&sub_plan, capacity * 2),
+                children: BuilderNodeList::with_capacity(&sub_plan, capacity * 2)?,
                 offsets,
                 current_offset: 0,
             }
         }
-        // Scalar Arrow types — build a primitive builder; `TypedBuilder::new`
-        // already panics on unsupported types.
+        // Scalar Arrow types — build a primitive builder. `TypedBuilder::new`
+        // still has an internal `unsupported leaf DataType` panic, but it's
+        // a build-bug-only path: `validate_arrow_leaf_types` rejects
+        // unsupported leaves at plan-build, so this call can't see one.
         _ => BuilderNode::Scalar(TypedBuilder::new(field.data_type(), capacity)),
-    }
+    })
 }
 
 #[cfg(test)]

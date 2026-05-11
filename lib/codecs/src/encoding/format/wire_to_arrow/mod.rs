@@ -233,7 +233,7 @@ impl WireToArrowEncoder {
     /// `RecordBatchAssembly` rejection from Arrow.
     pub fn encode_batch(&self, messages: &[Bytes]) -> Result<RecordBatch> {
         let capacity = messages.len();
-        let mut builders = BuilderNodeList::with_capacity(&self.plan, capacity);
+        let mut builders = BuilderNodeList::with_capacity(&self.plan, capacity)?;
         let mut dropped = 0u64;
         let mut sample_err: Option<WireToArrowError> = None;
 
