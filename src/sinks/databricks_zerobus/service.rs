@@ -6,14 +6,16 @@ use databricks_zerobus_ingest_sdk::{TableProperties, ZerobusSdk, ZerobusStream};
 use futures::future::BoxFuture;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tower::Service;
 use tracing::{info, warn};
+use vector_lib::codecs::encoding::{BatchEncoder, BatchOutput, BatchSerializerConfig};
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 use vrl::protobuf::descriptor::get_message_descriptor;
 
+use crate::event::Event;
 use crate::sinks::util::retries::RetryLogic;
 
 use super::{config::ZerobusSinkConfig, error::ZerobusSinkError, unity_catalog_schema};
@@ -32,9 +34,15 @@ pub enum ZerobusPayload {
 }
 
 /// Request type for the Zerobus service.
-#[derive(Clone, Debug)]
+///
+/// Carries the *unencoded* batch — encoding happens inside `Service::call` so
+/// that schema-fetch failures flow through the Tower retry layer. Events live
+/// behind an `Arc` because Tower's retry policy clones the request before
+/// every call (not just on retry), and a deep clone of `Vec<Event>` per call
+/// would be wasteful.
+#[derive(Clone)]
 pub struct ZerobusRequest {
-    pub payload: ZerobusPayload,
+    pub events: Arc<Vec<Event>>,
     pub metadata: RequestMetadata,
     pub finalizers: EventFinalizers,
 }
@@ -160,12 +168,19 @@ impl MockStream {
     }
 }
 
+/// Schema, encoder, and stream-mode derived from the Unity Catalog table or
+/// the path-based descriptor. Resolved lazily on first use.
+pub(super) struct ResolvedSchema {
+    encoder: BatchEncoder,
+    stream_mode: StreamMode,
+}
+
 /// Service for handling Zerobus requests.
 pub struct ZerobusService {
     sdk: Arc<ZerobusSdk>,
     config: Arc<ZerobusSinkConfig>,
     stream: Arc<Mutex<Option<Arc<ActiveStream>>>>,
-    stream_mode: StreamMode,
+    schema: Arc<OnceCell<ResolvedSchema>>,
     /// When true, the service waits for server-side acknowledgment after each
     /// ingest call. Derived from `AcknowledgementsConfig`.
     require_acknowledgements: bool,
@@ -174,7 +189,6 @@ pub struct ZerobusService {
 impl ZerobusService {
     pub async fn new(
         config: ZerobusSinkConfig,
-        stream_mode: StreamMode,
         require_acknowledgements: bool,
     ) -> Result<Self, ZerobusSinkError> {
         // Validate configuration
@@ -193,7 +207,7 @@ impl ZerobusService {
             sdk: Arc::new(sdk),
             config: Arc::new(config),
             stream: Arc::new(Mutex::new(None)),
-            stream_mode,
+            schema: Arc::new(OnceCell::new()),
             require_acknowledgements,
         })
     }
@@ -232,19 +246,102 @@ impl ZerobusService {
         }
     }
 
+    /// Resolve the schema on first use; cache the result.
+    pub(super) async fn ensure_schema(&self) -> Result<&ResolvedSchema, ZerobusSinkError> {
+        self.schema
+            .get_or_try_init(|| async {
+                let descriptor = Self::resolve_descriptor(&self.config).await?;
+
+                let mut batch_encoding = self.config.batch_encoding.clone();
+                let stream_mode = match &mut batch_encoding {
+                    BatchSerializerConfig::ProtoBatch(config) => {
+                        config.descriptor = Some(descriptor.clone());
+                        StreamMode::Proto {
+                            descriptor_proto: Arc::new(descriptor.descriptor_proto().clone()),
+                        }
+                    }
+                    #[cfg(feature = "codecs-arrow")]
+                    BatchSerializerConfig::ArrowStream(arrow_config) => {
+                        let arrow_schema =
+                            super::proto_to_arrow::proto_descriptor_to_arrow_schema(&descriptor)?;
+                        arrow_config.schema = Some(arrow_schema.clone());
+                        StreamMode::Arrow {
+                            arrow_schema: Arc::new(arrow_schema),
+                        }
+                    }
+                    #[cfg(feature = "codecs-arrow")]
+                    BatchSerializerConfig::WireToArrow(config) => {
+                        // `descriptor` from `resolve_descriptor` describes the *output*
+                        // table shape and is used solely to derive the Arrow schema.
+                        // The wire descriptor (for decoding incoming bytes) is loaded
+                        // separately by the encoder from `batch_encoding.desc_file` +
+                        // `batch_encoding.message_type` — under `SchemaSource::UnityCatalog`
+                        // the UC-synthesized descriptor's field numbers don't match
+                        // real wire tags, so the two descriptors must be distinct.
+                        let arrow_schema =
+                            super::proto_to_arrow::proto_descriptor_to_arrow_schema(&descriptor)?;
+                        config.schema = Some(arrow_schema.clone());
+                        StreamMode::Arrow {
+                            arrow_schema: Arc::new(arrow_schema),
+                        }
+                    }
+                };
+                let batch_serializer =
+                    batch_encoding
+                        .build()
+                        .map_err(|e| ZerobusSinkError::ConfigError {
+                            message: format!("Failed to build batch serializer: {}", e),
+                        })?;
+
+                Ok(ResolvedSchema {
+                    encoder: BatchEncoder::new(batch_serializer),
+                    stream_mode,
+                })
+            })
+            .await
+    }
+
+    /// Encode a batch of events into a `ZerobusPayload` plus its byte size.
+    pub(super) fn encode_batch(
+        schema: &ResolvedSchema,
+        events: &[Event],
+    ) -> Result<(ZerobusPayload, usize), ZerobusSinkError> {
+        match schema
+            .encoder
+            .encode_batch(events)
+            .map_err(|e| ZerobusSinkError::EncodingError {
+                message: format!("Failed to encode batch: {}", e),
+            })? {
+            BatchOutput::Records(records) => {
+                let size = records.iter().map(|r| r.len()).sum::<usize>();
+                Ok((ZerobusPayload::Records(records), size))
+            }
+            #[cfg(feature = "codecs-arrow")]
+            BatchOutput::Arrow(record_batch) => {
+                let size = record_batch.get_array_memory_size();
+                Ok((ZerobusPayload::Arrow(record_batch), size))
+            }
+        }
+    }
+
     /// Ensure we have an active stream, creating one if necessary.
     ///
-    /// Also used as the healthcheck: eagerly creating a stream verifies
-    /// OAuth credentials, endpoint connectivity, and table validity.
+    /// Also used as the healthcheck: resolving the schema verifies the table
+    /// and credentials against Unity Catalog, and creating the stream verifies
+    /// connectivity to the Zerobus endpoint.
     pub async fn ensure_stream(&self) -> Result<(), ZerobusSinkError> {
-        self.get_or_create_stream().await.map(|_| ())
+        let schema = self.ensure_schema().await?;
+        self.get_or_create_stream(schema).await.map(|_| ())
     }
 
     /// Return an `Arc` handle to the active stream, creating one if needed.
     ///
     /// The lock is held only while checking/creating the stream; callers can
     /// then use the returned `Arc` without holding the lock.
-    async fn get_or_create_stream(&self) -> Result<Arc<ActiveStream>, ZerobusSinkError> {
+    async fn get_or_create_stream(
+        &self,
+        schema: &ResolvedSchema,
+    ) -> Result<Arc<ActiveStream>, ZerobusSinkError> {
         let mut stream_guard = self.stream.lock().await;
 
         if stream_guard.is_none() {
@@ -258,7 +355,7 @@ impl ZerobusService {
                 ),
             };
 
-            let active_stream = match &self.stream_mode {
+            let active_stream = match &schema.stream_mode {
                 StreamMode::Proto { descriptor_proto } => {
                     let table_properties = TableProperties {
                         table_name: self.config.table_name.clone(),
@@ -331,21 +428,16 @@ impl ZerobusService {
         }
     }
 
-    /// Ingest a payload (proto records or Arrow batch).
-    ///
-    /// Obtains an `Arc` handle to the stream (creating one if needed) and
-    /// then releases the lock before calling into the SDK so that concurrent
-    /// ingests are not serialized.
+    /// Send an encoded payload to an already-resolved stream.
     ///
     /// On retryable errors the active stream is removed from the slot so that
     /// the next attempt (driven by Tower retry) creates a fresh one.
-    pub async fn ingest(
+    async fn ingest(
         &self,
+        mut stream: Arc<ActiveStream>,
         payload: ZerobusPayload,
         events_byte_size: GroupedCountByteSize,
     ) -> Result<ZerobusResponse, ZerobusSinkError> {
-        let mut stream = self.get_or_create_stream().await?;
-
         // Lock is not held here — other tasks can ingest concurrently.
         let result = match (payload, stream.as_ref()) {
             (ZerobusPayload::Records(records), ActiveStream::Proto(stream)) => {
@@ -412,7 +504,12 @@ impl Service<ZerobusRequest> for ZerobusService {
         let events_byte_size =
             std::mem::take(request.metadata_mut()).into_events_estimated_json_encoded_byte_size();
 
-        Box::pin(async move { service.ingest(request.payload, events_byte_size).await })
+        Box::pin(async move {
+            let schema = service.ensure_schema().await?;
+            let (payload, _) = Self::encode_batch(schema, &request.events)?;
+            let stream = service.get_or_create_stream(schema).await?;
+            service.ingest(stream, payload, events_byte_size).await
+        })
     }
 }
 
@@ -422,7 +519,7 @@ impl Clone for ZerobusService {
             sdk: Arc::clone(&self.sdk),
             config: Arc::clone(&self.config),
             stream: Arc::clone(&self.stream),
-            stream_mode: self.stream_mode.clone(),
+            schema: Arc::clone(&self.schema),
             require_acknowledgements: self.require_acknowledgements,
         }
     }
@@ -459,9 +556,7 @@ impl ZerobusService {
             sdk: Arc::new(sdk),
             config: Arc::new(config),
             stream: Arc::new(Mutex::new(Some(Arc::new(ActiveStream::Mock(mock))))),
-            stream_mode: StreamMode::Proto {
-                descriptor_proto: Arc::new(Default::default()),
-            },
+            schema: Arc::new(OnceCell::new()),
             require_acknowledgements,
         })
     }
@@ -523,14 +618,23 @@ mod tests {
         ZerobusPayload::Records(vec![vec![1, 2, 3]])
     }
 
+    async fn current_stream(service: &ZerobusService) -> Arc<ActiveStream> {
+        service.stream.lock().await.as_ref().unwrap().clone()
+    }
+
     #[tokio::test]
     async fn ingest_succeeds_with_mock_stream() {
         let service = ZerobusService::new_with_mock(test_config(), MockStream::succeeding(), false)
             .await
             .unwrap();
 
+        let stream = current_stream(&service).await;
         let result = service
-            .ingest(dummy_payload(), GroupedCountByteSize::new_untagged())
+            .ingest(
+                stream,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
             .await;
 
         assert!(result.is_ok());
@@ -548,8 +652,13 @@ mod tests {
 
         assert!(service.has_active_stream().await);
 
+        let stream = current_stream(&service).await;
         let err = service
-            .ingest(dummy_payload(), GroupedCountByteSize::new_untagged())
+            .ingest(
+                stream,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
             .await
             .unwrap_err();
 
@@ -568,8 +677,13 @@ mod tests {
 
         assert!(service.has_active_stream().await);
 
+        let stream = current_stream(&service).await;
         let err = service
-            .ingest(dummy_payload(), GroupedCountByteSize::new_untagged())
+            .ingest(
+                stream,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
             .await
             .unwrap_err();
 
@@ -588,9 +702,14 @@ mod tests {
             .unwrap();
 
         // First ingest succeeds.
+        let stream = current_stream(&service).await;
         assert!(
             service
-                .ingest(dummy_payload(), GroupedCountByteSize::new_untagged())
+                .ingest(
+                    stream,
+                    dummy_payload(),
+                    GroupedCountByteSize::new_untagged()
+                )
                 .await
                 .is_ok()
         );
@@ -607,8 +726,13 @@ mod tests {
         }
 
         // Second ingest fails and clears the stream.
+        let stream = current_stream(&service).await;
         let err = service
-            .ingest(dummy_payload(), GroupedCountByteSize::new_untagged())
+            .ingest(
+                stream,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
             .await
             .unwrap_err();
         assert!(ZerobusRetryLogic.is_retriable_error(&err));
@@ -619,9 +743,14 @@ mod tests {
         *service.stream.lock().await = Some(Arc::new(ActiveStream::Mock(MockStream::succeeding())));
 
         // Third ingest succeeds on the new stream.
+        let stream = current_stream(&service).await;
         assert!(
             service
-                .ingest(dummy_payload(), GroupedCountByteSize::new_untagged())
+                .ingest(
+                    stream,
+                    dummy_payload(),
+                    GroupedCountByteSize::new_untagged()
+                )
                 .await
                 .is_ok()
         );

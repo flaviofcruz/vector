@@ -9,15 +9,9 @@ use crate::sinks::{
     util::{BatchConfig, RealtimeSizeBasedDefaultBatchSettings},
 };
 
-use vector_lib::codecs::encoding::{
-    BatchEncoder, BatchSerializerConfig, ProtoBatchSerializerConfig,
-};
+use vector_lib::codecs::encoding::{BatchSerializerConfig, ProtoBatchSerializerConfig};
 
-use super::{
-    error::ZerobusSinkError,
-    service::{StreamMode, ZerobusService},
-    sink::ZerobusSink,
-};
+use super::{error::ZerobusSinkError, service::ZerobusService, sink::ZerobusSink};
 
 /// Authentication configuration for Databricks.
 #[configurable_component]
@@ -232,54 +226,12 @@ impl GenerateConfig for ZerobusSinkConfig {
 #[typetag::serde(name = "databricks_zerobus")]
 impl SinkConfig for ZerobusSinkConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let descriptor = ZerobusService::resolve_descriptor(self).await?;
-
-        let mut batch_encoding = self.batch_encoding.clone();
-        let stream_mode = match &mut batch_encoding {
-            BatchSerializerConfig::ProtoBatch(config) => {
-                config.descriptor = Some(descriptor.clone());
-                StreamMode::Proto {
-                    descriptor_proto: std::sync::Arc::new(descriptor.descriptor_proto().clone()),
-                }
-            }
-            #[cfg(feature = "codecs-arrow")]
-            BatchSerializerConfig::ArrowStream(arrow_config) => {
-                let arrow_schema =
-                    super::proto_to_arrow::proto_descriptor_to_arrow_schema(&descriptor)?;
-                arrow_config.schema = Some(arrow_schema.clone());
-                StreamMode::Arrow {
-                    arrow_schema: std::sync::Arc::new(arrow_schema),
-                }
-            }
-            #[cfg(feature = "codecs-arrow")]
-            BatchSerializerConfig::WireToArrow(config) => {
-                // `descriptor` from `resolve_descriptor` describes the *output*
-                // table shape and is used solely to derive the Arrow schema.
-                // The wire descriptor (for decoding incoming bytes) is loaded
-                // separately by the encoder from `batch_encoding.desc_file` +
-                // `batch_encoding.message_type` — under `SchemaSource::UnityCatalog`
-                // the UC-synthesized descriptor's field numbers don't match
-                // real wire tags, so the two descriptors must be distinct.
-                let arrow_schema =
-                    super::proto_to_arrow::proto_descriptor_to_arrow_schema(&descriptor)?;
-                config.schema = Some(arrow_schema.clone());
-                StreamMode::Arrow {
-                    arrow_schema: std::sync::Arc::new(arrow_schema),
-                }
-            }
-        };
-        let batch_serializer = batch_encoding
-            .build()
-            .map_err(|e| format!("Failed to build batch serializer: {}", e))?;
-        let encoder = BatchEncoder::new(batch_serializer);
-
-        let service =
-            ZerobusService::new(self.clone(), stream_mode, self.acknowledgements.enabled()).await?;
+        let service = ZerobusService::new(self.clone(), self.acknowledgements.enabled()).await?;
         let healthcheck_service = service.clone();
 
         let request_limits = self.request.into_settings();
 
-        let sink = ZerobusSink::new(service, request_limits, self.batch.clone(), encoder)?;
+        let sink = ZerobusSink::new(service, request_limits, self.batch.clone())?;
 
         let healthcheck = async move {
             healthcheck_service

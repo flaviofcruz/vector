@@ -18,6 +18,7 @@ impl InternalEvent for VectorStarted {
             revision = built_info::VECTOR_BUILD_DESC.unwrap_or(""),
         );
         counter!("started_total").increment(1);
+        gauge!("last_config_reload_success").set(1.0);
     }
 }
 

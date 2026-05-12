@@ -6,7 +6,7 @@ use std::fmt;
 use prost_types::field_descriptor_proto::Type;
 
 use crate::errors::{ParseError, ParseResult};
-use crate::wire::{decode_zigzag32, decode_zigzag64, try_read_varint, WireValue};
+use crate::wire::{WireValue, decode_zigzag32, decode_zigzag64, try_read_varint};
 
 /// Maximum allowed nesting depth for protobuf messages.
 /// Protobuf messages can be nested arbitrarily deep, but to prevent stack overflow
