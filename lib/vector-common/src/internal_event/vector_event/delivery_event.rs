@@ -10,48 +10,30 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
-// Sentinel used by woodchuck `source_context.topic` to indicate that the topic must be
-// inferred from the filename. (Note: VRL spells this `lumberjackTopicInfered` — single
-// "r" — and we match that spelling exactly so callers/queries can identify these events.)
+// Sentinel emitted when a Lumberjack source's topic cannot be resolved from
+// either the source context or the filename. The spelling — including the
+// "Infered" typo — matches the value used elsewhere in the pipeline.
 const LUMBERJACK_TOPIC_INFERRED_SENTINEL: &str = "lumberjackTopicInfered";
 
-// Extracts a Lumberjack topic from a source filename following the standard convention.
-//
-// The Lumberjack proto file naming convention (see woodchuck's
-// `conditionalForTopicFromFilenameFromLumberjackTableNameVrl` in `log-utils.libsonnet`):
-//   <prefix>.<TableNameCamelCase>.pb[.base64][.gz]
-//   <prefix>.<TableNameCamelCase>LaMigration.pb[.base64][.gz]
-//
-// Returns the dash-cased topic name (e.g. "service-request-log") when matched.
-// Returns `None` for filenames that don't match the convention — callers should
-// fall back to their own sentinel (typically `lumberjackTopicInfered` to mirror
-// what woodchuck VRL would emit for the same unmatched case).
-//
-// This is the Rust analogue of `vrlPseudoFunctions.parseTopicFromFile` in woodchuck.
-// It deliberately does NOT consult the Lumberjack catalog at runtime — the catalog
-// only validates *whether* a topic should exist, not how to derive its name from
-// the filename. The CamelCase ↔ dash-case relationship is the stable convention.
-//
-// For custom-pattern logs (HAL/nginx/envoy access logs etc.) this returns None,
-// matching the behavior of the simplified approach we chose for the M3 metric.
+/// Extracts a Lumberjack topic from a source filename of the form
+/// `<prefix>.<TableNameCamelCase>[LaMigration].pb[.base64][.gz]`, returning
+/// the dash-cased table name (e.g. `"service-request-log"`). Returns `None`
+/// for filenames that do not match the convention.
 pub fn extract_topic_from_source_filename(path: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        // The CamelCase capture is lazy (`+?`) so the optional `LaMigration` suffix
-        // matches as part of the trailing alternation rather than being absorbed
-        // into the capture group.
-        Regex::new(
-            r"\.([A-Z][A-Za-z0-9]+?)(LaMigration)?\.pb(?:\.base64)?(?:\.gz)?$",
-        )
-        .expect("topic extraction regex must compile")
+        // Lazy `+?` on the CamelCase capture lets the optional `LaMigration`
+        // suffix match outside the capture group rather than being absorbed.
+        Regex::new(r"\.([A-Z][A-Za-z0-9]+?)(LaMigration)?\.pb(?:\.base64)?(?:\.gz)?$")
+            .expect("topic extraction regex must compile")
     });
     let captures = re.captures(path)?;
     let camel = captures.get(1)?.as_str();
     Some(camel_to_dash_case(camel))
 }
 
-// Converts a CamelCase identifier to dash-case: "ServiceRequestLog" -> "service-request-log".
-// Inserts a dash before each uppercase letter that is not the first character, then lowercases.
+/// Converts a CamelCase identifier to dash-case
+/// (e.g. `"ServiceRequestLog"` -> `"service-request-log"`).
 fn camel_to_dash_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for (i, c) in s.chars().enumerate() {
@@ -63,15 +45,11 @@ fn camel_to_dash_case(s: &str) -> String {
     out
 }
 
-// Resolves the topic label for a source-read event using a three-step fallback:
-//   1. If source_context.topic is set and is NOT the inference sentinel, use it as-is.
-//   2. Otherwise attempt filename inference using the Lumberjack convention.
-//   3. If both fail (non-Lumberjack file with no explicit context), emit the sentinel
-//      string so queries can identify and filter these out.
-//
-// This mirrors the priority used by woodchuck's `ConvertDeliveryInfoLogs` VRL but
-// with a simpler inference rule (regex against the convention rather than a
-// catalog-driven cascade). Custom-pattern logs land in step 3.
+/// Resolves the topic label for a source-read event:
+/// 1. `source_context.topic` if it is a concrete value (not the sentinel).
+/// 2. Otherwise the topic inferred from the filename.
+/// 3. Otherwise the inference sentinel, so unresolved cases are filterable
+///    in downstream queries.
 fn resolve_received_topic(source_context: &HashMap<String, String>, path: &str) -> String {
     let explicit = source_context.get("topic").map(String::as_str);
     match explicit {
@@ -81,31 +59,17 @@ fn resolve_received_topic(source_context: &HashMap<String, String>, path: &str) 
     }
 }
 
-// Computes an hour-rounded Unix-milliseconds bucket for the current time, as a string.
-//
-// Format matches the `timeParity` field convention used throughout woodchuck VRL
-// transforms (e.g. `file_based_raw_proto_streaming.libsonnet`:
-//     `time_parity = uploadTime - mod(uploadTime, 60 * 60 * 1000)`),
-// so the counter's `time_parity` label is directly comparable to the values
-// emitted into the existing vector-event-log Kafka topic / Lumberjack table.
-//
-// Used as a fallback in the receive-time path (where logMetadata has not yet been
-// built by downstream VRL) and as the default for the delivered path when
-// value_map["timeParity"] is missing.
+/// Hour-rounded Unix-milliseconds bucket for the current time, as a string.
+/// The format (ms since epoch, rounded down to the hour) matches the
+/// `timeParity` value carried by events through the rest of the pipeline,
+/// so labels emitted from here are directly comparable to that field.
 fn current_hour_time_parity_ms() -> String {
     const HOUR_MS: i64 = 60 * 60 * 1000;
     let now_ms = Utc::now().timestamp_millis();
     (now_ms - (now_ms % HOUR_MS)).to_string()
 }
 
-// Reads `timeParity` from value_map when present (set upstream by the
-// `file_based_raw_proto_streaming` and `file_based_unstructured_log_daemon_wrapper`
-// VRL transforms in woodchuck, both of which round uploadTime to hour boundaries).
-// Falls back to the current hour for events whose pipelines do not set logMetadata.
-//
-// woodchuck's DELIVERY_EVENT_LOG_GRANULARITY_FIELDS already includes "timeParity",
-// so this field is populated in value_map for delivered/staged events by the
-// existing build_map machinery — no Phase 2 plumbing required for the delivered side.
+/// Reads `timeParity` from `value_map`, falling back to the current hour.
 fn time_parity_from_value_map(value_map: &HashMap<String, String>) -> String {
     value_map
         .get("timeParity")
@@ -113,8 +77,7 @@ fn time_parity_from_value_map(value_map: &HashMap<String, String>) -> String {
         .unwrap_or_else(current_hour_time_parity_ms)
 }
 
-// Reads `topic` from value_map if present, otherwise "unknown". Topics are bounded
-// (~100 distinct values) so this is M3-safe.
+/// Reads `topic` from `value_map`, falling back to `"unknown"`.
 fn topic_from_value_map(value_map: &HashMap<String, String>) -> String {
     value_map
         .get("topic")
@@ -174,16 +137,6 @@ impl InternalEvent for DeliveryReadEvent {
                 source_context = serde_json::to_string(&source_context).unwrap(),
             );
 
-            // Emit an event-time-bucketed counter for M3.
-            // Labels are bounded: topic (~100), delivery_event_type (small enum),
-            // time_parity (24 rolling hours, hour-rounded Unix milliseconds).
-            // pod_name/container_name/file are intentionally NOT included —
-            // woodchuck's internal_metrics pipeline strips those before exporting.
-            //
-            // Topic resolution mirrors what woodchuck's ConvertDeliveryInfoLogs
-            // VRL does for VECTOR_SOURCE_READ: prefer source_context.topic when
-            // it's a concrete value, otherwise infer from the filename, otherwise
-            // emit the lumberjackTopicInfered sentinel.
             counter!(
                 "events_received_total",
                 "delivery_event_type" => "VECTOR_SOURCE_READ",
@@ -262,15 +215,6 @@ impl VectorSinkDeliveryEvent {
                 internal_log_rate_limit = false,
             );
 
-            // Emit an event-time-bucketed counter for M3. Reads timeParity from
-            // value_map, which is populated by the build_map() machinery using the
-            // existing DELIVERY_EVENT_LOG_GRANULARITY_FIELDS = ["timeParity", "topic",
-            // "deliveryMethod"] convention. Because the upstream VRL transform sets
-            // `logMetadata.timeParity = uploadTime - mod(uploadTime, 3600000)` at
-            // receive time, the delivered counter increments with the event's
-            // *receive-time* bucket — not the current wall-clock hour. This is what
-            // makes the `delivered_total / received_total` ratio non-oscillating
-            // across the receive→deliver gap.
             counter!(
                 "events_delivered_total",
                 "delivery_event_type" => delivery_event_type.to_string(),
