@@ -9,24 +9,36 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
-// Computes an hour-rounded UTC bucket string ("YYYY-MM-DDTHH") for the current time.
-// Used as a default when an event's original receive-time bucket has not been propagated.
+// Computes an hour-rounded Unix-milliseconds bucket for the current time, as a string.
 //
-// Phase 2 work: source-side plumbing should set `event_time_bucket` in event metadata at
-// receive time so that delivered counters use the receive-time bucket (not delivery-time),
-// which is what makes completeness ratios non-oscillating across the receive/deliver gap.
-fn current_hour_bucket() -> String {
-    Utc::now().format("%Y-%m-%dT%H").to_string()
+// Format matches the `timeParity` field convention used throughout woodchuck VRL
+// transforms (e.g. `file_based_raw_proto_streaming.libsonnet`:
+//     `time_parity = uploadTime - mod(uploadTime, 60 * 60 * 1000)`),
+// so the counter's `time_parity` label is directly comparable to the values
+// emitted into the existing vector-event-log Kafka topic / Lumberjack table.
+//
+// Used as a fallback in the receive-time path (where logMetadata has not yet been
+// built by downstream VRL) and as the default for the delivered path when
+// value_map["timeParity"] is missing.
+fn current_hour_time_parity_ms() -> String {
+    const HOUR_MS: i64 = 60 * 60 * 1000;
+    let now_ms = Utc::now().timestamp_millis();
+    (now_ms - (now_ms % HOUR_MS)).to_string()
 }
 
-// Reads `event_time_bucket` from value_map when present (Phase 2), falling back to the
-// current hour (Phase 1). The label only contributes useful non-oscillation behavior
-// once Phase 2 plumbing is in place; Phase 1 still emits a working metric.
-fn bucket_from_value_map(value_map: &HashMap<String, String>) -> String {
+// Reads `timeParity` from value_map when present (set upstream by the
+// `file_based_raw_proto_streaming` and `file_based_unstructured_log_daemon_wrapper`
+// VRL transforms in woodchuck, both of which round uploadTime to hour boundaries).
+// Falls back to the current hour for events whose pipelines do not set logMetadata.
+//
+// woodchuck's DELIVERY_EVENT_LOG_GRANULARITY_FIELDS already includes "timeParity",
+// so this field is populated in value_map for delivered/staged events by the
+// existing build_map machinery — no Phase 2 plumbing required for the delivered side.
+fn time_parity_from_value_map(value_map: &HashMap<String, String>) -> String {
     value_map
-        .get("event_time_bucket")
+        .get("timeParity")
         .cloned()
-        .unwrap_or_else(current_hour_bucket)
+        .unwrap_or_else(current_hour_time_parity_ms)
 }
 
 // Reads `topic` from value_map if present, otherwise "unknown". Topics are bounded
@@ -92,9 +104,17 @@ impl InternalEvent for DeliveryReadEvent {
 
             // Emit an event-time-bucketed counter for M3.
             // Labels are bounded: topic (~100), delivery_event_type (small enum),
-            // event_time_bucket (24 rolling hours). pod_name/container_name/file are
-            // intentionally NOT included — woodchuck's internal_metrics pipeline strips
-            // those before exporting to Prometheus.
+            // time_parity (24 rolling hours, hour-rounded Unix milliseconds).
+            // pod_name/container_name/file are intentionally NOT included —
+            // woodchuck's internal_metrics pipeline strips those before exporting.
+            //
+            // On the receive side we always compute time_parity from now() because
+            // the file source's source_context map carries only user-provided keys
+            // (topic etc.) and not the logMetadata struct that downstream VRL
+            // transforms attach later. The hour granularity is what matters for
+            // non-oscillation: as long as receive and deliver land in the same
+            // hour-bucket (which they will whenever delivery latency stays under
+            // ~1 hour), the ratio is well-defined.
             let topic = source_context
                 .get("topic")
                 .cloned()
@@ -102,7 +122,7 @@ impl InternalEvent for DeliveryReadEvent {
             counter!(
                 "events_received_total",
                 "delivery_event_type" => "VECTOR_SOURCE_READ",
-                "event_time_bucket" => current_hour_bucket(),
+                "time_parity" => current_hour_time_parity_ms(),
                 "topic" => topic,
             )
             .increment(self.lines_read as u64);
@@ -177,15 +197,19 @@ impl VectorSinkDeliveryEvent {
                 internal_log_rate_limit = false,
             );
 
-            // Emit an event-time-bucketed counter for M3. Reads event_time_bucket from
-            // value_map if present (Phase 2 plumbing populates it via granularity_fields);
-            // falls back to the current hour if not. This counter's labels are bounded
-            // and safe for M3 once high-cardinality fields are stripped by the
-            // woodchuck internal_metrics pipeline.
+            // Emit an event-time-bucketed counter for M3. Reads timeParity from
+            // value_map, which is populated by the build_map() machinery using the
+            // existing DELIVERY_EVENT_LOG_GRANULARITY_FIELDS = ["timeParity", "topic",
+            // "deliveryMethod"] convention. Because the upstream VRL transform sets
+            // `logMetadata.timeParity = uploadTime - mod(uploadTime, 3600000)` at
+            // receive time, the delivered counter increments with the event's
+            // *receive-time* bucket — not the current wall-clock hour. This is what
+            // makes the `delivered_total / received_total` ratio non-oscillating
+            // across the receive→deliver gap.
             counter!(
                 "events_delivered_total",
                 "delivery_event_type" => delivery_event_type.to_string(),
-                "event_time_bucket" => bucket_from_value_map(&value.value_map),
+                "time_parity" => time_parity_from_value_map(&value.value_map),
                 "topic" => topic_from_value_map(&value.value_map),
             )
             .increment(value.count as u64);
