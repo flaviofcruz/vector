@@ -1,4 +1,6 @@
 use crate::internal_event::{InternalEvent, NamedInternalEvent};
+use chrono::Utc;
+use metrics::counter;
 use std::collections::HashMap;
 use std::env;
 use std::ops::Add;
@@ -6,6 +8,35 @@ use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU32, Ordering},
 };
+
+// Computes an hour-rounded UTC bucket string ("YYYY-MM-DDTHH") for the current time.
+// Used as a default when an event's original receive-time bucket has not been propagated.
+//
+// Phase 2 work: source-side plumbing should set `event_time_bucket` in event metadata at
+// receive time so that delivered counters use the receive-time bucket (not delivery-time),
+// which is what makes completeness ratios non-oscillating across the receive/deliver gap.
+fn current_hour_bucket() -> String {
+    Utc::now().format("%Y-%m-%dT%H").to_string()
+}
+
+// Reads `event_time_bucket` from value_map when present (Phase 2), falling back to the
+// current hour (Phase 1). The label only contributes useful non-oscillation behavior
+// once Phase 2 plumbing is in place; Phase 1 still emits a working metric.
+fn bucket_from_value_map(value_map: &HashMap<String, String>) -> String {
+    value_map
+        .get("event_time_bucket")
+        .cloned()
+        .unwrap_or_else(current_hour_bucket)
+}
+
+// Reads `topic` from value_map if present, otherwise "unknown". Topics are bounded
+// (~100 distinct values) so this is M3-safe.
+fn topic_from_value_map(value_map: &HashMap<String, String>) -> String {
+    value_map
+        .get("topic")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
 // Env flag to gate when we should be emitting the read event (want to support both while we check the performance of the new spot)
 pub static EMIT_READ_EVENT_AFTER_MULTILINE_AGG: OnceLock<bool> = OnceLock::new();
@@ -58,6 +89,23 @@ impl InternalEvent for DeliveryReadEvent {
                 // Instead, we have to convert to JSON string and unwrap later on
                 source_context = serde_json::to_string(&source_context).unwrap(),
             );
+
+            // Emit an event-time-bucketed counter for M3.
+            // Labels are bounded: topic (~100), delivery_event_type (small enum),
+            // event_time_bucket (24 rolling hours). pod_name/container_name/file are
+            // intentionally NOT included — woodchuck's internal_metrics pipeline strips
+            // those before exporting to Prometheus.
+            let topic = source_context
+                .get("topic")
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            counter!(
+                "events_received_total",
+                "delivery_event_type" => "VECTOR_SOURCE_READ",
+                "event_time_bucket" => current_hour_bucket(),
+                "topic" => topic,
+            )
+            .increment(self.lines_read as u64);
         }
     }
 }
@@ -128,6 +176,19 @@ impl VectorSinkDeliveryEvent {
                 // Specifying this allows us to emit without rate limiting (needed for high throughput sinks)
                 internal_log_rate_limit = false,
             );
+
+            // Emit an event-time-bucketed counter for M3. Reads event_time_bucket from
+            // value_map if present (Phase 2 plumbing populates it via granularity_fields);
+            // falls back to the current hour if not. This counter's labels are bounded
+            // and safe for M3 once high-cardinality fields are stripped by the
+            // woodchuck internal_metrics pipeline.
+            counter!(
+                "events_delivered_total",
+                "delivery_event_type" => delivery_event_type.to_string(),
+                "event_time_bucket" => bucket_from_value_map(&value.value_map),
+                "topic" => topic_from_value_map(&value.value_map),
+            )
+            .increment(value.count as u64);
         }
     }
 }
