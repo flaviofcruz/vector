@@ -1,6 +1,7 @@
 use crate::internal_event::{InternalEvent, NamedInternalEvent};
 use chrono::Utc;
 use metrics::counter;
+use regex::Regex;
 use std::collections::HashMap;
 use std::env;
 use std::ops::Add;
@@ -8,6 +9,77 @@ use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU32, Ordering},
 };
+
+// Sentinel used by woodchuck `source_context.topic` to indicate that the topic must be
+// inferred from the filename. (Note: VRL spells this `lumberjackTopicInfered` — single
+// "r" — and we match that spelling exactly so callers/queries can identify these events.)
+const LUMBERJACK_TOPIC_INFERRED_SENTINEL: &str = "lumberjackTopicInfered";
+
+// Extracts a Lumberjack topic from a source filename following the standard convention.
+//
+// The Lumberjack proto file naming convention (see woodchuck's
+// `conditionalForTopicFromFilenameFromLumberjackTableNameVrl` in `log-utils.libsonnet`):
+//   <prefix>.<TableNameCamelCase>.pb[.base64][.gz]
+//   <prefix>.<TableNameCamelCase>LaMigration.pb[.base64][.gz]
+//
+// Returns the dash-cased topic name (e.g. "service-request-log") when matched.
+// Returns `None` for filenames that don't match the convention — callers should
+// fall back to their own sentinel (typically `lumberjackTopicInfered` to mirror
+// what woodchuck VRL would emit for the same unmatched case).
+//
+// This is the Rust analogue of `vrlPseudoFunctions.parseTopicFromFile` in woodchuck.
+// It deliberately does NOT consult the Lumberjack catalog at runtime — the catalog
+// only validates *whether* a topic should exist, not how to derive its name from
+// the filename. The CamelCase ↔ dash-case relationship is the stable convention.
+//
+// For custom-pattern logs (HAL/nginx/envoy access logs etc.) this returns None,
+// matching the behavior of the simplified approach we chose for the M3 metric.
+pub fn extract_topic_from_source_filename(path: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // The CamelCase capture is lazy (`+?`) so the optional `LaMigration` suffix
+        // matches as part of the trailing alternation rather than being absorbed
+        // into the capture group.
+        Regex::new(
+            r"\.([A-Z][A-Za-z0-9]+?)(LaMigration)?\.pb(?:\.base64)?(?:\.gz)?$",
+        )
+        .expect("topic extraction regex must compile")
+    });
+    let captures = re.captures(path)?;
+    let camel = captures.get(1)?.as_str();
+    Some(camel_to_dash_case(camel))
+}
+
+// Converts a CamelCase identifier to dash-case: "ServiceRequestLog" -> "service-request-log".
+// Inserts a dash before each uppercase letter that is not the first character, then lowercases.
+fn camel_to_dash_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            out.push('-');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
+// Resolves the topic label for a source-read event using a three-step fallback:
+//   1. If source_context.topic is set and is NOT the inference sentinel, use it as-is.
+//   2. Otherwise attempt filename inference using the Lumberjack convention.
+//   3. If both fail (non-Lumberjack file with no explicit context), emit the sentinel
+//      string so queries can identify and filter these out.
+//
+// This mirrors the priority used by woodchuck's `ConvertDeliveryInfoLogs` VRL but
+// with a simpler inference rule (regex against the convention rather than a
+// catalog-driven cascade). Custom-pattern logs land in step 3.
+fn resolve_received_topic(source_context: &HashMap<String, String>, path: &str) -> String {
+    let explicit = source_context.get("topic").map(String::as_str);
+    match explicit {
+        Some(t) if t != LUMBERJACK_TOPIC_INFERRED_SENTINEL => t.to_string(),
+        _ => extract_topic_from_source_filename(path)
+            .unwrap_or_else(|| LUMBERJACK_TOPIC_INFERRED_SENTINEL.to_string()),
+    }
+}
 
 // Computes an hour-rounded Unix-milliseconds bucket for the current time, as a string.
 //
@@ -108,22 +180,15 @@ impl InternalEvent for DeliveryReadEvent {
             // pod_name/container_name/file are intentionally NOT included —
             // woodchuck's internal_metrics pipeline strips those before exporting.
             //
-            // On the receive side we always compute time_parity from now() because
-            // the file source's source_context map carries only user-provided keys
-            // (topic etc.) and not the logMetadata struct that downstream VRL
-            // transforms attach later. The hour granularity is what matters for
-            // non-oscillation: as long as receive and deliver land in the same
-            // hour-bucket (which they will whenever delivery latency stays under
-            // ~1 hour), the ratio is well-defined.
-            let topic = source_context
-                .get("topic")
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string());
+            // Topic resolution mirrors what woodchuck's ConvertDeliveryInfoLogs
+            // VRL does for VECTOR_SOURCE_READ: prefer source_context.topic when
+            // it's a concrete value, otherwise infer from the filename, otherwise
+            // emit the lumberjackTopicInfered sentinel.
             counter!(
                 "events_received_total",
                 "delivery_event_type" => "VECTOR_SOURCE_READ",
                 "time_parity" => current_hour_time_parity_ms(),
-                "topic" => topic,
+                "topic" => resolve_received_topic(&source_context, &self.path),
             )
             .increment(self.lines_read as u64);
         }
@@ -242,5 +307,117 @@ impl Add<VectorSinkDeliveryEvent> for VectorSinkDeliveryEvent {
 
     fn add(self, other: VectorSinkDeliveryEvent) -> Self::Output {
         combine_sink_delivery_events(vec![self, other])
+    }
+}
+
+#[cfg(test)]
+mod topic_inference_tests {
+    use super::*;
+
+    #[test]
+    fn camel_to_dash_case_basic() {
+        assert_eq!(camel_to_dash_case("ServiceRequestLog"), "service-request-log");
+        assert_eq!(camel_to_dash_case("Log"), "log");
+        assert_eq!(camel_to_dash_case("ABC"), "a-b-c");
+    }
+
+    #[test]
+    fn extract_topic_standard_pb_base64() {
+        assert_eq!(
+            extract_topic_from_source_filename(
+                "/var/lib/kubelet/pods/abc/volumes/logs/12345.ServiceRequestLog.pb.base64"
+            )
+            .as_deref(),
+            Some("service-request-log"),
+        );
+    }
+
+    #[test]
+    fn extract_topic_standard_pb_base64_gz() {
+        assert_eq!(
+            extract_topic_from_source_filename(
+                "/var/lib/kubelet/pods/abc/volumes/logs/12345.ProductEventLog.pb.base64.gz"
+            )
+            .as_deref(),
+            Some("product-event-log"),
+        );
+    }
+
+    #[test]
+    fn extract_topic_la_migration_variant() {
+        // The LaMigration suffix is stripped before dash-casing.
+        assert_eq!(
+            extract_topic_from_source_filename(
+                "/var/log/pods/sample/12345.ServiceRequestLogLaMigration.pb.base64"
+            )
+            .as_deref(),
+            Some("service-request-log"),
+        );
+    }
+
+    #[test]
+    fn extract_topic_bare_pb() {
+        // Some files end at .pb without .base64.
+        assert_eq!(
+            extract_topic_from_source_filename(
+                "/var/log/pods/sample/12345.BackgroundActivityLog.pb"
+            )
+            .as_deref(),
+            Some("background-activity-log"),
+        );
+    }
+
+    #[test]
+    fn extract_topic_returns_none_for_non_lumberjack() {
+        // HAL / nginx access logs don't follow the Lumberjack convention.
+        assert!(
+            extract_topic_from_source_filename(
+                "/var/log/pods/sample/nginx/service-access.log"
+            )
+            .is_none()
+        );
+        assert!(
+            extract_topic_from_source_filename("/var/log/pods/sample/audit.json").is_none()
+        );
+        assert!(extract_topic_from_source_filename("no-pattern-at-all").is_none());
+    }
+
+    #[test]
+    fn resolve_received_topic_uses_explicit_context_when_present() {
+        let mut ctx = HashMap::new();
+        ctx.insert("topic".to_string(), "audit-log".to_string());
+        assert_eq!(
+            resolve_received_topic(&ctx, "/some/file.json"),
+            "audit-log"
+        );
+    }
+
+    #[test]
+    fn resolve_received_topic_infers_when_context_is_sentinel() {
+        let mut ctx = HashMap::new();
+        ctx.insert("topic".to_string(), "lumberjackTopicInfered".to_string());
+        assert_eq!(
+            resolve_received_topic(&ctx, "/path/to/12345.ServiceRequestLog.pb.base64"),
+            "service-request-log"
+        );
+    }
+
+    #[test]
+    fn resolve_received_topic_falls_back_to_sentinel_when_no_match() {
+        let mut ctx = HashMap::new();
+        ctx.insert("topic".to_string(), "lumberjackTopicInfered".to_string());
+        assert_eq!(
+            resolve_received_topic(&ctx, "/path/to/nothing-matching.log"),
+            "lumberjackTopicInfered"
+        );
+    }
+
+    #[test]
+    fn resolve_received_topic_infers_when_context_missing() {
+        let ctx = HashMap::new();
+        assert_eq!(
+            resolve_received_topic(&ctx, "/path/to/12345.AuditLog.pb.base64.gz"),
+            "audit-log"
+        );
     }
 }

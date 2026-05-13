@@ -13918,6 +13918,7 @@ dependencies = [
  "metrics",
  "paste",
  "pin-project",
+ "regex",
  "serde",
  "serde_json",
  "smallvec",
