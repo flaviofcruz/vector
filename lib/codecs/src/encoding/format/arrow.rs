@@ -1150,6 +1150,26 @@ fn build_map_value_array(values: &[Value], field: &Field) -> Result<ArrayRef, Ar
             }
             Ok(Arc::new(builder.finish()))
         }
+        DataType::LargeBinary => {
+            let mut builder = LargeBinaryBuilder::with_capacity(values.len(), 0);
+            for v in values {
+                match v {
+                    Value::Bytes(b) => builder.append_value(b),
+                    _ => handle_null_constraints!(builder, nullable, field.name()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Binary => {
+            let mut builder = BinaryBuilder::with_capacity(values.len(), 0);
+            for v in values {
+                match v {
+                    Value::Bytes(b) => builder.append_value(b),
+                    _ => handle_null_constraints!(builder, nullable, field.name()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
         DataType::Boolean => {
             let mut builder = BooleanBuilder::with_capacity(values.len());
             for v in values {
@@ -3906,4 +3926,64 @@ mod tests {
             .unwrap();
         assert_eq!(f18_sub3.value(1), "code-a");
     }
+
+    /// Regression: `LargeBinary` columns inside a `List<Struct{…}>` must encode
+    /// via `LargeBinaryBuilder` in the nested value-builder path, not error out
+    /// as `UnsupportedType`. This shape arises from a proto `repeated message`
+    /// whose message has a `bytes` field.
+    #[test]
+    fn test_encode_list_struct_with_large_binary_child() {
+        use arrow::array::{LargeBinaryArray, ListArray, StructArray};
+        use vrl::value::ObjectMap;
+
+        let item_fields = Fields::from(vec![
+            Field::new("driver_id", DataType::LargeBinary, true),
+            Field::new("label", DataType::LargeUtf8, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(item_fields),
+                true,
+            ))),
+            true,
+        )]));
+
+        let make_item = |driver_id: &[u8], label: &str| {
+            let mut m = ObjectMap::new();
+            m.insert("driver_id".into(), Value::Bytes(driver_id.to_vec().into()));
+            m.insert("label".into(), Value::from(label));
+            Value::Object(m)
+        };
+
+        let mut log = LogEvent::default();
+        log.insert(
+            "items",
+            Value::Array(vec![
+                make_item(b"abc\x00\xff", "first"),
+                make_item(b"", "empty"),
+            ]),
+        );
+        let events = vec![Event::Log(log)];
+
+        let batch = build_record_batch(Arc::clone(&schema), &events)
+            .expect("nested LargeBinary must encode");
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let inner_arr = list.value(0);
+        let inner = inner_arr.as_any().downcast_ref::<StructArray>().unwrap();
+        let driver_ids = inner
+            .column_by_name("driver_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(driver_ids.value(0), b"abc\x00\xff");
+        assert_eq!(driver_ids.value(1), b"");
+    }
+
 }
