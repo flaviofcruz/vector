@@ -284,20 +284,6 @@ pub struct FileConfig {
     #[serde(default)]
     #[configurable(description = "Additional context applied to each log line")]
     pub source_context: Option<HashMap<String, String>>,
-
-    /// File extensions that identify immutable archive files.
-    ///
-    /// Archive files are fingerprinted once and the result is cached, avoiding
-    /// expensive I/O (e.g. gzip decompression) on every glob cycle. When an
-    /// archive file reaches EOF it is marked as done and never re-read.
-    #[serde(default = "default_archive_extensions")]
-    #[configurable(metadata(docs::examples = "gz"))]
-    #[configurable(metadata(docs::examples = "zst"))]
-    pub archive_extensions: Vec<String>,
-}
-
-fn default_archive_extensions() -> Vec<String> {
-    vec!["gz".to_string()]
 }
 
 fn default_max_line_bytes() -> usize {
@@ -441,7 +427,6 @@ impl Default for FileConfig {
             rotate_wait: default_rotate_wait(),
             ttl_removal_config: None,
             source_context: None,
-            archive_extensions: default_archive_extensions(),
         }
     }
 }
@@ -624,7 +609,6 @@ pub fn file_source(
         // The file source has no way of retrieving pod information, so we don't need to track it.
         file_to_pod_map: None,
         drain_on_shutdown: false,
-        archive_extensions: config.archive_extensions.clone(),
     };
 
     let event_metadata = EventMetadata {

@@ -69,10 +69,6 @@ where
     pub source_context: Option<HashMap<String, String>>,
     pub file_to_pod_map: Option<Arc<Mutex<HashMap<PathBuf, LogFileInfo>>>>,
     pub drain_on_shutdown: bool,
-    /// File extensions that identify immutable archive files (e.g. `["gz"]`).
-    /// These files are fingerprinted once and the mapping is cached, and they
-    /// are marked as done when EOF is reached so they are never re-read.
-    pub archive_extensions: Vec<String>,
 }
 
 /// `FileServer` as Source
@@ -93,16 +89,6 @@ where
     PP: PathsProvider,
     E: FileSourceInternalEvents,
 {
-    /// Returns `true` if the path has an extension that matches one of the
-    /// configured archive extensions (immutable files that never change).
-    fn is_archive(&self, path: &Path) -> bool {
-        path.extension().map_or(false, |ext| {
-            self.archive_extensions
-                .iter()
-                .any(|archive_ext| ext == archive_ext.as_str())
-        })
-    }
-
     // Update the file-to-pod map with the given path and log file info.
     fn update_file_to_pod_map(&mut self, path: PathBuf, log_file_info_opt: Option<LogFileInfo>) {
         if self.file_to_pod_map.is_some() {
@@ -234,43 +220,11 @@ where
                     watcher.set_file_findable(false); // assume not findable until found
                 }
                 for (log_file_info_opt, path) in self.paths_provider.paths().into_iter() {
-                    // Fast path: skip expensive fingerprinting (gzip decompression
-                    // + CRC64) for archived files whose path→fingerprint mapping
-                    // is already known. Since .gz files are immutable, the
-                    // fingerprint will never change for a given path.
-                    if !self.ignore_checkpoints && self.is_archive(&path) {
-                        if let Some(file_id) = checkpoints.get_archive_fingerprint(&path) {
-                            if let Some(watcher) = fp_map.get_mut(&file_id) {
-                                watcher.set_file_findable(true);
-                            } else if !checkpoints.get_done(file_id) {
-                                // Known archive fingerprint but no active watcher
-                                // and not done — re-open it to resume reading.
-                                self.watch_new_file(
-                                    path,
-                                    file_id,
-                                    &mut fp_map,
-                                    &checkpoints,
-                                    false,
-                                )
-                                .await;
-                                self.emitter.emit_files_open(fp_map.len());
-                            }
-                            // If done: skip entirely (no watcher, no fingerprint, no I/O).
-                            continue;
-                        }
-                    }
-
                     if let Some(file_id) = self
                         .fingerprinter
                         .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
                         .await
                     {
-                        // Cache the path→fingerprint mapping for archived files so
-                        // subsequent glob cycles can skip fingerprinting entirely.
-                        if self.is_archive(&path) {
-                            checkpoints.set_archive_path(file_id, &path);
-                        }
-
                         if let Some(watcher) = fp_map.get_mut(&file_id) {
                             // file fingerprint matches a watched file
                             let was_found_this_cycle = watcher.file_findable();
@@ -431,10 +385,12 @@ where
                         emitted_after_multiline_agg: false,
                     });
                 }
-                if watcher.reached_eof() && self.is_archive(&watcher.path) {
+                if watcher.reached_eof()
+                    && watcher.path.extension().map_or(false, |ext| ext == "gz")
+                {
                     //TODO: a vector event for done. important for debugging
                     info!(message = "File reached eof. Marking it done.", path = ?watcher.path);
-                    checkpoints.set_done(file_id, &watcher.path);
+                    checkpoints.set_done(file_id);
                 }
 
                 if bytes_read > 0 {
@@ -722,8 +678,11 @@ where
         };
 
         // Skip opening gzip files that have already been fully read.
-        if !self.ignore_checkpoints && checkpoints.get_done(file_id) && self.is_archive(&path) {
-            debug!(message = "Skipping already-done archive file.", ?path,);
+        if !self.ignore_checkpoints
+            && checkpoints.get_done(file_id)
+            && path.extension().map_or(false, |ext| ext == "gz")
+        {
+            debug!(message = "Skipping already-done gzipped file.", ?path,);
             return;
         }
 
@@ -1020,7 +979,6 @@ mod tests {
             source_context: None,
             file_to_pod_map: None,
             drain_on_shutdown,
-            archive_extensions: vec!["gz".to_string()],
         }
     }
 

@@ -422,20 +422,6 @@ pub struct Config {
     #[configurable(derived)]
     #[serde(default)]
     pub encoding: Option<EncodingConfig>,
-
-    /// File extensions that identify immutable archive files.
-    ///
-    /// Archive files are fingerprinted once and the result is cached, avoiding
-    /// expensive I/O (e.g. gzip decompression) on every glob cycle. When an
-    /// archive file reaches EOF it is marked as done and never re-read.
-    #[serde(default = "default_archive_extensions")]
-    #[configurable(metadata(docs::examples = "gz"))]
-    #[configurable(metadata(docs::examples = "zst"))]
-    pub archive_extensions: Vec<String>,
-}
-
-fn default_archive_extensions() -> Vec<String> {
-    vec!["gz".to_string()]
 }
 
 const fn default_read_from() -> ReadFromConfig {
@@ -502,7 +488,6 @@ impl Default for Config {
             host_key: None,
             line_delimiter: default_line_delimiter(),
             encoding: None,
-            archive_extensions: default_archive_extensions(),
         }
     }
 }
@@ -791,7 +776,6 @@ struct Source {
     host_key: Option<OwnedValuePath>,
     line_delimiter: String,
     encoding: Option<EncodingConfig>,
-    archive_extensions: Vec<String>,
 }
 
 /// Wrapper that aborts owned reflector tasks on drop, preventing leaks if the
@@ -1063,7 +1047,6 @@ impl Source {
             host_key: config.host_key.clone().and_then(|v| v.path),
             line_delimiter: config.line_delimiter.clone(),
             encoding: config.encoding.clone(),
-            archive_extensions: config.archive_extensions.clone(),
         })
     }
 
@@ -1112,7 +1095,6 @@ impl Source {
             host_key,
             line_delimiter,
             encoding,
-            archive_extensions,
         } = self;
 
         let hostname = host_key.as_ref().and_then(|_| {
@@ -1224,7 +1206,6 @@ impl Source {
             source_context: source_context.clone(),
             file_to_pod_map: Some(file_to_pod_map_ref),
             drain_on_shutdown,
-            archive_extensions,
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
