@@ -41,8 +41,6 @@ struct Checkpoint {
     modified: DateTime<Utc>,
     #[serde(default)]
     is_done: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
 }
 
 pub struct Checkpointer {
@@ -60,11 +58,6 @@ pub struct CheckpointsView {
     modified_times: DashMap<FileFingerprint, DateTime<Utc>>,
     removed_times: DashMap<FileFingerprint, DateTime<Utc>>,
     done: DashMap<FileFingerprint, bool>,
-    /// Reverse map from file path to fingerprint for archived (`.gz`) files.
-    /// Since archived files are immutable, their fingerprint never changes,
-    /// so we can skip expensive fingerprinting (gzip decompression + CRC64)
-    /// on every glob cycle by looking up the path here instead.
-    archive_paths: DashMap<PathBuf, FileFingerprint>,
 }
 
 impl CheckpointsView {
@@ -78,27 +71,12 @@ impl CheckpointsView {
         self.checkpoints.get(&fng).map(|r| *r.value())
     }
 
-    pub fn set_done(&self, fng: FileFingerprint, path: &Path) {
+    pub fn set_done(&self, fng: FileFingerprint) {
         self.done.insert(fng, true);
-        // Also ensure the archive path mapping exists for done files.
-        self.archive_paths.insert(path.to_path_buf(), fng);
     }
 
     pub fn get_done(&self, fng: FileFingerprint) -> bool {
         self.done.get(&fng).map(|r| *r.value()).unwrap_or(false)
-    }
-
-    /// Records the path→fingerprint mapping for an archived (`.gz`) file.
-    /// Call this when a `.gz` file is first fingerprinted so that subsequent
-    /// glob cycles can skip the expensive fingerprinting step.
-    pub fn set_archive_path(&self, fng: FileFingerprint, path: &Path) {
-        self.archive_paths.insert(path.to_path_buf(), fng);
-    }
-
-    /// Returns the cached fingerprint for an archived file path, if known.
-    /// This allows skipping gzip decompression + CRC64 during glob discovery.
-    pub fn get_archive_fingerprint(&self, path: &Path) -> Option<FileFingerprint> {
-        self.archive_paths.get(path).map(|r| *r.value())
     }
 
     pub fn set_dead(&self, fng: FileFingerprint) {
@@ -120,13 +98,6 @@ impl CheckpointsView {
 
         if let Some((_, value)) = self.done.remove(&old) {
             self.done.insert(new, value);
-        }
-
-        // Update archive_paths entries that pointed to the old fingerprint.
-        for mut entry in self.archive_paths.iter_mut() {
-            if *entry.value() == old {
-                *entry.value_mut() = new;
-            }
         }
     }
 
@@ -152,7 +123,6 @@ impl CheckpointsView {
             self.modified_times.remove(&fng);
             self.removed_times.remove(&fng);
             self.done.remove(&fng);
-            self.archive_paths.retain(|_, v| *v != fng);
         }
     }
 
@@ -163,13 +133,6 @@ impl CheckpointsView {
             .insert(checkpoint.fingerprint, checkpoint.modified);
         if checkpoint.is_done {
             self.done.insert(checkpoint.fingerprint, true);
-        }
-        // Restore the archive path mapping for any checkpoint that has one,
-        // regardless of is_done status. This allows skipping fingerprinting
-        // for in-progress archived files too.
-        if let Some(path) = checkpoint.path {
-            self.archive_paths
-                .insert(PathBuf::from(path), checkpoint.fingerprint);
         }
     }
 
@@ -189,13 +152,6 @@ impl CheckpointsView {
     }
 
     fn get_state(&self) -> State {
-        // Build a reverse map (fingerprint → path) for serialization.
-        let fng_to_path: std::collections::HashMap<FileFingerprint, String> = self
-            .archive_paths
-            .iter()
-            .map(|entry| (*entry.value(), entry.key().to_string_lossy().into_owned()))
-            .collect();
-
         State::V1 {
             checkpoints: self
                 .checkpoints
@@ -216,7 +172,6 @@ impl CheckpointsView {
                             .get(fingerprint)
                             .map(|r| *r.value())
                             .unwrap_or(false),
-                        path: fng_to_path.get(fingerprint).cloned(),
                     }
                 })
                 .collect(),
@@ -355,8 +310,6 @@ impl Checkpointer {
 
 #[cfg(test)]
 mod test {
-    use std::path::Path;
-
     use chrono::{Duration, Utc};
     use similar_asserts::assert_eq;
     use tempfile::tempdir;
@@ -406,7 +359,6 @@ mod test {
                     position,
                     modified: *modified,
                     is_done: false,
-                    path: None,
                 });
                 assert_eq!(chkptr.get_checkpoint(*fingerprint), Some(position));
                 chkptr.write_checkpoints().await.unwrap();
@@ -660,12 +612,8 @@ mod test {
         assert!(!view.get_done(fng));
 
         // Mark as done
-        view.set_done(fng, Path::new("/tmp/test.gz"));
+        view.set_done(fng);
         assert!(view.get_done(fng));
-        assert_eq!(
-            view.get_archive_fingerprint(Path::new("/tmp/test.gz")),
-            Some(fng)
-        );
 
         // Different fingerprint is still not done
         let other = FileFingerprint::FirstLinesChecksum(999);
@@ -677,16 +625,13 @@ mod test {
         let view = super::CheckpointsView::default();
         let old = FileFingerprint::DevInode(1, 2);
         let new = FileFingerprint::DevInode(3, 4);
-        let path = Path::new("/tmp/test.gz");
 
-        view.set_done(old, path);
+        view.set_done(old);
         assert!(view.get_done(old));
 
         view.update_key(old, new);
         assert!(!view.get_done(old));
         assert!(view.get_done(new));
-        // archive_paths entry now points to the new fingerprint
-        assert_eq!(view.get_archive_fingerprint(path), Some(new));
     }
 
     #[test]
@@ -704,10 +649,9 @@ mod test {
     fn test_checkpoints_view_remove_dead_clears_done() {
         let view = super::CheckpointsView::default();
         let fng = FileFingerprint::DevInode(1, 2);
-        let path = Path::new("/tmp/test.gz");
 
         view.checkpoints.insert(fng, 100);
-        view.set_done(fng, path);
+        view.set_done(fng);
         view.removed_times
             .insert(fng, Utc::now() - Duration::seconds(120));
 
@@ -715,7 +659,6 @@ mod test {
 
         assert!(view.get(fng).is_none());
         assert!(!view.get_done(fng));
-        assert!(view.get_archive_fingerprint(path).is_none());
     }
 
     #[test]
@@ -723,19 +666,14 @@ mod test {
         let view = super::CheckpointsView::default();
         let fng = FileFingerprint::DevInode(5, 6);
 
-        // Load a checkpoint with is_done = true and a path
+        // Load a checkpoint with is_done = true
         view.load(Checkpoint {
             fingerprint: fng,
             position: 42,
             modified: Utc::now(),
             is_done: true,
-            path: Some("/tmp/archive.gz".to_string()),
         });
         assert!(view.get_done(fng));
-        assert_eq!(
-            view.get_archive_fingerprint(Path::new("/tmp/archive.gz")),
-            Some(fng)
-        );
 
         // Load a checkpoint with is_done = false
         let fng2 = FileFingerprint::FirstLinesChecksum(111);
@@ -744,7 +682,6 @@ mod test {
             position: 99,
             modified: Utc::now(),
             is_done: false,
-            path: None,
         });
         assert!(!view.get_done(fng2));
     }
@@ -753,11 +690,10 @@ mod test {
     fn test_checkpoints_view_get_state_includes_is_done() {
         let view = super::CheckpointsView::default();
         let fng = FileFingerprint::DevInode(1, 2);
-        let path = Path::new("/tmp/test.gz");
 
         view.checkpoints.insert(fng, 100);
         view.modified_times.insert(fng, Utc::now());
-        view.set_done(fng, path);
+        view.set_done(fng);
 
         let state = view.get_state();
         match state {
@@ -765,7 +701,6 @@ mod test {
                 assert_eq!(checkpoints.len(), 1);
                 let checkpoint = checkpoints.into_iter().next().unwrap();
                 assert!(checkpoint.is_done);
-                assert_eq!(checkpoint.path.as_deref(), Some("/tmp/test.gz"));
             }
         }
     }
@@ -776,7 +711,7 @@ mod test {
         let position: FilePosition = 5678;
         let data_dir = tempdir().unwrap();
 
-        // Write a checkpoint with done=true and a path
+        // Write a checkpoint with done=true
         {
             let chkptr = Checkpointer::new(data_dir.path());
             chkptr.checkpoints.load(Checkpoint {
@@ -784,30 +719,17 @@ mod test {
                 position,
                 modified: Utc::now(),
                 is_done: true,
-                path: Some("/var/log/app.gz".to_string()),
             });
             assert!(chkptr.checkpoints.get_done(fng));
-            assert_eq!(
-                chkptr
-                    .checkpoints
-                    .get_archive_fingerprint(Path::new("/var/log/app.gz")),
-                Some(fng)
-            );
             chkptr.write_checkpoints().await.unwrap();
         }
 
-        // Read it back and verify done and path are preserved
+        // Read it back and verify done is preserved
         {
             let mut chkptr = Checkpointer::new(data_dir.path());
             chkptr.read_checkpoints(None).await;
             assert_eq!(chkptr.get_checkpoint(fng), Some(position));
             assert!(chkptr.checkpoints.get_done(fng));
-            assert_eq!(
-                chkptr
-                    .checkpoints
-                    .get_archive_fingerprint(Path::new("/var/log/app.gz")),
-                Some(fng)
-            );
         }
     }
 
