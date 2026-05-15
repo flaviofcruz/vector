@@ -244,10 +244,7 @@ vector-config-macros.workspace = true
 vector-vrl-functions = { workspace = true, features = ["vrl-metrics"] }
 vector-vrl-metrics = { path = "lib/vector-vrl-metrics" }
 loki-logproto = { path = "lib/loki-logproto", optional = true }
-databricks-zerobus-ingest-sdk = { git = "https://github.com/databricks/zerobus-sdk-rs", rev = "617d7ddae09c475269ef25dcf92b43cf182026d7", optional = true }
-# Use prost 0.13 to match the SDK's version (workspace has 0.12)
-zerobus-prost = { package = "prost", version = "0.13", optional = true }
-zerobus-prost-types = { package = "prost-types", version = "0.13", optional = true }
+databricks-zerobus-ingest-sdk = { git = "https://github.com/databricks/zerobus-sdk-rs", rev = "132996d05ae11c57490660643915d6dca38f9fc1", optional = true }
 
 # Tokio / Futures
 async-stream.workspace = true
@@ -361,8 +358,8 @@ greptimedb-ingester = { git = "https://github.com/GreptimeTeam/greptimedb-ingest
 arc-swap = { workspace = true, default-features = false, optional = true }
 async-compression = { version = "0.4.27", default-features = false, features = ["tokio", "gzip", "zstd"], optional = true }
 apache-avro = { version = "0.16.0", default-features = false, optional = true }
-arrow = { version = "56.2.0", default-features = false, features = ["ipc", "json"], optional = true }
-arrow-schema = { version = "56.2.0", default-features = false, optional = true }
+arrow = { version = "58.2.0", default-features = false, features = ["ipc", "json"], optional = true }
+arrow-schema = { version = "58.2.0", default-features = false, optional = true }
 axum = { version = "0.6.20", default-features = false }
 base64 = { workspace = true, optional = true }
 bloomy = { version = "1.2.0", default-features = false, optional = true }
@@ -931,7 +928,7 @@ sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost"]
 sinks-websocket = ["dep:tokio-tungstenite"]
 sinks-websocket-server = ["dep:tokio-tungstenite", "sources-utils-http-auth", "sources-utils-http-error", "sources-utils-http-prelude"]
 sinks-webhdfs = ["dep:opendal"]
-sinks-databricks-zerobus = ["dep:databricks-zerobus-ingest-sdk", "dep:zerobus-prost", "dep:zerobus-prost-types", "dep:prost-reflect", "dep:base64"]
+sinks-databricks-zerobus = ["dep:databricks-zerobus-ingest-sdk", "codecs-arrow"]
 
 # Identifies that the build is a nightly build
 nightly = []

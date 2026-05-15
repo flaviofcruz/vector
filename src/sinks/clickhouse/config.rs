@@ -460,14 +460,14 @@ impl ClickhouseConfig {
                 .into());
             }
 
-            let mut arrow_config = match batch_encoding {
-                BatchSerializerConfig::ArrowStream(config) => config.clone(),
-                _ => {
-                    return Err(
-                        "'batch_encoding' for ClickHouse must use 'arrow_stream' codec.".into(),
-                    );
-                }
+            let BatchSerializerConfig::ArrowStream(arrow_config) = batch_encoding else {
+                return Err(format!(
+                    "'batch_encoding.codec' must be 'arrow_stream' for the clickhouse sink. Found '{:?}'.",
+                    batch_encoding
+                )
+                .into());
             };
+            let mut arrow_config = arrow_config.clone();
 
             self.resolve_arrow_schema(
                 client,

@@ -1,10 +1,7 @@
 //! Zerobus service wrapper for Vector sink integration.
 
-#[cfg(feature = "codecs-arrow")]
-use databricks_zerobus_ingest_sdk::{ArrowTableProperties, ZerobusArrowStream};
-use databricks_zerobus_ingest_sdk::{TableProperties, ZerobusSdk, ZerobusStream};
+use databricks_zerobus_ingest_sdk::{ZerobusArrowStream, ZerobusSdk};
 use futures::future::BoxFuture;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 use tower::Service;
@@ -13,25 +10,14 @@ use vector_lib::codecs::encoding::{BatchEncoder, BatchOutput, BatchSerializerCon
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
-use vrl::protobuf::descriptor::get_message_descriptor;
-
 use crate::event::Event;
 use crate::sinks::util::retries::RetryLogic;
 
 use super::{config::ZerobusSinkConfig, error::ZerobusSinkError, unity_catalog_schema};
 
-/// The payload for a Zerobus request.
-///
-/// Proto payloads contain pre-encoded protobuf records, while Arrow payloads
-/// carry a RecordBatch for Arrow Flight ingestion.
+/// The payload for a Zerobus request: an Arrow `RecordBatch` for Arrow Flight ingestion.
 #[derive(Clone, Debug)]
-pub enum ZerobusPayload {
-    /// Pre-encoded protobuf records (one byte buffer per event).
-    Records(Vec<Vec<u8>>),
-    /// An Arrow RecordBatch for Arrow Flight ingestion.
-    #[cfg(feature = "codecs-arrow")]
-    Arrow(arrow::record_batch::RecordBatch),
-}
+pub struct ZerobusPayload(pub arrow::record_batch::RecordBatch);
 
 /// Request type for the Zerobus service.
 ///
@@ -79,24 +65,8 @@ impl MetaDescriptive for ZerobusRequest {
     }
 }
 
-/// Determines what kind of stream the service creates and how payloads are ingested.
-#[derive(Clone)]
-pub enum StreamMode {
-    /// Proto stream using `ZerobusStream::ingest_records_offset`.
-    Proto {
-        descriptor_proto: Arc<prost_reflect::prost_types::DescriptorProto>,
-    },
-    /// Arrow Flight stream using `ZerobusArrowStream::ingest_batch`.
-    #[cfg(feature = "codecs-arrow")]
-    Arrow {
-        arrow_schema: Arc<arrow::datatypes::Schema>,
-    },
-}
-
-/// The active stream, either proto or Arrow Flight.
+/// The active Arrow Flight stream.
 enum ActiveStream {
-    Proto(ZerobusStream),
-    #[cfg(feature = "codecs-arrow")]
     Arrow(ZerobusArrowStream),
     /// Test-only variant that returns a pre-configured error on ingest.
     #[cfg(test)]
@@ -110,8 +80,6 @@ impl ActiveStream {
     /// implementation is a no-op on already-closed streams.
     async fn close(&mut self) {
         let result = match self {
-            ActiveStream::Proto(s) => s.close().await,
-            #[cfg(feature = "codecs-arrow")]
             ActiveStream::Arrow(s) => s.close().await,
             #[cfg(test)]
             ActiveStream::Mock(m) => {
@@ -168,11 +136,11 @@ impl MockStream {
     }
 }
 
-/// Schema, encoder, and stream-mode derived from the Unity Catalog table or
-/// the path-based descriptor. Resolved lazily on first use.
+/// Arrow serializer + schema derived from the Unity Catalog table.
+/// Resolved lazily on first use.
 pub(super) struct ResolvedSchema {
     encoder: BatchEncoder,
-    stream_mode: StreamMode,
+    arrow_schema: Arc<arrow::datatypes::Schema>,
 }
 
 /// Service for handling Zerobus requests.
@@ -212,19 +180,15 @@ impl ZerobusService {
         })
     }
 
-    /// Resolve the protobuf message descriptor from the schema configuration.
-    pub async fn resolve_descriptor(
+    /// Resolve the Arrow schema for the configured Unity Catalog table.
+    pub async fn resolve_arrow_schema(
         config: &ZerobusSinkConfig,
-    ) -> Result<prost_reflect::MessageDescriptor, ZerobusSinkError> {
+    ) -> Result<arrow::datatypes::Schema, ZerobusSinkError> {
         match &config.schema {
-            super::config::SchemaSource::Path { path, message_type } => {
-                let path = Path::new(path);
-                get_message_descriptor(path, message_type).map_err(|e| {
-                    ZerobusSinkError::ConfigError {
-                        message: format!("Failed to get message descriptor: {}", e),
-                    }
-                })
-            }
+            super::config::SchemaSource::Path { .. } => Err(ZerobusSinkError::ConfigError {
+                message: "schema.type=\"path\" is no longer supported; use \"unity_catalog\""
+                    .to_string(),
+            }),
             super::config::SchemaSource::UnityCatalog => {
                 let (client_id, client_secret) = match &config.auth {
                     super::config::DatabricksAuthentication::OAuth {
@@ -241,7 +205,12 @@ impl ZerobusService {
                 )
                 .await?;
 
-                unity_catalog_schema::generate_descriptor_from_schema(&table_schema)
+                databricks_zerobus_ingest_sdk::schema::arrow_schema_from_uc_schema(
+                    &table_schema.to_sdk_uc_schema(),
+                )
+                .map_err(|e| ZerobusSinkError::ConfigError {
+                    message: format!("Failed to convert UC schema to Arrow: {}", e),
+                })
             }
         }
     }
@@ -250,42 +219,22 @@ impl ZerobusService {
     pub(super) async fn ensure_schema(&self) -> Result<&ResolvedSchema, ZerobusSinkError> {
         self.schema
             .get_or_try_init(|| async {
-                let descriptor = Self::resolve_descriptor(&self.config).await?;
-
+                let arrow_schema = Self::resolve_arrow_schema(&self.config).await?;
                 let mut batch_encoding = self.config.batch_encoding.clone();
-                let stream_mode = match &mut batch_encoding {
-                    BatchSerializerConfig::ProtoBatch(config) => {
-                        config.descriptor = Some(descriptor.clone());
-                        StreamMode::Proto {
-                            descriptor_proto: Arc::new(descriptor.descriptor_proto().clone()),
-                        }
-                    }
-                    #[cfg(feature = "codecs-arrow")]
-                    BatchSerializerConfig::ArrowStream(arrow_config) => {
-                        let arrow_schema =
-                            super::proto_to_arrow::proto_descriptor_to_arrow_schema(&descriptor)?;
-                        arrow_config.schema = Some(arrow_schema.clone());
-                        StreamMode::Arrow {
-                            arrow_schema: Arc::new(arrow_schema),
-                        }
-                    }
-                    #[cfg(feature = "codecs-arrow")]
-                    BatchSerializerConfig::WireToArrow(config) => {
-                        // `descriptor` from `resolve_descriptor` describes the *output*
-                        // table shape and is used solely to derive the Arrow schema.
-                        // The wire descriptor (for decoding incoming bytes) is loaded
-                        // separately by the encoder from `batch_encoding.desc_file` +
-                        // `batch_encoding.message_type` — under `SchemaSource::UnityCatalog`
-                        // the UC-synthesized descriptor's field numbers don't match
-                        // real wire tags, so the two descriptors must be distinct.
-                        let arrow_schema =
-                            super::proto_to_arrow::proto_descriptor_to_arrow_schema(&descriptor)?;
+                match &mut batch_encoding {
+                    BatchSerializerConfig::ArrowStream(config) => {
                         config.schema = Some(arrow_schema.clone());
-                        StreamMode::Arrow {
-                            arrow_schema: Arc::new(arrow_schema),
-                        }
                     }
-                };
+                    BatchSerializerConfig::WireToArrow(config) => {
+                        // The Arrow schema describes the *output* table shape.
+                        // The wire descriptor (for decoding incoming bytes) is
+                        // loaded separately by the encoder from
+                        // `batch_encoding.desc_file` + `batch_encoding.message_type`.
+                        config.schema = Some(arrow_schema.clone());
+                    }
+                }
+                let arrow_schema = Arc::new(arrow_schema);
+
                 let batch_serializer =
                     batch_encoding
                         .build()
@@ -295,33 +244,10 @@ impl ZerobusService {
 
                 Ok(ResolvedSchema {
                     encoder: BatchEncoder::new(batch_serializer),
-                    stream_mode,
+                    arrow_schema,
                 })
             })
             .await
-    }
-
-    /// Encode a batch of events into a `ZerobusPayload` plus its byte size.
-    pub(super) fn encode_batch(
-        schema: &ResolvedSchema,
-        events: &[Event],
-    ) -> Result<(ZerobusPayload, usize), ZerobusSinkError> {
-        match schema
-            .encoder
-            .encode_batch(events)
-            .map_err(|e| ZerobusSinkError::EncodingError {
-                message: format!("Failed to encode batch: {}", e),
-            })? {
-            BatchOutput::Records(records) => {
-                let size = records.iter().map(|r| r.len()).sum::<usize>();
-                Ok((ZerobusPayload::Records(records), size))
-            }
-            #[cfg(feature = "codecs-arrow")]
-            BatchOutput::Arrow(record_batch) => {
-                let size = record_batch.get_array_memory_size();
-                Ok((ZerobusPayload::Arrow(record_batch), size))
-            }
-        }
     }
 
     /// Ensure we have an active stream, creating one if necessary.
@@ -355,55 +281,36 @@ impl ZerobusService {
                 ),
             };
 
-            let active_stream = match &schema.stream_mode {
-                StreamMode::Proto { descriptor_proto } => {
-                    let table_properties = TableProperties {
-                        table_name: self.config.table_name.clone(),
-                        descriptor_proto: Some((**descriptor_proto).clone()),
-                    };
-                    let stream_options = Some(self.config.stream_options.clone().into());
-                    let stream = self
-                        .sdk
-                        .create_stream(table_properties, client_id, client_secret, stream_options)
-                        .await
-                        .map_err(|e| ZerobusSinkError::StreamInitError { source: e })?;
-                    ActiveStream::Proto(stream)
+            let stream_options = &self.config.stream_options;
+            let arrow_schema = &schema.arrow_schema;
+            // Log Arrow IPC schema size to help diagnose large-schema issues.
+            {
+                use arrow::ipc::writer::StreamWriter;
+                let mut buf = Vec::new();
+                if let Ok(mut w) = StreamWriter::try_new(&mut buf, arrow_schema) {
+                    let _ = w.finish();
                 }
-                #[cfg(feature = "codecs-arrow")]
-                StreamMode::Arrow { arrow_schema } => {
-                    // Log Arrow IPC schema size to help diagnose large-schema issues.
-                    {
-                        use arrow::ipc::writer::StreamWriter;
-                        let mut buf = Vec::new();
-                        if let Ok(mut w) = StreamWriter::try_new(&mut buf, arrow_schema) {
-                            let _ = w.finish();
-                        }
-                        info!(
-                            schema_fields = arrow_schema.fields().len(),
-                            ipc_bytes = buf.len(),
-                            "Arrow schema IPC size for stream setup"
-                        );
-                    }
-                    let table_properties = ArrowTableProperties {
-                        table_name: self.config.table_name.clone(),
-                        schema: Arc::clone(arrow_schema),
-                    };
-                    let stream_options = Some(self.config.stream_options.clone().into());
-                    let stream = self
-                        .sdk
-                        .create_arrow_stream(
-                            table_properties,
-                            client_id,
-                            client_secret,
-                            stream_options,
-                        )
-                        .await
-                        .map_err(|e| ZerobusSinkError::StreamInitError { source: e })?;
-                    ActiveStream::Arrow(stream)
-                }
-            };
+                info!(
+                    schema_fields = arrow_schema.fields().len(),
+                    ipc_bytes = buf.len(),
+                    "Arrow schema IPC size for stream setup"
+                );
+            }
+            let stream = self
+                .sdk
+                .stream_builder()
+                .table(self.config.table_name.clone())
+                .oauth(client_id, client_secret)
+                .arrow(Arc::clone(arrow_schema))
+                .recovery(true)
+                .recovery_retries(4)
+                .server_lack_of_ack_timeout_ms(stream_options.server_lack_of_ack_timeout_ms)
+                .flush_timeout_ms(stream_options.flush_timeout_ms)
+                .build_arrow()
+                .await
+                .map_err(|e| ZerobusSinkError::StreamInitError { source: e })?;
 
-            *stream_guard = Some(Arc::new(active_stream));
+            *stream_guard = Some(Arc::new(ActiveStream::Arrow(stream)));
         }
 
         Ok(Arc::clone(stream_guard.as_ref().unwrap()))
@@ -439,34 +346,17 @@ impl ZerobusService {
         events_byte_size: GroupedCountByteSize,
     ) -> Result<ZerobusResponse, ZerobusSinkError> {
         // Lock is not held here — other tasks can ingest concurrently.
-        let result = match (payload, stream.as_ref()) {
-            (ZerobusPayload::Records(records), ActiveStream::Proto(stream)) => {
-                match stream.ingest_records_offset(records).await {
-                    Ok(Some(offset)) if self.require_acknowledgements => {
-                        stream.wait_for_offset(offset).await.map(|_| ())
-                    }
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(e),
+        let ZerobusPayload(record_batch) = payload;
+        let result = match stream.as_ref() {
+            ActiveStream::Arrow(stream) => match stream.ingest_batch(record_batch).await {
+                Ok(offset) if self.require_acknowledgements => {
+                    stream.wait_for_offset(offset).await.map(|_| ())
                 }
-            }
-            #[cfg(feature = "codecs-arrow")]
-            (ZerobusPayload::Arrow(record_batch), ActiveStream::Arrow(stream)) => {
-                match stream.ingest_batch(record_batch).await {
-                    Ok(offset) if self.require_acknowledgements => {
-                        stream.wait_for_offset(offset).await.map(|_| ())
-                    }
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(e),
-                }
-            }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            },
             #[cfg(test)]
-            (ZerobusPayload::Records(_), ActiveStream::Mock(mock)) => mock.try_ingest(),
-            #[allow(unreachable_patterns)]
-            _ => {
-                return Err(ZerobusSinkError::ConfigError {
-                    message: "Payload type does not match stream type".to_string(),
-                });
-            }
+            ActiveStream::Mock(mock) => mock.try_ingest(),
         };
 
         match result {
@@ -506,7 +396,13 @@ impl Service<ZerobusRequest> for ZerobusService {
 
         Box::pin(async move {
             let schema = service.ensure_schema().await?;
-            let (payload, _) = Self::encode_batch(schema, &request.events)?;
+            let BatchOutput::Arrow(record_batch) = schema
+                .encoder
+                .encode_batch(&request.events)
+                .map_err(|e| ZerobusSinkError::EncodingError {
+                    message: format!("Failed to encode batch: {}", e),
+                })?;
+            let payload = ZerobusPayload(record_batch);
             let stream = service.get_or_create_stream(schema).await?;
             service.ingest(stream, payload, events_byte_size).await
         })
@@ -600,12 +496,9 @@ mod tests {
                 client_id: SensitiveString::from("id".to_string()),
                 client_secret: SensitiveString::from("secret".to_string()),
             },
-            schema: SchemaSource::Path {
-                path: "tests/data/protobuf/test_proto.desc".to_string(),
-                message_type: "test_proto.User".to_string(),
-            },
+            schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
-            batch_encoding: vector_lib::codecs::encoding::BatchSerializerConfig::ProtoBatch(
+            batch_encoding: vector_lib::codecs::encoding::BatchSerializerConfig::ArrowStream(
                 Default::default(),
             ),
             batch: Default::default(),
@@ -615,7 +508,10 @@ mod tests {
     }
 
     fn dummy_payload() -> ZerobusPayload {
-        ZerobusPayload::Records(vec![vec![1, 2, 3]])
+        use arrow::datatypes::Schema;
+        ZerobusPayload(
+            arrow::record_batch::RecordBatch::new_empty(Arc::new(Schema::empty())),
+        )
     }
 
     async fn current_stream(service: &ZerobusService) -> Arc<ActiveStream> {

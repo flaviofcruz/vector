@@ -6,22 +6,16 @@ use vector_core::event::Event;
 #[cfg(feature = "arrow")]
 use crate::encoding::{ArrowStreamSerializer, WireToArrowSerializer};
 use crate::{
-    encoding::{Error, Framer, ProtoBatchSerializer, Serializer},
+    encoding::{Error, Framer, Serializer},
     internal_events::{EncoderFramingError, EncoderSerializeError},
 };
 
 /// The output of a batch encoding operation.
-///
-/// Different batch serializers produce different output types:
-/// - Arrow serializer produces a `RecordBatch`
-/// - Proto serializer produces individual byte buffers per event
 #[derive(Debug)]
 pub enum BatchOutput {
     /// An Arrow RecordBatch containing all events encoded as columnar data.
     #[cfg(feature = "arrow")]
     Arrow(arrow::record_batch::RecordBatch),
-    /// A list of individually-serialized records (one per event).
-    Records(Vec<Vec<u8>>),
 }
 
 /// Serializers that support batch encoding (encoding all events at once).
@@ -30,8 +24,6 @@ pub enum BatchSerializer {
     /// Arrow IPC stream format serializer.
     #[cfg(feature = "arrow")]
     Arrow(ArrowStreamSerializer),
-    /// Protobuf batch serializer that encodes each event individually.
-    ProtoBatch(ProtoBatchSerializer),
     /// Streaming wire-format to Arrow serializer.
     #[cfg(feature = "arrow")]
     WireToArrow(WireToArrowSerializer),
@@ -70,12 +62,6 @@ impl BatchEncoder {
                 })?;
                 Ok(BatchOutput::Arrow(record_batch))
             }
-            BatchSerializer::ProtoBatch(serializer) => {
-                let records = serializer
-                    .encode_batch(events)
-                    .map_err(|err| Error::SerializingError(Box::new(err)))?;
-                Ok(BatchOutput::Records(records))
-            }
             #[cfg(feature = "arrow")]
             BatchSerializer::WireToArrow(serializer) => {
                 let record_batch = serializer
@@ -83,6 +69,8 @@ impl BatchEncoder {
                     .map_err(|err| Error::SerializingError(Box::new(err)))?;
                 Ok(BatchOutput::Arrow(record_batch))
             }
+            #[cfg(not(feature = "arrow"))]
+            _ => unreachable!("BatchSerializer has no variants without the `arrow` feature"),
         }
     }
 }
