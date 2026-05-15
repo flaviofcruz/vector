@@ -6,22 +6,16 @@ use vector_core::event::Event;
 #[cfg(feature = "arrow")]
 use crate::encoding::ArrowStreamSerializer;
 use crate::{
-    encoding::{Error, Framer, ProtoBatchSerializer, Serializer},
+    encoding::{Error, Framer, Serializer},
     internal_events::{EncoderFramingError, EncoderSerializeError},
 };
 
 /// The output of a batch encoding operation.
-///
-/// Different batch serializers produce different output types:
-/// - Arrow serializer produces a `RecordBatch`
-/// - Proto serializer produces individual byte buffers per event
 #[derive(Debug)]
 pub enum BatchOutput {
     /// An Arrow RecordBatch containing all events encoded as columnar data.
     #[cfg(feature = "arrow")]
     Arrow(arrow::record_batch::RecordBatch),
-    /// A list of individually-serialized records (one per event).
-    Records(Vec<Vec<u8>>),
 }
 
 /// Serializers that support batch encoding (encoding all events at once).
@@ -30,8 +24,6 @@ pub enum BatchSerializer {
     /// Arrow IPC stream format serializer.
     #[cfg(feature = "arrow")]
     Arrow(ArrowStreamSerializer),
-    /// Protobuf batch serializer that encodes each event individually.
-    ProtoBatch(ProtoBatchSerializer),
 }
 
 /// An encoder that encodes batches of events.
@@ -67,12 +59,8 @@ impl BatchEncoder {
                 })?;
                 Ok(BatchOutput::Arrow(record_batch))
             }
-            BatchSerializer::ProtoBatch(serializer) => {
-                let records = serializer
-                    .encode_batch(events)
-                    .map_err(|err| Error::SerializingError(Box::new(err)))?;
-                Ok(BatchOutput::Records(records))
-            }
+            #[cfg(not(feature = "arrow"))]
+            _ => unreachable!("BatchSerializer has no variants without the `arrow` feature"),
         }
     }
 }
@@ -82,7 +70,6 @@ impl tokio_util::codec::Encoder<Vec<Event>> for BatchEncoder {
 
     #[allow(unused_variables)]
     fn encode(&mut self, events: Vec<Event>, buffer: &mut BytesMut) -> Result<(), Self::Error> {
-        #[allow(unreachable_patterns)]
         match &mut self.serializer {
             #[cfg(feature = "arrow")]
             BatchSerializer::Arrow(serializer) => {
@@ -96,9 +83,8 @@ impl tokio_util::codec::Encoder<Vec<Event>> for BatchEncoder {
                     }
                 })
             }
-            _ => unreachable!(
-                "tokio Encoder trait is only used for Arrow; other batch serializers use encode_batch()"
-            ),
+            #[cfg(not(feature = "arrow"))]
+            _ => unreachable!("BatchSerializer has no variants without the `arrow` feature"),
         }
     }
 }

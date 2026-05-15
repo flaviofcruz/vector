@@ -27,7 +27,6 @@ pub use format::{
 };
 #[cfg(feature = "opentelemetry")]
 pub use format::{OtlpSerializer, OtlpSerializerConfig};
-pub use format::{ProtoBatchEncodingError, ProtoBatchSerializer, ProtoBatchSerializerConfig};
 #[cfg(feature = "syslog")]
 pub use format::{SyslogSerializer, SyslogSerializerConfig};
 pub use framing::{

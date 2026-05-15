@@ -8,7 +8,6 @@ use vector_core::{config::DataType, event::Event, schema};
 use super::format::{ArrowStreamSerializer, ArrowStreamSerializerConfig};
 #[cfg(feature = "opentelemetry")]
 use super::format::{OtlpSerializer, OtlpSerializerConfig};
-use super::format::{ProtoBatchSerializer, ProtoBatchSerializerConfig};
 #[cfg(feature = "syslog")]
 use super::format::{SyslogSerializer, SyslogSerializerConfig};
 use super::{
@@ -161,15 +160,6 @@ pub enum BatchSerializerConfig {
     #[cfg(feature = "arrow")]
     #[serde(rename = "arrow_stream")]
     ArrowStream(ArrowStreamSerializerConfig),
-
-    /// Encodes each event individually as a [Protocol Buffers][protobuf] message.
-    ///
-    /// Each event in the batch is serialized to protobuf bytes independently,
-    /// producing a list of byte buffers (one per event).
-    ///
-    /// [protobuf]: https://protobuf.dev/
-    #[serde(rename = "proto_batch")]
-    ProtoBatch(ProtoBatchSerializerConfig),
 }
 
 impl BatchSerializerConfig {
@@ -183,10 +173,6 @@ impl BatchSerializerConfig {
                 let serializer = ArrowStreamSerializer::new(arrow_config.clone())?;
                 Ok(super::BatchSerializer::Arrow(serializer))
             }
-            BatchSerializerConfig::ProtoBatch(proto_config) => {
-                let serializer = ProtoBatchSerializer::new(proto_config.clone())?;
-                Ok(super::BatchSerializer::ProtoBatch(serializer))
-            }
         }
     }
 
@@ -195,7 +181,6 @@ impl BatchSerializerConfig {
         match self {
             #[cfg(feature = "arrow")]
             BatchSerializerConfig::ArrowStream(arrow_config) => arrow_config.input_type(),
-            BatchSerializerConfig::ProtoBatch(proto_config) => proto_config.input_type(),
         }
     }
 
@@ -204,7 +189,6 @@ impl BatchSerializerConfig {
         match self {
             #[cfg(feature = "arrow")]
             BatchSerializerConfig::ArrowStream(arrow_config) => arrow_config.schema_requirement(),
-            BatchSerializerConfig::ProtoBatch(proto_config) => proto_config.schema_requirement(),
         }
     }
 }

@@ -9,7 +9,7 @@ use crate::sinks::{
     util::{BatchConfig, RealtimeSizeBasedDefaultBatchSettings},
 };
 
-use vector_lib::codecs::encoding::{BatchSerializerConfig, ProtoBatchSerializerConfig};
+use vector_lib::codecs::encoding::{ArrowStreamSerializerConfig, BatchSerializerConfig};
 
 use super::{error::ZerobusSinkError, service::ZerobusService, sink::ZerobusSink};
 
@@ -101,26 +101,12 @@ impl Default for ZerobusStreamOptions {
 
 impl From<ZerobusStreamOptions> for databricks_zerobus_ingest_sdk::StreamConfigurationOptions {
     fn from(options: ZerobusStreamOptions) -> Self {
-        Self {
-            recovery: true,
-            recovery_retries: 4,
-            server_lack_of_ack_timeout_ms: options.server_lack_of_ack_timeout_ms,
-            flush_timeout_ms: options.flush_timeout_ms,
-            ..Default::default()
-        }
-    }
-}
-
-#[cfg(feature = "codecs-arrow")]
-impl From<ZerobusStreamOptions> for databricks_zerobus_ingest_sdk::ArrowStreamConfigurationOptions {
-    fn from(options: ZerobusStreamOptions) -> Self {
-        Self {
-            recovery: true,
-            recovery_retries: 4,
-            server_lack_of_ack_timeout_ms: options.server_lack_of_ack_timeout_ms,
-            flush_timeout_ms: options.flush_timeout_ms,
-            ..Default::default()
-        }
+        let mut opts = Self::default();
+        opts.recovery = true;
+        opts.recovery_retries = 4;
+        opts.server_lack_of_ack_timeout_ms = options.server_lack_of_ack_timeout_ms;
+        opts.flush_timeout_ms = options.flush_timeout_ms;
+        opts
     }
 }
 
@@ -327,7 +313,7 @@ fn default_server_ack_timeout_ms() -> u64 {
 }
 
 fn default_batch_encoding() -> BatchSerializerConfig {
-    BatchSerializerConfig::ProtoBatch(ProtoBatchSerializerConfig::default())
+    BatchSerializerConfig::ArrowStream(ArrowStreamSerializerConfig::default())
 }
 
 #[cfg(test)]
