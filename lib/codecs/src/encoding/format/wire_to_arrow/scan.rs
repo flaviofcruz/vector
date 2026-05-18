@@ -58,7 +58,7 @@ pub(super) fn scan_message(
                 let sub_bytes = expect_len(&field.value)?;
                 children.reset_present();
                 scan_message(sub_plan, sub_bytes, children)?;
-                children.finalize_row(sub_plan);
+                children.finalize_row(sub_plan)?;
                 present[slot_idx] = true;
             }
             builders::BuilderNode::RepeatedMessage {
@@ -76,7 +76,7 @@ pub(super) fn scan_message(
                 let sub_bytes = expect_len(&field.value)?;
                 children.reset_present();
                 scan_message(sub_plan, sub_bytes, children)?;
-                children.finalize_row(sub_plan);
+                children.finalize_row(sub_plan)?;
                 *current_offset += 1;
                 present[slot_idx] = true;
             }
@@ -114,6 +114,17 @@ pub(super) fn scan_message(
 ///
 /// [`WireToArrowEncoder::encode_batch`]: super::encoder::WireToArrowEncoder::encode_batch
 pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<()> {
+    // Track which singular slots (Scalar / Struct) have been seen in this
+    // message so a duplicate tag drops the row instead of corrupting
+    // column-length alignment downstream in scan_message. Proto3 parsers
+    // are required to accept duplicate singular tags (last-wins for
+    // scalars, merge for sub-messages), but Arrow `*Builder` types don't
+    // expose retraction, so implementing last-wins would require either
+    // per-row scratch buffers or a lookahead pass. Dropping the row
+    // preserves per-row isolation; the wire_to_arrow_rows_dropped metric
+    // gives operators a signal if real producers start tripping this.
+    let mut seen_singular = vec![false; plan.slots.len()];
+
     while !bytes.is_empty() {
         let (field, rest) = try_parse_field(bytes)?;
         bytes = rest;
@@ -129,10 +140,26 @@ pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<(
         let slot = &plan.slots[slot_idx];
 
         match slot {
-            PlanSlot::Scalar(sk) => validate_scalar_from_wire(*sk, &field.value)?,
-            PlanSlot::Struct(sub_plan)
-            | PlanSlot::RepeatedMessage(sub_plan)
-            | PlanSlot::Map(sub_plan) => {
+            PlanSlot::Scalar(sk) => {
+                if seen_singular[slot_idx] {
+                    return Err(WireToArrowError::DuplicateSingularField {
+                        field_number: field.field_num as u32,
+                    });
+                }
+                seen_singular[slot_idx] = true;
+                validate_scalar_from_wire(*sk, &field.value)?;
+            }
+            PlanSlot::Struct(sub_plan) => {
+                if seen_singular[slot_idx] {
+                    return Err(WireToArrowError::DuplicateSingularField {
+                        field_number: field.field_num as u32,
+                    });
+                }
+                seen_singular[slot_idx] = true;
+                let sub_bytes = expect_len(&field.value)?;
+                validate_message(sub_plan, sub_bytes)?;
+            }
+            PlanSlot::RepeatedMessage(sub_plan) | PlanSlot::Map(sub_plan) => {
                 let sub_bytes = expect_len(&field.value)?;
                 validate_message(sub_plan, sub_bytes)?;
             }

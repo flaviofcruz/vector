@@ -182,6 +182,84 @@ pub(super) fn append_scalar_from_wire(
     })
 }
 
+/// Append the proto3 default for `kind` to `tb`. Used at `finalize_row` time
+/// for absent scalar slots inside Map entry sub-plans, where the Arrow Map
+/// type declares the key non-nullable but proto3 elides the key tag whenever
+/// it carries its default value (`""`, `0`, `false`, `b""`). Writing a null
+/// here would fail `StructArray::try_new` at finish; writing the proto3
+/// default matches the semantics every standards-compliant proto consumer
+/// applies.
+///
+/// (Kind, builder) pairings mirror [`append_scalar_from_wire`]; a mismatch
+/// indicates a plan/builder build bug and is reported as such.
+#[inline]
+pub(super) fn append_proto3_default(kind: ScalarKind, tb: &mut TypedBuilder) -> Result<()> {
+    match kind {
+        ScalarKind::Int32 | ScalarKind::SInt32 | ScalarKind::SFixed32 => {
+            if let TypedBuilder::Int32(b) = tb {
+                b.append_value(0);
+                return Ok(());
+            }
+        }
+        ScalarKind::Int64 | ScalarKind::SInt64 | ScalarKind::SFixed64 => match tb {
+            TypedBuilder::Int64(b) => {
+                b.append_value(0);
+                return Ok(());
+            }
+            TypedBuilder::TimestampMicros(b) => {
+                b.append_value(0);
+                return Ok(());
+            }
+            _ => {}
+        },
+        ScalarKind::UInt32 | ScalarKind::Fixed32 => {
+            if let TypedBuilder::UInt32(b) = tb {
+                b.append_value(0);
+                return Ok(());
+            }
+        }
+        ScalarKind::UInt64 | ScalarKind::Fixed64 => {
+            if let TypedBuilder::UInt64(b) = tb {
+                b.append_value(0);
+                return Ok(());
+            }
+        }
+        ScalarKind::Float => {
+            if let TypedBuilder::Float32(b) = tb {
+                b.append_value(0.0);
+                return Ok(());
+            }
+        }
+        ScalarKind::Double => {
+            if let TypedBuilder::Float64(b) = tb {
+                b.append_value(0.0);
+                return Ok(());
+            }
+        }
+        ScalarKind::Bool => {
+            if let TypedBuilder::Boolean(b) = tb {
+                b.append_value(false);
+                return Ok(());
+            }
+        }
+        ScalarKind::String => {
+            if let TypedBuilder::LargeUtf8(b) = tb {
+                b.append_value("");
+                return Ok(());
+            }
+        }
+        ScalarKind::Bytes => {
+            if let TypedBuilder::LargeBinary(b) = tb {
+                b.append_value(b"" as &[u8]);
+                return Ok(());
+            }
+        }
+    }
+    Err(WireToArrowError::PlanBuilderMismatch {
+        site: "append_proto3_default:kind_builder_pair",
+    })
+}
+
 #[inline(always)]
 fn expect_varint(kind: ScalarKind, wv: &WireValue) -> Result<u64> {
     if let WireValue::Varint(v) = wv {

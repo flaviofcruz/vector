@@ -77,7 +77,7 @@ impl WireToArrowEncoder {
             }
             builders.reset_present();
             scan_message(&self.plan, msg_bytes, &mut builders)?;
-            builders.finalize_row(&self.plan);
+            builders.finalize_row(&self.plan)?;
         }
 
         if dropped > 0 {

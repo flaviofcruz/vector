@@ -136,6 +136,14 @@ pub struct MessagePlan {
     pub(crate) slot_by_proto_field: Vec<u32>,
     /// Arrow `Fields` at this level, kept for assembly of `StructArray` / `ListArray`.
     pub(crate) arrow_fields: Fields,
+    /// True if this plan describes the entry sub-message of a `map<K, V>`
+    /// slot. Proto3 elides singular fields at their default value on the
+    /// wire — including *inside* `MapEntry` messages — but Arrow's Map type
+    /// declares the key field non-nullable. `finalize_row` consults this
+    /// flag and materializes the proto3 scalar default (e.g. `""` for
+    /// String, `0` for Int32) for absent scalar slots instead of writing a
+    /// null, which would fail `StructArray::try_new` at batch finish.
+    pub(crate) inside_map_entry: bool,
 }
 
 impl MessagePlan {
@@ -418,6 +426,7 @@ impl MessagePlan {
             slots,
             slot_by_proto_field,
             arrow_fields: fields.clone(),
+            inside_map_entry,
         })
     }
 
@@ -469,6 +478,7 @@ impl MessagePlan {
             slots,
             slot_by_proto_field: Vec::new(),
             arrow_fields: fields.clone(),
+            inside_map_entry: false,
         }
     }
 }

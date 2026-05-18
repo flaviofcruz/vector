@@ -173,6 +173,21 @@ pub enum WireToArrowError {
         arrow_type: String,
     },
 
+    /// A singular (non-repeated) proto field appeared more than once in a
+    /// single message. Proto3 parsers must accept this (last-wins for
+    /// scalars, merge for sub-messages), but the encoder appends to
+    /// Arrow column builders on every occurrence, which would diverge
+    /// column lengths and fail batch assembly. Surfaced from
+    /// `validate_message` so the offending row is dropped via the normal
+    /// per-row isolation path instead of poisoning the whole batch.
+    #[snafu(display(
+        "duplicate singular proto field {field_number} in one message"
+    ))]
+    DuplicateSingularField {
+        /// The proto field number whose tag appeared more than once.
+        field_number: u32,
+    },
+
     /// The Arrow schema declares a singular column as non-nullable, but the
     /// encoder cannot guarantee a value will be present on every row.
     ///

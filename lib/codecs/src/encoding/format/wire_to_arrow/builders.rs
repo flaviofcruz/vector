@@ -14,6 +14,7 @@ use arrow::array::{
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
+use super::append::append_proto3_default;
 use super::errors::{Result, WireToArrowError};
 use super::plan::{MessagePlan, PlanSlot, ScalarKind};
 
@@ -266,18 +267,37 @@ impl BuilderNodeList {
     }
 
     /// After scanning one message, push per-row bookkeeping (struct validity,
-    /// list offsets) and null-pad scalars whose tag wasn't seen. `plan` is
-    /// only consulted in debug builds for a length sanity-check.
+    /// list offsets) and pad scalars whose tag wasn't seen.
+    ///
+    /// Padding rule for absent singular Scalars:
+    /// - **Inside a Map entry sub-plan** (`plan.inside_map_entry == true`):
+    ///   write the proto3 scalar default (`""`, `0`, `false`, `b""`). Arrow's
+    ///   Map type declares the key non-nullable; proto3 wire format elides
+    ///   default-valued singular fields *inside* MapEntry messages too, so a
+    ///   null would fail `StructArray::try_new` at finish.
+    /// - **Elsewhere**: write null. The plan-build non-nullability check
+    ///   rejects schemas that can't tolerate the null up front.
+    ///
+    /// `plan` is consulted in debug builds for a length sanity-check and in
+    /// release for the map-entry default-vs-null routing above. Returns
+    /// `PlanBuilderMismatch` only if `append_proto3_default` is handed a
+    /// scalar kind it doesn't know how to pair with its builder — a plan-build
+    /// invariant violation, never user input.
     #[inline]
-    pub fn finalize_row(&mut self, plan: &MessagePlan) {
+    pub fn finalize_row(&mut self, plan: &MessagePlan) -> Result<()> {
         let Self { nodes, present } = self;
         debug_assert_eq!(plan.slots.len(), nodes.len());
         debug_assert_eq!(plan.slots.len(), present.len());
+        let inside_map_entry = plan.inside_map_entry;
         for (node, &was_present) in nodes.iter_mut().zip(present.iter()) {
             match node {
-                BuilderNode::Scalar { builder, .. } => {
+                BuilderNode::Scalar { kind, builder } => {
                     if !was_present {
-                        builder.append_null();
+                        if inside_map_entry {
+                            append_proto3_default(*kind, builder)?;
+                        } else {
+                            builder.append_null();
+                        }
                     }
                 }
                 BuilderNode::Struct {
@@ -310,6 +330,7 @@ impl BuilderNodeList {
                 }
             }
         }
+        Ok(())
     }
 
     /// Recursively append nulls / empty lists to the entire subtree so row

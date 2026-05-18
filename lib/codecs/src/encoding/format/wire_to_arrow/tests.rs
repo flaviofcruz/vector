@@ -544,6 +544,153 @@ fn map_roundtrip() {
     assert_eq!(pairs.get("beta").copied(), Some(2));
 }
 
+/// Build a `data` field carrying one map entry, with raw bytes for the
+/// MapEntry message (so we can elide the key tag, the value tag, or both —
+/// proto3 default elision applies inside MapEntry messages just like every
+/// other singular field). Schema: `test_protobuf3.Person.data` is field 4,
+/// `map<string, PhoneType>`. Wire format: outer tag `(4 << 3) | 2 = 0x22`,
+/// LEN-prefixed entry body.
+fn person_with_raw_map_entry(entry_body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(entry_body.len() + 2);
+    out.push(0x22); // tag 4, LEN
+    out.push(entry_body.len() as u8); // body length (small for tests)
+    out.extend_from_slice(entry_body);
+    out
+}
+
+#[test]
+fn map_entry_with_empty_string_key_encodes_as_empty_string_not_null() {
+    // Proto3 elides default-valued singular fields *inside* MapEntry too.
+    // Arrow's Map type declares the key field non-nullable; before the fix
+    // an absent key tag produced a null, which fails `StructArray::try_new`
+    // at batch finish — taking the whole batch down even though the wire
+    // bytes are perfectly valid proto3. Producers in prost / Python /
+    // protoc-gen-cpp emit exactly this shape when given a map with key "".
+    let desc = rich_descriptor();
+    let entry_fields = ArrowFields::from(vec![
+        Field::new("key", DataType::LargeUtf8, false),
+        Field::new("value", DataType::Int32, true),
+    ]);
+    let entry_field = Arc::new(Field::new(
+        "key_value",
+        DataType::Struct(entry_fields),
+        false,
+    ));
+    let schema = Schema::new(vec![Field::new(
+        "data",
+        DataType::Map(entry_field, false),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // MapEntry with only the value tag (key omitted, taking proto3 default "").
+    //   0x10 = (2 << 3) | 0 = value tag, varint
+    //   0x01 = enum value 1 (HOME)
+    let bytes = person_with_raw_map_entry(&[0x10, 0x01]);
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(bytes)])
+        .expect("default-keyed map entry must not fail the batch");
+    assert_eq!(batch.num_rows(), 1);
+    let map = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::MapArray>()
+        .expect("MapArray");
+    assert_eq!(map.value_length(0), 1);
+    let keys = map.keys().as_string::<i64>();
+    assert_eq!(keys.value(0), "", "empty-default key must materialize as \"\"");
+    assert!(!keys.is_null(0), "key column must contain no nulls");
+    let values = map.values().as_primitive::<arrow::datatypes::Int32Type>();
+    assert_eq!(values.value(0), 1);
+}
+
+#[test]
+fn map_entry_with_default_int_value_encodes_as_zero_not_null() {
+    // Mirror of the key case for the value side: proto3 elides value=0
+    // (default int) inside MapEntry. Even with a nullable Arrow value field,
+    // the proto semantics say "absent == 0", not "absent == null" — and
+    // when the Arrow value is *non*-nullable, a null here would crash the
+    // batch. Set value non-nullable to exercise both behaviors at once.
+    let desc = rich_descriptor();
+    let entry_fields = ArrowFields::from(vec![
+        Field::new("key", DataType::LargeUtf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]);
+    let entry_field = Arc::new(Field::new(
+        "key_value",
+        DataType::Struct(entry_fields),
+        false,
+    ));
+    let schema = Schema::new(vec![Field::new(
+        "data",
+        DataType::Map(entry_field, false),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // MapEntry with only the key tag (value omitted, taking proto3 default 0).
+    //   0x0a = (1 << 3) | 2 = key tag, LEN
+    //   0x03 = length
+    //   "foo"
+    let bytes = person_with_raw_map_entry(&[0x0a, 0x03, b'f', b'o', b'o']);
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(bytes)])
+        .expect("default-valued map entry must not fail the batch");
+    assert_eq!(batch.num_rows(), 1);
+    let map = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::MapArray>()
+        .unwrap();
+    let keys = map.keys().as_string::<i64>();
+    let values = map.values().as_primitive::<arrow::datatypes::Int32Type>();
+    assert_eq!(keys.value(0), "foo");
+    assert_eq!(values.value(0), 0, "default-int value must materialize as 0");
+    assert!(!values.is_null(0));
+}
+
+#[test]
+fn map_entry_with_all_defaults_encodes_as_empty_default_pair() {
+    // An entirely-empty MapEntry on the wire (`0x22 0x00`) is what prost
+    // emits when you serialize `HashMap::from([("".to_string(), 0)])`.
+    // Both key and value tags are elided. Must produce a valid Arrow row
+    // with `("", 0)`.
+    let desc = rich_descriptor();
+    let entry_fields = ArrowFields::from(vec![
+        Field::new("key", DataType::LargeUtf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]);
+    let entry_field = Arc::new(Field::new(
+        "key_value",
+        DataType::Struct(entry_fields),
+        false,
+    ));
+    let schema = Schema::new(vec![Field::new(
+        "data",
+        DataType::Map(entry_field, false),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let bytes = person_with_raw_map_entry(&[]); // empty MapEntry
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(bytes)])
+        .expect("empty MapEntry must not fail the batch");
+    assert_eq!(batch.num_rows(), 1);
+    let map = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::MapArray>()
+        .unwrap();
+    let keys = map.keys().as_string::<i64>();
+    let values = map.values().as_primitive::<arrow::datatypes::Int32Type>();
+    assert_eq!(keys.value(0), "");
+    assert_eq!(values.value(0), 0);
+}
+
 fn encode_varint_into(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         buf.push((value as u8) | 0x80);
@@ -1140,6 +1287,53 @@ fn encode_batch_drops_packed_scalar_eof_row() {
     assert_eq!(batch.num_rows(), 1);
     let list = batch.column(0).as_list::<i32>();
     assert_eq!(list.value_length(0), 1);
+}
+
+#[test]
+fn encode_batch_drops_row_with_duplicate_singular_scalar_tag() {
+    // Proto3 parsers must accept duplicate singular tags (last-wins for
+    // scalars), but the encoder appends to Arrow column builders on every
+    // occurrence, so a second tag would diverge column lengths and fail
+    // `RecordBatch::try_new`. `validate_message` detects the duplicate and
+    // drops the row before any builder is touched.
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut a = DynamicMessage::new(desc.clone());
+    a.set_field_by_name("name", ProtoValue::String("alice".into()));
+    a.set_field_by_name("id", ProtoValue::I32(1));
+    let mut buf_a = Vec::new();
+    a.encode(&mut buf_a).unwrap();
+
+    let mut b = DynamicMessage::new(desc.clone());
+    b.set_field_by_name("name", ProtoValue::String("bob".into()));
+    b.set_field_by_name("id", ProtoValue::I32(2));
+    let mut buf_b = Vec::new();
+    b.encode(&mut buf_b).unwrap();
+
+    // Hand-rolled bytes: two occurrences of singular tag 1 (`name`, LEN).
+    //   0x0a 0x03 "bob"     — first occurrence, value "bob"
+    //   0x0a 0x05 "alice"   — second occurrence, value "alice"
+    // Spec says last-wins ("alice"); the encoder cannot honor that without
+    // builder retraction, so the row must be dropped via validate.
+    let dup = vec![
+        0x0a, 0x03, b'b', b'o', b'b', 0x0a, 0x05, b'a', b'l', b'i', b'c', b'e',
+    ];
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(buf_a), Bytes::from(dup), Bytes::from(buf_b)])
+        .expect("duplicate-tag row must not fail the batch");
+    assert_eq!(batch.num_rows(), 2);
+    let names = batch.column(0).as_string::<i64>();
+    assert_eq!(names.value(0), "alice");
+    assert_eq!(names.value(1), "bob");
+    let ids = batch.column(1).as_primitive::<arrow::datatypes::Int32Type>();
+    assert_eq!(ids.value(0), 1);
+    assert_eq!(ids.value(1), 2);
 }
 
 // -------------------------------------------------------------------------
