@@ -26,6 +26,11 @@ pub enum ZerobusSinkError {
     /// Record ingestion failed.
     #[snafu(display("Record ingestion failed: {}", source))]
     IngestionError { source: ZerobusError },
+
+    /// Active stream was closed concurrently — retriable, the next attempt
+    /// will create a fresh stream.
+    #[snafu(display("Zerobus stream was closed concurrently"))]
+    StreamClosed,
 }
 
 impl From<ZerobusError> for ZerobusSinkError {
@@ -50,6 +55,7 @@ impl From<ZerobusSinkError> for EventStatus {
                     EventStatus::Rejected
                 }
             }
+            ZerobusSinkError::StreamClosed => EventStatus::Errored,
         }
     }
 }
