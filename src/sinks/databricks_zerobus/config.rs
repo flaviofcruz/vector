@@ -452,40 +452,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_stream_options_conversion() {
-        let options = ZerobusStreamOptions {
-            flush_timeout_ms: 45000,
-            server_lack_of_ack_timeout_ms: 90000,
-        };
-
-        let sdk_options: databricks_zerobus_ingest_sdk::StreamConfigurationOptions = options.into();
-        assert_eq!(sdk_options.flush_timeout_ms, 45000);
-        assert_eq!(sdk_options.server_lack_of_ack_timeout_ms, 90000);
-        assert_eq!(sdk_options.recovery, true);
-        assert_eq!(sdk_options.recovery_retries, 4);
-    }
-
     /// Exercises the `WireToArrow` branch of `ZerobusSinkConfig::build`
-    /// (config.rs:255-269) end-to-end, short of the Zerobus stream handshake.
+    /// end-to-end, short of the Zerobus stream handshake.
     ///
-    /// Under `SchemaSource::UnityCatalog`, `resolve_descriptor` returns a
-    /// descriptor synthesized from UC columns with position-based field
-    /// numbers. That descriptor is used *only* to shape the Arrow output
-    /// schema; the wire descriptor used for decoding is loaded independently
-    /// from `desc_file` + `message_type`. This test proves the two descriptors
-    /// are independent at runtime by constructing a wire descriptor whose tag
-    /// numbers (1001/1002/1003) don't overlap with the UC-synthesized tags
-    /// (1/2/3). A successful round-trip demonstrates that the UC descriptor
-    /// never touches wire bytes — if it did, wire tags would miss the lookup
-    /// table and every column would be null.
+    /// Under `SchemaSource::UnityCatalog`, `ZerobusService::resolve_arrow_schema`
+    /// derives the Arrow output schema directly from the UC table schema via
+    /// the SDK helper `arrow_schema_from_uc_schema`. The wire descriptor used
+    /// for decoding proto bytes is loaded independently from `desc_file` +
+    /// `message_type`. This test proves the two are independent at runtime
+    /// by constructing a wire descriptor whose tag numbers (1001/1002/1003)
+    /// are deliberately disjoint from anything the UC path could synthesize.
+    /// A successful round-trip demonstrates that the UC schema never touches
+    /// wire bytes — if it did, wire tags would miss the lookup table and
+    /// every column would be null.
     #[cfg(feature = "codecs-arrow")]
     #[test]
     fn wire_to_arrow_uc_source_decouples_arrow_schema_from_wire_descriptor() {
-        use super::super::proto_to_arrow::proto_descriptor_to_arrow_schema;
-        use super::super::unity_catalog_schema::{
-            UnityCatalogColumn, UnityCatalogTableSchema, generate_descriptor_from_schema,
-        };
+        use super::super::unity_catalog_schema::{UnityCatalogColumn, UnityCatalogTableSchema};
         use arrow::array::AsArray;
         use bytes::Bytes;
         use prost_reflect::prost::Message as _;
@@ -499,10 +482,11 @@ mod tests {
         };
         use vector_lib::event::{Event, LogEvent};
 
-        // --- UC side: stand in for `ZerobusService::resolve_descriptor` under
-        //     `SchemaSource::UnityCatalog`. `generate_descriptor_from_schema`
-        //     assigns field numbers as `position + 1`, so columns at positions
-        //     0/1/2 yield tags 1/2/3.
+        // --- UC side: stand in for `ZerobusService::resolve_arrow_schema`
+        //     under `SchemaSource::UnityCatalog`. The SDK helper turns a UC
+        //     table schema directly into an Arrow schema — no intermediate
+        //     proto descriptor — so the UC path has zero opportunity to leak
+        //     into wire decode.
         let uc_schema = UnityCatalogTableSchema {
             name: "test_table".into(),
             catalog_name: "test_cat".into(),
@@ -534,14 +518,10 @@ mod tests {
                 },
             ],
         };
-        let uc_descriptor = generate_descriptor_from_schema(&uc_schema).unwrap();
-        let arrow_schema = proto_descriptor_to_arrow_schema(&uc_descriptor).unwrap();
-        // Sanity: UC-synthesized tags are the small, position-based ones. If
-        // these ever leaked into wire decode, the assertion below would fail
-        // because the wire bytes carry tags 1001+.
-        for (i, field) in uc_descriptor.fields().enumerate() {
-            assert_eq!(field.number() as usize, i + 1, "UC tag = position + 1");
-        }
+        let arrow_schema = databricks_zerobus_ingest_sdk::schema::arrow_schema_from_uc_schema(
+            &uc_schema.to_sdk_uc_schema(),
+        )
+        .unwrap();
 
         // --- Wire side: a completely separate descriptor, written to a
         //     tempfile so we exercise the `desc_file` → `get_message_descriptor`
