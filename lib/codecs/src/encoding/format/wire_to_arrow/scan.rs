@@ -123,7 +123,11 @@ pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<(
     // per-row scratch buffers or a lookahead pass. Dropping the row
     // preserves per-row isolation; the wire_to_arrow_rows_dropped metric
     // gives operators a signal if real producers start tripping this.
-    let mut seen_singular = vec![false; plan.slots.len()];
+    //
+    // Stack-allocated for plans with <=128 slots per level (covers every
+    // realistic Arrow schema we encode); heap-allocated bitvec for wider
+    // plans. Common case is zero allocations on the hot path.
+    let mut seen_singular = SeenSingular::with_capacity(plan.slots.len());
 
     while !bytes.is_empty() {
         let (field, rest) = try_parse_field(bytes)?;
@@ -141,21 +145,19 @@ pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<(
 
         match slot {
             PlanSlot::Scalar(sk) => {
-                if seen_singular[slot_idx] {
+                if seen_singular.test_and_set(slot_idx) {
                     return Err(WireToArrowError::DuplicateSingularField {
                         field_number: field.field_num as u32,
                     });
                 }
-                seen_singular[slot_idx] = true;
                 validate_scalar_from_wire(*sk, &field.value)?;
             }
             PlanSlot::Struct(sub_plan) => {
-                if seen_singular[slot_idx] {
+                if seen_singular.test_and_set(slot_idx) {
                     return Err(WireToArrowError::DuplicateSingularField {
                         field_number: field.field_num as u32,
                     });
                 }
-                seen_singular[slot_idx] = true;
                 let sub_bytes = expect_len(&field.value)?;
                 validate_message(sub_plan, sub_bytes)?;
             }
@@ -176,4 +178,47 @@ pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Bitset for tracking which singular slots have already been seen in one
+/// `validate_message` call. Inline `u128` covers plans with up to 128
+/// singular Scalar/Struct slots per level — every realistic Arrow schema
+/// for zerobus targets fits — so the common case is allocation-free on
+/// the per-row hot path. Wider plans fall back to a heap `Vec<u64>`.
+enum SeenSingular {
+    Small(u128),
+    Large(Vec<u64>),
+}
+
+impl SeenSingular {
+    #[inline]
+    fn with_capacity(slot_count: usize) -> Self {
+        if slot_count <= 128 {
+            Self::Small(0)
+        } else {
+            Self::Large(vec![0u64; slot_count.div_ceil(64)])
+        }
+    }
+
+    /// Set the bit for `idx` and return whether it was already set.
+    /// Used by `validate_message` to detect duplicate singular tags
+    /// (`true` on the second occurrence of any Scalar/Struct slot).
+    #[inline]
+    fn test_and_set(&mut self, idx: usize) -> bool {
+        match self {
+            Self::Small(bits) => {
+                let mask = 1u128 << idx;
+                let already = (*bits & mask) != 0;
+                *bits |= mask;
+                already
+            }
+            Self::Large(words) => {
+                let word = &mut words[idx / 64];
+                let mask = 1u64 << (idx % 64);
+                let already = (*word & mask) != 0;
+                *word |= mask;
+                already
+            }
+        }
+    }
 }
