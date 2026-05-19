@@ -449,6 +449,7 @@ fn build_string_array(
                             appended = true;
                         }
                     }
+                    Value::Null => {}
                     _ => {
                         builder.append_value(&value.to_string_lossy());
                         appended = true;
@@ -583,6 +584,7 @@ fn build_large_string_array(
                             appended = true;
                         }
                     }
+                    Value::Null => {}
                     _ => {
                         builder.append_value(&value.to_string_lossy());
                         appended = true;
@@ -2069,6 +2071,96 @@ mod tests {
         let result = encode_events_to_arrow_ipc_stream(&events, Some(schema));
         assert!(result.is_err());
 
+        match result.unwrap_err() {
+            ArrowEncodingError::NullConstraint { field_name } => {
+                assert_eq!(field_name, "name");
+            }
+            other => panic!("Expected NullConstraint error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_nullable_string_field_with_explicit_null() {
+        // Regression: a present-but-null VRL value used to be stringified to
+        // the literal "<null>" via Value::to_string_lossy. It must become a
+        // real Arrow null instead.
+        let mut log1 = LogEvent::default();
+        log1.insert("name", "Alice");
+
+        let mut log2 = LogEvent::default();
+        log2.insert("name", Value::Null);
+
+        let events = vec![Event::Log(log1), Event::Log(log2)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Utf8,
+            true,
+        )]));
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(schema)).unwrap();
+        let cursor = Cursor::new(bytes);
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        let name_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_array.value(0), "Alice");
+        assert!(name_array.is_null(1));
+    }
+
+    #[test]
+    fn test_encode_nullable_large_string_field_with_explicit_null() {
+        use arrow::array::LargeStringArray;
+
+        let mut log1 = LogEvent::default();
+        log1.insert("name", "Alice");
+
+        let mut log2 = LogEvent::default();
+        log2.insert("name", Value::Null);
+
+        let events = vec![Event::Log(log1), Event::Log(log2)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::LargeUtf8,
+            true,
+        )]));
+
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(schema)).unwrap();
+        let cursor = Cursor::new(bytes);
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        let name_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert_eq!(name_array.value(0), "Alice");
+        assert!(name_array.is_null(1));
+    }
+
+    #[test]
+    fn test_encode_non_nullable_string_field_with_explicit_null_errors() {
+        let mut log1 = LogEvent::default();
+        log1.insert("name", "Alice");
+
+        let mut log2 = LogEvent::default();
+        log2.insert("name", Value::Null);
+
+        let events = vec![Event::Log(log1), Event::Log(log2)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let result = encode_events_to_arrow_ipc_stream(&events, Some(schema));
         match result.unwrap_err() {
             ArrowEncodingError::NullConstraint { field_name } => {
                 assert_eq!(field_name, "name");

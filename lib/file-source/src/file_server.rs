@@ -234,43 +234,39 @@ where
                     watcher.set_file_findable(false); // assume not findable until found
                 }
                 for (log_file_info_opt, path) in self.paths_provider.paths().into_iter() {
-                    // Fast path: skip expensive fingerprinting (gzip decompression
-                    // + CRC64) for archived files whose path→fingerprint mapping
-                    // is already known. Since .gz files are immutable, the
-                    // fingerprint will never change for a given path.
-                    if !self.ignore_checkpoints && self.is_archive(&path) {
-                        if let Some(file_id) = checkpoints.get_archive_fingerprint(&path) {
-                            if let Some(watcher) = fp_map.get_mut(&file_id) {
-                                watcher.set_file_findable(true);
-                            } else if !checkpoints.get_done(file_id) {
-                                // Known archive fingerprint but no active watcher
-                                // and not done — re-open it to resume reading.
-                                self.watch_new_file(
-                                    path,
-                                    file_id,
-                                    &mut fp_map,
-                                    &checkpoints,
-                                    false,
-                                )
-                                .await;
-                                self.emitter.emit_files_open(fp_map.len());
+                    // Resolve `file_id` for this path. For archives we treat the
+                    // checkpoint cache purely as a fingerprint-computation
+                    // optimization — once we have a `file_id`, all reconciliation
+                    // (path comparison, rename detection, duplicate-fingerprint
+                    // disambiguation, untracked-file handling) flows through the
+                    // single shared block below. This avoids the class of bugs
+                    // where a short-circuiting fast path skipped state
+                    // reconciliation and left watchers bound to stale inodes.
+                    let file_id = if !self.ignore_checkpoints && self.is_archive(&path) {
+                        match checkpoints.get_archive_fingerprint(&path) {
+                            Some(id) => Some(id),
+                            None => {
+                                let id = self
+                                    .fingerprinter
+                                    .fingerprint_or_emit(
+                                        &path,
+                                        &mut known_small_files,
+                                        &self.emitter,
+                                    )
+                                    .await;
+                                if let Some(id) = id {
+                                    checkpoints.set_archive_path(id, &path);
+                                }
+                                id
                             }
-                            // If done: skip entirely (no watcher, no fingerprint, no I/O).
-                            continue;
                         }
-                    }
+                    } else {
+                        self.fingerprinter
+                            .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
+                            .await
+                    };
 
-                    if let Some(file_id) = self
-                        .fingerprinter
-                        .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
-                        .await
-                    {
-                        // Cache the path→fingerprint mapping for archived files so
-                        // subsequent glob cycles can skip fingerprinting entirely.
-                        if self.is_archive(&path) {
-                            checkpoints.set_archive_path(file_id, &path);
-                        }
-
+                    if let Some(file_id) = file_id {
                         if let Some(watcher) = fp_map.get_mut(&file_id) {
                             // file fingerprint matches a watched file
                             let was_found_this_cycle = watcher.file_findable();
@@ -309,7 +305,16 @@ where
                                 }
                             }
                         } else {
-                            // untracked file fingerprint
+                            // untracked file fingerprint. For archives, skip
+                            // entirely if the checkpoint says this fingerprint
+                            // has already been fully read — the file is
+                            // immutable and there is nothing new to consume.
+                            if !self.ignore_checkpoints
+                                && self.is_archive(&path)
+                                && checkpoints.get_done(file_id)
+                            {
+                                continue;
+                            }
                             self.update_file_to_pod_map(path.clone(), log_file_info_opt);
                             self.watch_new_file(path, file_id, &mut fp_map, &checkpoints, false)
                                 .await;
@@ -541,18 +546,35 @@ where
                         info!(message = "Shutdown signal received, draining files before exit.");
 
                         // Snapshot current EOF of each watched file as the drain target.
+                        //
+                        // For archive watchers (e.g. .gz) we cannot use the on-disk
+                        // file length as the target: `watcher.get_file_position()`
+                        // tracks the *decompressed* byte position, while
+                        // `fs::metadata(path).len()` is the *compressed* size on
+                        // disk. Comparing them is wrong in both directions: with
+                        // typical compression the decompressed content is larger
+                        // than `target`, so the outer `file_position >= target`
+                        // check fires early and silently drops the remainder; with
+                        // small files where overhead exceeds savings the check
+                        // never fires and the drain loop spins. Use `u64::MAX` as
+                        // a sentinel and rely on `read_line` returning `Ok(None)`
+                        // (decompressed-stream EOF) as the completion signal.
                         let mut drain_targets: IndexMap<FileFingerprint, u64> = IndexMap::new();
                         for (&file_id, watcher) in &fp_map {
-                            match fs::metadata(&watcher.path).await {
-                                Ok(meta) => {
-                                    drain_targets.insert(file_id, meta.len());
-                                }
-                                Err(error) => {
-                                    warn!(
-                                        message = "Could not stat file for drain target, skipping.",
-                                        path = ?watcher.path,
-                                        ?error,
-                                    );
+                            if self.is_archive(&watcher.path) {
+                                drain_targets.insert(file_id, u64::MAX);
+                            } else {
+                                match fs::metadata(&watcher.path).await {
+                                    Ok(meta) => {
+                                        drain_targets.insert(file_id, meta.len());
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            message = "Could not stat file for drain target, skipping.",
+                                            path = ?watcher.path,
+                                            ?error,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -601,7 +623,31 @@ where
                                                 break;
                                             }
                                         }
-                                        Ok(_) => break,
+                                        Ok(_) => {
+                                            // No line available right now. For
+                                            // archive watchers this means the
+                                            // decompressed stream is exhausted —
+                                            // a definitive completion signal,
+                                            // because the size-based outer guard
+                                            // can't fire for archives (target is
+                                            // `u64::MAX`). Persist the checkpoint
+                                            // and drop the drain target.
+                                            if self.is_archive(&watcher.path) {
+                                                drain_targets.swap_remove(&file_id);
+                                                checkpoints
+                                                    .update(file_id, watcher.get_file_position());
+                                                if let Err(error) =
+                                                    drain_checkpointer.write_checkpoints().await
+                                                {
+                                                    error!(
+                                                        ?error,
+                                                        "Error writing checkpoints during drain"
+                                                    );
+                                                }
+                                                progress = true;
+                                            }
+                                            break;
+                                        }
                                         Err(_) => {
                                             drain_targets.swap_remove(&file_id);
                                             progress = true;
@@ -1338,5 +1384,196 @@ mod tests {
             received_b[x - 1].text,
             Bytes::from(format!("line {:04} -- padding to make this longer", x - 1)),
         );
+    }
+
+    /// Reproduces the file-handle / data-loss bug triggered when a watched
+    /// raw file is replaced by its gzip-compressed counterpart with the
+    /// **same mtime** (which is `gzip(1)`'s default) and the raw file is
+    /// then unlinked.
+    ///
+    /// The fingerprinter computes the archive's fingerprint from the
+    /// decompressed first line, so it equals the raw file's fingerprint.
+    /// In the discovery loop:
+    ///   * `checkpoints.set_archive_path(file_id, ".gz")` runs
+    ///     unconditionally after fingerprinting (file_server.rs ~line 272),
+    ///     locking in the path → fingerprint mapping.
+    ///   * The "more than one file has the same fingerprint" branch uses a
+    ///     strict `old_mtime < new_mtime` comparison (file_server.rs ~line
+    ///     302). With gzip's mtime preservation the mtimes are equal, so
+    ///     `update_path` is **not** called and the watcher keeps pointing
+    ///     at the raw file's inode.
+    ///   * On subsequent cycles the cache hit at file_server.rs ~line 244
+    ///     takes the fast path: it only sets `findable = true`. There is
+    ///     no path / inode reconciliation, so even after the raw file is
+    ///     unlinked the watcher continues to hold its fd on the deleted
+    ///     inode and never reads new content from the `.gz`.
+    ///
+    /// Observable symptom: lines that live only inside the `.gz`
+    /// (everything after the shared first line) are never delivered. This
+    /// test asserts that `"beta"` reaches the output channel. With the bug
+    /// it does not; with a fix that reconciles the watcher to the `.gz`
+    /// inode, `gzip_reader_at_offset` resumes at the post-fingerprint
+    /// position and delivers `"beta"`.
+    #[tokio::test]
+    async fn gzip_replacement_with_preserved_mtime_reconciles_watcher() {
+        use async_compression::tokio::bufread::GzipEncoder;
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::oneshot;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let log_path = tmp.path().join("app.log");
+        let gz_path = tmp.path().join("app.log.gz");
+
+        // Initial raw file. `"alpha\n"` will become the fingerprint line
+        // for both the raw and the gzipped variants.
+        fs::write(&log_path, b"alpha\n").await.unwrap();
+
+        let file_server = make_file_server(vec![log_path.clone(), gz_path.clone()], data_dir, true);
+        let (tx, rx) = mpsc::channel::<Vec<Line>>(8);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_data: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+            });
+        let shutdown_checkpointer = futures::future::ready(());
+        let checkpointer = Checkpointer::new(tmp.path().join("data").as_path());
+
+        let collector = tokio::spawn(async move {
+            let mut rx = rx;
+            let mut lines = Vec::new();
+            while let Some(batch) = rx.next().await {
+                lines.extend(batch);
+            }
+            lines
+        });
+
+        let log_path_m = log_path.clone();
+        let gz_path_m = gz_path.clone();
+        let manip: tokio::task::JoinHandle<DeletedFdSnapshot> = tokio::spawn(async move {
+            // 1. Let the server discover `app.log` and read `"alpha"`.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // 2. Create `app.log.gz` whose decompressed first line matches
+            //    the raw file, plus an extra line (`"beta"`) that lives
+            //    only inside the archive.
+            let payload: &[u8] = b"alpha\nbeta\n";
+            let mut encoder = GzipEncoder::new(payload);
+            let mut gz_bytes = Vec::new();
+            encoder.read_to_end(&mut gz_bytes).await.unwrap();
+            fs::write(&gz_path_m, &gz_bytes).await.unwrap();
+
+            // 3. Preserve mtime, as `gzip(1)` does by default. This is the
+            //    trigger: the strict `<` mtime check at file_server.rs:302
+            //    is false when mtimes are equal, so `update_path` is
+            //    skipped even though `app.log.gz` has the same fingerprint.
+            let raw_mtime = fs::metadata(&log_path_m).await.unwrap().modified().unwrap();
+            let gz_file = std::fs::File::options()
+                .write(true)
+                .open(&gz_path_m)
+                .unwrap();
+            gz_file.set_modified(raw_mtime).unwrap();
+            drop(gz_file);
+
+            // 4. Let one or two discovery cycles run while both files
+            //    coexist. The archive→fingerprint cache is populated here,
+            //    but `update_path` is not called.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // 5. Delete the raw file. The watcher's fd stays open on the
+            //    now-unlinked inode. Subsequent discovery cycles take the
+            //    fast path (cache hit) and only update `findable`, so the
+            //    watcher is never reconciled to `app.log.gz`.
+            fs::remove_file(&log_path_m).await.unwrap();
+
+            // 6. Give the server time to run several more cycles.
+            tokio::time::sleep(Duration::from_millis(700)).await;
+
+            // 7. Probe /proc/self/fd for any descriptor whose readlink
+            //    target is the deleted raw file. This runs *before*
+            //    shutdown so we observe the steady-state of an actively
+            //    running server, not the post-shutdown teardown.
+            let snapshot = snapshot_deleted_fds(&log_path_m);
+
+            let _ = shutdown_tx.send(());
+            snapshot
+        });
+
+        let result = file_server
+            .run(tx, shutdown_data, shutdown_checkpointer, checkpointer)
+            .await;
+        assert!(result.is_ok());
+        let fd_snapshot = manip.await.unwrap();
+
+        let received = collector.await.unwrap();
+        let texts: Vec<String> = received
+            .iter()
+            .map(|l| String::from_utf8_lossy(&l.text).into_owned())
+            .collect();
+
+        assert!(
+            texts.iter().any(|t| t == "alpha"),
+            "expected to receive 'alpha' from app.log; got {:?}",
+            texts,
+        );
+
+        // Direct symptom assertion: while the server is still running, no
+        // open file descriptor should still point at the unlinked raw
+        // file. The probe is implemented for Linux via /proc/self/fd; on
+        // other platforms the snapshot is vacuously empty and this assert
+        // is a no-op.
+        assert!(
+            fd_snapshot.leaked_fds.is_empty(),
+            "FileServer held open fd(s) on the deleted raw file {:?}: {:?}",
+            log_path,
+            fd_snapshot.leaked_fds,
+        );
+
+        // Behavioural assertion: after reconciliation, the watcher should
+        // resume from `gzip_reader_at_offset(reader, file_position)` and
+        // deliver the post-fingerprint content. With the bug it does not.
+        assert!(
+            texts.iter().any(|t| t == "beta"),
+            "expected the watcher to reconcile to app.log.gz and deliver \
+             'beta', but it did not. The watcher is still bound to the \
+             deleted raw inode (gzip-preserved-mtime bug). Received: {:?}",
+            texts,
+        );
+    }
+
+    /// Snapshot of any `/proc/self/fd/*` entries whose readlink target
+    /// names the given path with the kernel's `" (deleted)"` suffix.
+    /// Each entry is `(fd_number, readlink_target)`.
+    #[derive(Debug, Default)]
+    struct DeletedFdSnapshot {
+        leaked_fds: Vec<(u32, String)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_deleted_fds(unlinked_path: &Path) -> DeletedFdSnapshot {
+        let marker = format!("{} (deleted)", unlinked_path.to_string_lossy());
+        let mut leaked = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+            for entry in entries.flatten() {
+                let fd_num = entry.file_name().to_string_lossy().parse::<u32>().ok();
+                let target = std::fs::read_link(entry.path())
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+                if let (Some(fd), Some(t)) = (fd_num, target)
+                    && t == marker
+                {
+                    leaked.push((fd, t));
+                }
+            }
+        }
+        DeletedFdSnapshot { leaked_fds: leaked }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn snapshot_deleted_fds(_unlinked_path: &Path) -> DeletedFdSnapshot {
+        DeletedFdSnapshot::default()
     }
 }
