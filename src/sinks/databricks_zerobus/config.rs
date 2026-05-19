@@ -71,10 +71,30 @@ pub enum SchemaSource {
     UnityCatalog,
 }
 
+/// Arrow IPC compression codec for Zerobus Arrow Flight payloads.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Compression {
+    /// LZ4 frame compression.
+    Lz4Frame,
+    /// Zstandard compression.
+    Zstd,
+}
+
+impl From<Compression> for arrow::ipc::CompressionType {
+    fn from(value: Compression) -> Self {
+        match value {
+            Compression::Lz4Frame => arrow::ipc::CompressionType::LZ4_FRAME,
+            Compression::Zstd => arrow::ipc::CompressionType::ZSTD,
+        }
+    }
+}
+
 /// Zerobus stream configuration options.
 ///
-/// This is a thin wrapper around the SDK's `StreamConfigurationOptions` with Vector-specific
-/// configuration attributes and custom defaults suitable for Vector's use case.
+/// This is a thin wrapper around the SDK's `ArrowStreamConfigurationOptions` with
+/// Vector-specific configuration attributes and custom defaults suitable for Vector's use case.
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +108,10 @@ pub struct ZerobusStreamOptions {
     #[serde(default = "default_server_ack_timeout_ms")]
     #[configurable(metadata(docs::examples = 60000))]
     pub server_lack_of_ack_timeout_ms: u64,
+
+    /// Optional Arrow IPC compression for Flight payloads. Defaults to no compression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<Compression>,
 }
 
 impl Default for ZerobusStreamOptions {
@@ -95,18 +119,8 @@ impl Default for ZerobusStreamOptions {
         Self {
             flush_timeout_ms: default_flush_timeout_ms(),
             server_lack_of_ack_timeout_ms: default_server_ack_timeout_ms(),
+            compression: None,
         }
-    }
-}
-
-impl From<ZerobusStreamOptions> for databricks_zerobus_ingest_sdk::StreamConfigurationOptions {
-    fn from(options: ZerobusStreamOptions) -> Self {
-        let mut opts = Self::default();
-        opts.recovery = true;
-        opts.recovery_retries = 4;
-        opts.server_lack_of_ack_timeout_ms = options.server_lack_of_ack_timeout_ms;
-        opts.flush_timeout_ms = options.flush_timeout_ms;
-        opts
     }
 }
 
@@ -438,17 +452,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_stream_options_conversion() {
-        let options = ZerobusStreamOptions {
-            flush_timeout_ms: 45000,
-            server_lack_of_ack_timeout_ms: 90000,
-        };
-
-        let sdk_options: databricks_zerobus_ingest_sdk::StreamConfigurationOptions = options.into();
-        assert_eq!(sdk_options.flush_timeout_ms, 45000);
-        assert_eq!(sdk_options.server_lack_of_ack_timeout_ms, 90000);
-        assert_eq!(sdk_options.recovery, true);
-        assert_eq!(sdk_options.recovery_retries, 4);
-    }
 }

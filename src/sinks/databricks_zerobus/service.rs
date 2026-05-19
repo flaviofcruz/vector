@@ -296,6 +296,7 @@ impl ZerobusService {
                 .recovery_retries(4)
                 .server_lack_of_ack_timeout_ms(stream_options.server_lack_of_ack_timeout_ms)
                 .flush_timeout_ms(stream_options.flush_timeout_ms)
+                .ipc_compression(stream_options.compression.map(Into::into))
                 .build_arrow()
                 .await
                 .map_err(|e| ZerobusSinkError::StreamInitError { source: e })?;
