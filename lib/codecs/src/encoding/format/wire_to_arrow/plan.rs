@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Fields};
+use arrow::datatypes::{DataType, Fields, TimeUnit};
 use prost_reflect::{Cardinality, Kind, MessageDescriptor};
 
 use super::builders::TypedBuilder;
@@ -72,6 +72,35 @@ impl ScalarKind {
             ScalarKind::Fixed32 | ScalarKind::SFixed32 | ScalarKind::Float => WT_I32,
             ScalarKind::Fixed64 | ScalarKind::SFixed64 | ScalarKind::Double => WT_I64,
             ScalarKind::String | ScalarKind::Bytes => WT_LEN,
+        }
+    }
+
+    /// True iff `dt` is the Arrow leaf type that pairs with this proto
+    /// scalar kind. Enforced at plan-build by
+    /// [`MessagePlan::build_at_depth`] so the runtime appenders
+    /// ([`append_scalar_from_wire`] and [`append_proto3_default`]) can
+    /// assume the pairing is well-formed and don't need a runtime fallthrough
+    /// for kind/builder mismatches.
+    ///
+    /// [`append_scalar_from_wire`]: super::append::append_scalar_from_wire
+    /// [`append_proto3_default`]: super::append::append_proto3_default
+    pub(super) fn matches_arrow_type(self, dt: &DataType) -> bool {
+        match (self, dt) {
+            (ScalarKind::Int32 | ScalarKind::SInt32 | ScalarKind::SFixed32, DataType::Int32) => {
+                true
+            }
+            (
+                ScalarKind::Int64 | ScalarKind::SInt64 | ScalarKind::SFixed64,
+                DataType::Int64 | DataType::Timestamp(TimeUnit::Microsecond, _),
+            ) => true,
+            (ScalarKind::UInt32 | ScalarKind::Fixed32, DataType::UInt32) => true,
+            (ScalarKind::UInt64 | ScalarKind::Fixed64, DataType::UInt64) => true,
+            (ScalarKind::Float, DataType::Float32) => true,
+            (ScalarKind::Double, DataType::Float64) => true,
+            (ScalarKind::Bool, DataType::Boolean) => true,
+            (ScalarKind::String, DataType::LargeUtf8) => true,
+            (ScalarKind::Bytes, DataType::LargeBinary) => true,
+            _ => false,
         }
     }
 
@@ -309,6 +338,18 @@ impl MessagePlan {
                                 kind: format!("{kind:?}"),
                             }
                         })?;
+                        // Reject mismatched (proto scalar, Arrow leaf) pairings
+                        // up front. The runtime appenders rely on this invariant
+                        // to avoid a per-row fallthrough that would otherwise
+                        // fail the whole batch rather than the offending row.
+                        if !sk.matches_arrow_type(dt) {
+                            return Err(WireToArrowError::UnsupportedCombination {
+                                name: arrow_field.name().to_string(),
+                                kind: format!("{kind:?}"),
+                                arrow_type: format!("{dt:?}"),
+                                repeated: false,
+                            });
+                        }
                         PlanSlot::Scalar(sk)
                     }
                     // Singular nested message.
@@ -349,6 +390,14 @@ impl MessagePlan {
                                 kind: format!("{kind:?}"),
                             }
                         })?;
+                        if !sk.matches_arrow_type(item_field.data_type()) {
+                            return Err(WireToArrowError::UnsupportedCombination {
+                                name: arrow_field.name().to_string(),
+                                kind: format!("{kind:?}"),
+                                arrow_type: format!("List<{:?}>", item_field.data_type()),
+                                repeated: true,
+                            });
+                        }
                         PlanSlot::RepeatedScalar(sk)
                     }
                     (k, dt, r) => {
@@ -549,6 +598,22 @@ mod tests {
         let err = MessagePlan::build(&desc, &Fields::from(schema.fields().clone()))
             .expect_err("should fail");
         assert!(matches!(err, WireToArrowError::UnsupportedCombination { .. }));
+    }
+
+    #[test]
+    fn scalar_kind_arrow_type_mismatch_flagged() {
+        // Person.name is a proto String; declaring its Arrow column as Int32
+        // is a mis-paired schema. Plan-build must catch this so the runtime
+        // appenders can assume the (ScalarKind, TypedBuilder) pairing is
+        // well-formed and don't need a fallthrough that fails the whole batch.
+        let desc = load_person_descriptor();
+        let schema = Schema::new(vec![Field::new("name", DataType::Int32, true)]);
+        let err = MessagePlan::build(&desc, &Fields::from(schema.fields().clone()))
+            .expect_err("plan-build must reject String/Int32 pairing");
+        assert!(
+            matches!(err, WireToArrowError::UnsupportedCombination { .. }),
+            "expected UnsupportedCombination, got {err:?}"
+        );
     }
 
     #[test]

@@ -58,7 +58,7 @@ pub(super) fn scan_message(
                 let sub_bytes = expect_len(&field.value)?;
                 children.reset_present();
                 scan_message(sub_plan, sub_bytes, children)?;
-                children.finalize_row(sub_plan)?;
+                children.finalize_row(sub_plan);
                 present[slot_idx] = true;
             }
             builders::BuilderNode::RepeatedMessage {
@@ -76,7 +76,7 @@ pub(super) fn scan_message(
                 let sub_bytes = expect_len(&field.value)?;
                 children.reset_present();
                 scan_message(sub_plan, sub_bytes, children)?;
-                children.finalize_row(sub_plan)?;
+                children.finalize_row(sub_plan);
                 *current_offset += 1;
                 present[slot_idx] = true;
             }

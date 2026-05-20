@@ -190,74 +190,83 @@ pub(super) fn append_scalar_from_wire(
 /// default matches the semantics every standards-compliant proto consumer
 /// applies.
 ///
-/// (Kind, builder) pairings mirror [`append_scalar_from_wire`]; a mismatch
-/// indicates a plan/builder build bug and is reported as such.
+/// Infallible: [`MessagePlan::build_at_depth`] rejects any (`ScalarKind`,
+/// Arrow leaf) pairing this helper can't handle via
+/// [`ScalarKind::matches_arrow_type`], so by the time a builder tree exists
+/// every `BuilderNode::Scalar` paired with `inside_map_entry = true` is
+/// guaranteed to land in one of the matched arms below. Keep the pairings
+/// here in sync with that check and with [`append_scalar_from_wire`].
+///
+/// [`MessagePlan::build_at_depth`]: super::plan::MessagePlan
+/// [`ScalarKind::matches_arrow_type`]: super::plan::ScalarKind::matches_arrow_type
 #[inline]
-pub(super) fn append_proto3_default(kind: ScalarKind, tb: &mut TypedBuilder) -> Result<()> {
+pub(super) fn append_proto3_default(kind: ScalarKind, tb: &mut TypedBuilder) {
     match kind {
         ScalarKind::Int32 | ScalarKind::SInt32 | ScalarKind::SFixed32 => {
             if let TypedBuilder::Int32(b) = tb {
                 b.append_value(0);
-                return Ok(());
+                return;
             }
         }
         ScalarKind::Int64 | ScalarKind::SInt64 | ScalarKind::SFixed64 => match tb {
             TypedBuilder::Int64(b) => {
                 b.append_value(0);
-                return Ok(());
+                return;
             }
             TypedBuilder::TimestampMicros(b) => {
                 b.append_value(0);
-                return Ok(());
+                return;
             }
             _ => {}
         },
         ScalarKind::UInt32 | ScalarKind::Fixed32 => {
             if let TypedBuilder::UInt32(b) = tb {
                 b.append_value(0);
-                return Ok(());
+                return;
             }
         }
         ScalarKind::UInt64 | ScalarKind::Fixed64 => {
             if let TypedBuilder::UInt64(b) = tb {
                 b.append_value(0);
-                return Ok(());
+                return;
             }
         }
         ScalarKind::Float => {
             if let TypedBuilder::Float32(b) = tb {
                 b.append_value(0.0);
-                return Ok(());
+                return;
             }
         }
         ScalarKind::Double => {
             if let TypedBuilder::Float64(b) = tb {
                 b.append_value(0.0);
-                return Ok(());
+                return;
             }
         }
         ScalarKind::Bool => {
             if let TypedBuilder::Boolean(b) = tb {
                 b.append_value(false);
-                return Ok(());
+                return;
             }
         }
         ScalarKind::String => {
             if let TypedBuilder::LargeUtf8(b) = tb {
                 b.append_value("");
-                return Ok(());
+                return;
             }
         }
         ScalarKind::Bytes => {
             if let TypedBuilder::LargeBinary(b) = tb {
                 b.append_value(b"" as &[u8]);
-                return Ok(());
+                return;
             }
         }
     }
-    Err(WireToArrowError::PlanBuilderMismatch {
-        site: "append_proto3_default:kind_builder_pair",
-    })
+    unreachable!(
+        "plan-build invariant: (ScalarKind, TypedBuilder) pairing is enforced \
+         by ScalarKind::matches_arrow_type at MessagePlan::build_at_depth; \
+         reaching this arm means the plan and builder tree diverged"
+    );
 }
 
 #[inline(always)]

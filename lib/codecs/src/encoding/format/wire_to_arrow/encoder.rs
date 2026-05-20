@@ -54,8 +54,9 @@ impl WireToArrowEncoder {
     ///
     /// Errors out of this method are reserved for batch-level failures
     /// that aren't attributable to a single row: a code-bug surface
-    /// (`PlanBuilderMismatch`, scan-vs-validate divergence) or a
-    /// `RecordBatchAssembly` rejection from Arrow.
+    /// (scan-vs-validate divergence surfaced as `PlanBuilderMismatch`) or
+    /// a `RecordBatchAssembly` rejection from Arrow. Row-finalize is
+    /// infallible, so it doesn't appear in this list.
     pub fn encode_batch(&self, messages: &[Bytes]) -> Result<RecordBatch> {
         let capacity = messages.len();
         let mut builders = BuilderNodeList::with_capacity(&self.plan, capacity)?;
@@ -77,7 +78,7 @@ impl WireToArrowEncoder {
             }
             builders.reset_present();
             scan_message(&self.plan, msg_bytes, &mut builders)?;
-            builders.finalize_row(&self.plan)?;
+            builders.finalize_row(&self.plan);
         }
 
         if dropped > 0 {

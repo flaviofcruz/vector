@@ -278,13 +278,13 @@ impl BuilderNodeList {
     /// - **Elsewhere**: write null. The plan-build non-nullability check
     ///   rejects schemas that can't tolerate the null up front.
     ///
-    /// `plan` is consulted in debug builds for a length sanity-check and in
-    /// release for the map-entry default-vs-null routing above. Returns
-    /// `PlanBuilderMismatch` only if `append_proto3_default` is handed a
-    /// scalar kind it doesn't know how to pair with its builder — a plan-build
-    /// invariant violation, never user input.
+    /// Infallible: the (`ScalarKind`, `TypedBuilder`) pairing the proto3-default
+    /// helper relies on is enforced at plan-build time
+    /// (`ScalarKind::matches_arrow_type` inside `MessagePlan::build_at_depth`),
+    /// so there's no per-row failure mode here that would otherwise force the
+    /// caller to tear down the whole batch.
     #[inline]
-    pub fn finalize_row(&mut self, plan: &MessagePlan) -> Result<()> {
+    pub fn finalize_row(&mut self, plan: &MessagePlan) {
         let Self { nodes, present } = self;
         debug_assert_eq!(plan.slots.len(), nodes.len());
         debug_assert_eq!(plan.slots.len(), present.len());
@@ -294,7 +294,7 @@ impl BuilderNodeList {
                 BuilderNode::Scalar { kind, builder } => {
                     if !was_present {
                         if inside_map_entry {
-                            append_proto3_default(*kind, builder)?;
+                            append_proto3_default(*kind, builder);
                         } else {
                             builder.append_null();
                         }
@@ -330,7 +330,6 @@ impl BuilderNodeList {
                 }
             }
         }
-        Ok(())
     }
 
     /// Recursively append nulls / empty lists to the entire subtree so row
