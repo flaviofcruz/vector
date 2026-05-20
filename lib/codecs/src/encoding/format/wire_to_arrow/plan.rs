@@ -240,13 +240,24 @@ impl MessagePlan {
 
         for arrow_field in fields.iter() {
             let Some(proto_field) = descriptor.get_field_by_name(arrow_field.name()) else {
+                // Inside a Map entry sub-plan, a name that doesn't match the
+                // proto MapEntry's `key`/`value` is structurally broken: there's
+                // no proto field to read from, the Map type's non-null key
+                // contract still applies, and the absent-padding path would
+                // hand a kind/builder pair to `append_proto3_default` that it
+                // can't satisfy — which is now a panic (`unreachable!`) rather
+                // than a Result. Reject up front so the failure shows up at
+                // sink init with a clear message.
+                if inside_map_entry {
+                    return Err(WireToArrowError::MapEntryFieldNotInProto {
+                        name: arrow_field.name().to_string(),
+                    });
+                }
                 // Schema drift: the Arrow column exists but the proto doesn't
                 // carry it. We can only emit all-null for such a column, so
                 // a non-nullable declaration is a hard mismatch — error
-                // early before any data flows. (Skipped inside Map entry
-                // sub-plans, where Arrow's Map type itself dictates the
-                // non-null key contract.)
-                if !arrow_field.is_nullable() && !inside_map_entry {
+                // early before any data flows.
+                if !arrow_field.is_nullable() {
                     return Err(WireToArrowError::NonNullableNotGuaranteed {
                         name: arrow_field.name().to_string(),
                         reason: "the proto descriptor does not carry this field, \

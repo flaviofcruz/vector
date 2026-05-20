@@ -544,6 +544,41 @@ fn map_roundtrip() {
     assert_eq!(pairs.get("beta").copied(), Some(2));
 }
 
+#[test]
+fn map_entry_field_name_mismatch_rejected_at_plan_build() {
+    // Arrow's Map type doesn't enforce that the inner Struct's fields are
+    // named `key` and `value`, but proto MapEntry does. Declaring a Map
+    // whose entry struct has a different name ("k" here) leaves no proto
+    // field for the encoder to route bytes from and would force the
+    // absent-padding path to hand `append_proto3_default` a kind/builder
+    // pair it can't satisfy. Plan-build must reject this up front so the
+    // failure surfaces at sink init rather than as a runtime panic.
+    let desc = rich_descriptor();
+    let entry_fields = ArrowFields::from(vec![
+        Field::new("k", DataType::LargeUtf8, false),
+        Field::new("value", DataType::Int32, true),
+    ]);
+    let entry_field = Arc::new(Field::new(
+        "key_value",
+        DataType::Struct(entry_fields),
+        false,
+    ));
+    let schema = Schema::new(vec![Field::new(
+        "data",
+        DataType::Map(entry_field, false),
+        true,
+    )]);
+    let err = WireToArrowEncoder::new(&desc, schema)
+        .expect_err("plan-build must reject Map entry field 'k' (not in proto MapEntry)");
+    assert!(
+        matches!(
+            err,
+            WireToArrowError::MapEntryFieldNotInProto { ref name } if name == "k"
+        ),
+        "expected MapEntryFieldNotInProto, got {err:?}"
+    );
+}
+
 /// Build a `data` field carrying one map entry, with raw bytes for the
 /// MapEntry message (so we can elide the key tag, the value tag, or both —
 /// proto3 default elision applies inside MapEntry messages just like every

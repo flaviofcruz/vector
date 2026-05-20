@@ -188,6 +188,28 @@ pub enum WireToArrowError {
         field_number: u32,
     },
 
+    /// Arrow Map's entry struct declares a field name that the proto
+    /// MapEntry descriptor doesn't carry.
+    ///
+    /// Proto `map<K, V>` is generated as a `MapEntry` message with fields
+    /// named `key` (1) and `value` (2). Arrow's Map type doesn't enforce
+    /// these names on its inner Struct, so a user-supplied schema can
+    /// declare `Map<Struct(k, v)>` and have it pass type checking — but
+    /// there is no proto field for the encoder to read into the slot, the
+    /// `MapEntry`'s key non-null contract still applies, and the
+    /// absent-padding path can't honor both. Reject the mismatch at
+    /// plan-build so it surfaces clearly at sink init rather than as a
+    /// runtime panic when the proto3-default helper meets a kind/builder
+    /// pair it can't pad.
+    #[snafu(display(
+        "Arrow Map entry has field '{name}' which is not declared in the proto MapEntry; \
+         entry struct field names must match proto MapEntry's 'key' and 'value'"
+    ))]
+    MapEntryFieldNotInProto {
+        /// The Arrow Map entry field name that doesn't match proto MapEntry.
+        name: String,
+    },
+
     /// The Arrow schema declares a singular column as non-nullable, but the
     /// encoder cannot guarantee a value will be present on every row.
     ///
