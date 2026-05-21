@@ -21,6 +21,8 @@ mod raw_message;
 #[cfg(feature = "syslog")]
 mod syslog;
 mod text;
+#[cfg(feature = "arrow")]
+mod wire_to_arrow;
 
 use std::fmt::Debug;
 
@@ -28,6 +30,10 @@ use std::fmt::Debug;
 pub use arrow::{
     ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig, SchemaProvider,
     build_record_batch, record_batch_to_arrow_ipc_stream,
+};
+#[cfg(feature = "arrow")]
+pub use wire_to_arrow::{
+    WireToArrowEncoder, WireToArrowError, WireToArrowSerializer, WireToArrowSerializerConfig,
 };
 pub use avro::{AvroSerializer, AvroSerializerConfig, AvroSerializerOptions};
 pub use cef::{CefSerializer, CefSerializerConfig};

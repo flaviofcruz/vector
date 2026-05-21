@@ -33,6 +33,7 @@ opentelemetry-proto = { path = "../opentelemetry-proto", optional = true }
 ordered-float.workspace = true
 prost.workspace = true
 prost-reflect.workspace = true
+zeroparser = { path = "../zeroparser", optional = true }
 rand.workspace = true
 regex.workspace = true
 serde.workspace = true
@@ -62,13 +63,14 @@ toml.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 similar-asserts = "1.7.0"
 vector-core = { path = "../vector-core", default-features = false, features = ["vrl", "test"] }
+proptest.workspace = true
 rstest = "0.26.1"
 tracing-test = "0.2.5"
 uuid.workspace = true
 vrl.workspace = true
 
 [features]
-arrow = []
+arrow = ["dep:zeroparser"]
 opentelemetry = ["dep:opentelemetry-proto"]
 syslog = ["dep:syslog_loose", "dep:strum", "dep:derive_more", "dep:serde-aux", "dep:toml"]
 test = []

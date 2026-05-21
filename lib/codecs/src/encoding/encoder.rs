@@ -4,7 +4,7 @@ use vector_common::internal_event::emit;
 use vector_core::event::Event;
 
 #[cfg(feature = "arrow")]
-use crate::encoding::ArrowStreamSerializer;
+use crate::encoding::{ArrowStreamSerializer, WireToArrowSerializer};
 use crate::{
     encoding::{Error, Framer, Serializer},
     internal_events::{EncoderFramingError, EncoderSerializeError},
@@ -24,6 +24,9 @@ pub enum BatchSerializer {
     /// Arrow IPC stream format serializer.
     #[cfg(feature = "arrow")]
     Arrow(ArrowStreamSerializer),
+    /// Streaming wire-format to Arrow serializer.
+    #[cfg(feature = "arrow")]
+    WireToArrow(WireToArrowSerializer),
 }
 
 /// An encoder that encodes batches of events.
@@ -59,6 +62,13 @@ impl BatchEncoder {
                 })?;
                 Ok(BatchOutput::Arrow(record_batch))
             }
+            #[cfg(feature = "arrow")]
+            BatchSerializer::WireToArrow(serializer) => {
+                let record_batch = serializer
+                    .encode_to_record_batch(events)
+                    .map_err(|err| Error::SerializingError(Box::new(err)))?;
+                Ok(BatchOutput::Arrow(record_batch))
+            }
             #[cfg(not(feature = "arrow"))]
             _ => unreachable!("BatchSerializer has no variants without the `arrow` feature"),
         }
@@ -70,6 +80,7 @@ impl tokio_util::codec::Encoder<Vec<Event>> for BatchEncoder {
 
     #[allow(unused_variables)]
     fn encode(&mut self, events: Vec<Event>, buffer: &mut BytesMut) -> Result<(), Self::Error> {
+        #[allow(unreachable_patterns)]
         match &mut self.serializer {
             #[cfg(feature = "arrow")]
             BatchSerializer::Arrow(serializer) => {
@@ -83,8 +94,9 @@ impl tokio_util::codec::Encoder<Vec<Event>> for BatchEncoder {
                     }
                 })
             }
-            #[cfg(not(feature = "arrow"))]
-            _ => unreachable!("BatchSerializer has no variants without the `arrow` feature"),
+            _ => unreachable!(
+                "tokio Encoder trait is only used for Arrow; other batch serializers use encode_batch()"
+            ),
         }
     }
 }

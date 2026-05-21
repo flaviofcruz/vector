@@ -211,7 +211,7 @@ pub struct WireField<'a> {
 /// Returns `Err(ParseError::TruncatedVarint)` if buffer is too short.
 /// Returns `Err(ParseError::VarintTooLong)` if varint exceeds 10 bytes.
 #[inline(always)]
-pub(crate) fn try_read_varint(data: &[u8]) -> ParseResult<(u64, &[u8])> {
+pub fn try_read_varint(data: &[u8]) -> ParseResult<(u64, &[u8])> {
     match *data {
         // Empty buffer.
         [] => Err(ParseError::TruncatedVarint),

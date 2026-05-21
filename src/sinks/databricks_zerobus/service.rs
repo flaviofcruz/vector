@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell, RwLock};
 use tower::Service;
 use tracing::{info, warn};
-use vector_lib::codecs::encoding::{ArrowStreamSerializer, BatchSerializerConfig};
+use vector_lib::codecs::encoding::{BatchEncoder, BatchOutput, BatchSerializerConfig};
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
@@ -214,7 +214,7 @@ impl MockStream {
 /// Arrow serializer + schema derived from the Unity Catalog table.
 /// Resolved lazily on first use.
 pub(super) struct ResolvedSchema {
-    serializer: ArrowStreamSerializer,
+    encoder: BatchEncoder,
     arrow_schema: Arc<arrow::datatypes::Schema>,
 }
 
@@ -294,20 +294,31 @@ impl ZerobusService {
     pub(super) async fn ensure_schema(&self) -> Result<&ResolvedSchema, ZerobusSinkError> {
         self.schema
             .get_or_try_init(|| async {
-                let BatchSerializerConfig::ArrowStream(mut arrow_config) =
-                    self.config.batch_encoding.clone();
                 let arrow_schema = Self::resolve_arrow_schema(&self.config).await?;
-                arrow_config.schema = Some(arrow_schema.clone());
+                let mut batch_encoding = self.config.batch_encoding.clone();
+                match &mut batch_encoding {
+                    BatchSerializerConfig::ArrowStream(config) => {
+                        config.schema = Some(arrow_schema.clone());
+                    }
+                    BatchSerializerConfig::WireToArrow(config) => {
+                        // The Arrow schema describes the *output* table shape.
+                        // The wire descriptor (for decoding incoming bytes) is
+                        // loaded separately by the encoder from
+                        // `batch_encoding.desc_file` + `batch_encoding.message_type`.
+                        config.schema = Some(arrow_schema.clone());
+                    }
+                }
                 let arrow_schema = Arc::new(arrow_schema);
 
-                let serializer = ArrowStreamSerializer::new(arrow_config).map_err(|e| {
-                    ZerobusSinkError::ConfigError {
-                        message: format!("Failed to build Arrow serializer: {}", e),
-                    }
-                })?;
+                let batch_serializer =
+                    batch_encoding
+                        .build()
+                        .map_err(|e| ZerobusSinkError::ConfigError {
+                            message: format!("Failed to build batch serializer: {}", e),
+                        })?;
 
                 Ok(ResolvedSchema {
-                    serializer,
+                    encoder: BatchEncoder::new(batch_serializer),
                     arrow_schema,
                 })
             })
@@ -473,9 +484,9 @@ impl Service<ZerobusRequest> for ZerobusService {
 
         Box::pin(async move {
             let schema = service.ensure_schema().await?;
-            let record_batch = schema
-                .serializer
-                .encode_to_record_batch(&request.events)
+            let BatchOutput::Arrow(record_batch) = schema
+                .encoder
+                .encode_batch(&request.events)
                 .map_err(|e| ZerobusSinkError::EncodingError {
                     message: format!("Failed to encode batch: {}", e),
                 })?;
