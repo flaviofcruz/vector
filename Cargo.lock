@@ -3745,8 +3745,8 @@ dependencies = [
 
 [[package]]
 name = "databricks-zerobus-ingest-sdk"
-version = "2.0.0"
-source = "git+https://github.com/databricks/zerobus-sdk-rs?rev=132996d05ae11c57490660643915d6dca38f9fc1#132996d05ae11c57490660643915d6dca38f9fc1"
+version = "2.0.1"
+source = "git+https://github.com/databricks/zerobus-sdk-rs#13bf6896a9d224546e63d39c1428600c0cdae475"
 dependencies = [
  "arrow-array 58.2.0",
  "arrow-flight",
