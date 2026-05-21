@@ -1,5 +1,7 @@
 //! Zerobus service wrapper for Vector sink integration.
 
+use crate::event::Event;
+use crate::sinks::util::retries::RetryLogic;
 use databricks_zerobus_ingest_sdk::{ZerobusArrowStream, ZerobusSdk};
 use futures::future::BoxFuture;
 use std::sync::Arc;
@@ -10,8 +12,6 @@ use vector_lib::codecs::encoding::{BatchEncoder, BatchOutput, BatchSerializerCon
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
-use crate::event::Event;
-use crate::sinks::util::retries::RetryLogic;
 
 use super::{config::ZerobusSinkConfig, error::ZerobusSinkError, unity_catalog_schema};
 
@@ -598,9 +598,9 @@ mod tests {
 
     fn dummy_payload() -> ZerobusPayload {
         use arrow::datatypes::Schema;
-        ZerobusPayload(
-            arrow::record_batch::RecordBatch::new_empty(Arc::new(Schema::empty())),
-        )
+        ZerobusPayload(arrow::record_batch::RecordBatch::new_empty(Arc::new(
+            Schema::empty(),
+        )))
     }
 
     async fn current_stream(service: &ZerobusService) -> Arc<ActiveStream> {
@@ -783,14 +783,22 @@ mod tests {
         let s1 = service.clone();
         let stream1 = current_stream(&service).await;
         let t1 = tokio::spawn(async move {
-            s1.ingest(stream1, dummy_payload(), GroupedCountByteSize::new_untagged())
-                .await
+            s1.ingest(
+                stream1,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
+            .await
         });
         let s2 = service.clone();
         let stream2 = current_stream(&service).await;
         let t2 = tokio::spawn(async move {
-            s2.ingest(stream2, dummy_payload(), GroupedCountByteSize::new_untagged())
-                .await
+            s2.ingest(
+                stream2,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
+            .await
         });
 
         // Wait until both ingests are inside the gate (both `Arc`s alive).
