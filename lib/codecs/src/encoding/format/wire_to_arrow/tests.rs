@@ -1371,6 +1371,106 @@ fn encode_batch_drops_row_with_duplicate_singular_scalar_tag() {
     assert_eq!(ids.value(1), 2);
 }
 
+#[test]
+fn append_repeated_scalar_unpacked_offset_overflow_is_clean_error() {
+    // The Arrow `ListArray` uses i32 offsets, so `current_offset` can grow
+    // at most to `i32::MAX` across a batch. Without bounds checking the
+    // `+= 1` wraps in release mode and `OffsetBuffer::new` later asserts at
+    // batch finish, panicking the process. The encoder uses `checked_add`
+    // here so an overflow surfaces as a structured `OffsetOverflow` error.
+    // This converts a process-panic surface (adversarial input → crash) into
+    // a clean batch-level failure.
+    use super::append::append_repeated_scalar;
+    use super::builders::TypedBuilder;
+    let mut values = TypedBuilder::new(&DataType::Int32, 1);
+    let mut current_offset: i32 = i32::MAX;
+    let wv = WireValue::Varint(42);
+    let err = append_repeated_scalar(ScalarKind::Int32, &wv, &mut values, &mut current_offset)
+        .expect_err("unpacked repeated-scalar increment at i32::MAX must error");
+    assert!(
+        matches!(err, WireToArrowError::OffsetOverflow { .. }),
+        "expected OffsetOverflow, got {err:?}",
+    );
+}
+
+#[test]
+fn append_repeated_scalar_packed_offset_overflow_is_clean_error() {
+    // Same property for the packed-blob inner loop. A two-element packed
+    // varint starting from `current_offset == i32::MAX - 1` overflows on
+    // the second element; the loop's `checked_add` must surface that as
+    // `OffsetOverflow` rather than wrapping silently.
+    use super::append::append_repeated_scalar;
+    use super::builders::TypedBuilder;
+    let mut values = TypedBuilder::new(&DataType::Int32, 4);
+    // Two varint elements (7, 8) packed inline. We synthesize at the
+    // WireValue layer, so the outer tag + length prefix have already been
+    // stripped — only the inner packed payload appears here.
+    let blob: Vec<u8> = vec![0x07, 0x08];
+    let wv = WireValue::Len(&blob);
+    let mut current_offset: i32 = i32::MAX - 1;
+    let err = append_repeated_scalar(ScalarKind::Int32, &wv, &mut values, &mut current_offset)
+        .expect_err("packed-scalar increment crossing i32::MAX must error");
+    assert!(
+        matches!(err, WireToArrowError::OffsetOverflow { .. }),
+        "expected OffsetOverflow, got {err:?}",
+    );
+}
+
+#[test]
+fn map_preserves_user_entry_field_name_and_metadata() {
+    // Arrow's Map spec doesn't pin a specific entry name — "entries" is
+    // canonical in Arrow itself; "key_value" is the Spark/Delta convention
+    // the zerobus sink uses. Before the fix the encoder hardcoded
+    // "key_value" at finish time, so any caller whose schema declared a
+    // different entry name (or attached metadata) got `RecordBatch::try_new`
+    // rejection on every batch. The fix preserves the user-supplied entry
+    // Field unchanged.
+    let desc = rich_descriptor();
+    let entry_fields = ArrowFields::from(vec![
+        Field::new("key", DataType::LargeUtf8, false),
+        Field::new("value", DataType::Int32, true),
+    ]);
+    let user_entry = Arc::new(
+        Field::new("entries", DataType::Struct(entry_fields), false).with_metadata(
+            [("source".to_string(), "unit_test".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    let outer_field = Field::new("data", DataType::Map(Arc::clone(&user_entry), false), true);
+    let schema = Schema::new(vec![outer_field.clone()]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut msg = DynamicMessage::new(desc.clone());
+    let mut entries: std::collections::HashMap<prost_reflect::MapKey, ProtoValue> =
+        std::collections::HashMap::new();
+    entries.insert(
+        prost_reflect::MapKey::String("k1".into()),
+        ProtoValue::EnumNumber(1),
+    );
+    msg.set_field_by_name("data", ProtoValue::Map(entries));
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(buf)])
+        .expect("batch must finish with the user-supplied entry name preserved");
+    assert_eq!(batch.num_rows(), 1);
+    // The schema the batch reports must match what we declared, including
+    // the non-default entry name and the metadata we attached.
+    let col_field = batch.schema().field(0).clone();
+    let actual_entry = match col_field.data_type() {
+        DataType::Map(f, _) => Arc::clone(f),
+        other => panic!("expected Map, got {other:?}"),
+    };
+    assert_eq!(actual_entry.name(), "entries");
+    assert_eq!(
+        actual_entry.metadata().get("source").map(String::as_str),
+        Some("unit_test"),
+        "user-attached entry metadata must round-trip",
+    );
+}
+
 // -------------------------------------------------------------------------
 // Fuzz: random wire bytes through `encode_batch` must not panic. Any
 // `Result` outcome is acceptable — we only care that bad input is reported

@@ -77,7 +77,17 @@ pub(super) fn scan_message(
                 children.reset_present();
                 scan_message(sub_plan, sub_bytes, children)?;
                 children.finalize_row(sub_plan);
-                *current_offset += 1;
+                // Cumulative across the batch — checked_add converts what
+                // would otherwise be a release-mode wrap + OffsetBuffer
+                // assertion (process panic at finish) into a clean batch
+                // failure. Per-row validate doesn't catch this case because
+                // the overflow can be aggregate across many small rows.
+                *current_offset =
+                    current_offset
+                        .checked_add(1)
+                        .ok_or(WireToArrowError::OffsetOverflow {
+                            site: "scan_message:repeated_message_or_map",
+                        })?;
                 present[slot_idx] = true;
             }
             builders::BuilderNode::RepeatedScalar {

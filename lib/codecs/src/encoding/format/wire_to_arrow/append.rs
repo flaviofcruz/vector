@@ -323,7 +323,13 @@ pub(super) fn append_repeated_scalar(
     // wire type. Single append, regardless of scalar kind.
     if wire_type_byte(wv) == kind.wire_type() {
         append_scalar_from_wire(kind, wv, values)?;
-        *current_offset += 1;
+        // Cumulative across the batch — see scan.rs for the rationale.
+        *current_offset =
+            current_offset
+                .checked_add(1)
+                .ok_or(WireToArrowError::OffsetOverflow {
+                    site: "append_repeated_scalar:unpacked",
+                })?;
         return Ok(());
     }
 
@@ -350,7 +356,12 @@ pub(super) fn append_repeated_scalar(
         let decoded;
         (decoded, remaining) = read_packed_element(kind, remaining)?;
         append_scalar_from_wire(kind, &decoded, values)?;
-        *current_offset += 1;
+        *current_offset =
+            current_offset
+                .checked_add(1)
+                .ok_or(WireToArrowError::OffsetOverflow {
+                    site: "append_repeated_scalar:packed",
+                })?;
     }
     Ok(())
 }
@@ -395,6 +406,13 @@ pub(super) fn validate_scalar_from_wire(kind: ScalarKind, wv: &WireValue) -> Res
 /// where a partial append is possible (an EOF on element N leaves N-1
 /// values already in the builder), so dropping the row up front here is how
 /// we keep per-row isolation for repeated scalars.
+///
+/// Also enforces a per-row guard against a single packed blob that would
+/// push the Arrow list's running offset past `i32::MAX`. The scan-time
+/// `checked_add` catches batch-cumulative overflow as a clean error, but
+/// surfacing the single-row case here keeps it inside per-row isolation —
+/// the offending row drops, the rest of the batch survives. The cumulative
+/// across-rows case is the irreducible remainder.
 pub(super) fn validate_repeated_scalar(kind: ScalarKind, wv: &WireValue) -> Result<()> {
     if wire_type_byte(wv) == kind.wire_type() {
         return validate_scalar_from_wire(kind, wv);
@@ -412,11 +430,20 @@ pub(super) fn validate_repeated_scalar(kind: ScalarKind, wv: &WireValue) -> Resu
         });
     }
     let mut remaining: &[u8] = inner;
+    // u64 so we can compare against i32::MAX without overflowing the counter
+    // itself; a packed blob is bounded by the wire-bytes length, which fits.
+    let mut count: u64 = 0;
     while !remaining.is_empty() {
         // Packed scalars are always varint / fixed32 / fixed64; the decoded
         // `WireValue` is always shape-compatible with `kind`, so no further
         // per-element validation is needed.
         (_, remaining) = read_packed_element(kind, remaining)?;
+        count += 1;
+        if count > i32::MAX as u64 {
+            return Err(WireToArrowError::OffsetOverflow {
+                site: "validate_repeated_scalar:packed_row_exceeds_i32",
+            });
+        }
     }
     Ok(())
 }

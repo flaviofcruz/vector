@@ -173,6 +173,31 @@ pub enum WireToArrowError {
         arrow_type: String,
     },
 
+    /// A repeated-list slot's running offset would overflow `i32`.
+    ///
+    /// Arrow's `ListArray` / `MapArray` use `i32` offsets, so the cumulative
+    /// element count across all rows in a batch is capped at `i32::MAX`
+    /// (~2.1B). The encoder normally bumps the counter via `+= 1` inside
+    /// `scan_message` / `append_repeated_scalar`; without bounds checking,
+    /// release-mode wrap-around silently produces a non-monotonic offsets
+    /// buffer and `OffsetBuffer::new` asserts at batch finish, taking the
+    /// whole process down.
+    ///
+    /// Two places guard against this:
+    /// - `validate_message`'s packed-scalar count drops a single row whose
+    ///   own delta would already exceed `i32::MAX` (per-row isolation).
+    /// - The runtime appenders use `checked_add` and surface this variant if
+    ///   the cumulative count (across rows + sub-rows in the batch) would
+    ///   wrap. That path fails the batch cleanly with a structured error
+    ///   rather than panicking the process — adversarial wire bytes can no
+    ///   longer crash the encoder regardless of how many rows they span.
+    #[snafu(display("repeated-list offset would overflow i32 at {site}"))]
+    OffsetOverflow {
+        /// Short label naming the site that detected the overflow (e.g.
+        /// `"scan_message:repeated_message"`, `"append_repeated_scalar:packed"`).
+        site: &'static str,
+    },
+
     /// A singular (non-repeated) proto field appeared more than once in a
     /// single message. Proto3 parsers must accept this (last-wins for
     /// scalars, merge for sub-messages), but the encoder appends to

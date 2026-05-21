@@ -175,15 +175,19 @@ pub enum BuilderNode {
         offsets: Vec<i32>,
         current_offset: i32,
     },
-    /// Proto map -> Arrow `Map<Struct(key, value)>`. Wire-level handling is
-    /// identical to `RepeatedMessage` (proto maps are `repeated MapEntry`),
-    /// but the finish step assembles a `MapArray` with `key_value` entry name
-    /// matching the zerobus sink's existing convention.
+    /// Proto map -> Arrow `Map<Struct(...)>`. Wire-level handling is identical
+    /// to `RepeatedMessage` (proto maps are `repeated MapEntry`); the finish
+    /// step assembles a `MapArray` reusing the user-supplied `entry_field`
+    /// verbatim — its name, nullability, and metadata are all preserved.
+    /// Arrow's Map type doesn't mandate a specific entry name (zerobus + Spark
+    /// favor "key_value", the Arrow spec uses "entries"); honoring the caller's
+    /// choice is what lets `RecordBatch::try_new` accept the assembled batch.
     Map {
         sub_plan: Arc<MessagePlan>,
         children: BuilderNodeList,
         offsets: Vec<i32>,
         current_offset: i32,
+        entry_field: Arc<Field>,
     },
 }
 
@@ -240,6 +244,14 @@ impl BuilderNodeList {
                     }
                 }
                 PlanSlot::Map(sub_plan) => {
+                    let entry_field = match field.data_type() {
+                        DataType::Map(entry_field, _) => Arc::clone(entry_field),
+                        _ => {
+                            return Err(WireToArrowError::PlanBuilderMismatch {
+                                site: "with_capacity:map_non_map_arrow_type",
+                            });
+                        }
+                    };
                     let mut offsets = Vec::with_capacity(capacity + 1);
                     offsets.push(0);
                     BuilderNode::Map {
@@ -247,6 +259,7 @@ impl BuilderNodeList {
                         children: BuilderNodeList::with_capacity(sub_plan, capacity * 2)?,
                         offsets,
                         current_offset: 0,
+                        entry_field,
                     }
                 }
                 // No proto tag points here, so the slot is null-padded each
@@ -455,6 +468,7 @@ impl BuilderNodeList {
                     sub_plan,
                     children,
                     offsets,
+                    entry_field,
                     ..
                 } => {
                     let child_arrays = children.finish(sub_plan)?;
@@ -466,20 +480,26 @@ impl BuilderNodeList {
                             })?;
                     let offset_buffer =
                         OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
-                    // Match zerobus's `proto_descriptor_to_arrow_schema` convention:
-                    // entry field is named "key_value" and carries the sub-plan's
-                    // struct fields (key at position 0, value at position 1).
-                    let entry_field = Arc::new(Field::new(
-                        "key_value",
-                        DataType::Struct(sub_plan.arrow_fields.clone()),
-                        false,
-                    ));
+                    // Reuse the user-supplied entry Field unchanged: Arrow's
+                    // Map spec doesn't pin the entry name ("entries" is
+                    // canonical; zerobus + Spark/Delta use "key_value"), and
+                    // a name mismatch makes `RecordBatch::try_new` reject the
+                    // whole batch at finish. Honoring the caller's name +
+                    // nullability + metadata avoids that footgun. The encoder
+                    // never emits null entries (only empty maps), so a
+                    // declared non-nullable entry is also safe.
                     Arc::new(
-                        MapArray::try_new(entry_field, offset_buffer, struct_arr, None, false)
-                            .map_err(|e| WireToArrowError::ArrayAssembly {
-                                kind: "map",
-                                source: e,
-                            })?,
+                        MapArray::try_new(
+                            Arc::clone(entry_field),
+                            offset_buffer,
+                            struct_arr,
+                            None,
+                            false,
+                        )
+                        .map_err(|e| WireToArrowError::ArrayAssembly {
+                            kind: "map",
+                            source: e,
+                        })?,
                     )
                 }
             };
@@ -544,6 +564,7 @@ fn build_absent_node(field: &Field, capacity: usize) -> Result<BuilderNode> {
                 sub_plan,
                 offsets,
                 current_offset: 0,
+                entry_field: Arc::clone(entry_field),
             }
         }
         // Scalar Arrow types — build a primitive builder. `TypedBuilder::new`
