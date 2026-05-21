@@ -6,11 +6,12 @@
 
 use arrow::{
     array::{
-        ArrayRef, BinaryBuilder, BooleanBuilder, Decimal128Builder, Decimal256Builder,
-        Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder,
-        LargeBinaryBuilder, LargeStringBuilder, ListArray, MapArray, StringBuilder, StructArray,
-        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
-        TimestampSecondBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+        ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Date64Builder, Decimal128Builder,
+        Decimal256Builder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder,
+        Int64Builder, LargeBinaryBuilder, LargeStringBuilder, ListArray, MapArray, StringBuilder,
+        StructArray, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+        TimestampNanosecondBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
+        UInt32Builder, UInt64Builder,
     },
     buffer::{NullBuffer, OffsetBuffer, ScalarBuffer},
     datatypes::{DataType, Field, Fields, Schema, TimeUnit, i256},
@@ -19,7 +20,7 @@ use arrow::{
 };
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use snafu::Snafu;
 use std::sync::Arc;
@@ -417,6 +418,72 @@ fn build_timestamp_array(
     }
 }
 
+// Arrow's Date32/Date64 epoch is 1970-01-01 UTC. `chrono::NaiveDate::num_days_from_ce`
+// counts from year 1 CE, so we subtract the epoch's CE-day count.
+fn days_since_epoch(date: NaiveDate) -> i32 {
+    const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
+    date.num_days_from_ce() - UNIX_EPOCH_DAYS_FROM_CE
+}
+
+fn build_date32_array(
+    events: &[Event],
+    field_name: &str,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let mut builder = Date32Builder::with_capacity(events.len());
+    for event in events {
+        if let Event::Log(log) = event {
+            let value_to_append = log.get(field_name).and_then(|value| {
+                if let Some(ts) = extract_timestamp(value) {
+                    Some(days_since_epoch(ts.date_naive()))
+                } else if let Value::Integer(i) = value {
+                    i32::try_from(*i).ok()
+                } else {
+                    None
+                }
+            });
+            if value_to_append.is_none() && !nullable {
+                return Err(ArrowEncodingError::NullConstraint {
+                    field_name: field_name.into(),
+                });
+            }
+            builder.append_option(value_to_append);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_date64_array(
+    events: &[Event],
+    field_name: &str,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let mut builder = Date64Builder::with_capacity(events.len());
+    for event in events {
+        if let Event::Log(log) = event {
+            let value_to_append = log.get(field_name).and_then(|value| {
+                // Date64 must be midnight-aligned; truncate timestamps to the
+                // date component. Integers pass through: caller is responsible
+                // for supplying a valid millis-since-epoch midnight value.
+                if let Some(ts) = extract_timestamp(value) {
+                    Some(i64::from(days_since_epoch(ts.date_naive())) * 86_400_000)
+                } else if let Value::Integer(i) = value {
+                    Some(*i)
+                } else {
+                    None
+                }
+            });
+            if value_to_append.is_none() && !nullable {
+                return Err(ArrowEncodingError::NullConstraint {
+                    field_name: field_name.into(),
+                });
+            }
+            builder.append_option(value_to_append);
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
 fn build_string_array(
     events: &[Event],
     field_name: &str,
@@ -734,6 +801,8 @@ fn build_column_for_path(
         DataType::Timestamp(time_unit, tz) => {
             build_timestamp_array(events, path, *time_unit, tz.clone(), nullable)
         }
+        DataType::Date32 => build_date32_array(events, path, nullable),
+        DataType::Date64 => build_date64_array(events, path, nullable),
         DataType::Utf8 => build_string_array(events, path, nullable),
         DataType::LargeUtf8 => build_large_string_array(events, path, nullable),
         DataType::Int8 => build_int8_array(events, path, nullable),
@@ -1264,14 +1333,15 @@ mod tests {
     use super::*;
     use arrow::{
         array::{
-            Array, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray,
-            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-            TimestampSecondArray,
+            Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array,
+            StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+            TimestampNanosecondArray, TimestampSecondArray,
         },
         datatypes::Field,
         ipc::reader::StreamReader,
     };
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
+    use rstest::rstest;
     use std::io::Cursor;
     use vector_core::event::LogEvent;
 
@@ -1683,6 +1753,183 @@ mod tests {
         assert_eq!(ts_nano.value(0), now.timestamp_nanos_opt().unwrap());
     }
 
+    // 2026-05-19 is 20_592 days since the 1970-01-01 UTC epoch: used as the
+    // single fixed reference point for the date-encoding tests below.
+    const EXPECTED_DAYS_SINCE_EPOCH: i32 = 20_592;
+    const EXPECTED_MS_SINCE_EPOCH: i64 = 20_592 * 86_400_000;
+
+    // Materializes the test date as one of the supported VRL input forms,
+    // then inserts it into a log event under "d". The "integer" form is
+    // expressed in the target Arrow date type's native unit: days for
+    // Date32, milliseconds for Date64.
+    fn insert_test_date(log: &mut LogEvent, kind: &str, target: &DataType) {
+        let date = Utc.with_ymd_and_hms(2026, 5, 19, 13, 27, 52).unwrap();
+        match (kind, target) {
+            ("timestamp", _) => log.insert("d", date),
+            ("string", _) => log.insert("d", "2026-05-19T13:27:52Z"),
+            ("integer", DataType::Date32) => log.insert("d", i64::from(EXPECTED_DAYS_SINCE_EPOCH)),
+            ("integer", DataType::Date64) => log.insert("d", EXPECTED_MS_SINCE_EPOCH),
+            _ => unreachable!("unknown input kind {kind} for {target:?}"),
+        };
+    }
+
+    // Round-trips a single-event batch through encode + StreamReader and returns
+    // the decoded batch. Used by both date32 and date64 tests.
+    fn encode_single_event(field: Field, log: LogEvent) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![field]));
+        let bytes = encode_events_to_arrow_ipc_stream(&[Event::Log(log)], Some(schema))
+            .expect("encoding should succeed");
+        StreamReader::try_new(Cursor::new(bytes), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+    }
+
+    // Test plan: verify that build_date32_array converts every supported VRL
+    // input form (native timestamp, RFC 3339 string, integer days-since-epoch)
+    // into the same Arrow Date32 value — 20_588 days since 1970-01-01 UTC.
+    #[rstest]
+    #[case::timestamp("timestamp")]
+    #[case::rfc3339_string("string")]
+    #[case::integer_days("integer")]
+    fn test_encode_date32_from_input(#[case] kind: &str) {
+        let mut log = LogEvent::default();
+        insert_test_date(&mut log, kind, &DataType::Date32);
+
+        let batch = encode_single_event(Field::new("d", DataType::Date32, true), log);
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("column should be a Date32Array");
+        assert_eq!(array.value(0), EXPECTED_DAYS_SINCE_EPOCH);
+    }
+
+    // Test plan: verify that build_date64_array converts every supported VRL
+    // input form (native timestamp, RFC 3339 string, integer millis-since-epoch)
+    // into the same Arrow Date64 value: 20_588 * 86_400_000 ms.
+    #[rstest]
+    #[case::timestamp("timestamp")]
+    #[case::rfc3339_string("string")]
+    #[case::integer_millis("integer")]
+    fn test_encode_date64_from_input(#[case] kind: &str) {
+        let mut log = LogEvent::default();
+        insert_test_date(&mut log, kind, &DataType::Date64);
+
+        let batch = encode_single_event(Field::new("d", DataType::Date64, true), log);
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date64Array>()
+            .expect("column should be a Date64Array");
+        assert_eq!(array.value(0), EXPECTED_MS_SINCE_EPOCH);
+    }
+
+    // Test plan: verify that a missing value on a nullable Date32/Date64 column
+    // encodes as an explicit null in the resulting array, and on a non-nullable
+    // column raises NullConstraint naming the offending field.
+    #[rstest]
+    #[case::date32_nullable(DataType::Date32)]
+    #[case::date64_nullable(DataType::Date64)]
+    fn test_encode_date_nullable_missing_value_is_null(#[case] data_type: DataType) {
+        let batch = encode_single_event(
+            Field::new("d", data_type, /* nullable */ true),
+            LogEvent::default(),
+        );
+        assert_eq!(batch.num_rows(), 1);
+        assert!(batch.column(0).is_null(0));
+    }
+
+    #[rstest]
+    #[case::date32_non_nullable(DataType::Date32)]
+    #[case::date64_non_nullable(DataType::Date64)]
+    fn test_encode_date_non_nullable_missing_value_errors(#[case] data_type: DataType) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d", data_type, /* nullable */ false,
+        )]));
+        let result =
+            encode_events_to_arrow_ipc_stream(&[Event::Log(LogEvent::default())], Some(schema));
+        match result {
+            Err(ArrowEncodingError::NullConstraint { field_name }) => {
+                assert_eq!(field_name, "d");
+            }
+            other => panic!("expected NullConstraint error, got {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::date32(
+        DataType::Date32,
+        i64::from(EXPECTED_DAYS_SINCE_EPOCH - 1),
+        i64::from(EXPECTED_DAYS_SINCE_EPOCH),
+    )]
+    #[case::date64(
+        DataType::Date64,
+        (EXPECTED_DAYS_SINCE_EPOCH as i64 - 1) * 86_400_000,
+        EXPECTED_MS_SINCE_EPOCH,
+    )]
+    fn test_encode_date_multi_event_batch(
+        #[case] data_type: DataType,
+        #[case] expected_prev_day: i64,
+        #[case] expected_target_day: i64,
+    ) {
+        let mut log_ts = LogEvent::default();
+        insert_test_date(&mut log_ts, "timestamp", &data_type);
+
+        let mut log_string = LogEvent::default();
+        log_string.insert("d", "2026-05-18T00:00:00Z");
+
+        let mut log_integer = LogEvent::default();
+        insert_test_date(&mut log_integer, "integer", &data_type);
+
+        let log_missing = LogEvent::default();
+
+        let events = vec![
+            Event::Log(log_ts),
+            Event::Log(log_string),
+            Event::Log(log_integer),
+            Event::Log(log_missing),
+        ];
+        let schema = Arc::new(Schema::new(vec![Field::new("d", data_type.clone(), true)]));
+        let bytes = encode_events_to_arrow_ipc_stream(&events, Some(schema))
+            .expect("encoding should succeed");
+        let batch = StreamReader::try_new(Cursor::new(bytes), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 4);
+        let column = batch.column(0);
+
+        let row_values: Vec<Option<i64>> = match data_type {
+            DataType::Date32 => {
+                let array = column.as_any().downcast_ref::<Date32Array>().unwrap();
+                (0..array.len())
+                    .map(|i| (!array.is_null(i)).then(|| i64::from(array.value(i))))
+                    .collect()
+            }
+            DataType::Date64 => {
+                let array = column.as_any().downcast_ref::<Date64Array>().unwrap();
+                (0..array.len())
+                    .map(|i| (!array.is_null(i)).then(|| array.value(i)))
+                    .collect()
+            }
+            _ => unreachable!(),
+        };
+
+        assert_eq!(
+            row_values,
+            vec![
+                Some(expected_target_day),
+                Some(expected_prev_day),
+                Some(expected_target_day),
+                None,
+            ]
+        );
+    }
+
     #[test]
     fn test_encode_mixed_timestamp_string_and_native() {
         // Test mixing string timestamps with native Timestamp values
@@ -2092,11 +2339,7 @@ mod tests {
 
         let events = vec![Event::Log(log1), Event::Log(log2)];
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "name",
-            DataType::Utf8,
-            true,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
 
         let bytes = encode_events_to_arrow_ipc_stream(&events, Some(schema)).unwrap();
         let cursor = Cursor::new(bytes);
@@ -2154,11 +2397,7 @@ mod tests {
 
         let events = vec![Event::Log(log1), Event::Log(log2)];
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "name",
-            DataType::Utf8,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
 
         let result = encode_events_to_arrow_ipc_stream(&events, Some(schema));
         match result.unwrap_err() {
@@ -4077,5 +4316,4 @@ mod tests {
         assert_eq!(driver_ids.value(0), b"abc\x00\xff");
         assert_eq!(driver_ids.value(1), b"");
     }
-
 }

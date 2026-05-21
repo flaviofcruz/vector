@@ -451,5 +451,4 @@ mod tests {
             panic!("Expected ConfigError for empty OAuth client_id");
         }
     }
-
 }
