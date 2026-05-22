@@ -71,6 +71,12 @@ pub enum SchemaSource {
     UnityCatalog,
 }
 
+impl Default for SchemaSource {
+    fn default() -> Self {
+        SchemaSource::UnityCatalog
+    }
+}
+
 /// Arrow IPC compression codec for Zerobus Arrow Flight payloads.
 #[configurable_component]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,15 +167,10 @@ pub struct ZerobusSinkConfig {
 
     /// Schema definition for the table.
     ///
-    /// The schema must be provided either as:
-    /// - A path to a protobuf descriptor file
-    /// - Unity Catalog table schema (fetched automatically)
-    ///
-    /// Protobuf descriptors can be generated using protoc:
-    /// ```sh
-    /// protoc --descriptor_set_out=schema.desc --include_imports your_schema.proto
-    /// ```
+    /// Defaults to fetching the schema dynamically from Unity Catalog.
+    /// Can be omitted from the configuration entirely to use the default.
     #[configurable(derived)]
+    #[serde(default)]
     pub schema: SchemaSource,
 
     /// Zerobus stream configuration options.
