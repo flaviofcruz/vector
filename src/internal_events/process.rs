@@ -18,6 +18,9 @@ impl InternalEvent for VectorStarted {
             revision = built_info::VECTOR_BUILD_DESC.unwrap_or(""),
         );
         counter!("started_total").increment(1);
+        // No-op increment to pre-populate the counter so the series is visible
+        // at the first `:8687/metrics` scrape even on pods that never reload.
+        counter!("reloaded_total").increment(0);
         gauge!("last_config_reload_success").set(1.0);
     }
 }
