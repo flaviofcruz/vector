@@ -105,6 +105,14 @@ impl InternalEvent for VectorConfigLoadError {
             stage = error_stage::PROCESSING,
             internal_log_rate_limit = false,
         );
+        info!(
+            message = "Failed to load config files, reload aborted.",
+            // VECTOR_SERVICE_EVENT
+            vector_event_type = 2,
+            // VECTOR_PROCESS_CONFIG_RELOAD_FAILED
+            service_event = 6,
+            internal_log_rate_limit = false,
+        );
         counter!(
             "component_errors_total",
             "error_code" => "config_load",
