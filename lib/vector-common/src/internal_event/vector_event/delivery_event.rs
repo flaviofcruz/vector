@@ -15,16 +15,30 @@ use std::sync::{
 // "Infered" typo — matches the value used elsewhere in the pipeline.
 const LUMBERJACK_TOPIC_INFERRED_SENTINEL: &str = "lumberjackTopicInfered";
 
-/// Extracts a Lumberjack topic from a source filename of the form
-/// `<prefix>.<TableNameCamelCase>[LaMigration].pb[.base64][.gz]`, returning
-/// the dash-cased table name (e.g. `"service-request-log"`). Returns `None`
-/// for filenames that do not match the convention.
+// Fallback topic used by the woodchuck VRL for kubernetes_logs events that
+// have neither an explicit source_context.topic nor a Lumberjack filename
+// match. Mirrors `event_logs.libsonnet:155`.
+const KUBERNETES_LOGS_FALLBACK_TOPIC: &str = "sawmill-service-log";
+
+/// Identifies which source emitted the event, used to align topic resolution
+/// with the woodchuck VRL's per-source fallback behavior.
+pub const SOURCE_TYPE_FILE: &str = "file";
+pub const SOURCE_TYPE_KUBERNETES_LOGS: &str = "kubernetes_logs";
+
+/// Extracts a Lumberjack topic from a source filename of either the active
+/// form (`<TableNameCamelCase>[LaMigration].pb[.base64][.gz]`) or the
+/// archived/rotated form (`<prefix>.<TableNameCamelCase>[LaMigration].pb[.base64][.gz]`),
+/// returning the dash-cased table name (e.g. `"service-request-log"`).
+/// Returns `None` for filenames that do not match either form.
 pub fn extract_topic_from_source_filename(path: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
+        // The CamelCase capture is allowed to start at the beginning of the
+        // string, after a `/` (directory separator), or after a `.` (timestamp
+        // / hostname separator) so both active and archived filenames match.
         // Lazy `+?` on the CamelCase capture lets the optional `LaMigration`
         // suffix match outside the capture group rather than being absorbed.
-        Regex::new(r"\.([A-Z][A-Za-z0-9]+?)(LaMigration)?\.pb(?:\.base64)?(?:\.gz)?$")
+        Regex::new(r"(?:^|[/.])([A-Z][A-Za-z0-9]+?)(LaMigration)?\.pb(?:\.base64)?(?:\.gz)?$")
             .expect("topic extraction regex must compile")
     });
     let captures = re.captures(path)?;
@@ -45,17 +59,27 @@ fn camel_to_dash_case(s: &str) -> String {
     out
 }
 
-/// Resolves the topic label for a source-read event:
+/// Resolves the topic label for a source-read event. Mirrors the per-source
+/// branching in `event_logs.libsonnet`'s `ConvertDeliveryInfoLogs`:
 /// 1. `source_context.topic` if it is a concrete value (not the sentinel).
 /// 2. Otherwise the topic inferred from the filename.
-/// 3. Otherwise the inference sentinel, so unresolved cases are filterable
-///    in downstream queries.
-fn resolve_received_topic(source_context: &HashMap<String, String>, path: &str) -> String {
+/// 3. Otherwise a source-specific fallback: `"sawmill-service-log"` for
+///    `kubernetes_logs` sources, the inference sentinel for everything else.
+fn resolve_received_topic(
+    source_context: &HashMap<String, String>,
+    path: &str,
+    source_type: &str,
+) -> String {
     let explicit = source_context.get("topic").map(String::as_str);
     match explicit {
         Some(t) if t != LUMBERJACK_TOPIC_INFERRED_SENTINEL => t.to_string(),
-        _ => extract_topic_from_source_filename(path)
-            .unwrap_or_else(|| LUMBERJACK_TOPIC_INFERRED_SENTINEL.to_string()),
+        _ => extract_topic_from_source_filename(path).unwrap_or_else(|| {
+            if source_type == SOURCE_TYPE_KUBERNETES_LOGS {
+                KUBERNETES_LOGS_FALLBACK_TOPIC.to_string()
+            } else {
+                LUMBERJACK_TOPIC_INFERRED_SENTINEL.to_string()
+            }
+        }),
     }
 }
 
@@ -104,6 +128,10 @@ pub struct DeliveryReadEvent {
     // Read event is changing spots in the file source to after multilne agg. This new spot may not be as stable / performative
     // So we want to have a mark that tracks whether it's coming from this new spot that pairs with an ENV gate
     pub emitted_after_multiline_agg: bool,
+    /// Source component that emitted this read event. Used by the metric to
+    /// pick the right topic fallback when the filename doesn't match a
+    /// Lumberjack convention. See `SOURCE_TYPE_FILE` / `SOURCE_TYPE_KUBERNETES_LOGS`.
+    pub source_type: &'static str,
 }
 
 impl DeliveryReadEvent {
@@ -138,10 +166,10 @@ impl InternalEvent for DeliveryReadEvent {
             );
 
             counter!(
-                "events_received_total",
+                "delivery_events_total",
                 "delivery_event_type" => "VECTOR_SOURCE_READ",
                 "time_parity" => current_hour_time_parity_ms(),
-                "topic" => resolve_received_topic(&source_context, &self.path),
+                "topic" => resolve_received_topic(&source_context, &self.path, self.source_type),
             )
             .increment(self.lines_read as u64);
         }
@@ -216,7 +244,7 @@ impl VectorSinkDeliveryEvent {
             );
 
             counter!(
-                "events_delivered_total",
+                "delivery_events_total",
                 "delivery_event_type" => delivery_event_type.to_string(),
                 "time_parity" => time_parity_from_value_map(&value.value_map),
                 "topic" => topic_from_value_map(&value.value_map),
@@ -288,14 +316,38 @@ mod topic_inference_tests {
     }
 
     #[test]
-    fn extract_topic_la_migration_variant() {
-        // The LaMigration suffix is stripped before dash-casing.
+    fn extract_topic_la_migration_archived() {
+        // Archived/rotated form: timestamp prefix, ends in .gz.
         assert_eq!(
             extract_topic_from_source_filename(
-                "/var/log/pods/sample/12345.ServiceRequestLogLaMigration.pb.base64"
+                "/var/log/pods/sample/2026-05-22-01.ServiceRequestLogLaMigration.pb.base64.gz"
             )
             .as_deref(),
             Some("service-request-log"),
+        );
+    }
+
+    #[test]
+    fn extract_topic_la_migration_active() {
+        // Active form: filename starts directly with the CamelCase, no prefix.
+        assert_eq!(
+            extract_topic_from_source_filename(
+                "/var/log/pods/sample/ServiceRequestLogLaMigration.pb.base64"
+            )
+            .as_deref(),
+            Some("service-request-log"),
+        );
+    }
+
+    #[test]
+    fn extract_topic_active_form_no_suffix() {
+        // Active form without LaMigration suffix.
+        assert_eq!(
+            extract_topic_from_source_filename(
+                "/var/log/pods/sample/ProductEventLog.pb.base64"
+            )
+            .as_deref(),
+            Some("product-event-log"),
         );
     }
 
@@ -331,7 +383,7 @@ mod topic_inference_tests {
         let mut ctx = HashMap::new();
         ctx.insert("topic".to_string(), "audit-log".to_string());
         assert_eq!(
-            resolve_received_topic(&ctx, "/some/file.json"),
+            resolve_received_topic(&ctx, "/some/file.json", SOURCE_TYPE_FILE),
             "audit-log"
         );
     }
@@ -341,18 +393,54 @@ mod topic_inference_tests {
         let mut ctx = HashMap::new();
         ctx.insert("topic".to_string(), "lumberjackTopicInfered".to_string());
         assert_eq!(
-            resolve_received_topic(&ctx, "/path/to/12345.ServiceRequestLog.pb.base64"),
+            resolve_received_topic(
+                &ctx,
+                "/path/to/12345.ServiceRequestLog.pb.base64",
+                SOURCE_TYPE_FILE,
+            ),
             "service-request-log"
         );
     }
 
     #[test]
-    fn resolve_received_topic_falls_back_to_sentinel_when_no_match() {
+    fn resolve_received_topic_falls_back_to_sentinel_for_file_source() {
         let mut ctx = HashMap::new();
         ctx.insert("topic".to_string(), "lumberjackTopicInfered".to_string());
         assert_eq!(
-            resolve_received_topic(&ctx, "/path/to/nothing-matching.log"),
+            resolve_received_topic(&ctx, "/path/to/nothing-matching.log", SOURCE_TYPE_FILE),
             "lumberjackTopicInfered"
+        );
+    }
+
+    #[test]
+    fn resolve_received_topic_falls_back_to_sawmill_for_kubernetes_logs() {
+        // kubernetes_logs source with non-Lumberjack filename and no useful
+        // source_context falls back to "sawmill-service-log" to match the
+        // woodchuck VRL's ConvertDeliveryInfoLogs branch for k8s logs.
+        let ctx = HashMap::new();
+        assert_eq!(
+            resolve_received_topic(
+                &ctx,
+                "/var/log/pods/some-pod/container/0.log",
+                SOURCE_TYPE_KUBERNETES_LOGS,
+            ),
+            "sawmill-service-log"
+        );
+    }
+
+    #[test]
+    fn resolve_received_topic_kubernetes_logs_still_prefers_filename_match() {
+        // A kubernetes_logs source reading a Lumberjack proto file still
+        // resolves via filename — the sawmill-service-log fallback only
+        // applies when no other resolution is available.
+        let ctx = HashMap::new();
+        assert_eq!(
+            resolve_received_topic(
+                &ctx,
+                "/var/log/pods/sample/12345.AuditLog.pb.base64",
+                SOURCE_TYPE_KUBERNETES_LOGS,
+            ),
+            "audit-log"
         );
     }
 
@@ -360,7 +448,7 @@ mod topic_inference_tests {
     fn resolve_received_topic_infers_when_context_missing() {
         let ctx = HashMap::new();
         assert_eq!(
-            resolve_received_topic(&ctx, "/path/to/12345.AuditLog.pb.base64.gz"),
+            resolve_received_topic(&ctx, "/path/to/12345.AuditLog.pb.base64.gz", SOURCE_TYPE_FILE),
             "audit-log"
         );
     }

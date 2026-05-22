@@ -625,6 +625,7 @@ pub fn file_source(
         file_to_pod_map: None,
         drain_on_shutdown: false,
         archive_extensions: config.archive_extensions.clone(),
+        source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
     };
 
     let event_metadata = EventMetadata {
@@ -926,6 +927,7 @@ fn create_event(
         lines_read: 1,
         source_context: meta.source_context.clone(),
         emitted_after_multiline_agg: true,
+        source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
     });
 
     emit!(FileEventsReceived {

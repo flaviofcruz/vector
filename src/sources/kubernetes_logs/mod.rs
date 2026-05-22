@@ -1225,6 +1225,7 @@ impl Source {
             file_to_pod_map: Some(file_to_pod_map_ref),
             drain_on_shutdown,
             archive_extensions,
+            source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
@@ -1460,6 +1461,7 @@ fn create_event(
         lines_read: 1,
         source_context: source_context.clone(),
         emitted_after_multiline_agg: true,
+        source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
     });
 
     log.into()

@@ -73,6 +73,11 @@ where
     /// These files are fingerprinted once and the mapping is cached, and they
     /// are marked as done when EOF is reached so they are never re-read.
     pub archive_extensions: Vec<String>,
+    /// Source type passed through to emitted `DeliveryReadEvent`s. Used by
+    /// the metric in `delivery_event.rs` to pick the correct topic fallback
+    /// when a filename doesn't match the Lumberjack convention
+    /// (e.g. `kubernetes_logs` falls back to `sawmill-service-log`).
+    pub source_type: &'static str,
 }
 
 /// `FileServer` as Source
@@ -434,6 +439,7 @@ where
                         lines_read,
                         source_context: self.source_context.clone(),
                         emitted_after_multiline_agg: false,
+                        source_type: self.source_type,
                     });
                 }
                 if watcher.reached_eof() && self.is_archive(&watcher.path) {
@@ -1067,6 +1073,7 @@ mod tests {
             file_to_pod_map: None,
             drain_on_shutdown,
             archive_extensions: vec!["gz".to_string()],
+            source_type: "file",
         }
     }
 
