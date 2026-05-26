@@ -25,6 +25,19 @@ const KUBERNETES_LOGS_FALLBACK_TOPIC: &str = "sawmill-service-log";
 pub const SOURCE_TYPE_FILE: &str = "file";
 pub const SOURCE_TYPE_KUBERNETES_LOGS: &str = "kubernetes_logs";
 
+/// Canonical `deliveryMethod` values written by the woodchuck VRL into
+/// `logMetadata.deliveryMethod`. Used both on the read side (where the VRL
+/// hasn't run yet, so we infer the value from `source_type`) and to keep the
+/// metric label aligned with what downstream consumers already see in VEL.
+/// Mirrors `woodchuck/configuration/components/transforms/`:
+/// `*_log_daemon_wrapper.libsonnet`, `diskless.libsonnet`,
+/// `application_heartbeats.libsonnet`, `file_based_raw_proto_streaming.libsonnet`.
+pub const DELIVERY_METHOD_FILE: &str = "VECTOR_WOODCHUCK_V2_FILE";
+/// Read-side label for kubernetes_logs source events. The woodchuck VRL does
+/// not currently stamp this value on sawmill events, so the corresponding
+/// sink-side counter falls through to `"unknown"` until that VRL is updated.
+pub const DELIVERY_METHOD_KUBERNETES_LOGS: &str = "VECTOR_WOODCHUCK_V2_KUBERNETES_LOGS";
+
 /// Extracts a Lumberjack topic from a source filename of either the active
 /// form (`<TableNameCamelCase>[LaMigration].pb[.base64][.gz]`) or the
 /// archived/rotated form (`<prefix>.<TableNameCamelCase>[LaMigration].pb[.base64][.gz]`),
@@ -109,6 +122,30 @@ fn topic_from_value_map(value_map: &HashMap<String, String>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Reads `deliveryMethod` from `value_map`, falling back to `"unknown"`.
+/// Mirrors `topic_from_value_map` / `time_parity_from_value_map`. Splitting
+/// the completeness ratio by this label distinguishes file-source deliveries
+/// (`VECTOR_WOODCHUCK_V2_FILE`) from diskless gRPC deliveries
+/// (`VECTOR_WOODCHUCK_V2_DISKLESS`), which is necessary because diskless
+/// events have no corresponding read-side counter.
+fn delivery_method_from_value_map(value_map: &HashMap<String, String>) -> String {
+    value_map
+        .get("deliveryMethod")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Maps a source's `source_type` to the canonical `deliveryMethod` value the
+/// VRL pipeline assigns to events emitted by that source. Used on the read
+/// side, where `logMetadata.deliveryMethod` isn't populated yet.
+fn delivery_method_for_source_type(source_type: &str) -> &'static str {
+    match source_type {
+        SOURCE_TYPE_FILE => DELIVERY_METHOD_FILE,
+        SOURCE_TYPE_KUBERNETES_LOGS => DELIVERY_METHOD_KUBERNETES_LOGS,
+        _ => "unknown",
+    }
+}
+
 // Env flag to gate when we should be emitting the read event (want to support both while we check the performance of the new spot)
 pub static EMIT_READ_EVENT_AFTER_MULTILINE_AGG: OnceLock<bool> = OnceLock::new();
 pub fn emit_read_event_after_multiline_agg() -> bool {
@@ -170,6 +207,7 @@ impl InternalEvent for DeliveryReadEvent {
                 "delivery_event_type" => "VECTOR_SOURCE_READ",
                 "time_parity" => current_hour_time_parity_ms(),
                 "topic" => resolve_received_topic(&source_context, &self.path, self.source_type),
+                "delivery_method" => delivery_method_for_source_type(self.source_type),
             )
             .increment(self.lines_read as u64);
         }
@@ -248,6 +286,7 @@ impl VectorSinkDeliveryEvent {
                 "delivery_event_type" => delivery_event_type.to_string(),
                 "time_parity" => time_parity_from_value_map(&value.value_map),
                 "topic" => topic_from_value_map(&value.value_map),
+                "delivery_method" => delivery_method_from_value_map(&value.value_map),
             )
             .increment(value.count as u64);
         }
@@ -451,5 +490,39 @@ mod topic_inference_tests {
             resolve_received_topic(&ctx, "/path/to/12345.AuditLog.pb.base64.gz", SOURCE_TYPE_FILE),
             "audit-log"
         );
+    }
+
+    #[test]
+    fn delivery_method_for_source_type_known_values() {
+        assert_eq!(
+            delivery_method_for_source_type(SOURCE_TYPE_FILE),
+            DELIVERY_METHOD_FILE
+        );
+        assert_eq!(
+            delivery_method_for_source_type(SOURCE_TYPE_KUBERNETES_LOGS),
+            DELIVERY_METHOD_KUBERNETES_LOGS
+        );
+    }
+
+    #[test]
+    fn delivery_method_for_source_type_unknown_falls_back() {
+        assert_eq!(delivery_method_for_source_type("vector"), "unknown");
+        assert_eq!(delivery_method_for_source_type(""), "unknown");
+    }
+
+    #[test]
+    fn delivery_method_from_value_map_reads_existing_key() {
+        let mut value_map = HashMap::new();
+        value_map.insert("deliveryMethod".to_string(), "VECTOR_WOODCHUCK_V2_DISKLESS".to_string());
+        assert_eq!(
+            delivery_method_from_value_map(&value_map),
+            "VECTOR_WOODCHUCK_V2_DISKLESS"
+        );
+    }
+
+    #[test]
+    fn delivery_method_from_value_map_falls_back_when_missing() {
+        let value_map = HashMap::new();
+        assert_eq!(delivery_method_from_value_map(&value_map), "unknown");
     }
 }
