@@ -111,11 +111,29 @@ pub struct PrometheusK8sScrapeConfig {
 
     /// The pod annotation key used for annotation-based endpoint discovery.
     ///
-    /// Pods carrying this annotation will be scraped on the port number given as
-    /// the annotation value. Set to `null` to disable annotation-based discovery.
+    /// Pods carrying this annotation will be scraped on the port number(s) given as
+    /// the annotation value. The value may be a single port (e.g. `"9091"`) or a
+    /// comma-separated list (e.g. `"9091,9092"`), in which case one endpoint is
+    /// produced per unique valid port; whitespace around each entry is ignored,
+    /// duplicate ports are collapsed (first-seen wins), and unparseable entries
+    /// are silently skipped. Set to `null` to disable annotation-based discovery.
     #[serde(default = "default_annotation_name")]
     #[configurable(metadata(docs::examples = "system_metrics_enabled"))]
     annotation_name: Option<String>,
+
+    /// The maximum number of scrape endpoints produced per pod.
+    ///
+    /// Caps how many endpoints a single pod can contribute via annotation-based
+    /// discovery (the named-port path already produces at most one endpoint per
+    /// pod, so the effective per-pod ceiling is `max_endpoints_per_pod + 1`
+    /// when both paths fire on distinct ports). Successfully parsed annotation
+    /// ports beyond this limit are silently dropped (a warning is logged at
+    /// most once per minute per scrape). This guards against accidental or
+    /// malicious annotations that would otherwise generate a large number of
+    /// scrape targets.
+    #[serde(default = "default_max_endpoints_per_pod")]
+    #[configurable(metadata(docs::advanced))]
+    max_endpoints_per_pod: usize,
 
     /// Controls whether to add pod metadata (pod_name, pod_namespace, endpoint) to scraped metrics.
     ///
@@ -147,6 +165,7 @@ impl Default for PrometheusK8sScrapeConfig {
             honor_labels: false,
             named_port: default_named_port(),
             annotation_name: default_annotation_name(),
+            max_endpoints_per_pod: default_max_endpoints_per_pod(),
             emit_pod_metadata: true,
             tls: None,
             auth: None,
@@ -205,6 +224,7 @@ impl SourceConfig for PrometheusK8sScrapeConfig {
                 config.honor_labels,
                 config.named_port,
                 config.annotation_name,
+                config.max_endpoints_per_pod,
                 config.emit_pod_metadata,
                 config.auth,
                 tls,
@@ -240,6 +260,7 @@ async fn run_source(
     honor_labels: bool,
     named_port: Option<String>,
     annotation_name: Option<String>,
+    max_endpoints_per_pod: usize,
     emit_pod_metadata: bool,
     auth: Option<Auth>,
     tls: TlsSettings,
@@ -282,7 +303,12 @@ async fn run_source(
     ));
 
     // Create endpoint provider
-    let endpoint_provider = K8sEndpointProvider::new(pod_state, named_port, annotation_name);
+    let endpoint_provider = K8sEndpointProvider::new(
+        pod_state,
+        named_port,
+        annotation_name,
+        max_endpoints_per_pod,
+    );
 
     // Run the scraping loop
     let scrape_result = scrape_loop(
@@ -579,6 +605,10 @@ fn default_named_port() -> Option<String> {
 
 fn default_annotation_name() -> Option<String> {
     Some("system_metrics_enabled".to_string())
+}
+
+fn default_max_endpoints_per_pod() -> usize {
+    2
 }
 
 mod http_client {
