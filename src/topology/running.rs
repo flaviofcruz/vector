@@ -361,6 +361,12 @@ impl RunningTopology {
                 // flush) would block wave 2 indefinitely. On timeout, proceed to wave 2
                 // anyway: the straggling components will be cancelled naturally when their
                 // upstream channels close as wave 2 shuts down deferred sources.
+                //
+                // `gracefully_closed` records whether wave 1 drained inside the deadline so
+                // the COMPONENTS_CLOSED VEL below can carry it. The defensive no-deadline
+                // arm is also considered graceful because the unbounded join can't time
+                // out; the only non-graceful path is the timeout arm here.
+                let mut gracefully_closed = false;
                 if let Some(data_deadline) = data_source_deadline {
                     let mut wave1_straggler_check_handles = wave1_straggler_check_handles;
                     match tokio::time::timeout_at(
@@ -369,7 +375,9 @@ impl RunningTopology {
                     )
                     .await
                     {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            gracefully_closed = true;
+                        }
                         Err(_) => {
                             // Compute the straggler list using the same peek-based filter
                             // as the reporter, restricted to exclusively-non-deferred keys
@@ -395,6 +403,7 @@ impl RunningTopology {
                     // Defensive: use_two_wave implies data_source_deadline.is_some(), but
                     // fall back to the original unbounded wait if that invariant changes.
                     futures::future::join_all(wave1_wait_handles).await;
+                    gracefully_closed = true;
                 }
 
                 // Emit a VEL event indicating all data components have been closed.
@@ -406,6 +415,7 @@ impl RunningTopology {
                     vector_event_type = 2,
                     // VECTOR_PROCESS_COMPONENTS_CLOSED
                     service_event = 5,
+                    gracefully_closed = gracefully_closed,
                     internal_log_rate_limit = false,
                 );
 
@@ -461,12 +471,15 @@ impl RunningTopology {
                 // Emit a VEL event indicating data components have been closed.
                 // Emitted before deferred source shutdown so that internal_logs
                 // (if present as a deferred source) can still deliver the event.
+                // `gracefully_closed` is always false on this branch: two-wave shutdown
+                // is not active, so there is no wave 1 deadline to meet.
                 info!(
                     message = "All Vector data components have been closed.",
                     // VECTOR_SERVICE_EVENT
                     vector_event_type = 2,
                     // VECTOR_PROCESS_COMPONENTS_CLOSED
                     service_event = 5,
+                    gracefully_closed = false,
                     internal_log_rate_limit = false,
                 );
 
