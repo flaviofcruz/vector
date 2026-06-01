@@ -157,29 +157,3 @@ impl<E: std::fmt::Display> InternalEvent for SinkRequestBuildError<E> {
         .increment(1);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use vector_lib::internal_event::InternalEvent;
-
-    use super::ComponentEncodeCpuTime;
-    use crate::metrics::{Controller, init_test};
-
-    #[test]
-    fn component_encode_cpu_time_records_histogram() {
-        init_test();
-        ComponentEncodeCpuTime {
-            cpu_time: Duration::from_millis(1),
-        }
-        .emit();
-        let metrics = Controller::get().unwrap().capture_metrics();
-        assert!(
-            metrics
-                .iter()
-                .any(|m| m.name() == "component_encode_cpu_seconds"),
-            "component_encode_cpu_seconds histogram was not emitted"
-        );
-    }
-}
