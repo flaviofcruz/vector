@@ -33,10 +33,6 @@ pub const SOURCE_TYPE_KUBERNETES_LOGS: &str = "kubernetes_logs";
 /// `*_log_daemon_wrapper.libsonnet`, `diskless.libsonnet`,
 /// `application_heartbeats.libsonnet`, `file_based_raw_proto_streaming.libsonnet`.
 pub const DELIVERY_METHOD_FILE: &str = "VECTOR_WOODCHUCK_V2_FILE";
-/// Read-side label for kubernetes_logs source events. The woodchuck VRL does
-/// not currently stamp this value on sawmill events, so the corresponding
-/// sink-side counter falls through to `"unknown"` until that VRL is updated.
-pub const DELIVERY_METHOD_KUBERNETES_LOGS: &str = "VECTOR_WOODCHUCK_V2_KUBERNETES_LOGS";
 
 /// Extracts a Lumberjack topic from a source filename of either the active
 /// form (`<TableNameCamelCase>[LaMigration].pb[.base64][.gz]`) or the
@@ -135,13 +131,18 @@ fn delivery_method_from_value_map(value_map: &HashMap<String, String>) -> String
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Maps a source's `source_type` to the canonical `deliveryMethod` value the
-/// VRL pipeline assigns to events emitted by that source. Used on the read
-/// side, where `logMetadata.deliveryMethod` isn't populated yet.
+/// Maps a read source's `source_type` to the `deliveryMethod` value the VRL
+/// pipeline stamps downstream. `deliveryMethod` denotes *how the content was
+/// read* — `VECTOR_WOODCHUCK_V2_FILE` for content read from files,
+/// `VECTOR_WOODCHUCK_V2_DISKLESS` for diskless gRPC — it is not a topic-type
+/// taxonomy. Both the `file` source and the Databricks fork's `kubernetes_logs`
+/// source read from files (the latter reads Lumberjack proto files, and pod
+/// stdout, from container directories), so both map to `DELIVERY_METHOD_FILE`.
+/// The diskless gRPC source emits no read event, so reads are always
+/// file-based; the `_` arm is a defensive fallback for any unexpected source.
 fn delivery_method_for_source_type(source_type: &str) -> &'static str {
     match source_type {
-        SOURCE_TYPE_FILE => DELIVERY_METHOD_FILE,
-        SOURCE_TYPE_KUBERNETES_LOGS => DELIVERY_METHOD_KUBERNETES_LOGS,
+        SOURCE_TYPE_FILE | SOURCE_TYPE_KUBERNETES_LOGS => DELIVERY_METHOD_FILE,
         _ => "unknown",
     }
 }
@@ -206,8 +207,8 @@ impl InternalEvent for DeliveryReadEvent {
                 "delivery_events_total",
                 "delivery_event_type" => "VECTOR_SOURCE_READ",
                 "time_parity" => current_hour_time_parity_ms(),
-                "topic" => resolve_received_topic(&source_context, &self.path, self.source_type),
                 "delivery_method" => delivery_method_for_source_type(self.source_type),
+                "topic" => resolve_received_topic(&source_context, &self.path, self.source_type),
             )
             .increment(self.lines_read as u64);
         }
@@ -493,14 +494,16 @@ mod topic_inference_tests {
     }
 
     #[test]
-    fn delivery_method_for_source_type_known_values() {
+    fn delivery_method_for_source_type_file_sources_are_file() {
         assert_eq!(
             delivery_method_for_source_type(SOURCE_TYPE_FILE),
             DELIVERY_METHOD_FILE
         );
+        // The Databricks fork's kubernetes_logs source reads files, so it is
+        // file-based too — not a distinct delivery method.
         assert_eq!(
             delivery_method_for_source_type(SOURCE_TYPE_KUBERNETES_LOGS),
-            DELIVERY_METHOD_KUBERNETES_LOGS
+            DELIVERY_METHOD_FILE
         );
     }
 
