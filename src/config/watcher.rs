@@ -93,6 +93,21 @@ pub fn spawn_thread<'a>(
     info!("Watching configuration files.");
 
     thread::spawn(move || {
+        // Send an initial ReloadFromDisk signal before entering the watch loop.
+        // This handles the race condition where config files (e.g. vector.json
+        // written by log-operator) were already present before the watcher started,
+        // so no filesystem event would be generated for them.
+        info!("Triggering initial config reload to pick up any pre-existing config changes.");
+        _ = signal_tx
+            .send(crate::signal::SignalTo::ReloadFromDisk)
+            .map_err(|error| {
+                error!(
+                    message = "Unable to perform initial configuration reload.",
+                    cause = %error,
+                    internal_log_rate_limit = false,
+                )
+            });
+
         loop {
             if let Some((mut watcher, receiver)) = watcher.take() {
                 while let Ok(Ok(event)) = receiver.recv() {
@@ -249,6 +264,26 @@ mod tests {
         test_util::{temp_dir, temp_file, trace_init},
     };
 
+    /// Drain the initial ReloadFromDisk signal that the watcher sends on startup.
+    /// This is expected to be a no-op since no config files have changed since
+    /// vector started — the topology reload logic (outside the watcher) reads
+    /// configs from disk and diffs against the running config, so an unchanged
+    /// config results in no action.
+    async fn drain_initial_reload(receiver: &mut SignalRx, timeout: Duration) {
+        match tokio::time::timeout(timeout, receiver.recv()).await {
+            Ok(Ok(signal)) => {
+                assert_eq!(
+                    signal,
+                    crate::signal::SignalTo::ReloadFromDisk,
+                    "Expected initial ReloadFromDisk signal from watcher startup, got {:?}",
+                    signal
+                );
+            }
+            Ok(Err(e)) => panic!("Failed to receive initial reload signal: {}", e),
+            Err(_) => panic!("Timed out waiting for initial reload signal"),
+        }
+    }
+
     async fn test_signal(
         files: &mut [std::fs::File],
         expected_signal: crate::signal::SignalTo,
@@ -296,6 +331,9 @@ mod tests {
         );
 
         let (signal_tx, signal_rx) = broadcast::channel(128);
+        let mut signal_rx = signal_rx.resubscribe();
+        let mut signal_rx2 = signal_rx.resubscribe();
+
         spawn_thread(
             watcher_conf,
             signal_tx,
@@ -305,8 +343,8 @@ mod tests {
         )
         .unwrap();
 
-        let signal_rx = signal_rx.resubscribe();
-        let signal_rx2 = signal_rx.resubscribe();
+        drain_initial_reload(&mut signal_rx, delay * 5).await;
+        drain_initial_reload(&mut signal_rx2, delay * 5).await;
 
         if !test_signal(
             &mut component_files[0..1],
@@ -364,6 +402,8 @@ mod tests {
         );
 
         let (signal_tx, signal_rx) = broadcast::channel(128);
+        let mut signal_rx = signal_rx.resubscribe();
+
         spawn_thread(
             watcher_conf,
             signal_tx,
@@ -373,7 +413,7 @@ mod tests {
         )
         .unwrap();
 
-        let signal_rx = signal_rx.resubscribe();
+        drain_initial_reload(&mut signal_rx, delay * 5).await;
 
         if !test_signal(
             &mut component_files,
@@ -413,6 +453,8 @@ mod tests {
         );
 
         let (signal_tx, signal_rx) = broadcast::channel(128);
+        let mut signal_rx = signal_rx.resubscribe();
+
         spawn_thread(
             watcher_conf,
             signal_tx,
@@ -422,7 +464,7 @@ mod tests {
         )
         .unwrap();
 
-        let signal_rx = signal_rx.resubscribe();
+        drain_initial_reload(&mut signal_rx, delay * 5).await;
 
         if !test_signal(
             &mut component_files,
@@ -448,8 +490,10 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let file = File::create(&file_path).unwrap();
 
-        let (signal_tx, signal_rx) = broadcast::channel(128);
+        let (signal_tx, mut signal_rx) = broadcast::channel(128);
         spawn_thread(watcher_conf, signal_tx, &[dir], vec![], delay).unwrap();
+
+        drain_initial_reload(&mut signal_rx, delay * 5).await;
 
         if !test_signal(
             &mut vec![file],
@@ -472,8 +516,10 @@ mod tests {
         let file = File::create(&file_path).unwrap();
         let watcher_conf = WatcherConfig::RecommendedWatcher;
 
-        let (signal_tx, signal_rx) = broadcast::channel(128);
+        let (signal_tx, mut signal_rx) = broadcast::channel(128);
         spawn_thread(watcher_conf, signal_tx, &[file_path], vec![], delay).unwrap();
+
+        drain_initial_reload(&mut signal_rx, delay * 5).await;
 
         if !test_signal(
             &mut vec![file],
@@ -500,8 +546,10 @@ mod tests {
 
         let watcher_conf = WatcherConfig::RecommendedWatcher;
 
-        let (signal_tx, signal_rx) = broadcast::channel(128);
+        let (signal_tx, mut signal_rx) = broadcast::channel(128);
         spawn_thread(watcher_conf, signal_tx, &[sym_file], vec![], delay).unwrap();
+
+        drain_initial_reload(&mut signal_rx, delay * 5).await;
 
         if !test_signal(
             &mut vec![file],
@@ -528,8 +576,10 @@ mod tests {
         std::fs::create_dir_all(&sub_dir).unwrap();
         let file = File::create(&file_path).unwrap();
 
-        let (signal_tx, signal_rx) = broadcast::channel(128);
+        let (signal_tx, mut signal_rx) = broadcast::channel(128);
         spawn_thread(watcher_conf, signal_tx, &[sub_dir], vec![], delay).unwrap();
+
+        drain_initial_reload(&mut signal_rx, delay * 5).await;
 
         if !test_signal(
             &mut vec![file],

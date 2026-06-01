@@ -25,11 +25,21 @@
 # directory and this [patch.crates-io] block — the SDK will then resolve
 # hyper-http-proxy cleanly from crates.io.
 # ---------------------------------------------------------------------------
-# Rust 1.70+ defaults to the sparse registry (index.crates.io), but the
-# Docker build environment cannot resolve that hostname. Use the git-based
-# registry instead, which goes through github.com.
-[registries.crates-io]
-protocol = "git"
+[net]
+git-fetch-with-cli = true
+retry = 5
+
+[http]
+timeout = 120
+
+[source.crates-io]
+replace-with = "databricks-proxy"
+
+[source.databricks-proxy]
+registry = "sparse+https://crates-proxy.cloud.databricks.com/"
+
+[registries]
+databricks-proxy = { index = "sparse+https://crates-proxy.cloud.databricks.com/" }
 
 [patch.crates-io]
 hyper-http-proxy = { path = "vendor/hyper-http-proxy-1.1.0" }
