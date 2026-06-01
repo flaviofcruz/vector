@@ -1455,6 +1455,11 @@ fn create_event(
         }
     };
 
+    // Discovery-time hour bucket, shared between the read counter and the event
+    // (stamped below) so the read/staged/delivered legs bucket on the same value.
+    let time_parity =
+        vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value();
+
     emit!(DeliveryReadEvent {
         path: file.to_string(),
         bytes_read: log.estimated_json_encoded_size_of().get(),
@@ -1462,7 +1467,12 @@ fn create_event(
         source_context: source_context.clone(),
         emitted_after_multiline_agg: true,
         source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
+        time_parity,
     });
+
+    // Carry the discovery-time bucket downstream for the woodchuck VRL wrappers to
+    // copy into logMetadata.timeParity (see file.rs for the rationale).
+    log.insert("time_parity", time_parity);
 
     log.into()
 }

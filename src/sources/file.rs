@@ -921,6 +921,13 @@ fn create_event(
         }
     }
 
+    // Discovery-time hour bucket, shared between the read counter (below) and the
+    // event itself (stamped before return) so the read/staged/delivered legs all
+    // bucket on the same value instead of each recomputing a wall-clock hour at a
+    // different pipeline stage.
+    let time_parity =
+        vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value();
+
     emit!(DeliveryReadEvent {
         path: file.to_string(),
         bytes_read: event.estimated_json_encoded_size_of().get(),
@@ -928,6 +935,7 @@ fn create_event(
         source_context: meta.source_context.clone(),
         emitted_after_multiline_agg: true,
         source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
+        time_parity,
     });
 
     emit!(FileEventsReceived {
@@ -936,6 +944,12 @@ fn create_event(
         byte_size: event.estimated_json_encoded_size_of(),
         include_file_metric_tag,
     });
+
+    // Carry the discovery-time bucket downstream; the woodchuck VRL wrappers copy
+    // `.time_parity` into `logMetadata.timeParity` instead of recomputing it.
+    // Stamped after the byte-size measurements above so it does not inflate the
+    // reported read byte count.
+    event.insert("time_parity", time_parity);
 
     event
 }

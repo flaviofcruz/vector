@@ -92,14 +92,24 @@ fn resolve_received_topic(
     }
 }
 
-/// Hour-rounded Unix-milliseconds bucket for the current time, as a string.
-/// The format (ms since epoch, rounded down to the hour) matches the
-/// `timeParity` value carried by events through the rest of the pipeline,
-/// so labels emitted from here are directly comparable to that field.
-fn current_hour_time_parity_ms() -> String {
+/// Hour-rounded Unix-milliseconds bucket for the current time, as an `i64`.
+/// This is the discovery-time `timeParity`: it is stamped onto the event at
+/// read time (see `file.rs` / `kubernetes_logs/mod.rs`) and carried through the
+/// rest of the pipeline, so the read/staged/delivered legs all bucket on the
+/// same instant rather than each recomputing a wall-clock hour at a different
+/// pipeline stage. Matches the spec for `time_period_parity` ("the unix time
+/// the log was discovered by logging-agent, truncated to the hour, consistent
+/// across all stages").
+pub fn current_hour_time_parity_ms_value() -> i64 {
     const HOUR_MS: i64 = 60 * 60 * 1000;
     let now_ms = Utc::now().timestamp_millis();
-    (now_ms - (now_ms % HOUR_MS)).to_string()
+    now_ms - (now_ms % HOUR_MS)
+}
+
+/// String form of [`current_hour_time_parity_ms_value`], for use as a metric label
+/// and as the fallback when an event carries no `timeParity`.
+fn current_hour_time_parity_ms() -> String {
+    current_hour_time_parity_ms_value().to_string()
 }
 
 /// Reads `timeParity` from `value_map`, falling back to the current hour.
@@ -170,6 +180,11 @@ pub struct DeliveryReadEvent {
     /// pick the right topic fallback when the filename doesn't match a
     /// Lumberjack convention. See `SOURCE_TYPE_FILE` / `SOURCE_TYPE_KUBERNETES_LOGS`.
     pub source_type: &'static str,
+    /// Discovery-time hour bucket (hour-floored Unix ms), computed once at the
+    /// source via `current_hour_time_parity_ms_value()`. The same value is
+    /// stamped onto the event so this read counter and the downstream
+    /// staged/delivered legs bucket on the identical `timeParity`.
+    pub time_parity: i64,
 }
 
 impl DeliveryReadEvent {
@@ -206,7 +221,7 @@ impl InternalEvent for DeliveryReadEvent {
             counter!(
                 "delivery_events_total",
                 "delivery_event_type" => "VECTOR_SOURCE_READ",
-                "time_parity" => current_hour_time_parity_ms(),
+                "time_parity" => self.time_parity.to_string(),
                 "delivery_method" => delivery_method_for_source_type(self.source_type),
                 "topic" => resolve_received_topic(&source_context, &self.path, self.source_type),
             )

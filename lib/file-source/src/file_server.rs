@@ -440,6 +440,9 @@ where
                         source_context: self.source_context.clone(),
                         emitted_after_multiline_agg: false,
                         source_type: self.source_type,
+                        // Pre-multiline path emits only the read counter (no event to
+                        // stamp here). Gated off by default (EMIT_READ_EVENT_AFTER_MULTILINE_AGG).
+                        time_parity: vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value(),
                     });
                 }
                 if watcher.reached_eof() && self.is_archive(&watcher.path) {
