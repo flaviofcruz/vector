@@ -15,7 +15,7 @@ use pin_project::pin_project;
 use tower::Service;
 use tracing::Span;
 use vector_lib::{
-    ByteSizeOf,
+    ByteSizeOf, emit,
     event::{Finalizable, Metric},
     partition::Partitioner,
     stream::{
@@ -27,6 +27,28 @@ use vector_lib::{
 use super::{
     IncrementalRequestBuilder, Normalizer, RequestBuilder, buffer::metrics::MetricNormalize,
 };
+use crate::internal_events::ComponentEncodeCpuTime;
+
+// Calling thread's consumed CPU time; `None` if unavailable on this platform.
+#[cfg(target_os = "linux")]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` only writes `ts`; the clock id is valid on Linux.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if rc == 0 {
+        Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
+}
 
 impl<T: ?Sized> SinkBuilderExt for T where T: Stream {}
 
@@ -131,8 +153,14 @@ pub trait SinkBuilderExt: Stream {
                 // Split the input into metadata and events.
                 let (metadata, request_metadata_builder, events) = builder.split_input(input);
 
-                // Encode the events.
+                // Encode is synchronous, so the thread CPU delta is this component's encode cost.
+                let cpu_before = thread_cpu_time();
                 let payload = builder.encode_events(events)?;
+                if let Some(cpu_time) = cpu_before
+                    .and_then(|before| thread_cpu_time().map(|after| after.saturating_sub(before)))
+                {
+                    emit!(ComponentEncodeCpuTime { cpu_time });
+                }
 
                 // Note: it would be nice for the RequestMetadataBuilder to build be created from the
                 // events here, and not need to be required by split_input(). But this then requires

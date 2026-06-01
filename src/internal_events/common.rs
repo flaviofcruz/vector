@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use metrics::{counter, histogram};
 use vector_lib::NamedInternalEvent;
@@ -119,6 +119,17 @@ impl InternalEvent for CollectionCompleted {
         debug!(message = "Collection completed.");
         counter!("collect_completed_total").increment(1);
         histogram!("collect_duration_seconds").record(self.end - self.start);
+    }
+}
+
+#[derive(Debug, NamedInternalEvent)]
+pub struct ComponentEncodeCpuTime {
+    pub cpu_time: Duration,
+}
+
+impl InternalEvent for ComponentEncodeCpuTime {
+    fn emit(self) {
+        histogram!("component_encode_cpu_seconds").record(self.cpu_time);
     }
 }
 
