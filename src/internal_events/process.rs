@@ -38,6 +38,14 @@ impl InternalEvent for VectorReloaded<'_> {
             path = ?self.config_paths,
             internal_log_rate_limit = false,
         );
+        info!(
+            message = "Vector has reloaded.",
+            // VECTOR_SERVICE_EVENT
+            vector_event_type = 2,
+            // VECTOR_CONFIG_RELOAD_SUCCESS
+            service_event = 6,
+            internal_log_rate_limit = false,
+        );
         counter!("reloaded_total").increment(1);
         gauge!("last_config_reload_success").set(1.0);
     }
@@ -84,6 +92,14 @@ impl InternalEvent for VectorReloadError {
             stage = error_stage::PROCESSING,
             internal_log_rate_limit = false,
         );
+        info!(
+            message = "Reload was not successful.",
+            // VECTOR_SERVICE_EVENT
+            vector_event_type = 2,
+            // VECTOR_CONFIG_RELOAD_FAILURE
+            service_event = 7,
+            internal_log_rate_limit = false,
+        );
         counter!(
             "component_errors_total",
             "error_code" => "reload",
@@ -112,8 +128,8 @@ impl InternalEvent for VectorConfigLoadError {
             message = "Failed to load config files, reload aborted.",
             // VECTOR_SERVICE_EVENT
             vector_event_type = 2,
-            // VECTOR_PROCESS_CONFIG_RELOAD_FAILED
-            service_event = 6,
+            // VECTOR_CONFIG_RELOAD_FAILURE (was erroneously 6 = SUCCESS)
+            service_event = 7,
             internal_log_rate_limit = false,
         );
         counter!(
