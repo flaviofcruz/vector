@@ -41,6 +41,39 @@ use crate::{
 
 pub type ShutdownErrorReceiver = mpsc::UnboundedReceiver<ShutdownError>;
 
+/// Role a component plays in the topology, used to bucket still-running components in the
+/// shutdown logs. `Config` exposes sources/transforms/sinks separately rather than a single
+/// key->role lookup, so we precompute this map once before the reporting closures take over.
+#[derive(Clone, Copy)]
+enum ComponentRole {
+    Source,
+    Transform,
+    Sink,
+}
+
+/// Partitions still-running component keys by role so shutdown logs can report sources,
+/// transforms, and sinks separately instead of as one undifferentiated list. Each returned
+/// string is the matching keys, sorted and comma-joined.
+fn partition_remaining_by_role<'a>(
+    keys: impl Iterator<Item = &'a ComponentKey>,
+    roles: &HashMap<ComponentKey, ComponentRole>,
+) -> (String, String, String) {
+    let (mut sources, mut transforms, mut sinks) = (Vec::new(), Vec::new(), Vec::new());
+    for key in keys {
+        match roles.get(key) {
+            Some(ComponentRole::Source) => sources.push(key),
+            Some(ComponentRole::Transform) => transforms.push(key),
+            Some(ComponentRole::Sink) => sinks.push(key),
+            None => {}
+        }
+    }
+    (
+        sources.into_iter().sorted().join(", "),
+        transforms.into_iter().sorted().join(", "),
+        sinks.into_iter().sorted().join(", "),
+    )
+}
+
 #[derive(Debug, Snafu)]
 pub enum ReloadError {
     #[snafu(display("global options changed: {}", changed_fields.join(", ")))]
@@ -217,11 +250,33 @@ impl RunningTopology {
             wait_handles.push(metrics_task.map(map_closure).shared());
         }
 
+        // Classify component keys by role up front so the shutdown logs below can report
+        // still-running sources, transforms, and sinks separately. `self.config` is borrowed
+        // here before the reporting closures take ownership of the handle maps. Wrapped in an
+        // `Arc` so each closure shares one copy via a cheap pointer clone.
+        let component_roles: Arc<HashMap<ComponentKey, ComponentRole>> = Arc::new(
+            self.config
+                .sources()
+                .map(|(key, _)| (key.clone(), ComponentRole::Source))
+                .chain(
+                    self.config
+                        .transforms()
+                        .map(|(key, _)| (key.clone(), ComponentRole::Transform)),
+                )
+                .chain(
+                    self.config
+                        .sinks()
+                        .map(|(key, _)| (key.clone(), ComponentRole::Sink)),
+                )
+                .collect(),
+        );
+
         let timeout = if let Some(deadline) = deadline {
             // If we reach the deadline, this future will print out which components
             // won't gracefully shutdown since we will start to forcefully shutdown
             // the sources.
             let mut check_handles2 = check_handles.clone();
+            let component_roles = Arc::clone(&component_roles);
             Box::pin(async move {
                 sleep_until(deadline).await;
                 // Remove all tasks that have shutdown.
@@ -229,10 +284,13 @@ impl RunningTopology {
                     retain(handles, |handle| handle.peek().is_none());
                     !handles.is_empty()
                 });
-                let remaining_components = check_handles2.keys().sorted().join(", ");
+                let (remaining_sources, remaining_transforms, remaining_sinks) =
+                    partition_remaining_by_role(check_handles2.keys(), &component_roles);
 
                 error!(
-                    components = ?remaining_components,
+                    remaining_sources = ?remaining_sources,
+                    remaining_transforms = ?remaining_transforms,
+                    remaining_sinks = ?remaining_sinks,
                     message = "Failed to gracefully shut down in time. Killing components.",
                     internal_log_rate_limit = false
                 );
@@ -259,6 +317,7 @@ impl RunningTopology {
 
         // Reports in intervals which components are still running.
         let mut interval = interval(Duration::from_secs(5));
+        let reporter_component_roles = Arc::clone(&component_roles);
         let reporter = async move {
             loop {
                 interval.tick().await;
@@ -275,7 +334,8 @@ impl RunningTopology {
                     retain(handles, |handle| handle.peek().is_none());
                     !handles.is_empty()
                 });
-                let remaining_components = check_handles.keys().sorted().join(", ");
+                let (remaining_sources, remaining_transforms, remaining_sinks) =
+                    partition_remaining_by_role(check_handles.keys(), &reporter_component_roles);
 
                 let (deadline_passed, time_remaining) = match deadline {
                     Some(d) => match d.checked_duration_since(Instant::now()) {
@@ -286,7 +346,9 @@ impl RunningTopology {
                 };
 
                 info!(
-                    remaining_components = ?remaining_components,
+                    remaining_sources = ?remaining_sources,
+                    remaining_transforms = ?remaining_transforms,
+                    remaining_sinks = ?remaining_sinks,
                     time_remaining = ?time_remaining,
                     "Shutting down... Waiting on running components."
                 );
@@ -297,7 +359,12 @@ impl RunningTopology {
                     info!("Shutdown reporter exiting: all components shut down.");
                     break;
                 } else if deadline_passed {
-                    error!(remaining_components = ?remaining_components, "Shutdown reporter: deadline exceeded.");
+                    error!(
+                        remaining_sources = ?remaining_sources,
+                        remaining_transforms = ?remaining_transforms,
+                        remaining_sinks = ?remaining_sinks,
+                        "Shutdown reporter: deadline exceeded."
+                    );
                     break;
                 }
             }
@@ -432,7 +499,8 @@ impl RunningTopology {
                     retain(handles, |handle| handle.peek().is_none());
                     !handles.is_empty()
                 });
-                let remaining_components = wave2_start_check_handles.keys().sorted().join(", ");
+                let (remaining_sources, remaining_transforms, remaining_sinks) =
+                    partition_remaining_by_role(wave2_start_check_handles.keys(), &component_roles);
                 let time_remaining = match deadline {
                     Some(d) => match d.checked_duration_since(Instant::now()) {
                         Some(remaining) => format!("{} seconds left", remaining.as_secs()),
@@ -441,7 +509,9 @@ impl RunningTopology {
                     None => "no time limit".to_string(),
                 };
                 info!(
-                    remaining_components = ?remaining_components,
+                    remaining_sources = ?remaining_sources,
+                    remaining_transforms = ?remaining_transforms,
+                    remaining_sinks = ?remaining_sinks,
                     time_remaining = ?time_remaining,
                     "Wave 2 starting. Components still active."
                 );
