@@ -82,6 +82,7 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
             // Similarly the exact blob isn't determined here yet
             blob: "".to_string(),
             container: self.bucket.clone(),
+            bucket: Some(self.bucket.clone()),
             count_map: generate_count_map(&events, false),
         };
 

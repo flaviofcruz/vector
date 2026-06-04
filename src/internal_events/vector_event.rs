@@ -13,6 +13,11 @@ pub struct VectorEventLogSendMetadata {
     pub events_len: usize,
     pub blob: String,
     pub container: String,
+    // For Azure this is the storage account name; for S3/GCS the bucket. Lands
+    // in the `bucket` proto field of VectorSendMessagesEvent so it matches
+    // log-daemon's destination_bucket. `container` still drives the URL's
+    // container slot in the downstream VRL transform.
+    pub bucket: Option<String>,
     // Count map here allows us to keep track of the count/size of events per combination of fields
     // Key is a string encoding those combinations for ease of update
     pub count_map: HashMap<String, MetadataValuesCount>,
@@ -25,6 +30,7 @@ impl VectorEventLogSendMetadata {
             events_len: 0,
             blob: "".to_string(),
             container: "".to_string(),
+            bucket: None,
             count_map: HashMap::new(),
         }
     }
@@ -50,6 +56,7 @@ impl VectorEventLogSendMetadata {
                 events_len = value.count,
                 blob = self.blob,
                 container = self.container,
+                bucket = self.bucket.as_deref().unwrap_or(""),
                 vector_event_type = event_type,
                 internal_log_rate_limit = false,
             );

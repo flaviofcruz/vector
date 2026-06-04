@@ -24,6 +24,7 @@ fn default_config(encoding: EncodingConfigWithFraming) -> AzureBlobSinkConfig {
     AzureBlobSinkConfig {
         connection_string: Default::default(),
         container_name: Default::default(),
+        storage_account: Default::default(),
         blob_prefix: Default::default(),
         blob_time_format: Default::default(),
         blob_append_uuid: Default::default(),
@@ -62,6 +63,7 @@ fn azure_blob_build_request_without_compression() {
 
     let request_options = AzureBlobRequestOptions {
         container_name,
+        storage_account: Some(String::from("some-account")),
         blob_time_format,
         blob_append_uuid,
         blob_prepend_crypto_nonce: false,
@@ -111,6 +113,7 @@ fn azure_blob_build_request_with_compression() {
 
     let request_options = AzureBlobRequestOptions {
         container_name,
+        storage_account: Some(String::from("some-account")),
         blob_time_format,
         blob_append_uuid,
         blob_prepend_crypto_nonce: false,
@@ -160,6 +163,7 @@ fn azure_blob_build_request_with_time_format() {
 
     let request_options = AzureBlobRequestOptions {
         container_name,
+        storage_account: Some(String::from("some-account")),
         blob_time_format,
         blob_append_uuid,
         blob_prepend_crypto_nonce: false,
@@ -212,6 +216,7 @@ fn azure_blob_build_request_with_uuid() {
 
     let request_options = AzureBlobRequestOptions {
         container_name,
+        storage_account: Some(String::from("some-account")),
         blob_time_format,
         blob_append_uuid,
         blob_prepend_crypto_nonce: false,
@@ -257,6 +262,7 @@ fn azure_blob_build_request_with_crypto_nonce() {
 
     let request_options = AzureBlobRequestOptions {
         container_name,
+        storage_account: Some(String::from("some-account")),
         blob_time_format: String::new(),
         blob_append_uuid: false,
         blob_prepend_crypto_nonce: true,
@@ -291,4 +297,88 @@ fn azure_blob_build_request_with_crypto_nonce() {
     assert!(nonce[..8].chars().all(|c| c.is_ascii_hexdigit()));
     assert_eq!(&nonce[8..], "-");
     assert!(rest.is_empty());
+}
+
+#[test]
+fn azure_blob_event_log_metadata_bucket_and_container_split() {
+    // The `container` field powers the URL (wasbs://<container>/...) while
+    // the new `bucket` field carries the storage account name for parity
+    // with log-daemon's LogSyncEvent.destination_bucket.
+    let log = Event::Log(LogEvent::from("test message"));
+    let container_name = String::from("my-container");
+    let storage_account = String::from("mylogstorage");
+    let sink_config = AzureBlobSinkConfig {
+        blob_prefix: "blob".try_into().unwrap(),
+        container_name: container_name.clone(),
+        storage_account: Some(storage_account.clone()),
+        ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+    };
+    let key = sink_config
+        .key_partitioner()
+        .unwrap()
+        .partition(&log)
+        .expect("key wasn't provided");
+
+    let request_options = AzureBlobRequestOptions {
+        container_name: container_name.clone(),
+        storage_account: Some(storage_account.clone()),
+        blob_time_format: String::new(),
+        blob_append_uuid: false,
+        blob_prepend_crypto_nonce: false,
+        encoder: (
+            Default::default(),
+            Encoder::<Framer>::new(
+                NewlineDelimitedEncoder::default().into(),
+                TextSerializerConfig::default().build().into(),
+            ),
+        ),
+        compression: Compression::None,
+    };
+
+    let (metadata, _request_metadata_builder, _events) =
+        request_options.split_input((key, vec![log]));
+
+    assert_eq!(metadata.event_log_metadata.container, container_name);
+    assert_eq!(metadata.event_log_metadata.bucket, Some(storage_account));
+}
+
+#[test]
+fn azure_blob_event_log_metadata_bucket_none_when_storage_account_unset() {
+    // If jsonnet forgets to populate storage_account, the daemon must not
+    // crashloop. The bucket field shows up as None so the downstream VRL
+    // emits an empty bucket (loud-fail in vector-event-log).
+    let log = Event::Log(LogEvent::from("test message"));
+    let container_name = String::from("my-container");
+    let sink_config = AzureBlobSinkConfig {
+        blob_prefix: "blob".try_into().unwrap(),
+        container_name: container_name.clone(),
+        ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+    };
+    let key = sink_config
+        .key_partitioner()
+        .unwrap()
+        .partition(&log)
+        .expect("key wasn't provided");
+
+    let request_options = AzureBlobRequestOptions {
+        container_name: container_name.clone(),
+        storage_account: None,
+        blob_time_format: String::new(),
+        blob_append_uuid: false,
+        blob_prepend_crypto_nonce: false,
+        encoder: (
+            Default::default(),
+            Encoder::<Framer>::new(
+                NewlineDelimitedEncoder::default().into(),
+                TextSerializerConfig::default().build().into(),
+            ),
+        ),
+        compression: Compression::None,
+    };
+
+    let (metadata, _request_metadata_builder, _events) =
+        request_options.split_input((key, vec![log]));
+
+    assert_eq!(metadata.event_log_metadata.container, container_name);
+    assert_eq!(metadata.event_log_metadata.bucket, None);
 }
