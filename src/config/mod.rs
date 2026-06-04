@@ -159,6 +159,8 @@ pub struct Config {
     secret: IndexMap<ComponentKey, SecretBackends>,
     pub graceful_shutdown_duration: Option<Duration>,
     pub graceful_data_source_shutdown_duration: Option<Duration>,
+    pub graceful_data_sink_shutdown_duration: Option<Duration>,
+    pub graceful_internal_source_shutdown_duration: Option<Duration>,
 }
 
 impl Config {

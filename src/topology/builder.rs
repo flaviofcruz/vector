@@ -16,6 +16,7 @@ use tokio::{
     time::timeout,
 };
 use tracing::Instrument;
+use vector_common::flush_signal::FlushSignal;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf,
     buffers::{
@@ -90,6 +91,10 @@ struct Builder<'a> {
     inputs: HashMap<ComponentKey, (BufferSender<EventArray>, Inputs<OutputId>)>,
     healthchecks: HashMap<ComponentKey, Task>,
     detach_triggers: HashMap<ComponentKey, Trigger>,
+    // Per-sink flush signals (only present for disk-buffered sinks), so the topology can ask a
+    // sink to drain its open batches at a shutdown wave boundary instead of waiting for the
+    // batcher's own timeout.
+    sink_flush_signals: HashMap<ComponentKey, FlushSignal>,
     extra_context: ExtraContext,
     utilization_emitter: Option<UtilizationEmitter>,
     utilization_registry: UtilizationRegistry,
@@ -122,6 +127,7 @@ impl<'a> Builder<'a> {
             inputs: HashMap::new(),
             healthchecks: HashMap::new(),
             detach_triggers: HashMap::new(),
+            sink_flush_signals: HashMap::new(),
             extra_context,
             utilization_emitter: emitter,
             utilization_registry: registry,
@@ -148,6 +154,7 @@ impl<'a> Builder<'a> {
                 healthchecks: self.healthchecks,
                 shutdown_coordinator: self.shutdown_coordinator,
                 detach_triggers: self.detach_triggers,
+                sink_flush_signals: self.sink_flush_signals,
                 metrics_storage: METRICS_STORAGE.clone(),
                 utilization: self
                     .utilization_emitter
@@ -638,6 +645,14 @@ impl<'a> Builder<'a> {
                 }
             };
 
+            // Capture the sink's flush signal (present only for disk-buffered sinks) before the rx
+            // is moved into the sink task. It is a clone of the same `Arc<AtomicBool>` the in-task
+            // `PartitionedBatcher` reads via task-local `FLUSH_SIGNAL`, so the topology can `.set()`
+            // it at a shutdown wave boundary to make the sink drain its open batches.
+            if let Some(flush_signal) = rx.lock().unwrap().as_ref().and_then(|s| s.flush_signal()) {
+                self.sink_flush_signals.insert(key.clone(), flush_signal);
+            }
+
             let cx = SinkContext {
                 healthcheck,
                 globals: self.config.global.clone(),
@@ -831,6 +846,7 @@ pub struct TopologyPieces {
     pub(super) healthchecks: HashMap<ComponentKey, Task>,
     pub(crate) shutdown_coordinator: SourceShutdownCoordinator,
     pub(crate) detach_triggers: HashMap<ComponentKey, Trigger>,
+    pub(crate) sink_flush_signals: HashMap<ComponentKey, FlushSignal>,
     pub(crate) metrics_storage: MetricsStorage,
     pub(crate) utilization: Option<(UtilizationEmitter, UtilizationRegistry)>,
 }

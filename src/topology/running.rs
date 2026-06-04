@@ -15,6 +15,7 @@ use tokio::{
     time::{Duration, Instant, interval, sleep_until},
 };
 use tracing::Instrument;
+use vector_common::flush_signal::FlushSignal;
 use vector_lib::{
     buffers::topology::channel::BufferSender,
     shutdown::ShutdownSignal,
@@ -96,18 +97,81 @@ pub struct RunningTopology {
     tasks: HashMap<ComponentKey, TaskHandle>,
     shutdown_coordinator: SourceShutdownCoordinator,
     detach_triggers: HashMap<ComponentKey, DisabledTrigger>,
+    // Per-sink flush signals (disk-buffered sinks only). Set at a shutdown wave boundary to make a
+    // sink drain its open batches once its upstream sources have stopped.
+    sink_flush_signals: HashMap<ComponentKey, FlushSignal>,
     pub(crate) config: Config,
     pub(crate) abort_tx: mpsc::UnboundedSender<ShutdownError>,
     watch: (WatchTx, WatchRx),
     pub(crate) running: Arc<AtomicBool>,
     graceful_shutdown_duration: Option<Duration>,
     graceful_data_source_shutdown_duration: Option<Duration>,
+    graceful_data_sink_shutdown_duration: Option<Duration>,
+    graceful_internal_source_shutdown_duration: Option<Duration>,
     utilization_registry: Option<UtilizationRegistry>,
     utilization_task: Option<TaskHandle>,
     utilization_task_shutdown_trigger: Option<Trigger>,
     metrics_task: Option<TaskHandle>,
     metrics_task_shutdown_trigger: Option<Trigger>,
     pending_reload: Option<HashSet<ComponentKey>>,
+}
+
+/// Force-cancel every still-running task in `handles` via `tokio::task::JoinHandle::abort` (which
+/// cancels the task at its next await point). Already-finished tasks are skipped so the returned
+/// `(components, tasks)` counts stay truthful about what actually had to be killed. `abort` is
+/// strictly stronger than the per-source `shutdown_force_trigger`: that trigger only covers
+/// non-deferred sources and is `.disable()`'d as soon as a source handshakes shutdown — even if
+/// its task body (e.g. `kubernetes_logs`' 30 s event-loop tail) is still emitting — and it has no
+/// effect at all on transforms or sinks.
+fn abort_active_tasks(
+    handles: &HashMap<ComponentKey, Vec<tokio::task::AbortHandle>>,
+) -> (usize, usize) {
+    let mut aborted_components = 0usize;
+    let mut aborted_tasks = 0usize;
+    for task_handles in handles.values() {
+        let mut hit = false;
+        for handle in task_handles {
+            if !handle.is_finished() {
+                handle.abort();
+                aborted_tasks += 1;
+                hit = true;
+            }
+        }
+        if hit {
+            aborted_components += 1;
+        }
+    }
+    (aborted_components, aborted_tasks)
+}
+
+/// Set the flush signal on each `(key, signal)` pair, asking those (disk-buffered) sinks to drain
+/// their currently-open batches now that their upstream sources have stopped — rather than waiting
+/// for the batcher's own timeout. Best-effort and idempotent: the batcher clears the flag when it
+/// next polls, and a sink with no open batch simply observes nothing to do.
+fn signal_sink_flush(signals: &[(ComponentKey, FlushSignal)]) {
+    for (key, signal) in signals {
+        info!(component_id = %key, internal_log_rate_limit = false, "Flush-on-shutdown: signaling sink to drain open batches.");
+        signal.set();
+    }
+}
+
+/// Drive `gate` to completion while concurrently polling `background` purely for its side effects
+/// (the periodic shutdown reporter). `gate` is authoritative for when shutdown ends; `background`
+/// is abandoned the moment `gate` resolves, so a reporter parked until its next 5 s tick can't
+/// delay the return. If `background` happens to resolve first, keep awaiting `gate`.
+///
+/// `gate` joins the wave orchestration with the completion signal, so the orchestration always
+/// runs to completion (emitting the `COMPONENTS_CLOSED` VEL and issuing its source aborts) and the
+/// return is additionally held until everything has drained or the overall deadline fired.
+async fn drive_shutdown_to_completion<G, B>(gate: G, background: B)
+where
+    G: Future<Output = ()>,
+    B: Future<Output = ()>,
+{
+    futures::pin_mut!(gate, background);
+    if let future::Either::Right((_, gate)) = future::select(gate, background).await {
+        gate.await;
+    }
 }
 
 impl RunningTopology {
@@ -119,6 +183,7 @@ impl RunningTopology {
             outputs_tap_metadata: HashMap::new(),
             shutdown_coordinator: SourceShutdownCoordinator::default(),
             detach_triggers: HashMap::new(),
+            sink_flush_signals: HashMap::new(),
             source_tasks: HashMap::new(),
             tasks: HashMap::new(),
             abort_tx,
@@ -126,6 +191,9 @@ impl RunningTopology {
             running: Arc::new(AtomicBool::new(true)),
             graceful_shutdown_duration: config.graceful_shutdown_duration,
             graceful_data_source_shutdown_duration: config.graceful_data_source_shutdown_duration,
+            graceful_data_sink_shutdown_duration: config.graceful_data_sink_shutdown_duration,
+            graceful_internal_source_shutdown_duration: config
+                .graceful_internal_source_shutdown_duration,
             config,
             utilization_registry: None,
             utilization_task: None,
@@ -192,8 +260,23 @@ impl RunningTopology {
             .graceful_shutdown_duration
             .map(|grace_period| Instant::now() + grace_period);
 
+        // Staged wave deadlines, all relative to now. Ordering is guaranteed by `app.rs`:
+        //   data_source < data_sink < internal_source < deadline (overall).
+        // - data_source_deadline: force-close wave-1 (data) SOURCES only.
+        // - data_sink_deadline:   end of wave 1 / start of wave 2. Wave-1 transforms+sinks are
+        //                         NOT force-closed here — they keep flushing until `deadline`.
+        // - internal_source_deadline: force-close wave-2 (internal) SOURCES only.
+        // - deadline:             force-close everything still running.
         let data_source_deadline = self
             .graceful_data_source_shutdown_duration
+            .map(|grace_period| Instant::now() + grace_period);
+
+        let data_sink_deadline = self
+            .graceful_data_sink_shutdown_duration
+            .map(|grace_period| Instant::now() + grace_period);
+
+        let internal_source_deadline = self
+            .graceful_internal_source_shutdown_duration
             .map(|grace_period| Instant::now() + grace_period);
 
         // Cancel utilization and metrics tasks.
@@ -226,18 +309,69 @@ impl RunningTopology {
             HashSet::new()
         };
 
+        // Source component keys, used to distinguish "force-close sources only" from
+        // "force-close transforms/sinks too" at each staged deadline. Deferred (internal)
+        // sources are the wave-2 sources; the rest of the source set that is also exclusively
+        // non-deferred are the wave-1 sources.
+        let source_keys: HashSet<ComponentKey> =
+            self.config.sources().map(|(k, _)| k.clone()).collect();
+        let wave2_source_keys: HashSet<ComponentKey> = if use_two_wave {
+            deferred_shutdowns.deferred_keys()
+        } else {
+            HashSet::new()
+        };
+
         // Create handy handles collections of all tasks for the subsequent operations.
         let mut wait_handles = Vec::new();
-        let mut wave1_wait_handles = Vec::new();
+        // Wave-1 task-completion futures, split so sources can be force-closed at
+        // data_source_deadline while their downstream transforms/sinks get until
+        // data_sink_deadline to drain.
+        let mut wave1_source_wait_handles = Vec::new();
+        let mut wave1_sink_wait_handles = Vec::new();
+        // Wave-2 (deferred/internal) source task-completion futures.
+        let mut wave2_source_wait_handles = Vec::new();
         let mut check_handles = HashMap::<ComponentKey, Vec<_>>::new();
+        // `AbortHandle`s captured before each `JoinHandle` is folded into a `Shared` future, so
+        // the staged deadlines can force-cancel stragglers (sources at their wave deadline,
+        // everything still running at the overall deadline) rather than just naming them.
+        // `AbortHandle` is `Clone`, so a task can appear in more than one of these maps.
+        let mut all_abort_handles = HashMap::<ComponentKey, Vec<tokio::task::AbortHandle>>::new();
+        let mut wave1_source_abort_handles =
+            HashMap::<ComponentKey, Vec<tokio::task::AbortHandle>>::new();
+        let mut wave2_source_abort_handles =
+            HashMap::<ComponentKey, Vec<tokio::task::AbortHandle>>::new();
 
         // Source components have two tasks: pump in self.tasks, and source in self.source_tasks.
         for (key, task) in self.tasks.into_iter().chain(self.source_tasks.into_iter()) {
+            let abort_handle = task.abort_handle();
             let task = task.map(map_closure).shared();
 
             wait_handles.push(task.clone());
-            if use_two_wave && exclusively_non_deferred_keys.contains(&key) {
-                wave1_wait_handles.push(task.clone());
+            all_abort_handles
+                .entry(key.clone())
+                .or_default()
+                .push(abort_handle.clone());
+
+            if use_two_wave {
+                let is_source = source_keys.contains(&key);
+                if exclusively_non_deferred_keys.contains(&key) {
+                    if is_source {
+                        wave1_source_wait_handles.push(task.clone());
+                        wave1_source_abort_handles
+                            .entry(key.clone())
+                            .or_default()
+                            .push(abort_handle.clone());
+                    } else {
+                        wave1_sink_wait_handles.push(task.clone());
+                    }
+                }
+                if wave2_source_keys.contains(&key) {
+                    wave2_source_wait_handles.push(task.clone());
+                    wave2_source_abort_handles
+                        .entry(key.clone())
+                        .or_default()
+                        .push(abort_handle.clone());
+                }
             }
             check_handles.entry(key).or_default().push(task);
         }
@@ -272,9 +406,10 @@ impl RunningTopology {
         );
 
         let timeout = if let Some(deadline) = deadline {
-            // If we reach the deadline, this future will print out which components
-            // won't gracefully shutdown since we will start to forcefully shutdown
-            // the sources.
+            // The overall deadline: anything still running here is force-aborted. This is the
+            // final backstop — wave-1 transforms/sinks that never drained, plus any wave-2
+            // components — so the process can exit promptly instead of relying on the runtime
+            // tearing tasks down as it drops them.
             let mut check_handles2 = check_handles.clone();
             let component_roles = Arc::clone(&component_roles);
             Box::pin(async move {
@@ -294,6 +429,17 @@ impl RunningTopology {
                     message = "Failed to gracefully shut down in time. Killing components.",
                     internal_log_rate_limit = false
                 );
+
+                let (aborted_components, aborted_tasks) = abort_active_tasks(&all_abort_handles);
+                if aborted_tasks > 0 {
+                    warn!(
+                        aborted_components = aborted_components,
+                        aborted_tasks = aborted_tasks,
+                        message = "Overall shutdown deadline exceeded; force-aborted all remaining \
+                             component tasks.",
+                        internal_log_rate_limit = false,
+                    );
+                }
             }) as future::BoxFuture<'static, ()>
         } else {
             Box::pin(future::pending()) as future::BoxFuture<'static, ()>
@@ -309,11 +455,10 @@ impl RunningTopology {
         // The reporter closure below takes ownership of the original.
         let mut wave2_start_check_handles = check_handles.clone();
 
-        // Separate snapshot of check_handles used only if the wave 1 drain exceeds
-        // data_source_deadline, to name the still-active exclusively-non-deferred
-        // components in a warn log. Must be cloned before `reporter` takes ownership of
-        // the original `check_handles`.
-        let wave1_straggler_check_handles = check_handles.clone();
+        // Separate snapshot of check_handles used only if the wave 1 sink-drain deadline is
+        // exceeded, to name the still-active wave-1 transforms/sinks in a warn log. Must be
+        // cloned before `reporter` takes ownership of the original `check_handles`.
+        let wave1_sink_check_handles = check_handles.clone();
 
         // Reports in intervals which components are still running.
         let mut interval = interval(Duration::from_secs(5));
@@ -373,24 +518,41 @@ impl RunningTopology {
         // Finishes once all tasks have shutdown.
         let success = futures::future::join_all(wait_handles).map(|_| ());
 
-        // Aggregate future that ends once anything detects that all tasks have shutdown.
-        let shutdown_complete_future = future::select_all(vec![
+        // `completion` decides when `stop()` returns: either every task drained (`success`) or
+        // the overall deadline fired (`timeout`, which force-aborts whatever is left). The
+        // periodic `reporter` is intentionally NOT in this set — it breaks early when wave 2
+        // suppresses it, and letting that resolve the shutdown would cut wave-2 sinks' flush
+        // window short. The reporter is instead driven (for its logging side effects only)
+        // alongside the wave orchestration via `drive_shutdown_to_completion`.
+        let completion = future::select_all(vec![
             Box::pin(timeout) as future::BoxFuture<'static, ()>,
-            Box::pin(reporter) as future::BoxFuture<'static, ()>,
             Box::pin(success) as future::BoxFuture<'static, ()>,
-        ]);
+        ])
+        .map(|_| ());
+
+        // Wave-1 sink/transform keys (exclusively-non-deferred minus sources), used only to name
+        // stragglers if wave 1's sink-drain deadline is exceeded.
+        let wave1_sink_keys: HashSet<ComponentKey> = exclusively_non_deferred_keys
+            .difference(&source_keys)
+            .cloned()
+            .collect();
 
         if use_two_wave {
-            // Two-wave shutdown.
+            // Two-wave, staged shutdown. Each wave force-closes SOURCES at its deadline but lets
+            // the downstream transforms/sinks keep flushing; everything still alive is finally
+            // force-aborted at the overall deadline (by the `timeout` future).
             //
-            // Wave 1: Non-deferred (data) sources shut down, then we wait for all
-            // exclusively-non-deferred transforms/sinks to drain. Components with ANY
-            // deferred source in their ancestry stay alive — their deferred source input
-            // keeps the channel open so they naturally continue running.
+            // Wave 1 (data): non-deferred sources are signaled to stop. At
+            // `data_source_deadline` any still-running data-source tasks are force-aborted
+            // (phase A). Their exclusively-non-deferred transforms/sinks then drain until
+            // `data_sink_deadline` (phase B) but are NOT force-closed there. Components with any
+            // deferred source in their ancestry stay alive — their deferred input keeps the
+            // channel open.
             //
-            // Wave 2: Deferred (internal) sources shut down. Their downstream components
-            // (including any with mixed inputs) close naturally as the remaining input
-            // channels drop.
+            // Wave 2 (internal): deferred sources are signaled to stop. At
+            // `internal_source_deadline` any still-running internal-source tasks are
+            // force-aborted; their downstream components keep flushing until the overall
+            // deadline.
 
             // Snapshot the component classifications now so they're available for logging
             // inside source_shutdown_complete after deferred_shutdowns is consumed. Sort so
@@ -403,10 +565,23 @@ impl RunningTopology {
                 .sorted()
                 .join(", ");
 
-            // exclusively_non_deferred_keys is also consumed by source_shutdown_complete
-            // (for filtering the wave 1 straggler snapshot below), so clone it here — the
-            // snapshot above already borrowed it for non_deferred_components_str.
-            let wave1_straggler_keys = exclusively_non_deferred_keys.clone();
+            // Partition the disk-buffered sink flush signals by wave. Wave-1
+            // (exclusively-non-deferred) sinks are asked to drain once their data sources are
+            // closed (at data_source_deadline); the rest — sinks fed by an internal source — once
+            // the internal sources are closed (at internal_source_deadline). Setting a signal just
+            // nudges the sink's batcher to flush open batches early; the sink keeps running.
+            let wave1_sink_flush_signals: Vec<(ComponentKey, FlushSignal)> = self
+                .sink_flush_signals
+                .iter()
+                .filter(|(key, _)| exclusively_non_deferred_keys.contains(*key))
+                .map(|(key, signal)| (key.clone(), signal.clone()))
+                .collect();
+            let wave2_sink_flush_signals: Vec<(ComponentKey, FlushSignal)> = self
+                .sink_flush_signals
+                .iter()
+                .filter(|(key, _)| !exclusively_non_deferred_keys.contains(*key))
+                .map(|(key, signal)| (key.clone(), signal.clone()))
+                .collect();
 
             let source_shutdown_complete = async move {
                 info!(
@@ -415,63 +590,96 @@ impl RunningTopology {
                     message = "Wave 1: Shutting down data sources.",
                     internal_log_rate_limit = false,
                 );
+                // Begin-shutdown was already sent to the non-deferred sources synchronously by
+                // `shutdown_non_deferred`; awaiting `wave1_complete` drives the force-trigger
+                // that fires at `data_source_deadline`. It is internally bounded by that
+                // deadline, so this await cannot outlast it.
                 wave1_complete.await;
 
-                // Wait for all exclusively-non-deferred components to finish draining.
-                info!(
-                    message = "Wave 1 complete. Waiting for exclusively-non-deferred transforms and sinks to drain.",
-                    internal_log_rate_limit = false,
-                );
-                // Bound the wait by data_source_deadline. wave1_complete is already bounded
-                // by this deadline inside the shutdown coordinator, but without a matching
-                // bound here a stuck downstream sink (e.g., a Kafka producer that can't
-                // flush) would block wave 2 indefinitely. On timeout, proceed to wave 2
-                // anyway: the straggling components will be cancelled naturally when their
-                // upstream channels close as wave 2 shuts down deferred sources.
-                //
-                // `gracefully_closed` records whether wave 1 drained inside the deadline so
-                // the COMPONENTS_CLOSED VEL below can carry it. The defensive no-deadline
-                // arm is also considered graceful because the unbounded join can't time
-                // out; the only non-graceful path is the timeout arm here.
-                let mut gracefully_closed = false;
-                if let Some(data_deadline) = data_source_deadline {
-                    let mut wave1_straggler_check_handles = wave1_straggler_check_handles;
-                    match tokio::time::timeout_at(
-                        data_deadline,
-                        futures::future::join_all(wave1_wait_handles),
+                // Wave 1, phase A — data SOURCES. A source can handshake shutdown (which
+                // `.disable()`s its force-trigger) yet keep its task body alive — e.g.
+                // `kubernetes_logs`' 30 s event-processing-loop tail — so the trigger alone
+                // can't guarantee the task is gone. Wait for the source *tasks* to actually
+                // exit, bounded by `data_source_deadline`; on timeout, force-abort the
+                // still-running source tasks. Sources only: their downstream transforms/sinks
+                // get their own drain window in phase B.
+                let mut wave1_sources_clean = true;
+                if let Some(ds_deadline) = data_source_deadline {
+                    if tokio::time::timeout_at(
+                        ds_deadline,
+                        futures::future::join_all(wave1_source_wait_handles),
                     )
                     .await
+                    .is_err()
                     {
-                        Ok(_) => {
-                            gracefully_closed = true;
-                        }
-                        Err(_) => {
-                            // Compute the straggler list using the same peek-based filter
-                            // as the reporter, restricted to exclusively-non-deferred keys
-                            // so the warn log only names components that were actually
-                            // blocking wave 2.
-                            wave1_straggler_check_handles.retain(|key, handles| {
-                                if !wave1_straggler_keys.contains(key) {
-                                    return false;
-                                }
-                                retain(handles, |handle| handle.peek().is_none());
-                                !handles.is_empty()
-                            });
-                            let stragglers =
-                                wave1_straggler_check_handles.keys().sorted().join(", ");
-                            warn!(
-                                components = ?stragglers,
-                                message = "Wave 1 drain deadline exceeded; proceeding to wave 2.",
-                                internal_log_rate_limit = false,
-                            );
-                        }
+                        wave1_sources_clean = false;
+                        let (aborted_components, aborted_tasks) =
+                            abort_active_tasks(&wave1_source_abort_handles);
+                        warn!(
+                            aborted_components = aborted_components,
+                            aborted_tasks = aborted_tasks,
+                            message = "Wave 1: data-source drain deadline exceeded; force-aborted \
+                                       stuck data-source tasks.",
+                            internal_log_rate_limit = false,
+                        );
                     }
                 } else {
-                    // Defensive: use_two_wave implies data_source_deadline.is_some(), but
-                    // fall back to the original unbounded wait if that invariant changes.
-                    futures::future::join_all(wave1_wait_handles).await;
-                    gracefully_closed = true;
+                    // Defensive: use_two_wave implies data_source_deadline.is_some().
+                    futures::future::join_all(wave1_source_wait_handles).await;
                 }
+
+                // Data sources are now closed, so ask the wave-1 (disk-buffered) sinks to flush
+                // their open batches instead of sitting on them until the batch timeout. This
+                // happens at data_source_deadline and gives them the phase-B window to drain.
+                signal_sink_flush(&wave1_sink_flush_signals);
+
+                // Wave 1, phase B — data transforms/SINKS. Give them until `data_sink_deadline`
+                // to flush whatever the (now-closed) data sources produced. Crucially we do NOT
+                // force-close them on timeout: a slow-but-progressing sink should keep draining
+                // through wave 2, right up to the overall deadline. We only name the stragglers
+                // and proceed to wave 2.
+                info!(
+                    message = "Wave 1: data sources closed. Waiting for downstream transforms \
+                               and sinks to drain.",
+                    internal_log_rate_limit = false,
+                );
+                let mut wave1_sinks_clean = true;
+                if let Some(dk_deadline) = data_sink_deadline {
+                    let mut wave1_sink_check_handles = wave1_sink_check_handles;
+                    if tokio::time::timeout_at(
+                        dk_deadline,
+                        futures::future::join_all(wave1_sink_wait_handles),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        wave1_sinks_clean = false;
+                        // Same peek-based filter as the reporter, restricted to wave-1 sink
+                        // keys so the warn only names components that were still draining.
+                        wave1_sink_check_handles.retain(|key, handles| {
+                            if !wave1_sink_keys.contains(key) {
+                                return false;
+                            }
+                            retain(handles, |handle| handle.peek().is_none());
+                            !handles.is_empty()
+                        });
+                        let stragglers = wave1_sink_check_handles.keys().sorted().join(", ");
+                        warn!(
+                            components = ?stragglers,
+                            message = "Wave 1 sink-drain deadline exceeded; starting wave 2 \
+                                       without force-closing wave-1 sinks (they keep flushing \
+                                       until the overall deadline).",
+                            internal_log_rate_limit = false,
+                        );
+                    }
+                } else {
+                    // Defensive: use_two_wave implies data_sink_deadline.is_some().
+                    futures::future::join_all(wave1_sink_wait_handles).await;
+                }
+
+                // `gracefully_closed` is true only when wave 1 drained fully within its
+                // deadlines — neither the sources nor the sinks had to be timed out.
+                let gracefully_closed = wave1_sources_clean && wave1_sinks_clean;
 
                 // Flush any batched delivery-event VEL logs now, while data
                 // sources/sinks have all emitted their final counts (wave 1 is
@@ -523,7 +731,9 @@ impl RunningTopology {
                     "Wave 2 starting. Components still active."
                 );
 
-                // Wave 2: Shut down deferred (internal) sources with remaining main deadline.
+                // Wave 2: Shut down deferred (internal) sources. They are force-closed at
+                // `internal_source_deadline` (falling back to the overall deadline only if the
+                // staged deadline is somehow unset).
                 info!(
                     message = "Wave 2: Shutting down deferred (internal) sources.",
                     internal_log_rate_limit = false,
@@ -534,12 +744,50 @@ impl RunningTopology {
                 // on-shutdown behavior in `internal_logs`; either alone closes
                 // the common case, but together they tolerate scheduler jitter.
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                deferred_shutdowns.shutdown_all(deadline).await;
+                deferred_shutdowns
+                    .shutdown_all(internal_source_deadline.or(deadline))
+                    .await;
+
+                // Wave 2, source force-abort. Same source-task-vs-handshake gap as wave 1: the
+                // coordinator above signals (and force-triggers at the deadline) the internal
+                // sources, but their task bodies may still be running. Wait for the wave-2
+                // source tasks to exit, bounded by `internal_source_deadline`; on timeout,
+                // force-abort the stragglers — sources only. Wave-2 transforms/sinks keep
+                // flushing until the overall deadline (the `timeout` future force-aborts
+                // anything still alive then).
+                if let Some(is_deadline) = internal_source_deadline {
+                    if tokio::time::timeout_at(
+                        is_deadline,
+                        futures::future::join_all(wave2_source_wait_handles),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let (aborted_components, aborted_tasks) =
+                            abort_active_tasks(&wave2_source_abort_handles);
+                        if aborted_tasks > 0 {
+                            warn!(
+                                aborted_components = aborted_components,
+                                aborted_tasks = aborted_tasks,
+                                message = "Wave 2: internal-source drain deadline exceeded; \
+                                           force-aborted stuck internal-source tasks.",
+                                internal_log_rate_limit = false,
+                            );
+                        }
+                    }
+                }
+
+                // Internal sources are now closed, so ask the wave-2 (disk-buffered) sinks to
+                // flush their open batches. This happens at internal_source_deadline and gives
+                // them the window up to the overall deadline to drain.
+                signal_sink_flush(&wave2_sink_flush_signals);
             };
 
-            futures::future::join(source_shutdown_complete, shutdown_complete_future)
-                .map(|_| ())
-                .boxed()
+            // The gate joins the orchestration (so it runs fully — VEL + source aborts) with the
+            // completion signal (all drained, or the overall deadline force-aborted the rest). The
+            // reporter is driven for logging only and abandoned once the gate resolves.
+            let gate = futures::future::join(source_shutdown_complete, completion).map(|_| ());
+            drive_shutdown_to_completion(gate, reporter).boxed()
         } else {
             // No deferred sources or no data source deadline: use original single-pass behavior.
             let source_shutdown_complete = async move {
@@ -569,9 +817,19 @@ impl RunningTopology {
                 deferred_shutdowns.shutdown_all(deadline).await;
             };
 
-            futures::future::join(source_shutdown_complete, shutdown_complete_future)
-                .map(|_| ())
-                .boxed()
+            // Same gate structure as the two-wave branch: join the orchestration with the
+            // completion signal so the orchestration runs fully, hold until all-drained or the
+            // overall deadline, and abandon the reporter once the gate resolves.
+            //
+            // This restructure is behavior-preserving for the single-pass path. `suppress_reporter`
+            // is set only in the two-wave wave-2 path, so here the reporter can break only on
+            // all-drained or deadline-passed — i.e. never before `success`/`timeout` resolves — so
+            // keeping it out of `completion` cannot change when `stop()` returns. And the overall
+            // `timeout` now force-aborts stragglers at the deadline instead of leaving them for the
+            // runtime to cancel on drop: same instant, same cancel-at-next-await semantics, just
+            // deterministic rather than drop-driven.
+            let gate = futures::future::join(source_shutdown_complete, completion).map(|_| ());
+            drive_shutdown_to_completion(gate, reporter).boxed()
         }
     }
 
@@ -1320,6 +1578,11 @@ impl RunningTopology {
             .detach_triggers
             .remove(key)
             .map(|trigger| self.detach_triggers.insert(key.clone(), trigger.into()));
+        // Sinks backed by a disk buffer carry a flush signal; transforms don't, so this is a
+        // no-op for them. Move it over so the wave-boundary flush in `stop()` can reach it.
+        if let Some(signal) = new_pieces.sink_flush_signals.remove(key) {
+            self.sink_flush_signals.insert(key.clone(), signal);
+        }
     }
 
     fn remove_outputs(&mut self, key: &ComponentKey) {
@@ -1329,6 +1592,7 @@ impl RunningTopology {
     async fn remove_inputs(&mut self, key: &ComponentKey, diff: &ConfigDiff, new_config: &Config) {
         self.inputs.remove(key);
         self.detach_triggers.remove(key);
+        self.sink_flush_signals.remove(key);
 
         let old_inputs = self.config.inputs_for_node(key).expect("node exists");
         let new_inputs = new_config
@@ -1766,4 +2030,33 @@ fn get_changed_outputs(diff: &ConfigDiff, output_ids: Inputs<OutputId>) -> Vec<O
     }
 
     changed_outputs
+}
+
+#[cfg(test)]
+mod tests {
+    use vector_common::flush_signal::FlushSignal;
+
+    use super::signal_sink_flush;
+    use crate::config::ComponentKey;
+
+    #[test]
+    fn signal_sink_flush_sets_every_signal() {
+        let signals: Vec<(ComponentKey, FlushSignal)> = ["sink_a", "sink_b", "sink_c"]
+            .iter()
+            .map(|k| (ComponentKey::from(*k), FlushSignal::new()))
+            .collect();
+
+        signal_sink_flush(&signals);
+
+        // `take` clears the flag and returns its previous value; every signal must have been set.
+        for (key, signal) in &signals {
+            assert!(signal.take(), "expected flush signal for {key} to be set");
+        }
+    }
+
+    #[test]
+    fn signal_sink_flush_handles_empty_slice() {
+        // No sinks (e.g. none disk-buffered) must be a no-op, not a panic.
+        signal_sink_flush(&[]);
+    }
 }

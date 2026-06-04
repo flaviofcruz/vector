@@ -70,11 +70,26 @@ pub struct ConfigBuilder {
     #[doc(hidden)]
     pub graceful_shutdown_duration: Option<Duration>,
 
-    /// The duration in seconds to wait for non-internal (data) sources to shut down during
-    /// the first wave of graceful shutdown. Must be strictly less than `graceful_shutdown_duration`.
+    /// The duration in seconds at which non-internal (data) sources are force-closed during the
+    /// first wave of graceful shutdown. Must be strictly less than `graceful_shutdown_duration`.
     #[serde(default, skip)]
     #[doc(hidden)]
     pub graceful_data_source_shutdown_duration: Option<Duration>,
+
+    /// The duration in seconds at which the first wave of graceful shutdown ends and the second
+    /// wave begins. Wave-1 transforms/sinks are NOT force-closed at this deadline (they keep
+    /// flushing until `graceful_shutdown_duration`). Clamped strictly between
+    /// `graceful_data_source_shutdown_duration` and `graceful_internal_source_shutdown_duration`.
+    #[serde(default, skip)]
+    #[doc(hidden)]
+    pub graceful_data_sink_shutdown_duration: Option<Duration>,
+
+    /// The duration in seconds at which deferred (internal) sources are force-closed during the
+    /// second wave of graceful shutdown. Clamped strictly between
+    /// `graceful_data_sink_shutdown_duration` and `graceful_shutdown_duration`.
+    #[serde(default, skip)]
+    #[doc(hidden)]
+    pub graceful_internal_source_shutdown_duration: Option<Duration>,
 
     /// Allow the configuration to be empty, resulting in a topology with no components.
     #[serde(default, skip)]
@@ -98,6 +113,8 @@ impl From<Config> for ConfigBuilder {
             secret,
             graceful_shutdown_duration,
             graceful_data_source_shutdown_duration,
+            graceful_data_sink_shutdown_duration,
+            graceful_internal_source_shutdown_duration,
         } = config;
 
         let transforms = transforms
@@ -132,6 +149,8 @@ impl From<Config> for ConfigBuilder {
             secret,
             graceful_shutdown_duration,
             graceful_data_source_shutdown_duration,
+            graceful_data_sink_shutdown_duration,
+            graceful_internal_source_shutdown_duration,
             allow_empty: false,
         }
     }
