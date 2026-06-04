@@ -199,7 +199,22 @@ fn extract_pod_logs_directory(pod: &Pod) -> Option<PathBuf> {
         }
     };
 
-    Some(build_pod_logs_directory(namespace, name, uid))
+    // Pods running inside microVMs (brickvisor runtime) have their kubelet pod
+    // log tree rooted at /var/log/microvms instead of /var/log/pods. The dblet
+    // runtime mode is surfaced via a pod annotation; default to /var/log/pods
+    // when it is unset or set to anything other than "brickvisor".
+    let use_microvms_path = metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(RUNTIME_MODE_ANNOTATION_KEY))
+        .is_some_and(|mode| mode == RUNTIME_MODE_BRICKVISOR);
+
+    Some(build_pod_logs_directory(
+        namespace,
+        name,
+        uid,
+        use_microvms_path,
+    ))
 }
 
 /// The annotation name for the Databricks hostPath logging override (internal logs).
@@ -220,6 +235,12 @@ const DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX: &str = "/databricks/host-root";
 //    used. This is the default behavior for pods.
 /// The annotation key for the pod name (used when metadata.name includes node suffix).
 const POD_NAME_ANNOTATION_KEY: &str = "dblet.dev/pod-name";
+
+/// The annotation key describing the dblet runtime mode of the pod.
+const RUNTIME_MODE_ANNOTATION_KEY: &str = "dblet.dev/runtime-mode";
+/// The runtime-mode annotation value indicating the pod runs inside a microVM,
+/// whose kubelet pod log tree is rooted at `/var/log/microvms`.
+const RUNTIME_MODE_BRICKVISOR: &str = "brickvisor";
 
 fn extract_databricks_pod_logs_directory(
     pod: &Pod,
@@ -611,6 +632,42 @@ mod tests {
                     ..Pod::default()
                 },
                 Some("/var/log/pods/sandbox0-ns_sandbox0-name_sandbox0-config-hashsum"),
+            ),
+            // brickvisor runtime mode -> /var/log/microvms.
+            (
+                Pod {
+                    metadata: ObjectMeta {
+                        namespace: Some("sandbox0-ns".to_owned()),
+                        name: Some("sandbox0-name".to_owned()),
+                        uid: Some("sandbox0-uid".to_owned()),
+                        annotations: Some(
+                            vec![("dblet.dev/runtime-mode".to_owned(), "brickvisor".to_owned())]
+                                .into_iter()
+                                .collect(),
+                        ),
+                        ..ObjectMeta::default()
+                    },
+                    ..Pod::default()
+                },
+                Some("/var/log/microvms/sandbox0-ns_sandbox0-name_sandbox0-uid"),
+            ),
+            // Non-brickvisor runtime mode -> status quo /var/log/pods.
+            (
+                Pod {
+                    metadata: ObjectMeta {
+                        namespace: Some("sandbox0-ns".to_owned()),
+                        name: Some("sandbox0-name".to_owned()),
+                        uid: Some("sandbox0-uid".to_owned()),
+                        annotations: Some(
+                            vec![("dblet.dev/runtime-mode".to_owned(), "default".to_owned())]
+                                .into_iter()
+                                .collect(),
+                        ),
+                        ..ObjectMeta::default()
+                    },
+                    ..Pod::default()
+                },
+                Some("/var/log/pods/sandbox0-ns_sandbox0-name_sandbox0-uid"),
             ),
         ];
 

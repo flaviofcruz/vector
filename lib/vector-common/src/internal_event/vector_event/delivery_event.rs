@@ -1,4 +1,3 @@
-use crate::internal_event::{InternalEvent, NamedInternalEvent};
 use chrono::Utc;
 use metrics::counter;
 use regex::Regex;
@@ -6,9 +5,12 @@ use std::collections::HashMap;
 use std::env;
 use std::ops::Add;
 use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicU32, Ordering},
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
+use tokio::runtime::Handle;
+use tokio::sync::Notify;
+use tracing::Span;
 
 // Sentinel emitted when a Lumberjack source's topic cannot be resolved from
 // either the source context or the filename. The spelling — including the
@@ -33,10 +35,6 @@ pub const SOURCE_TYPE_KUBERNETES_LOGS: &str = "kubernetes_logs";
 /// `*_log_daemon_wrapper.libsonnet`, `diskless.libsonnet`,
 /// `application_heartbeats.libsonnet`, `file_based_raw_proto_streaming.libsonnet`.
 pub const DELIVERY_METHOD_FILE: &str = "VECTOR_WOODCHUCK_V2_FILE";
-/// Read-side label for kubernetes_logs source events. The woodchuck VRL does
-/// not currently stamp this value on sawmill events, so the corresponding
-/// sink-side counter falls through to `"unknown"` until that VRL is updated.
-pub const DELIVERY_METHOD_KUBERNETES_LOGS: &str = "VECTOR_WOODCHUCK_V2_KUBERNETES_LOGS";
 
 /// Extracts a Lumberjack topic from a source filename of either the active
 /// form (`<TableNameCamelCase>[LaMigration].pb[.base64][.gz]`) or the
@@ -96,14 +94,24 @@ fn resolve_received_topic(
     }
 }
 
-/// Hour-rounded Unix-milliseconds bucket for the current time, as a string.
-/// The format (ms since epoch, rounded down to the hour) matches the
-/// `timeParity` value carried by events through the rest of the pipeline,
-/// so labels emitted from here are directly comparable to that field.
-fn current_hour_time_parity_ms() -> String {
+/// Hour-rounded Unix-milliseconds bucket for the current time, as an `i64`.
+/// This is the discovery-time `timeParity`: it is stamped onto the event at
+/// read time (see `file.rs` / `kubernetes_logs/mod.rs`) and carried through the
+/// rest of the pipeline, so the read/staged/delivered legs all bucket on the
+/// same instant rather than each recomputing a wall-clock hour at a different
+/// pipeline stage. Matches the spec for `time_period_parity` ("the unix time
+/// the log was discovered by logging-agent, truncated to the hour, consistent
+/// across all stages").
+pub fn current_hour_time_parity_ms_value() -> i64 {
     const HOUR_MS: i64 = 60 * 60 * 1000;
     let now_ms = Utc::now().timestamp_millis();
-    (now_ms - (now_ms % HOUR_MS)).to_string()
+    now_ms - (now_ms % HOUR_MS)
+}
+
+/// String form of [`current_hour_time_parity_ms_value`], for use as a metric label
+/// and as the fallback when an event carries no `timeParity`.
+fn current_hour_time_parity_ms() -> String {
+    current_hour_time_parity_ms_value().to_string()
 }
 
 /// Reads `timeParity` from `value_map`, falling back to the current hour.
@@ -135,13 +143,18 @@ fn delivery_method_from_value_map(value_map: &HashMap<String, String>) -> String
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Maps a source's `source_type` to the canonical `deliveryMethod` value the
-/// VRL pipeline assigns to events emitted by that source. Used on the read
-/// side, where `logMetadata.deliveryMethod` isn't populated yet.
+/// Maps a read source's `source_type` to the `deliveryMethod` value the VRL
+/// pipeline stamps downstream. `deliveryMethod` denotes *how the content was
+/// read* — `VECTOR_WOODCHUCK_V2_FILE` for content read from files,
+/// `VECTOR_WOODCHUCK_V2_DISKLESS` for diskless gRPC — it is not a topic-type
+/// taxonomy. Both the `file` source and the Databricks fork's `kubernetes_logs`
+/// source read from files (the latter reads Lumberjack proto files, and pod
+/// stdout, from container directories), so both map to `DELIVERY_METHOD_FILE`.
+/// The diskless gRPC source emits no read event, so reads are always
+/// file-based; the `_` arm is a defensive fallback for any unexpected source.
 fn delivery_method_for_source_type(source_type: &str) -> &'static str {
     match source_type {
-        SOURCE_TYPE_FILE => DELIVERY_METHOD_FILE,
-        SOURCE_TYPE_KUBERNETES_LOGS => DELIVERY_METHOD_KUBERNETES_LOGS,
+        SOURCE_TYPE_FILE | SOURCE_TYPE_KUBERNETES_LOGS => DELIVERY_METHOD_FILE,
         _ => "unknown",
     }
 }
@@ -156,61 +169,316 @@ pub fn emit_read_event_after_multiline_agg() -> bool {
     })
 }
 
+/// Shared gate for read-event emission: emit only once — either *before*
+/// multiline aggregation with `EMIT_READ_EVENT_AFTER_MULTILINE_AGG` off, or
+/// *after* it with the flag on. Both read spots (the pre-multiline spot in
+/// `file_server.rs` and the per-line post-multiline spots in `file.rs` /
+/// `kubernetes_logs`) route through the singleton; this keeps exactly one of
+/// them active for a given config.
+fn read_should_emit(emitted_after_multiline_agg: bool) -> bool {
+    (emitted_after_multiline_agg && emit_read_event_after_multiline_agg())
+        || (!emitted_after_multiline_agg && !emit_read_event_after_multiline_agg())
+}
+
+/// Per-`(source_type, path)` read accumulation. `source_context` is captured
+/// once on first insert within a flush window (a given path is read by a single
+/// source instance, so its context is stable), so the hot per-line path never
+/// re-clones it.
 #[derive(Debug)]
-pub struct DeliveryReadEvent {
-    pub path: String,
-    pub bytes_read: usize,
-    pub lines_read: usize,
-    pub source_context: Option<HashMap<String, String>>,
-    // Read event is changing spots in the file source to after multilne agg. This new spot may not be as stable / performative
-    // So we want to have a mark that tracks whether it's coming from this new spot that pairs with an ENV gate
-    pub emitted_after_multiline_agg: bool,
-    /// Source component that emitted this read event. Used by the metric to
-    /// pick the right topic fallback when the filename doesn't match a
-    /// Lumberjack convention. See `SOURCE_TYPE_FILE` / `SOURCE_TYPE_KUBERNETES_LOGS`.
-    pub source_type: &'static str,
+struct ReadAccum {
+    source_context: HashMap<String, String>,
+    bytes_read: usize,
+    lines_read: usize,
+    /// Component span captured at accumulate time. Re-entered around the flush
+    /// `info!` so the trace `BroadcastLayer` copies `component_id`/`type`/`kind`
+    /// onto the log under `.vector.*` — restoring the component context that the
+    /// detached flush task would otherwise lack.
+    span: Span,
 }
 
-impl DeliveryReadEvent {
-    fn should_emit(&self) -> bool {
-        // Emit only once either if it's before multiline and the flag is off, or after with flag on
-        (self.emitted_after_multiline_agg && emit_read_event_after_multiline_agg())
-            || (!self.emitted_after_multiline_agg && !emit_read_event_after_multiline_agg())
+/// A sink delivery count plus the component span it was accumulated under, so
+/// the batched flush log carries `.vector.component_*` like the read leg.
+#[derive(Debug)]
+struct SinkAccum {
+    value: MetadataValuesCount,
+    span: Span,
+}
+
+/// Flush interval for the global delivery-event singleton. Configurable via
+/// `VECTOR_DELIVERY_FLUSH_INTERVAL_SECS` (whole seconds, must be > 0); defaults
+/// to 60s. Read once and cached.
+pub fn delivery_flush_interval() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 60;
+    static INTERVAL_SECS: OnceLock<u64> = OnceLock::new();
+    let secs = *INTERVAL_SECS.get_or_init(|| {
+        env::var("VECTOR_DELIVERY_FLUSH_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(DEFAULT_SECS)
+    });
+    std::time::Duration::from_secs(secs)
+}
+
+/// Which sink leg a count map belongs to.
+#[derive(Clone, Copy)]
+enum SinkLeg {
+    Staged,
+    Delivered,
+}
+
+/// Process-global accumulator for all VEL delivery events (source reads, sink
+/// staged, sink delivered). Emit sites call `accumulate_*` (cheap per-leg map
+/// merges); a single background task flushes every `delivery_flush_interval()`
+/// and once more when `shutdown()` is invoked.
+///
+/// This replaces both the per-line `info!`/`counter!` emissions and the
+/// per-source `DeliveryReadAccumulator` with one flush loop, one configurable
+/// interval, and one shutdown flush. The shutdown flush is invoked from
+/// `topology::running::stop` at the wave-1 -> wave-2 boundary — after every
+/// data source/sink has emitted its final counts, but while `internal_logs` is
+/// still alive to forward the resulting VEL logs (see the matching comment
+/// around `VECTOR_PROCESS_COMPONENTS_CLOSED`).
+pub struct DeliveryEventSingleton {
+    // Separate locks per leg so the hot read path never contends with sink
+    // response handling. Each lock is held only for a HashMap merge.
+    reads: Mutex<HashMap<(&'static str, String), ReadAccum>>,
+    staged: Mutex<HashMap<String, SinkAccum>>,
+    delivered: Mutex<HashMap<String, SinkAccum>>,
+    /// Signals the background flush task to perform a final flush and exit.
+    shutdown: Notify,
+    /// Set once the background flush task has been spawned.
+    spawned: AtomicBool,
+}
+
+static DELIVERY_SINGLETON: OnceLock<DeliveryEventSingleton> = OnceLock::new();
+
+/// Returns the process-global delivery-event accumulator, initializing it on
+/// first use. The background flush task is spawned lazily on the first
+/// `accumulate_*` call that runs inside a Tokio runtime.
+pub fn delivery_singleton() -> &'static DeliveryEventSingleton {
+    DELIVERY_SINGLETON.get_or_init(|| DeliveryEventSingleton {
+        reads: Mutex::new(HashMap::new()),
+        staged: Mutex::new(HashMap::new()),
+        delivered: Mutex::new(HashMap::new()),
+        shutdown: Notify::new(),
+        spawned: AtomicBool::new(false),
+    })
+}
+
+impl DeliveryEventSingleton {
+    /// Spawns the periodic flush task the first time it is called from within a
+    /// Tokio runtime. A cheap relaxed load makes every subsequent call a no-op.
+    fn ensure_flush_task(&'static self) {
+        if self.spawned.load(Ordering::Relaxed) {
+            return;
+        }
+        // Outside a runtime (e.g. unit tests, `vector generate`) there is no
+        // task to drive periodic flushing; accumulation still works and can be
+        // flushed explicitly. Retry on a later call once a runtime exists.
+        if Handle::try_current().is_err() {
+            return;
+        }
+        if self
+            .spawned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            tokio::spawn(self.run_flush_loop());
+        }
     }
-}
 
-impl NamedInternalEvent for DeliveryReadEvent {
-    fn name(&self) -> &'static str {
-        "DeliveryReadEvent"
+    async fn run_flush_loop(&'static self) {
+        let mut ticker = tokio::time::interval(delivery_flush_interval());
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick resolves immediately; consume it so we don't flush an
+        // empty registry right away.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => self.flush(),
+                _ = self.shutdown.notified() => {
+                    self.flush();
+                    break;
+                }
+            }
+        }
     }
-}
 
-impl InternalEvent for DeliveryReadEvent {
-    fn emit(self) {
-        if self.should_emit() {
-            let source_context = self.source_context.clone().unwrap_or_default();
-            info!(
-                message = "Delivery event: READ_MESSAGES.",
-                file = %self.path,
-                num_bytes = self.bytes_read,
-                num_events = self.lines_read,
-                delivery_event_type = "VECTOR_SOURCE_READ",
-                vector_event_type = "VECTOR_LOG_DELIVERY_EVENT",
-                internal_log_rate_limit = false,
-                // info! needs explicit field names at compile time, so we can't just log the whole map as individual fields
-                // Instead, we have to convert to JSON string and unwrap later on
-                source_context = serde_json::to_string(&source_context).unwrap(),
-            );
+    /// Accumulates a source read. The `delivery_events_total` counter fires
+    /// immediately (left as-is, so the metric stays exact); only the VEL
+    /// `info!` log is batched. `source_context` is borrowed and only cloned on
+    /// the first occurrence of a `(source_type, path)` within a flush window.
+    pub fn accumulate_read(
+        &'static self,
+        path: String,
+        bytes_read: usize,
+        lines_read: usize,
+        source_context: &Option<HashMap<String, String>>,
+        source_type: &'static str,
+        time_parity: i64,
+        emitted_after_multiline_agg: bool,
+    ) {
+        if !read_should_emit(emitted_after_multiline_agg) {
+            return;
+        }
 
+        // Counter emitted inline, bucketed on the read-time `time_parity` the
+        // event is stamped with — not batched through the flush.
+        {
+            let empty = HashMap::new();
+            let ctx = source_context.as_ref().unwrap_or(&empty);
             counter!(
                 "delivery_events_total",
                 "delivery_event_type" => "VECTOR_SOURCE_READ",
-                "time_parity" => current_hour_time_parity_ms(),
-                "topic" => resolve_received_topic(&source_context, &self.path, self.source_type),
-                "delivery_method" => delivery_method_for_source_type(self.source_type),
+                "time_parity" => time_parity.to_string(),
+                "delivery_method" => delivery_method_for_source_type(source_type),
+                "topic" => resolve_received_topic(ctx, &path, source_type),
             )
-            .increment(self.lines_read as u64);
+            .increment(lines_read as u64);
         }
+
+        self.ensure_flush_task();
+        let mut reads = self.reads.lock().expect("delivery reads lock poisoned");
+        let entry = reads
+            .entry((source_type, path))
+            .or_insert_with(|| ReadAccum {
+                source_context: source_context.clone().unwrap_or_default(),
+                bytes_read: 0,
+                lines_read: 0,
+                // Captured once per key: the source component span is stable per path.
+                span: Span::current(),
+            });
+        entry.bytes_read += bytes_read;
+        entry.lines_read += lines_read;
+    }
+
+    /// Accumulates a sink "staged" count map (one per sink request).
+    pub fn accumulate_staged(&'static self, count_map: &HashMap<String, MetadataValuesCount>) {
+        self.merge_sink(count_map, SinkLeg::Staged);
+    }
+
+    /// Accumulates a sink "delivered" count map (one per successful request).
+    pub fn accumulate_delivered(&'static self, count_map: &HashMap<String, MetadataValuesCount>) {
+        self.merge_sink(count_map, SinkLeg::Delivered);
+    }
+
+    fn merge_sink(&'static self, count_map: &HashMap<String, MetadataValuesCount>, leg: SinkLeg) {
+        if count_map.is_empty() {
+            return;
+        }
+        self.ensure_flush_task();
+        // One emit call comes from a single sink, so the component span is the
+        // same for every key in this count map; captured once and stored per key.
+        let span = Span::current();
+        let lock = match leg {
+            SinkLeg::Staged => &self.staged,
+            SinkLeg::Delivered => &self.delivered,
+        };
+        let mut target = lock.lock().expect("delivery sink lock poisoned");
+        for (key, value) in count_map {
+            target
+                .entry(key.clone())
+                .and_modify(|existing| {
+                    existing.value.count += value.count;
+                    existing.value.size += value.size;
+                })
+                .or_insert_with(|| SinkAccum {
+                    value: value.clone(),
+                    span: span.clone(),
+                });
+        }
+    }
+
+    /// Drains all three legs and emits the aggregated VEL `info!` logs. Only the
+    /// logs are batched here; the `delivery_events_total` counters are emitted
+    /// inline at the event sites. Each leg lock is taken only to swap out its
+    /// map, so `info!` never runs while a registry lock is held.
+    pub fn flush(&self) {
+        let reads = std::mem::take(&mut *self.reads.lock().expect("delivery reads lock poisoned"));
+        let staged =
+            std::mem::take(&mut *self.staged.lock().expect("delivery staged lock poisoned"));
+        let delivered =
+            std::mem::take(&mut *self.delivered.lock().expect("delivery delivered lock poisoned"));
+
+        for ((_source_type, path), accum) in reads {
+            // Re-enter the source's component span so the trace BroadcastLayer
+            // copies `.vector.component_{id,type,kind}` onto the log.
+            let _entered = accum.span.enter();
+            info!(
+                message = "Delivery event: READ_MESSAGES.",
+                file = %path,
+                num_bytes = accum.bytes_read,
+                num_events = accum.lines_read,
+                delivery_event_type = "VECTOR_SOURCE_READ",
+                vector_event_type = "VECTOR_LOG_DELIVERY_EVENT",
+                internal_log_rate_limit = false,
+                source_context = serde_json::to_string(&accum.source_context).unwrap(),
+            );
+        }
+
+        emit_sink_delivery_logs(
+            staged.values(),
+            "Delivery event: SINK_STAGED_MESSAGES",
+            "VECTOR_SINK_UPLOAD_STAGED",
+        );
+        emit_sink_delivery_logs(
+            delivered.values(),
+            "Delivery event: SINK_DELIVERED_MESSAGES",
+            "VECTOR_SINK_UPLOAD_DELIVERED",
+        );
+    }
+
+    /// Final flush at shutdown: stops the background task and drains
+    /// synchronously so the events are emitted in the wave-1 -> wave-2 window
+    /// while `internal_logs` can still forward them.
+    pub fn shutdown(&self) {
+        self.shutdown.notify_one();
+        self.flush();
+    }
+}
+
+/// Emits one VEL `info!` log per aggregated `value_map`. Used by the sink
+/// delivery legs of the singleton flush. Each entry's component span is
+/// re-entered so the trace BroadcastLayer copies `.vector.component_*` onto the
+/// log. The matching counters are emitted separately and inline by
+/// [`emit_sink_delivery_counters`].
+fn emit_sink_delivery_logs<'a>(
+    accums: impl Iterator<Item = &'a SinkAccum>,
+    message: &'static str,
+    delivery_event_type: &'static str,
+) {
+    for accum in accums {
+        let value = &accum.value;
+        let _entered = accum.span.enter();
+        info!(
+            message = message,
+            keys = serde_json::to_string(&value.value_map).unwrap(),
+            delivery_event_type = delivery_event_type,
+            vector_event_type = "VECTOR_LOG_DELIVERY_EVENT",
+            num_events = value.count,
+            num_bytes = value.size,
+            // Specifying this allows us to emit without rate limiting (needed for high throughput sinks)
+            internal_log_rate_limit = false,
+        );
+    }
+}
+
+/// Emits the `delivery_events_total` counter per `value_map`. Called inline
+/// (per sink request) so the metric is not affected by the log batching.
+fn emit_sink_delivery_counters<'a>(
+    values: impl Iterator<Item = &'a MetadataValuesCount>,
+    delivery_event_type: &'static str,
+) {
+    for value in values {
+        counter!(
+            "delivery_events_total",
+            "delivery_event_type" => delivery_event_type.to_string(),
+            "time_parity" => time_parity_from_value_map(&value.value_map),
+            "topic" => topic_from_value_map(&value.value_map),
+            "delivery_method" => delivery_method_from_value_map(&value.value_map),
+        )
+        .increment(value.count as u64);
     }
 }
 
@@ -253,43 +521,17 @@ impl VectorSinkDeliveryEvent {
         // Mark for testing
         self.delivered_call_count.fetch_add(1, Ordering::SeqCst);
 
-        // VECTOR_DELIVERED_MESSAGES_EVENT
-        self.emit_count_map(
-            "Delivery event: SINK_DELIVERED_MESSAGES",
-            "VECTOR_SINK_UPLOAD_DELIVERED",
-        )
+        // VECTOR_DELIVERED_MESSAGES_EVENT. The counter is emitted inline per
+        // request (left as-is); only the VEL `info!` log is batched through the
+        // process-global singleton.
+        emit_sink_delivery_counters(self.count_map.values(), "VECTOR_SINK_UPLOAD_DELIVERED");
+        delivery_singleton().accumulate_delivered(&self.count_map);
     }
 
     pub fn emit_staged_event(&self) {
-        // VECTOR_STAGED_MESSAGES_EVENT
-        self.emit_count_map(
-            "Delivery event: SINK_STAGED_MESSAGES",
-            "VECTOR_SINK_UPLOAD_STAGED",
-        )
-    }
-
-    fn emit_count_map(&self, message: &str, delivery_event_type: &str) {
-        for value in self.count_map.values() {
-            info!(
-                message = message,
-                keys = serde_json::to_string(&value.value_map).unwrap(),
-                delivery_event_type = delivery_event_type,
-                vector_event_type = "VECTOR_LOG_DELIVERY_EVENT",
-                num_events = value.count,
-                num_bytes = value.size,
-                // Specifying this allows us to emit without rate limiting (needed for high throughput sinks)
-                internal_log_rate_limit = false,
-            );
-
-            counter!(
-                "delivery_events_total",
-                "delivery_event_type" => delivery_event_type.to_string(),
-                "time_parity" => time_parity_from_value_map(&value.value_map),
-                "topic" => topic_from_value_map(&value.value_map),
-                "delivery_method" => delivery_method_from_value_map(&value.value_map),
-            )
-            .increment(value.count as u64);
-        }
+        // VECTOR_STAGED_MESSAGES_EVENT — see `emit_delivered_event`.
+        emit_sink_delivery_counters(self.count_map.values(), "VECTOR_SINK_UPLOAD_STAGED");
+        delivery_singleton().accumulate_staged(&self.count_map);
     }
 }
 
@@ -493,14 +735,16 @@ mod topic_inference_tests {
     }
 
     #[test]
-    fn delivery_method_for_source_type_known_values() {
+    fn delivery_method_for_source_type_file_sources_are_file() {
         assert_eq!(
             delivery_method_for_source_type(SOURCE_TYPE_FILE),
             DELIVERY_METHOD_FILE
         );
+        // The Databricks fork's kubernetes_logs source reads files, so it is
+        // file-based too — not a distinct delivery method.
         assert_eq!(
             delivery_method_for_source_type(SOURCE_TYPE_KUBERNETES_LOGS),
-            DELIVERY_METHOD_KUBERNETES_LOGS
+            DELIVERY_METHOD_FILE
         );
     }
 

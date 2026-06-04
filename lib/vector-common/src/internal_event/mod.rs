@@ -24,7 +24,7 @@ pub use metrics::SharedString;
 pub use optional_tag::OptionalTag;
 pub use prelude::{error_stage, error_type};
 pub use service::{CallError, PollReadyError};
-pub use vector_event::delivery_event::DeliveryReadEvent;
+pub use vector_event::delivery_event::{DeliveryEventSingleton, delivery_singleton};
 
 use crate::json_size::JsonSize;
 

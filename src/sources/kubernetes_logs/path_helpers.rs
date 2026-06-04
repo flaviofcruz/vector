@@ -9,6 +9,9 @@ use vector_lib::file_source::paths_provider::LogFileInfo;
 
 /// The root directory for pod logs.
 const K8S_LOGS_DIR: &str = "/var/log/pods";
+/// The root directory for pod logs on instances that run pods inside microVMs
+/// (brickvisor runtime). The directory tree under it mirrors [`K8S_LOGS_DIR`].
+const MICROVMS_LOGS_DIR: &str = "/var/log/microvms";
 const DATABRICKS_K8S_LOGS_DIR: &str = "/var/lib/kubelet/pods";
 const DATABRICKS_K8S_LOGS_DIR_SUFFIX: &str = "volumes/kubernetes.io~empty-dir";
 
@@ -17,14 +20,23 @@ const LOG_PATH_DELIMITER: &str = "_";
 
 /// Builds absolute log directory path for a pod sandbox.
 ///
+/// When `use_microvms_path` is true the path is rooted at [`MICROVMS_LOGS_DIR`]
+/// instead of [`K8S_LOGS_DIR`]; the rest of the path layout is identical.
+///
 /// Based on <https://github.com/kubernetes/kubernetes/blob/31305966789525fca49ec26c289e565467d1f1c4/pkg/kubelet/kuberuntime/helpers.go#L178>
 pub(super) fn build_pod_logs_directory(
     pod_namespace: &str,
     pod_name: &str,
     pod_uid: &str,
+    use_microvms_path: bool,
 ) -> PathBuf {
+    let root = if use_microvms_path {
+        MICROVMS_LOGS_DIR
+    } else {
+        K8S_LOGS_DIR
+    };
     [
-        K8S_LOGS_DIR,
+        root,
         &[pod_namespace, pod_name, pod_uid].join(LOG_PATH_DELIMITER),
     ]
     .join("/")
@@ -73,32 +85,25 @@ mod tests {
 
     #[test]
     fn test_build_pod_logs_directory() {
-        let path = format!(
-            "{}{}",
-            std::path::MAIN_SEPARATOR,
-            [
-                "var",
-                "log",
-                "pods",
-                "sandbox0-ns_sandbox0-name_sandbox0-uid",
-            ]
-            .iter()
-            .collect::<PathBuf>()
-            .into_os_string()
-            .into_string()
-            .unwrap()
-        );
-        let s_path = path.as_str();
         let cases = vec![
-            // Valid inputs.
-            (("sandbox0-ns", "sandbox0-name", "sandbox0-uid"), s_path),
+            // Valid inputs, default (/var/log/pods) root.
+            (
+                ("sandbox0-ns", "sandbox0-name", "sandbox0-uid", false),
+                "/var/log/pods/sandbox0-ns_sandbox0-name_sandbox0-uid",
+            ),
+            // Valid inputs, microVM (/var/log/microvms) root.
+            (
+                ("sandbox0-ns", "sandbox0-name", "sandbox0-uid", true),
+                "/var/log/microvms/sandbox0-ns_sandbox0-name_sandbox0-uid",
+            ),
             // Invalid inputs.
-            (("", "", ""), "/var/log/pods/__"),
+            (("", "", "", false), "/var/log/pods/__"),
+            (("", "", "", true), "/var/log/microvms/__"),
         ];
 
-        for ((in_namespace, in_name, in_uid), expected) in cases.into_iter() {
+        for ((in_namespace, in_name, in_uid, use_microvms_path), expected) in cases.into_iter() {
             assert_eq!(
-                build_pod_logs_directory(in_namespace, in_name, in_uid),
+                build_pod_logs_directory(in_namespace, in_name, in_uid, use_microvms_path),
                 PathBuf::from(expected)
             );
         }

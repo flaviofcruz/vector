@@ -37,6 +37,7 @@ use crate::{
 const DEFAULT_SCRAPE_INTERVAL_SECS: u64 = 30;
 const DEFAULT_SCRAPE_TIMEOUT_SECS: f64 = 10.0;
 const SELF_NODE_NAME_ENV_KEY: &str = "VECTOR_SELF_NODE_NAME";
+const METRICS_NAMESPACE_TAG: &str = "tenant";
 
 /// Configuration for the `prometheus_k8s_scrape` source.
 #[serde_as]
@@ -135,6 +136,18 @@ pub struct PrometheusK8sScrapeConfig {
     #[configurable(metadata(docs::advanced))]
     max_endpoints_per_pod: usize,
 
+    /// The pod annotation key used to read a metrics-namespace value for each
+    /// scraped pod.
+    ///
+    /// When set, the annotation's value is recorded on every endpoint
+    /// discovered for that pod and emitted as a `tenant` tag on each scraped
+    /// metric (subject to `honor_labels` and `emit_pod_metadata`). Pods that
+    /// lack the annotation are scraped normally with no `tenant` tag. Set to
+    /// `null` (the default) to disable metrics-namespace discovery entirely.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "databricks_tenant"))]
+    metrics_ns_annotation_name: Option<String>,
+
     /// Controls whether to add pod metadata (pod_name, pod_namespace, endpoint) to scraped metrics.
     ///
     /// When false, no Kubernetes metadata tags will be added to the metrics.
@@ -166,6 +179,7 @@ impl Default for PrometheusK8sScrapeConfig {
             named_port: default_named_port(),
             annotation_name: default_annotation_name(),
             max_endpoints_per_pod: default_max_endpoints_per_pod(),
+            metrics_ns_annotation_name: None,
             emit_pod_metadata: true,
             tls: None,
             auth: None,
@@ -225,6 +239,7 @@ impl SourceConfig for PrometheusK8sScrapeConfig {
                 config.named_port,
                 config.annotation_name,
                 config.max_endpoints_per_pod,
+                config.metrics_ns_annotation_name,
                 config.emit_pod_metadata,
                 config.auth,
                 tls,
@@ -261,6 +276,7 @@ async fn run_source(
     named_port: Option<String>,
     annotation_name: Option<String>,
     max_endpoints_per_pod: usize,
+    metrics_ns_annotation_name: Option<String>,
     emit_pod_metadata: bool,
     auth: Option<Auth>,
     tls: TlsSettings,
@@ -308,6 +324,7 @@ async fn run_source(
         named_port,
         annotation_name,
         max_endpoints_per_pod,
+        metrics_ns_annotation_name,
     );
 
     // Run the scraping loop
@@ -500,6 +517,14 @@ async fn scrape_endpoint(
                             // Skip if honor_labels is true and tag already exists
                         } else {
                             metric.replace_tag(tag.clone(), endpoint.namespace.clone());
+                        }
+                    }
+
+                    if let Some(ref metrics_ns) = endpoint.metrics_namespace {
+                        if honor_labels && metric.tags().and_then(|t| t.get(METRICS_NAMESPACE_TAG)).is_some() {
+                            // Honor existing `tenant` label from the scrape target.
+                        } else {
+                            metric.replace_tag(METRICS_NAMESPACE_TAG.to_string(), metrics_ns.clone());
                         }
                     }
 
@@ -707,6 +732,7 @@ test_gauge 3.14
             url: format!("http://{}/metrics", addr),
             name: "test-pod".to_string(),
             namespace: "test-namespace".to_string(),
+            metrics_namespace: None,
         };
         let result = scrape_endpoint(
             endpoint.clone(),
@@ -774,6 +800,7 @@ test_gauge 3.14
             url: format!("http://{}/metrics", addr),
             name: "test-pod".to_string(),
             namespace: "test-namespace".to_string(),
+            metrics_namespace: None,
         };
         let result = scrape_endpoint(
             endpoint,
@@ -825,6 +852,7 @@ test_gauge 3.14
             url: format!("http://{}/metrics", addr),
             name: "test-pod".to_string(),
             namespace: "test-namespace".to_string(),
+            metrics_namespace: None,
         };
         let result = scrape_endpoint(
             endpoint,
@@ -889,6 +917,7 @@ test_gauge 3.14
             url: format!("http://{}/metrics", addr),
             name: "test-pod".to_string(),
             namespace: "test-namespace".to_string(),
+            metrics_namespace: None,
         };
         let result = scrape_endpoint(
             endpoint,
@@ -955,6 +984,7 @@ http_requests_total{method="GET",status="200"} 1234
             url: format!("http://{}/metrics", addr),
             name: "test-pod".to_string(),
             namespace: "test-namespace".to_string(),
+            metrics_namespace: None,
         };
         let result = scrape_endpoint(
             endpoint.clone(),
@@ -1045,6 +1075,7 @@ http_requests_total{method="POST",status="201"} 5678
             url: format!("http://{}/metrics", addr),
             name: "test-pod".to_string(),
             namespace: "test-namespace".to_string(),
+            metrics_namespace: None,
         };
         let result = scrape_endpoint(
             endpoint,
@@ -1092,6 +1123,222 @@ http_requests_total{method="POST",status="201"} 5678
                     // Original metric tags should still be present
                     assert_eq!(tags.get("method").unwrap(), "POST");
                     assert_eq!(tags.get("status").unwrap(), "201");
+                }
+            }
+        }
+    }
+
+    /// Helper to spin up a one-shot HTTP server returning a fixed body and
+    /// return its listening address and shutdown trigger.
+    async fn spawn_metrics_server(body: &'static str) -> (SocketAddr, oneshot::Sender<()>) {
+        let (tx, rx) = oneshot::channel();
+
+        let make_svc = make_service_fn(move |_conn| async move {
+            Ok::<_, Infallible>(service_fn(move |_req| async move {
+                Ok::<_, Infallible>(Response::new(Body::from(body)))
+            }))
+        });
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Server::bind(&addr).serve(make_svc);
+        let addr = server.local_addr();
+
+        tokio::spawn(async move {
+            let server = server.with_graceful_shutdown(async {
+                rx.await.ok();
+            });
+            server.await.ok();
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (addr, tx)
+    }
+
+    /// When the endpoint carries a metrics-namespace value, scrape_endpoint
+    /// emits a `tenant` tag on every metric (subject to emit_pod_metadata
+    /// being true).
+    #[tokio::test]
+    async fn test_scrape_endpoint_emits_metrics_namespace_tag_when_present() {
+        let (addr, tx) = spawn_metrics_server(
+            "# TYPE http_requests_total counter\nhttp_requests_total{method=\"GET\"} 1\n",
+        )
+        .await;
+
+        let tls = TlsSettings::default();
+        let proxy = ProxyConfig::default();
+        let client = http_client::build_client(&tls, &proxy).unwrap();
+
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+            metrics_namespace: Some("alpha".to_string()),
+        };
+        let result = scrape_endpoint(
+            endpoint,
+            client,
+            Duration::from_secs(5),
+            None,
+            Some("pod_name".to_string()),
+            Some("pod_namespace".to_string()),
+            false,
+            true,
+        )
+        .await;
+
+        tx.send(()).ok();
+
+        let events = result.unwrap();
+        assert!(!events.is_empty());
+        for event in &events {
+            if let Event::Metric(metric) = event {
+                let tags = metric.tags().expect("metric should have tags");
+                assert_eq!(
+                    tags.get(METRICS_NAMESPACE_TAG),
+                    Some("alpha"),
+                    "`tenant` tag should be present and match endpoint.metrics_namespace"
+                );
+            }
+        }
+    }
+
+    /// When the endpoint has no metrics-namespace value, scrape_endpoint must
+    /// not add a `tenant` tag (and must not synthesize one from elsewhere).
+    #[tokio::test]
+    async fn test_scrape_endpoint_no_metrics_namespace_tag_when_absent() {
+        let (addr, tx) = spawn_metrics_server(
+            "# TYPE http_requests_total counter\nhttp_requests_total{method=\"GET\"} 1\n",
+        )
+        .await;
+
+        let tls = TlsSettings::default();
+        let proxy = ProxyConfig::default();
+        let client = http_client::build_client(&tls, &proxy).unwrap();
+
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+            metrics_namespace: None,
+        };
+        let result = scrape_endpoint(
+            endpoint,
+            client,
+            Duration::from_secs(5),
+            None,
+            Some("pod_name".to_string()),
+            Some("pod_namespace".to_string()),
+            false,
+            true,
+        )
+        .await;
+
+        tx.send(()).ok();
+
+        let events = result.unwrap();
+        assert!(!events.is_empty());
+        for event in &events {
+            if let Event::Metric(metric) = event {
+                if let Some(tags) = metric.tags() {
+                    assert!(
+                        !tags.contains_key(METRICS_NAMESPACE_TAG),
+                        "`tenant` tag must not appear when endpoint.metrics_namespace is None"
+                    );
+                }
+            }
+        }
+    }
+
+    /// honor_labels = true preserves a `tenant` label already present on the
+    /// scraped metric and does not overwrite it with endpoint.metrics_namespace.
+    #[tokio::test]
+    async fn test_scrape_endpoint_metrics_namespace_honor_labels() {
+        let (addr, tx) = spawn_metrics_server(
+            "test_metric{tenant=\"original_tenant\"} 1\n",
+        )
+        .await;
+
+        let tls = TlsSettings::default();
+        let proxy = ProxyConfig::default();
+        let client = http_client::build_client(&tls, &proxy).unwrap();
+
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+            metrics_namespace: Some("override_tenant".to_string()),
+        };
+        let result = scrape_endpoint(
+            endpoint,
+            client,
+            Duration::from_secs(5),
+            None,
+            None,
+            None,
+            true, // honor_labels
+            true,
+        )
+        .await;
+
+        tx.send(()).ok();
+
+        let events = result.unwrap();
+        assert!(!events.is_empty());
+        for event in &events {
+            if let Event::Metric(metric) = event {
+                let tags = metric.tags().expect("metric should have tags");
+                assert_eq!(
+                    tags.get(METRICS_NAMESPACE_TAG),
+                    Some("original_tenant"),
+                    "honor_labels must preserve the scraped `tenant` label"
+                );
+            }
+        }
+    }
+
+    /// emit_pod_metadata = false suppresses the `tenant` tag too — the
+    /// metrics-namespace value lives in the same metadata block as
+    /// pod_name/pod_namespace.
+    #[tokio::test]
+    async fn test_scrape_endpoint_metrics_namespace_suppressed_when_metadata_disabled() {
+        let (addr, tx) = spawn_metrics_server(
+            "# TYPE http_requests_total counter\nhttp_requests_total{method=\"GET\"} 1\n",
+        )
+        .await;
+
+        let tls = TlsSettings::default();
+        let proxy = ProxyConfig::default();
+        let client = http_client::build_client(&tls, &proxy).unwrap();
+
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+            metrics_namespace: Some("alpha".to_string()),
+        };
+        let result = scrape_endpoint(
+            endpoint,
+            client,
+            Duration::from_secs(5),
+            None,
+            Some("pod_name".to_string()),
+            Some("pod_namespace".to_string()),
+            false,
+            false, // emit_pod_metadata = false
+        )
+        .await;
+
+        tx.send(()).ok();
+
+        let events = result.unwrap();
+        assert!(!events.is_empty());
+        for event in &events {
+            if let Event::Metric(metric) = event {
+                if let Some(tags) = metric.tags() {
+                    assert!(
+                        !tags.contains_key(METRICS_NAMESPACE_TAG),
+                        "`tenant` tag must not appear when emit_pod_metadata is false"
+                    );
                 }
             }
         }

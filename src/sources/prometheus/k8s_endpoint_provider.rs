@@ -30,6 +30,11 @@ pub struct Endpoint {
     pub name: String,
     /// The namespace of the pod
     pub namespace: String,
+    /// Optional metrics-namespace value read from a configurable pod
+    /// annotation. `None` when metrics-namespace discovery is disabled or the
+    /// pod does not carry the configured annotation. Emitted on each scraped
+    /// metric as the `tenant` tag (see `METRICS_NAMESPACE_TAG`).
+    pub metrics_namespace: Option<String>,
 }
 
 /// Trait for providing endpoints for Prometheus scraping
@@ -65,6 +70,11 @@ pub struct K8sEndpointProvider {
     /// The maximum number of endpoints contributed per pod by the annotation
     /// path. Ports parsed beyond this cap are dropped.
     max_endpoints_per_pod: usize,
+    /// Pod annotation key whose value is the metrics-namespace identifier to
+    /// attach to each endpoint discovered for that pod, or `None` to disable
+    /// metrics-namespace discovery. Pods that lack the annotation produce
+    /// endpoints with `metrics_namespace = None`.
+    metrics_ns_annotation_name: Option<String>,
 }
 
 impl K8sEndpointProvider {
@@ -80,17 +90,21 @@ impl K8sEndpointProvider {
     /// * `max_endpoints_per_pod` - Caps the number of endpoints a single pod
     ///   can contribute via the annotation path; additional parsed ports are
     ///   silently dropped
+    /// * `metrics_ns_annotation_name` - Pod annotation key whose value is recorded as
+    ///   the endpoint's `metrics_namespace`; `None` disables metrics-namespace discovery
     pub fn new(
         pod_state: Store<Pod>,
         named_port: Option<String>,
         annotation_name: Option<String>,
         max_endpoints_per_pod: usize,
+        metrics_ns_annotation_name: Option<String>,
     ) -> Self {
         Self {
             pod_state,
             named_port,
             annotation_name,
             max_endpoints_per_pod,
+            metrics_ns_annotation_name,
         }
     }
 }
@@ -105,6 +119,7 @@ impl EndpointProvider for K8sEndpointProvider {
             self.named_port.as_deref(),
             self.annotation_name.as_deref(),
             self.max_endpoints_per_pod,
+            self.metrics_ns_annotation_name.as_deref(),
         )
     }
 }
@@ -124,17 +139,21 @@ impl EndpointProvider for K8sEndpointProvider {
 ///   numbers. Pass `None` to disable annotation-based discovery entirely.
 /// * `max_endpoints_per_pod` - Caps the number of endpoints contributed per pod
 ///   by the annotation path; additional parsed ports are silently dropped.
+/// * `metrics_ns_annotation_name` - Pod annotation key whose value is recorded as the
+///   endpoint's `metrics_namespace`; `None` disables metrics-namespace discovery so
+///   all endpoints have `metrics_namespace = None`.
 fn compute_endpoints(
     state: &[Arc<Pod>],
     named_port: Option<&str>,
     annotation_name: Option<&str>,
     max_endpoints_per_pod: usize,
+    metrics_ns_annotation_name: Option<&str>,
 ) -> Vec<Endpoint> {
     let named_port_endpoints: Vec<Endpoint> = match named_port {
         Some(port) => state
             .iter()
             .filter(|pod| pod_has_named_port(pod.as_ref(), port))
-            .filter_map(|pod| extract_metrics_endpoint(pod.as_ref(), port))
+            .filter_map(|pod| extract_metrics_endpoint(pod.as_ref(), port, metrics_ns_annotation_name))
             .collect(),
         None => vec![],
     };
@@ -143,7 +162,12 @@ fn compute_endpoints(
         Some(name) => state
             .iter()
             .flat_map(|pod| {
-                extract_endpoints_from_annotation(pod.as_ref(), name, max_endpoints_per_pod)
+                extract_endpoints_from_annotation(
+                    pod.as_ref(),
+                    name,
+                    max_endpoints_per_pod,
+                    metrics_ns_annotation_name,
+                )
             })
             .collect(),
         None => vec![],
@@ -186,18 +210,47 @@ fn pod_has_named_port(pod: &Pod, port_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Read the metrics-namespace value for a pod from the configured annotation.
+///
+/// The returned value is emitted on each scraped metric as the `tenant` tag
+/// (see [`super::k8s_scrape::METRICS_NAMESPACE_TAG`]) — the user-visible label
+/// is named `tenant` because that is the label name the downstream metrics
+/// system expects, even though everything in code refers to it as the metrics
+/// namespace.
+///
+/// Returns `None` when metrics-namespace discovery is disabled
+/// (`metrics_ns_annotation_name` is `None`), when the pod carries no
+/// annotations, or when the configured annotation key is absent. The
+/// annotation value is returned verbatim with no parsing — empty strings are
+/// returned as `Some("".to_string())` since the caller may want to treat that
+/// as "explicitly empty".
+fn extract_metrics_namespace(pod: &Pod, metrics_ns_annotation_name: Option<&str>) -> Option<String> {
+    let key = metrics_ns_annotation_name?;
+    pod.metadata
+        .annotations
+        .as_ref()?
+        .get(key)
+        .cloned()
+}
+
 /// Extract the endpoint (pod_ip:port) for pods with the specified named port
 ///
 /// # Arguments
 ///
 /// * `pod` - The Kubernetes pod to extract the endpoint from
 /// * `port_name` - The name of the port to look for
+/// * `metrics_ns_annotation_name` - Pod annotation key whose value is recorded as the
+///   endpoint's `metrics_namespace`; `None` disables metrics-namespace discovery
 ///
 /// # Returns
 ///
 /// An `Option<Endpoint>` containing the HTTP endpoint URL if the pod has an IP
 /// and a matching port, or `None` otherwise
-fn extract_metrics_endpoint(pod: &Pod, port_name: &str) -> Option<Endpoint> {
+fn extract_metrics_endpoint(
+    pod: &Pod,
+    port_name: &str,
+    metrics_ns_annotation_name: Option<&str>,
+) -> Option<Endpoint> {
     let pod_ip = pod.status.as_ref()?.pod_ip.as_ref()?;
     let name = pod.metadata.name.clone().unwrap_or_default();
     let namespace = pod.metadata.namespace.clone().unwrap_or_default();
@@ -213,19 +266,22 @@ fn extract_metrics_endpoint(pod: &Pod, port_name: &str) -> Option<Endpoint> {
     })?;
 
     let url = format!("http://{}:{}/metrics", pod_ip, port_number);
+    let metrics_ns = extract_metrics_namespace(pod, metrics_ns_annotation_name);
 
     trace!(
         message = "Created endpoint for pod with named port.",
         pod = %name,
         namespace = %namespace,
         port_name,
-        endpoint = %url
+        endpoint = %url,
+        metrics_namespace = ?metrics_ns,
     );
 
     Some(Endpoint {
         url,
         name,
         namespace,
+        metrics_namespace: metrics_ns,
     })
 }
 
@@ -244,6 +300,7 @@ fn extract_endpoints_from_annotation(
     pod: &Pod,
     annotation_name: &str,
     max_ports: usize,
+    metrics_ns_annotation_name: Option<&str>,
 ) -> Vec<Endpoint> {
     let Some(annotations) = pod.metadata.annotations.as_ref() else {
         return vec![];
@@ -256,6 +313,7 @@ fn extract_endpoints_from_annotation(
     };
     let name = pod.metadata.name.clone().unwrap_or_default();
     let namespace = pod.metadata.namespace.clone().unwrap_or_default();
+    let metrics_ns = extract_metrics_namespace(pod, metrics_ns_annotation_name);
 
     // Parse, drop invalid entries, then dedupe (first-seen wins). Deduplication
     // runs before the cap so accidental duplicates in the annotation don't
@@ -292,12 +350,14 @@ fn extract_endpoints_from_annotation(
                 pod = %name,
                 namespace = %namespace,
                 port = port_number,
-                endpoint = %url
+                endpoint = %url,
+                metrics_namespace = ?metrics_ns,
             );
             Endpoint {
                 url,
                 name: name.clone(),
                 namespace: namespace.clone(),
+                metrics_namespace: metrics_ns.clone(),
             }
         })
         .collect()
@@ -312,6 +372,7 @@ mod tests {
         api::core::v1::{Container, ContainerPort, PodSpec, PodStatus},
         apimachinery::pkg::apis::meta::v1::ObjectMeta,
     };
+    use rstest::rstest;
 
     /// Effectively-unlimited cap used in tests whose intent is unrelated to the
     /// `max_endpoints_per_pod` enforcement.
@@ -374,13 +435,14 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoint = extract_metrics_endpoint(&pod, "user-metrics");
+        let endpoint = extract_metrics_endpoint(&pod, "user-metrics", None);
         assert_eq!(
             endpoint,
             Some(Endpoint {
                 url: "http://10.244.1.5:9090/metrics".to_string(),
                 name: "test-pod".to_string(),
                 namespace: "test-namespace".to_string(),
+                metrics_namespace: None,
             })
         );
     }
@@ -404,7 +466,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoint = extract_metrics_endpoint(&pod, "user-metrics");
+        let endpoint = extract_metrics_endpoint(&pod, "user-metrics", None);
         assert_eq!(endpoint, None);
     }
 
@@ -427,13 +489,14 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
         assert_eq!(
             endpoints,
             vec![Endpoint {
                 url: "http://10.244.2.3:9091/metrics".to_string(),
                 name: "annotated-pod".to_string(),
                 namespace: "default".to_string(),
+                metrics_namespace: None,
             }]
         );
     }
@@ -457,7 +520,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
         assert_eq!(endpoints.len(), 2);
         let urls: HashSet<&str> = endpoints.iter().map(|e| e.url.as_str()).collect();
         assert!(urls.contains("http://10.244.2.4:9091/metrics"));
@@ -490,7 +553,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
         let urls: HashSet<&str> = endpoints.iter().map(|e| e.url.as_str()).collect();
         assert_eq!(urls.len(), 3);
         assert!(urls.contains("http://10.244.2.5:9091/metrics"));
@@ -520,7 +583,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
         let urls: HashSet<&str> = endpoints.iter().map(|e| e.url.as_str()).collect();
         assert_eq!(urls.len(), 2);
         assert!(urls.contains("http://10.244.2.6:9091/metrics"));
@@ -549,7 +612,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
         assert!(endpoints.is_empty());
     }
 
@@ -569,7 +632,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
         assert!(endpoints.is_empty());
     }
 
@@ -598,7 +661,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
         assert_eq!(endpoints.len(), 2);
         // Order preserved: first two declared ports survive.
         assert_eq!(endpoints[0].url, "http://10.244.2.8:9091/metrics");
@@ -626,7 +689,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 0);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 0, None);
         assert!(endpoints.is_empty());
     }
 
@@ -652,7 +715,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 5);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 5, None);
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].url, "http://10.244.2.10:9091/metrics");
     }
@@ -682,7 +745,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].url, "http://10.244.2.11:9091/metrics");
         assert_eq!(endpoints[1].url, "http://10.244.2.11:9092/metrics");
@@ -719,7 +782,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].url, "http://10.244.3.1:9091/metrics");
         assert_eq!(endpoints[1].url, "http://10.244.3.1:9092/metrics");
@@ -750,7 +813,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].url, "http://10.244.3.2:9091/metrics");
         assert_eq!(endpoints[1].url, "http://10.244.3.2:9092/metrics");
@@ -780,7 +843,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].url, "http://10.244.3.3:9091/metrics");
     }
@@ -810,7 +873,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].url, "http://10.244.3.4:9092/metrics");
         assert_eq!(endpoints[1].url, "http://10.244.3.4:9091/metrics");
@@ -842,7 +905,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].url, "http://10.244.3.5:9091/metrics");
         assert_eq!(endpoints[1].url, "http://10.244.3.5:9092/metrics");
@@ -917,6 +980,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
+            None,
         );
 
         assert_eq!(endpoints.len(), 1);
@@ -936,6 +1000,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
+            None,
         );
 
         assert_eq!(endpoints.len(), 1);
@@ -955,6 +1020,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
+            None,
         );
 
         assert_eq!(endpoints.len(), 1);
@@ -974,6 +1040,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
+            None,
         );
 
         assert!(endpoints.is_empty());
@@ -998,6 +1065,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
+            None,
         );
 
         assert_eq!(endpoints.len(), 2);
@@ -1021,7 +1089,7 @@ mod tests {
         );
         let state = vec![pod];
 
-        let endpoints = compute_endpoints(&state, Some("user-metrics"), None, UNLIMITED);
+        let endpoints = compute_endpoints(&state, Some("user-metrics"), None, UNLIMITED, None);
 
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].url, "http://10.0.0.7:9090/metrics");
@@ -1042,7 +1110,7 @@ mod tests {
         );
         let state = vec![pod];
 
-        let endpoints = compute_endpoints(&state, None, Some("system_metrics_enabled"), UNLIMITED);
+        let endpoints = compute_endpoints(&state, None, Some("system_metrics_enabled"), UNLIMITED, None);
 
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].url, "http://10.0.0.8:9091/metrics");
@@ -1060,7 +1128,7 @@ mod tests {
         );
         let state = vec![pod];
 
-        let endpoints = compute_endpoints(&state, None, None, UNLIMITED);
+        let endpoints = compute_endpoints(&state, None, None, UNLIMITED, None);
 
         assert!(endpoints.is_empty());
     }
@@ -1085,6 +1153,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
+            None,
         );
 
         assert_eq!(endpoints.len(), 2);
@@ -1102,7 +1171,7 @@ mod tests {
         let pod_b = make_pod("pod-b", "10.0.0.21", None, None, Some("9091,9092,9093,9094"));
         let state = vec![pod_a, pod_b];
 
-        let endpoints = compute_endpoints(&state, None, Some("system_metrics_enabled"), 2);
+        let endpoints = compute_endpoints(&state, None, Some("system_metrics_enabled"), 2, None);
 
         // 2 ports * 2 pods = 4 endpoints total.
         assert_eq!(endpoints.len(), 4);
@@ -1125,8 +1194,265 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
+            None,
         );
 
         assert!(endpoints.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tenant-annotation discovery
+    // -----------------------------------------------------------------------
+
+    /// Build a pod that carries an additional annotation `key=value` alongside
+    /// whatever the standard helper already configures.
+    fn make_pod_with_extra_annotation(
+        name: &str,
+        ip: &str,
+        port_name: Option<&str>,
+        port_number: Option<i32>,
+        annotation_port: Option<&str>,
+        extra_key: &str,
+        extra_value: &str,
+    ) -> Arc<Pod> {
+        let mut annotations = BTreeMap::new();
+        if let Some(v) = annotation_port {
+            annotations.insert("system_metrics_enabled".to_string(), v.to_string());
+        }
+        annotations.insert(extra_key.to_string(), extra_value.to_string());
+
+        Arc::new(Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some("default".to_string()),
+                annotations: Some(annotations),
+                ..Default::default()
+            },
+            spec: match (port_name, port_number) {
+                (Some(pn), Some(num)) => Some(PodSpec {
+                    containers: vec![Container {
+                        name: "app".to_string(),
+                        ports: Some(vec![ContainerPort {
+                            name: Some(pn.to_string()),
+                            container_port: num,
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                _ => None,
+            },
+            status: Some(PodStatus {
+                pod_ip: Some(ip.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Build a pod carrying at most one annotation; `None` means no
+    /// annotations map is set on the pod at all (distinct from "empty map").
+    fn pod_with_optional_annotation(kv: Option<(&str, &str)>) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                annotations: kv.map(|(k, v)| {
+                    let mut m = BTreeMap::new();
+                    m.insert(k.to_string(), v.to_string());
+                    m
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Exercises every branch of `extract_metrics_namespace`:
+    /// 1. discovery disabled (caller passes `None`) — pod content irrelevant
+    /// 2. pod has no annotations map at all
+    /// 3. pod has annotations but the configured key is absent
+    /// 4. pod has the configured key — value returned verbatim
+    #[rstest]
+    #[case::disabled(Some(("databricks_tenant", "alpha")), None,                      None)]
+    #[case::no_annotations_map(None,                       Some("databricks_tenant"), None)]
+    #[case::key_absent(Some(("other_key", "ignored")),     Some("databricks_tenant"), None)]
+    #[case::present(Some(("databricks_tenant", "alpha")),  Some("databricks_tenant"), Some("alpha".to_string()))]
+    fn test_extract_metrics_namespace(
+        #[case] annotation: Option<(&str, &str)>,
+        #[case] metrics_ns_annotation_name: Option<&str>,
+        #[case] expected: Option<String>,
+    ) {
+        let pod = pod_with_optional_annotation(annotation);
+        assert_eq!(extract_metrics_namespace(&pod, metrics_ns_annotation_name), expected);
+    }
+
+    /// Named-port path attaches the metrics-namespace value when the pod
+    /// carries the configured annotation.
+    #[test]
+    fn test_extract_metrics_endpoint_with_metrics_namespace() {
+        let pod = make_pod_with_extra_annotation(
+            "tenant-pod",
+            "10.244.1.5",
+            Some("user-metrics"),
+            Some(9090),
+            None,
+            "databricks_tenant",
+            "alpha",
+        );
+
+        let endpoint =
+            extract_metrics_endpoint(pod.as_ref(), "user-metrics", Some("databricks_tenant"));
+        assert_eq!(
+            endpoint,
+            Some(Endpoint {
+                url: "http://10.244.1.5:9090/metrics".to_string(),
+                name: "tenant-pod".to_string(),
+                namespace: "default".to_string(),
+                metrics_namespace: Some("alpha".to_string()),
+            })
+        );
+    }
+
+    /// Named-port path: pod missing the annotation yields `metrics_namespace = None`.
+    #[test]
+    fn test_extract_metrics_endpoint_without_metrics_ns_annotation_name() {
+        let pod = make_pod(
+            "no-tenant-pod",
+            "10.244.1.6",
+            Some("user-metrics"),
+            Some(9090),
+            None,
+        );
+
+        let endpoint =
+            extract_metrics_endpoint(pod.as_ref(), "user-metrics", Some("databricks_tenant"));
+        assert_eq!(endpoint.unwrap().metrics_namespace, None);
+    }
+
+    /// Annotation-discovery path: every endpoint produced from one pod shares
+    /// the same metrics-namespace value.
+    #[test]
+    fn test_extract_endpoints_from_annotation_propagates_metrics_namespace() {
+        let pod = make_pod_with_extra_annotation(
+            "tenant-multi-pod",
+            "10.244.2.4",
+            None,
+            None,
+            Some("9091,9092"),
+            "databricks_tenant",
+            "beta",
+        );
+
+        let endpoints = extract_endpoints_from_annotation(
+            pod.as_ref(),
+            "system_metrics_enabled",
+            UNLIMITED,
+            Some("databricks_tenant"),
+        );
+        assert_eq!(endpoints.len(), 2);
+        for ep in &endpoints {
+            assert_eq!(ep.metrics_namespace.as_deref(), Some("beta"));
+        }
+    }
+
+    /// `compute_endpoints` propagates the metrics-namespace value through both
+    /// discovery paths. Pod has a named port (9090) and a different-port
+    /// annotation (9091); both resulting endpoints inherit the value.
+    #[test]
+    fn test_compute_endpoints_metrics_namespace_propagates_through_both_paths() {
+        let pod = make_pod_with_extra_annotation(
+            "tenant-both-pod",
+            "10.244.5.5",
+            Some("user-metrics"),
+            Some(9090),
+            Some("9091"),
+            "databricks_tenant",
+            "gamma",
+        );
+        let state = vec![pod];
+
+        let endpoints = compute_endpoints(
+            &state,
+            Some("user-metrics"),
+            Some("system_metrics_enabled"),
+            UNLIMITED,
+            Some("databricks_tenant"),
+        );
+
+        assert_eq!(endpoints.len(), 2);
+        for ep in &endpoints {
+            assert_eq!(ep.metrics_namespace.as_deref(), Some("gamma"));
+        }
+    }
+
+    /// `compute_endpoints` produces endpoints with `metrics_namespace = None`
+    /// when metrics-namespace discovery is disabled, even if the pod happens
+    /// to carry the annotation that would otherwise match.
+    #[test]
+    fn test_compute_endpoints_metrics_namespace_disabled_ignores_annotation() {
+        let pod = make_pod_with_extra_annotation(
+            "would-be-tenant-pod",
+            "10.244.5.6",
+            Some("user-metrics"),
+            Some(9090),
+            None,
+            "databricks_tenant",
+            "delta",
+        );
+        let state = vec![pod];
+
+        let endpoints = compute_endpoints(
+            &state,
+            Some("user-metrics"),
+            Some("system_metrics_enabled"),
+            UNLIMITED,
+            None, // metrics-namespace discovery disabled
+        );
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].metrics_namespace, None);
+    }
+
+    /// Per-pod metrics-namespace isolation: two pods with different values
+    /// produce endpoints carrying their own value.
+    #[test]
+    fn test_compute_endpoints_per_pod_metrics_namespace_isolation() {
+        let pod_a = make_pod_with_extra_annotation(
+            "pod-a",
+            "10.0.0.30",
+            None,
+            None,
+            Some("9091"),
+            "databricks_tenant",
+            "alpha",
+        );
+        let pod_b = make_pod_with_extra_annotation(
+            "pod-b",
+            "10.0.0.31",
+            None,
+            None,
+            Some("9091"),
+            "databricks_tenant",
+            "beta",
+        );
+        let state = vec![pod_a, pod_b];
+
+        let endpoints = compute_endpoints(
+            &state,
+            None,
+            Some("system_metrics_enabled"),
+            UNLIMITED,
+            Some("databricks_tenant"),
+        );
+
+        assert_eq!(endpoints.len(), 2);
+        let metrics_ns_for = |name: &str| -> Option<String> {
+            endpoints
+                .iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.metrics_namespace.clone())
+        };
+        assert_eq!(metrics_ns_for("pod-a").as_deref(), Some("alpha"));
+        assert_eq!(metrics_ns_for("pod-b").as_deref(), Some("beta"));
     }
 }
