@@ -25,7 +25,7 @@ use tokio::{
 };
 
 use tracing::{debug, error, info, trace, warn};
-use vector_common::internal_event::{DeliveryReadEvent, emit};
+use vector_common::internal_event::delivery_singleton;
 
 use crate::{
     FileTTLAction, FileTTLRemovalConfig,
@@ -73,9 +73,9 @@ where
     /// These files are fingerprinted once and the mapping is cached, and they
     /// are marked as done when EOF is reached so they are never re-read.
     pub archive_extensions: Vec<String>,
-    /// Source type passed through to emitted `DeliveryReadEvent`s. Used by
-    /// the metric in `delivery_event.rs` to pick the correct topic fallback
-    /// when a filename doesn't match the Lumberjack convention
+    /// Source type passed through to the delivery singleton's `accumulate_read`.
+    /// Used by the metric in `delivery_event.rs` to pick the correct topic
+    /// fallback when a filename doesn't match the Lumberjack convention
     /// (e.g. `kubernetes_logs` falls back to `sawmill-service-log`).
     pub source_type: &'static str,
 }
@@ -433,17 +433,20 @@ where
                 }
                 stats.record("reading", start.elapsed());
                 if lines_read > 0 {
-                    emit(DeliveryReadEvent {
-                        path: watcher.path.to_str().expect("not a valid path").to_owned(),
+                    // Pre-multiline read spot, gated off by default
+                    // (EMIT_READ_EVENT_AFTER_MULTILINE_AGG). The counter fires
+                    // inline; only the VEL `info!` log is batched by the
+                    // process-global delivery singleton. `source_context` is
+                    // borrowed and only cloned on first sight of this path.
+                    delivery_singleton().accumulate_read(
+                        watcher.path.to_str().expect("not a valid path").to_owned(),
                         bytes_read,
                         lines_read,
-                        source_context: self.source_context.clone(),
-                        emitted_after_multiline_agg: false,
-                        source_type: self.source_type,
-                        // Pre-multiline path emits only the read counter (no event to
-                        // stamp here). Gated off by default (EMIT_READ_EVENT_AFTER_MULTILINE_AGG).
-                        time_parity: vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value(),
-                    });
+                        &self.source_context,
+                        self.source_type,
+                        vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value(),
+                        false,
+                    );
                 }
                 if watcher.reached_eof() && self.is_archive(&watcher.path) {
                     //TODO: a vector event for done. important for debugging

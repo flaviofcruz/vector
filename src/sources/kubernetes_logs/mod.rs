@@ -24,7 +24,7 @@ use kube::{
 };
 use lifecycle::Lifecycle;
 use serde_with::serde_as;
-use vector_lib::internal_event::DeliveryReadEvent;
+use vector_lib::internal_event::delivery_singleton;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf, TimeZone,
     codecs::{BytesDeserializer, BytesDeserializerConfig},
@@ -1455,20 +1455,24 @@ fn create_event(
         }
     };
 
-    // Discovery-time hour bucket, shared between the read counter and the event
-    // (stamped below) so the read/staged/delivered legs bucket on the same value.
+    // Discovery-time hour bucket, stamped onto the event (below) so the
+    // staged/delivered legs bucket on the same value. Also passed to the
+    // immediate read counter so the metric buckets on the same read-time value.
     let time_parity =
         vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value();
 
-    emit!(DeliveryReadEvent {
-        path: file.to_string(),
-        bytes_read: log.estimated_json_encoded_size_of().get(),
-        lines_read: 1,
-        source_context: source_context.clone(),
-        emitted_after_multiline_agg: true,
-        source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
+    // Post-multiline read spot (gated on EMIT_READ_EVENT_AFTER_MULTILINE_AGG).
+    // The `delivery_events_total` counter fires immediately; only the VEL
+    // `info!` log is batched through the singleton.
+    delivery_singleton().accumulate_read(
+        file.to_string(),
+        log.estimated_json_encoded_size_of().get(),
+        1,
+        source_context,
+        vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
         time_parity,
-    });
+        true,
+    );
 
     // Carry the discovery-time bucket downstream for the woodchuck VRL wrappers to
     // copy into logMetadata.timeParity (see file.rs for the rationale).

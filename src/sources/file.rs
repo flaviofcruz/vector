@@ -19,7 +19,7 @@ use vector_lib::file_source::{
     paths_provider::{Glob, MatchOptions},
 };
 use vector_lib::finalizer::OrderedFinalizer;
-use vector_lib::internal_event::DeliveryReadEvent;
+use vector_lib::internal_event::delivery_singleton;
 use vector_lib::lookup::{OwnedValuePath, lookup_v2::OptionalValuePath, owned_value_path, path};
 use vector_lib::{
     EstimatedJsonEncodedSizeOf,
@@ -921,22 +921,26 @@ fn create_event(
         }
     }
 
-    // Discovery-time hour bucket, shared between the read counter (below) and the
-    // event itself (stamped before return) so the read/staged/delivered legs all
-    // bucket on the same value instead of each recomputing a wall-clock hour at a
-    // different pipeline stage.
+    // Discovery-time hour bucket, stamped onto the event before return (below) so
+    // the staged/delivered legs bucket on the same value instead of each
+    // recomputing a wall-clock hour at a different pipeline stage. The read-side
+    // `delivery_events_total` counter is emitted from the delivery singleton's
+    // flush (which buckets on its own flush-time value) rather than here per line.
     let time_parity =
         vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value();
 
-    emit!(DeliveryReadEvent {
-        path: file.to_string(),
-        bytes_read: event.estimated_json_encoded_size_of().get(),
-        lines_read: 1,
-        source_context: meta.source_context.clone(),
-        emitted_after_multiline_agg: true,
-        source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
+    // Post-multiline read spot (gated on EMIT_READ_EVENT_AFTER_MULTILINE_AGG).
+    // The counter fires inline; only the VEL `info!` log is batched. `meta.source_context`
+    // is borrowed; the singleton clones it only on first sight of this path within a window.
+    delivery_singleton().accumulate_read(
+        file.to_string(),
+        event.estimated_json_encoded_size_of().get(),
+        1,
+        &meta.source_context,
+        vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
         time_parity,
-    });
+        true,
+    );
 
     emit!(FileEventsReceived {
         count: 1,

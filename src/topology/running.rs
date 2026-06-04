@@ -473,6 +473,13 @@ impl RunningTopology {
                     gracefully_closed = true;
                 }
 
+                // Flush any batched delivery-event VEL logs now, while data
+                // sources/sinks have all emitted their final counts (wave 1 is
+                // complete) but internal_logs is still alive to forward them
+                // (wave 2 shuts it down). Same window as the COMPONENTS_CLOSED
+                // emit below.
+                vector_lib::internal_event::delivery_singleton().shutdown();
+
                 // Emit a VEL event indicating all data components have been closed.
                 // This must happen before wave 2 shuts down internal sources (including
                 // internal_logs), so the event can still be delivered through the pipeline.
@@ -537,6 +544,10 @@ impl RunningTopology {
             // No deferred sources or no data source deadline: use original single-pass behavior.
             let source_shutdown_complete = async move {
                 wave1_complete.await;
+
+                // Flush any batched delivery-event VEL logs while internal_logs
+                // is still alive to forward them (see the two-wave branch).
+                vector_lib::internal_event::delivery_singleton().shutdown();
 
                 // Emit a VEL event indicating data components have been closed.
                 // Emitted before deferred source shutdown so that internal_logs
