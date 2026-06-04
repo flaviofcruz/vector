@@ -101,6 +101,11 @@ impl VectorFileSendEvent {
                 container = self.file_metadata.container,
                 vector_event_type = "VECTOR_FILE_SEND_EVENT",
                 file_send_event_type = "VECTOR_FILE_SEND_WARN",
+                // Structured error reason so credential-expiry failures (e.g.
+                // ExpiredToken) can be isolated from generic request failures in
+                // the VEL send-event stream (ES-1899972). Mapped to the proto
+                // VectorSendMessagesEvent.error_reason by the woodchuck VEL VRL.
+                error_reason = error,
                 internal_log_rate_limit = false,
             );
         }
