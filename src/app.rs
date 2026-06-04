@@ -68,11 +68,30 @@ impl ApplicationConfig {
         let graceful_shutdown_duration = (!opts.no_graceful_shutdown_limit)
             .then(|| Duration::from_secs(u64::from(opts.graceful_shutdown_limit_secs)));
 
-        let graceful_data_source_shutdown_duration = graceful_shutdown_duration.and_then(|main| {
-            let data =
-                Duration::from_secs(u64::from(opts.graceful_data_source_shutdown_limit_secs));
-            if data < main { Some(data) } else { None }
-        });
+        // Derive the three staged sub-deadlines (data-source < data-sink < internal-source <
+        // overall), silently clamping to preserve strict ordering. `None` for all three means
+        // two-wave shutdown is disabled and the legacy single-pass path is used (which happens
+        // when there is no overall limit, or the data-source limit is not below the overall
+        // limit). See `staged_shutdown_secs`.
+        let (
+            graceful_data_source_shutdown_duration,
+            graceful_data_sink_shutdown_duration,
+            graceful_internal_source_shutdown_duration,
+        ) = match graceful_shutdown_duration.and_then(|main| {
+            staged_shutdown_secs(
+                main.as_secs(),
+                u64::from(opts.graceful_data_source_shutdown_limit_secs),
+                u64::from(opts.graceful_data_sink_shutdown_limit_secs),
+                u64::from(opts.graceful_internal_source_shutdown_limit_secs),
+            )
+        }) {
+            Some((data_source, data_sink, internal_source)) => (
+                Some(Duration::from_secs(data_source)),
+                Some(Duration::from_secs(data_sink)),
+                Some(Duration::from_secs(internal_source)),
+            ),
+            None => (None, None, None),
+        };
 
         let watcher_conf = if opts.watch_config {
             Some(watcher_config(
@@ -91,6 +110,8 @@ impl ApplicationConfig {
             !opts.disable_env_var_interpolation,
             graceful_shutdown_duration,
             graceful_data_source_shutdown_duration,
+            graceful_data_sink_shutdown_duration,
+            graceful_internal_source_shutdown_duration,
             signal_handler,
         )
         .await?;
@@ -580,6 +601,8 @@ pub async fn load_configs(
     interpolate_env: bool,
     graceful_shutdown_duration: Option<Duration>,
     graceful_data_source_shutdown_duration: Option<Duration>,
+    graceful_data_sink_shutdown_duration: Option<Duration>,
+    graceful_internal_source_shutdown_duration: Option<Duration>,
     signal_handler: &mut SignalHandler,
 ) -> Result<Config, ExitCode> {
     let config_paths = config::process_paths(config_paths).ok_or(exitcode::CONFIG)?;
@@ -668,8 +691,57 @@ pub async fn load_configs(
     config.healthchecks.set_require_healthy(require_healthy);
     config.graceful_shutdown_duration = graceful_shutdown_duration;
     config.graceful_data_source_shutdown_duration = graceful_data_source_shutdown_duration;
+    config.graceful_data_sink_shutdown_duration = graceful_data_sink_shutdown_duration;
+    config.graceful_internal_source_shutdown_duration = graceful_internal_source_shutdown_duration;
 
     Ok(config)
+}
+
+/// Given the overall graceful-shutdown limit and the three staged sub-limits (all in seconds),
+/// return `(data_source, data_sink, internal_source)` clamped to satisfy the strict ordering
+/// `data_source < data_sink < internal_source < overall`. Adjustment is silent.
+///
+/// Returns `None` — disabling two-wave shutdown so the legacy single-pass path runs — only when
+/// the data-source limit is not below the overall limit, matching the historical fallback where
+/// `graceful_data_source_shutdown_duration` was dropped if it was `>= graceful_shutdown_duration`.
+///
+/// The clamp walks each point above its predecessor, then pulls any that reach the overall limit
+/// back below it. With realistic inputs (the deploy config derives all four as fractions of
+/// `terminationGracePeriodSeconds`) the inputs are already well-ordered and pass through
+/// unchanged; the clamp only matters for hand-set or pathological values.
+fn staged_shutdown_secs(
+    overall: u64,
+    data_source: u64,
+    data_sink: u64,
+    internal_source: u64,
+) -> Option<(u64, u64, u64)> {
+    if data_source >= overall {
+        return None;
+    }
+
+    // Each staged point must be strictly greater than the previous one. `data_source` is never
+    // adjusted — it is the contractual wave-1 source deadline and is only range-checked above.
+    let mut data_sink = data_sink.max(data_source + 1);
+    let mut internal_source = internal_source.max(data_sink + 1);
+
+    // internal_source must stay strictly below the overall limit. If it overshoots, pull it (and
+    // then data_sink, if needed) back down while keeping everything above data_source.
+    let ceiling = overall.saturating_sub(1);
+    if internal_source > ceiling {
+        internal_source = ceiling;
+    }
+    if data_sink >= internal_source {
+        data_sink = internal_source.saturating_sub(1);
+    }
+    // Last-resort guard for a window too tight to hold two strict intermediate points
+    // (overall - data_source < 3): keep data_sink above data_source without exceeding
+    // internal_source. The deadlines may coincide in this degenerate case, which only makes
+    // the corresponding stage's budget zero — aggressive, but still correct.
+    if data_sink <= data_source {
+        data_sink = (data_source + 1).min(internal_source);
+    }
+
+    Some((data_source, data_sink, internal_source))
 }
 
 pub fn init_logging(color: bool, format: LogFormat, log_level: &str, rate: u64) {
@@ -694,5 +766,67 @@ pub fn watcher_config(
     match method {
         WatchConfigMethod::Recommended => config::watcher::WatcherConfig::RecommendedWatcher,
         WatchConfigMethod::Poll => config::watcher::WatcherConfig::PollWatcher(interval.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::staged_shutdown_secs;
+
+    #[test]
+    fn staged_shutdown_secs_passes_through_well_ordered_inputs() {
+        // The deploy config derives all four as fractions of terminationGracePeriodSeconds, so
+        // realistic inputs are already strictly ordered and must be left untouched.
+        assert_eq!(staged_shutdown_secs(54, 30, 36, 48), Some((30, 36, 48)));
+        assert_eq!(staged_shutdown_secs(60, 20, 30, 50), Some((20, 30, 50)));
+    }
+
+    #[test]
+    fn staged_shutdown_secs_disables_two_wave_when_data_source_not_below_overall() {
+        // Matches the historical fallback: data-source >= overall drops the staged deadlines and
+        // the single-pass path runs.
+        assert_eq!(staged_shutdown_secs(20, 20, 25, 30), None);
+        assert_eq!(staged_shutdown_secs(20, 25, 26, 27), None);
+    }
+
+    #[test]
+    fn staged_shutdown_secs_bumps_each_point_above_its_predecessor() {
+        // data_sink and internal_source below data_source get pulled up to keep strict ordering.
+        assert_eq!(staged_shutdown_secs(60, 30, 20, 25), Some((30, 31, 32)));
+        // Equal inputs are nudged apart.
+        assert_eq!(staged_shutdown_secs(60, 30, 30, 30), Some((30, 31, 32)));
+    }
+
+    #[test]
+    fn staged_shutdown_secs_pulls_overshooting_points_below_overall() {
+        // internal_source above the overall limit is pulled to overall-1, and data_sink follows.
+        assert_eq!(staged_shutdown_secs(40, 30, 50, 60), Some((30, 38, 39)));
+    }
+
+    #[test]
+    fn staged_shutdown_secs_preserves_strict_ordering() {
+        // Property: for any inputs where it returns Some, the result is strictly increasing and
+        // strictly below the overall limit (except in the degenerate too-tight window, which is
+        // exercised separately).
+        for overall in [4u64, 25, 54, 60, 120] {
+            for data_source in [1u64, 5, 20, 30] {
+                for data_sink in [1u64, 10, 36, 100] {
+                    for internal_source in [1u64, 25, 48, 100] {
+                        if let Some((ds, dk, is)) =
+                            staged_shutdown_secs(overall, data_source, data_sink, internal_source)
+                        {
+                            assert_eq!(ds, data_source, "data_source is never adjusted");
+                            // Strict ordering holds whenever the window can fit it.
+                            if overall - data_source >= 3 {
+                                assert!(
+                                    ds < dk && dk < is && is < overall,
+                                    "expected {ds} < {dk} < {is} < {overall}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

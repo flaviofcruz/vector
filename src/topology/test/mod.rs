@@ -23,9 +23,10 @@ use crate::{
     schema::Definition,
     test_util::{
         mock::{
-            basic_sink, basic_sink_failing_healthcheck, basic_sink_with_data, basic_source,
-            basic_source_with_data, basic_source_with_event_counter, basic_transform,
-            deferred_source, error_definition_transform,
+            backpressure_sink, backpressure_source, basic_sink, basic_sink_failing_healthcheck,
+            basic_sink_with_data, basic_source, basic_source_with_data,
+            basic_source_with_event_counter, basic_transform, deferred_source,
+            error_definition_transform,
         },
         start_topology, trace_init,
     },
@@ -1010,10 +1011,13 @@ async fn topology_two_wave_graceful_shutdown() {
     let mut config = Config::builder();
     // Enable two-wave shutdown via the global option.
     config.global.two_wave_shutdown = true.into();
-    // Set shutdown durations: wave 1 = 5s, overall = 30s.
-    // The test must complete well under 30s — hitting the deadline means something is broken.
+    // Staged shutdown deadlines: data-source 5s < data-sink 10s < internal-source 20s <
+    // overall 30s. The test must complete well under 30s — hitting the overall deadline means
+    // something is broken.
     config.graceful_shutdown_duration = Some(Duration::from_secs(30));
     config.graceful_data_source_shutdown_duration = Some(Duration::from_secs(5));
+    config.graceful_data_sink_shutdown_duration = Some(Duration::from_secs(10));
+    config.graceful_internal_source_shutdown_duration = Some(Duration::from_secs(20));
 
     config.add_source("external_data_1", ext_data_1_source);
     config.add_source("external_data_2", ext_data_2_source);
@@ -1106,5 +1110,134 @@ async fn topology_two_wave_graceful_shutdown() {
     assert!(
         elapsed < Duration::from_secs(5),
         "Shutdown took {elapsed:?}, expected < 5s for a clean two-wave shutdown."
+    );
+}
+
+/// Regression: a wave-1 data SOURCE that ignores its shutdown signal (here a
+/// `backpressure_source`, which loops forever and never observes `cx.shutdown`) must be
+/// force-aborted at `data_source_deadline` so the rest of shutdown can proceed. Without the
+/// source force-abort the topology would only unblock at the overall deadline (when the stuck
+/// task is finally killed), since the per-source `shutdown_force_trigger` has no effect on a
+/// source that never awaits it.
+///
+/// Topology:
+/// - stuck_source (non-deferred, never stops) → drain_sink
+/// - internal_logs (deferred)                 → internal_sink
+///
+/// Deadlines are aggressive: data-source 1s < data-sink 2s < internal-source 3s < overall 10s.
+/// With the fix, shutdown completes shortly after the staged source deadline (well under the 10s
+/// overall). Asserting `< 6s` discriminates the fix (~1-3s) from the broken path (~10s).
+#[tokio::test]
+async fn topology_two_wave_aborts_stuck_wave1_source_at_data_source_deadline() {
+    trace_init();
+
+    let stuck_counter = Arc::new(AtomicUsize::new(0));
+    let stuck_source = backpressure_source(&stuck_counter);
+    // The data sink is healthy — continuously drain its output so it never blocks on its own
+    // send. The only thing keeping wave 1 alive is the stuck source, which must be force-aborted.
+    let (drain_out, drain_sink) = basic_sink(10);
+    tokio::spawn(drain_out.for_each(|_| async {}));
+
+    let (mut internal_tx, internal_source) = deferred_source();
+    let (_internal_out, internal_sink) = basic_sink(10);
+
+    let mut config = Config::builder();
+    config.global.two_wave_shutdown = true.into();
+    config.graceful_shutdown_duration = Some(Duration::from_secs(10));
+    config.graceful_data_source_shutdown_duration = Some(Duration::from_secs(1));
+    config.graceful_data_sink_shutdown_duration = Some(Duration::from_secs(2));
+    config.graceful_internal_source_shutdown_duration = Some(Duration::from_secs(3));
+
+    config.add_source("stuck_source", stuck_source);
+    config.add_source("internal_logs", internal_source);
+    config.add_sink("drain_sink", &["stuck_source"], drain_sink);
+    config.add_sink("internal_sink", &["internal_logs"], internal_sink);
+
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
+
+    internal_tx
+        .send_event(Event::Log(LogEvent::from("internal")))
+        .await
+        .unwrap();
+    // The deferred source exits cleanly once its sender drops; only the stuck non-deferred
+    // source needs to be force-aborted.
+    drop(internal_tx);
+
+    let start = Instant::now();
+    topology.stop().await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "Shutdown took {elapsed:?}; expected the stuck wave-1 source to be force-aborted near \
+         the 1s data-source deadline. Without the source abort it would stall to the 10s overall \
+         deadline."
+    );
+}
+
+/// Regression: a permanently-stuck wave-1 SINK (here `backpressure_sink(0)`, whose task pends
+/// forever) must NOT be force-closed at the wave-1 sink-drain deadline. Wave-1 sinks are allowed
+/// to keep flushing until the overall deadline; only there is everything force-aborted. This is
+/// the staged-shutdown distinction from sources, which are force-closed at their (earlier) wave
+/// deadline.
+///
+/// Topology:
+/// - clean_source (non-deferred) → stuck_sink (backpressure, never drains)
+/// - internal_logs (deferred)    → internal_sink
+///
+/// Deadlines: data-source 1s < data-sink 2s < internal-source 3s < overall 5s. The stuck sink is
+/// force-aborted only by the overall-deadline backstop, so shutdown completes around 5s. Asserting
+/// `>= 4s` proves the sink was not force-closed early (at the 2s sink deadline or 3s internal
+/// deadline); asserting `< 9s` proves shutdown still terminates rather than hanging on the stuck
+/// sink forever.
+#[tokio::test]
+async fn topology_two_wave_does_not_force_close_wave1_sinks_before_overall_deadline() {
+    trace_init();
+
+    let (mut ext_tx, ext_source) = basic_source();
+    let stuck_sink = backpressure_sink(0); // consumes nothing, then pends forever
+
+    let (mut internal_tx, internal_source) = deferred_source();
+    let (_internal_out, internal_sink) = basic_sink(10);
+
+    let mut config = Config::builder();
+    config.global.two_wave_shutdown = true.into();
+    config.graceful_shutdown_duration = Some(Duration::from_secs(5));
+    config.graceful_data_source_shutdown_duration = Some(Duration::from_secs(1));
+    config.graceful_data_sink_shutdown_duration = Some(Duration::from_secs(2));
+    config.graceful_internal_source_shutdown_duration = Some(Duration::from_secs(3));
+
+    config.add_source("clean_source", ext_source);
+    config.add_source("internal_logs", internal_source);
+    config.add_sink("stuck_sink", &["clean_source"], stuck_sink);
+    config.add_sink("internal_sink", &["internal_logs"], internal_sink);
+
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
+
+    // Engage the stuck sink so it reaches its `pending()` and one event into the deferred path.
+    ext_tx
+        .send_event(Event::Log(LogEvent::from("stuck")))
+        .await
+        .unwrap();
+    internal_tx
+        .send_event(Event::Log(LogEvent::from("internal")))
+        .await
+        .unwrap();
+    drop(ext_tx);
+    drop(internal_tx);
+
+    let start = Instant::now();
+    topology.stop().await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_secs(4),
+        "Shutdown took {elapsed:?}; expected the stuck wave-1 sink to keep flushing until the 5s \
+         overall deadline, not be force-closed at the 2s sink or 3s internal-source deadline."
+    );
+    assert!(
+        elapsed < Duration::from_secs(9),
+        "Shutdown took {elapsed:?}; expected the overall-deadline backstop to force-abort the \
+         stuck sink near 5s rather than hang."
     );
 }
