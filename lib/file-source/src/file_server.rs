@@ -450,7 +450,7 @@ where
                 }
                 if watcher.reached_eof() && self.is_archive(&watcher.path) {
                     //TODO: a vector event for done. important for debugging
-                    info!(message = "File reached eof. Marking it done.", path = ?watcher.path);
+                    debug!(message = "File reached eof. Marking it done.", path = ?watcher.path);
                     checkpoints.set_done(file_id, &watcher.path);
                 }
 
