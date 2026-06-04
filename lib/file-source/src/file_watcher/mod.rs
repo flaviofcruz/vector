@@ -53,7 +53,7 @@ pub struct FileWatcher {
     pub path: PathBuf,
     pub is_active: bool,
     findable: bool,
-    reader: Box<dyn AsyncBufRead + Send + Unpin>,
+    reader: Box<dyn AsyncBufRead + Send + Sync + Unpin>,
     file_position: FilePosition,
     devno: u64,
     inode: u64,
@@ -115,7 +115,7 @@ impl FileWatcher {
         let gzipped = is_gzipped(&mut reader).await?;
 
         // Determine the actual position at which we should start reading
-        let (reader, file_position): (Box<dyn AsyncBufRead + Send + Unpin>, FilePosition) =
+        let (reader, file_position): (Box<dyn AsyncBufRead + Send + Sync + Unpin>, FilePosition) =
             if inactive {
                 debug!(
                     message = "Not reading file modified before `start_reading_at`.",
@@ -211,7 +211,7 @@ impl FileWatcher {
         if (file_info.portable_dev(), file_info.portable_ino()) != (self.devno, self.inode) {
             let mut reader = BufReader::new(File::open(&path).await?);
             let gzipped = is_gzipped(&mut reader).await?;
-            let new_reader: Box<dyn AsyncBufRead + Send + Unpin> = if gzipped {
+            let new_reader: Box<dyn AsyncBufRead + Send + Sync + Unpin> = if gzipped {
                 gzip_reader_at_offset(reader, self.file_position).await?
             } else {
                 reader.seek(io::SeekFrom::Start(self.file_position)).await?;
@@ -394,7 +394,7 @@ fn null_reader() -> impl AsyncBufRead {
 async fn gzip_reader_at_offset(
     reader: BufReader<File>,
     offset: u64,
-) -> io::Result<Box<dyn AsyncBufRead + Send + Unpin>> {
+) -> io::Result<Box<dyn AsyncBufRead + Send + Sync + Unpin>> {
     let mut gzip_reader = BufReader::new(GzipDecoder::new(reader));
     if offset > 0 {
         skip_first_n_bytes(&mut gzip_reader, offset as usize).await?;

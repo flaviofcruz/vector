@@ -386,6 +386,53 @@ impl From<bool> for TwoWaveShutdownConfig {
     }
 }
 
+/// Controls whether the `kubernetes_logs` source runs its `FileServer` directly on the async
+/// runtime instead of inside a `spawn_blocking` + `Handle::block_on` wrapper.
+///
+/// When disabled (the default), the legacy `spawn_blocking` wrapper is used — preserving the
+/// historical behavior exactly. When enabled, the file server runs as a normal async task so the
+/// source can be cancelled at an `.await` point (e.g. by the wave-1 drain-deadline force-close),
+/// rather than holding a blocking-pool thread that keeps draining past the deadline. Gated so the
+/// behavior change can be ramped gradually via config.
+#[configurable_component]
+#[configurable(
+    title = "Controls whether the kubernetes_logs file server runs on the async runtime."
+)]
+#[configurable(
+    description = "When enabled, the `kubernetes_logs` source runs its file server directly on the async runtime (no `spawn_blocking` wrapper), making the source promptly cancellable on shutdown. Disabled by default."
+)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AsyncKubernetesLogsFileServerConfig {
+    /// Whether or not the async (non-`spawn_blocking`) file server is enabled.
+    enabled: Option<bool>,
+}
+
+impl AsyncKubernetesLogsFileServerConfig {
+    pub const DEFAULT: Self = Self { enabled: None };
+
+    #[must_use]
+    pub fn merge_default(&self, other: &Self) -> Self {
+        let enabled = self.enabled.or(other.enabled);
+        Self { enabled }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+}
+
+impl From<Option<bool>> for AsyncKubernetesLogsFileServerConfig {
+    fn from(enabled: Option<bool>) -> Self {
+        Self { enabled }
+    }
+}
+
+impl From<bool> for AsyncKubernetesLogsFileServerConfig {
+    fn from(enabled: bool) -> Self {
+        Some(enabled).into()
+    }
+}
+
 /// End-to-end acknowledgements configuration.
 #[configurable_component]
 #[configurable(title = "Controls how acknowledgements are handled for this sink.")]
