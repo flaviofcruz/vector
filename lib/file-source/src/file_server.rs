@@ -109,18 +109,32 @@ where
     }
 
     // Update the file-to-pod map with the given path and log file info.
-    fn update_file_to_pod_map(&mut self, path: PathBuf, log_file_info_opt: Option<LogFileInfo>) {
-        if self.file_to_pod_map.is_some() {
-            if let Some(log_file_info) = log_file_info_opt {
-                self.file_to_pod_map
-                    .as_mut()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .insert(path.clone(), log_file_info.clone());
+    fn update_file_to_pod_map(&self, path: PathBuf, log_file_info_opt: Option<LogFileInfo>) {
+        if let (Some(file_to_pod_map), Some(log_file_info)) =
+            (&self.file_to_pod_map, log_file_info_opt)
+        {
+            file_to_pod_map.lock().unwrap().insert(path, log_file_info);
+        }
+    }
+
+    // Keep the file-to-pod map aligned with watcher paths that may still be emitted on lines.
+    fn update_file_to_pod_map_for_path_change(
+        &self,
+        old_path: &Path,
+        new_path: PathBuf,
+        log_file_info_opt: Option<LogFileInfo>,
+    ) {
+        if let Some(file_to_pod_map) = &self.file_to_pod_map {
+            let mut file_to_pod_map = file_to_pod_map.lock().unwrap();
+            let log_file_info =
+                log_file_info_opt.or_else(|| file_to_pod_map.get(old_path).cloned());
+
+            if let Some(log_file_info) = log_file_info {
+                file_to_pod_map.insert(new_path.clone(), log_file_info);
             }
         }
     }
+
     // The first `shutdown_data` signal here is to stop this file
     // server from outputting new data; the second
     // `shutdown_checkpointer` is for finishing the background
@@ -288,7 +302,14 @@ where
                                     path = ?path,
                                     old_path = ?watcher.path
                                 );
-                                watcher.update_path(path).await.ok(); // ok if this fails: might fix next cycle
+                                let old_path = watcher.path.clone();
+                                if watcher.update_path(path.clone()).await.is_ok() {
+                                    self.update_file_to_pod_map_for_path_change(
+                                        &old_path,
+                                        path,
+                                        log_file_info_opt,
+                                    );
+                                } // ok if this fails: might fix next cycle
                             } else {
                                 info!(
                                     message = "More than one file has the same fingerprint.",
@@ -306,7 +327,14 @@ where
                                         new_modified_time = ?new_modified_time,
                                         old_modified_time = ?old_modified_time,
                                     );
-                                    watcher.update_path(path).await.ok(); // ok if this fails: might fix next cycle
+                                    let old_path = watcher.path.clone();
+                                    if watcher.update_path(path.clone()).await.is_ok() {
+                                        self.update_file_to_pod_map_for_path_change(
+                                            &old_path,
+                                            path,
+                                            log_file_info_opt,
+                                        );
+                                    } // ok if this fails: might fix next cycle
                                 }
                             }
                         } else {
@@ -1081,6 +1109,65 @@ mod tests {
             archive_extensions: vec!["gz".to_string()],
             source_type: "file",
         }
+    }
+
+    fn test_log_file_info() -> crate::paths_provider::LogFileInfo {
+        crate::paths_provider::LogFileInfo {
+            pod_namespace: "dbr".to_string(),
+            pod_name: "driver-pod".to_string(),
+            pod_uid: "pod-uid".to_string(),
+            container_name: "DEFAULT_CONTAINER_NAME".to_string(),
+        }
+    }
+
+    #[test]
+    fn file_to_pod_map_moves_metadata_when_watcher_path_changes() {
+        let tmp = tempdir().unwrap();
+        let file_to_pod_map = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut file_server = make_file_server(vec![], tmp.path().to_path_buf(), false);
+        file_server.file_to_pod_map = Some(file_to_pod_map.clone());
+
+        let old_path = PathBuf::from("/databricks/host-root/old/spark-master.out");
+        let new_path = PathBuf::from("/databricks/host-root/new/spark-master.out.2026-06-05");
+        let log_file_info = test_log_file_info();
+
+        file_server.update_file_to_pod_map(old_path.clone(), Some(log_file_info.clone()));
+        file_server.update_file_to_pod_map_for_path_change(
+            &old_path,
+            new_path.clone(),
+            Some(log_file_info.clone()),
+        );
+
+        let file_to_pod_map = file_to_pod_map.lock().unwrap();
+        assert_eq!(file_to_pod_map.get(&new_path), Some(&log_file_info));
+        assert_eq!(
+            file_to_pod_map.get(&old_path),
+            Some(&log_file_info),
+            "old watcher path should remain annotated for queued lines"
+        );
+    }
+
+    #[test]
+    fn file_to_pod_map_reuses_old_metadata_when_path_change_lacks_metadata() {
+        let tmp = tempdir().unwrap();
+        let file_to_pod_map = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut file_server = make_file_server(vec![], tmp.path().to_path_buf(), false);
+        file_server.file_to_pod_map = Some(file_to_pod_map.clone());
+
+        let old_path = PathBuf::from("/databricks/host-root/old/spark-master.out");
+        let new_path = PathBuf::from("/databricks/host-root/old/spark-master.out.2026-06-05");
+        let log_file_info = test_log_file_info();
+
+        file_server.update_file_to_pod_map(old_path.clone(), Some(log_file_info.clone()));
+        file_server.update_file_to_pod_map_for_path_change(&old_path, new_path.clone(), None);
+
+        let file_to_pod_map = file_to_pod_map.lock().unwrap();
+        assert_eq!(file_to_pod_map.get(&new_path), Some(&log_file_info));
+        assert_eq!(
+            file_to_pod_map.get(&old_path),
+            Some(&log_file_info),
+            "old watcher path should remain annotated for queued lines"
+        );
     }
 
     #[tokio::test]
