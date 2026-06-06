@@ -242,7 +242,7 @@ enum SinkLeg {
 pub struct DeliveryEventSingleton {
     // Separate locks per leg so the hot read path never contends with sink
     // response handling. Each lock is held only for a HashMap merge.
-    reads: Mutex<HashMap<(&'static str, String), ReadAccum>>,
+    reads: Mutex<HashMap<(&'static str, String, i64), ReadAccum>>,
     staged: Mutex<HashMap<String, SinkAccum>>,
     delivered: Mutex<HashMap<String, SinkAccum>>,
     /// Signals the background flush task to perform a final flush and exit.
@@ -308,7 +308,7 @@ impl DeliveryEventSingleton {
     /// Accumulates a source read. The `delivery_events_total` counter fires
     /// immediately (left as-is, so the metric stays exact); only the VEL
     /// `info!` log is batched. `source_context` is borrowed and only cloned on
-    /// the first occurrence of a `(source_type, path)` within a flush window.
+    /// the first occurrence of a `(source_type, path, time_parity)` within a flush window.
     pub fn accumulate_read(
         &'static self,
         path: String,
@@ -341,7 +341,7 @@ impl DeliveryEventSingleton {
         self.ensure_flush_task();
         let mut reads = self.reads.lock().expect("delivery reads lock poisoned");
         let entry = reads
-            .entry((source_type, path))
+            .entry((source_type, path, time_parity))
             .or_insert_with(|| ReadAccum {
                 source_context: source_context.clone().unwrap_or_default(),
                 bytes_read: 0,
@@ -401,7 +401,7 @@ impl DeliveryEventSingleton {
         let delivered =
             std::mem::take(&mut *self.delivered.lock().expect("delivery delivered lock poisoned"));
 
-        for ((_source_type, path), accum) in reads {
+        for ((_source_type, path, time_parity), accum) in reads {
             // Re-enter the source's component span so the trace BroadcastLayer
             // copies `.vector.component_{id,type,kind}` onto the log.
             let _entered = accum.span.enter();
@@ -412,6 +412,10 @@ impl DeliveryEventSingleton {
                 num_events = accum.lines_read,
                 delivery_event_type = "VECTOR_SOURCE_READ",
                 vector_event_type = "VECTOR_LOG_DELIVERY_EVENT",
+                // Read-time hour bucket carried onto the batched log so the universe
+                // VRL buckets the read leg on the same `timeParity` as staged/delivered,
+                // instead of recomputing it from the (up-to-flush-interval-late) timestamp.
+                time_parity = time_parity,
                 internal_log_rate_limit = false,
                 source_context = serde_json::to_string(&accum.source_context).unwrap(),
             );
@@ -768,5 +772,118 @@ mod topic_inference_tests {
     fn delivery_method_from_value_map_falls_back_when_missing() {
         let value_map = HashMap::new();
         assert_eq!(delivery_method_from_value_map(&value_map), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod read_accumulation_tests {
+    use super::*;
+
+    // A fresh, isolated singleton per test. Leaked to obtain the `&'static`
+    // reference `accumulate_read` requires; under `#[test]` there is no Tokio
+    // runtime, so `ensure_flush_task` is a no-op and nothing is spawned.
+    fn empty_singleton() -> &'static DeliveryEventSingleton {
+        Box::leak(Box::new(DeliveryEventSingleton {
+            reads: Mutex::new(HashMap::new()),
+            staged: Mutex::new(HashMap::new()),
+            delivered: Mutex::new(HashMap::new()),
+            shutdown: Notify::new(),
+            spawned: AtomicBool::new(false),
+        }))
+    }
+
+    // An arbitrary hour-floored timestamp (ms).
+    const TP: i64 = 1_700_000_000_000 - (1_700_000_000_000 % (60 * 60 * 1000));
+
+    // Reads for the same path within one hour bucket aggregate into a single
+    // entry, so the flush emits one VEL read line carrying that bucket.
+    #[test]
+    fn same_bucket_aggregates() {
+        let s = empty_singleton();
+        s.accumulate_read(
+            "/f.log".to_string(),
+            10,
+            1,
+            &None::<HashMap<String, String>>,
+            SOURCE_TYPE_FILE,
+            TP,
+            false,
+        );
+        s.accumulate_read(
+            "/f.log".to_string(),
+            25,
+            2,
+            &None::<HashMap<String, String>>,
+            SOURCE_TYPE_FILE,
+            TP,
+            false,
+        );
+
+        let reads = s.reads.lock().unwrap();
+        assert_eq!(
+            reads.len(),
+            1,
+            "same (path, time_parity) must share one entry"
+        );
+        let accum = reads
+            .get(&(SOURCE_TYPE_FILE, "/f.log".to_string(), TP))
+            .expect("entry for the read bucket");
+        assert_eq!(accum.bytes_read, 35);
+        assert_eq!(accum.lines_read, 3);
+    }
+
+    // Reads for the same path that straddle an hour boundary bucket separately,
+    // so the flush emits one correctly-bucketed VEL read line per hour instead of
+    // collapsing both into the flush-time bucket. This is the gap the fix closes.
+    #[test]
+    fn hour_boundary_buckets_separately() {
+        let s = empty_singleton();
+        let tp_next = TP + 60 * 60 * 1000;
+        s.accumulate_read(
+            "/f.log".to_string(),
+            10,
+            1,
+            &None::<HashMap<String, String>>,
+            SOURCE_TYPE_FILE,
+            TP,
+            false,
+        );
+        s.accumulate_read(
+            "/f.log".to_string(),
+            10,
+            1,
+            &None::<HashMap<String, String>>,
+            SOURCE_TYPE_FILE,
+            tp_next,
+            false,
+        );
+
+        let reads = s.reads.lock().unwrap();
+        assert_eq!(
+            reads.len(),
+            2,
+            "reads crossing an hour boundary must bucket separately"
+        );
+        assert!(reads.contains_key(&(SOURCE_TYPE_FILE, "/f.log".to_string(), TP)));
+        assert!(reads.contains_key(&(SOURCE_TYPE_FILE, "/f.log".to_string(), tp_next)));
+    }
+
+    // flush() drains the read registry so each bucket is emitted exactly once.
+    #[test]
+    fn flush_drains_reads() {
+        let s = empty_singleton();
+        s.accumulate_read(
+            "/f.log".to_string(),
+            10,
+            1,
+            &None::<HashMap<String, String>>,
+            SOURCE_TYPE_FILE,
+            TP,
+            false,
+        );
+        assert_eq!(s.reads.lock().unwrap().len(), 1);
+
+        s.flush();
+        assert!(s.reads.lock().unwrap().is_empty(), "flush must drain reads");
     }
 }

@@ -15,11 +15,20 @@
 //! argument. Endpoints discovered by both paths for the same pod are
 //! deduplicated by URL.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::reflector::store::Store;
 use tracing::{trace, warn};
+
+/// Per-namespace mapping of pod annotation key → label name. Outer key is the
+/// pod's namespace (matched exactly); inner key is the annotation key to read
+/// off the pod; inner value is the label name to emit on each scraped metric.
+/// An empty map disables this feature entirely.
+pub type NamespaceAnnotationLabels = HashMap<String, HashMap<String, String>>;
 
 /// Represents a Kubernetes pod endpoint for Prometheus scraping
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,11 +39,13 @@ pub struct Endpoint {
     pub name: String,
     /// The namespace of the pod
     pub namespace: String,
-    /// Optional metrics-namespace value read from a configurable pod
-    /// annotation. `None` when metrics-namespace discovery is disabled or the
-    /// pod does not carry the configured annotation. Emitted on each scraped
-    /// metric as the `tenant` tag (see `METRICS_NAMESPACE_TAG`).
-    pub metrics_namespace: Option<String>,
+    /// Labels sourced from pod annotations per the configured
+    /// `namespace_annotation_labels` map. Keys are label names; values are the
+    /// raw annotation values. Empty when discovery is disabled, the pod's
+    /// namespace has no entry in the map, or none of the configured
+    /// annotations are present on the pod. `BTreeMap` for deterministic
+    /// ordering in logs and tests.
+    pub extra_labels: BTreeMap<String, String>,
 }
 
 /// Trait for providing endpoints for Prometheus scraping
@@ -70,11 +81,10 @@ pub struct K8sEndpointProvider {
     /// The maximum number of endpoints contributed per pod by the annotation
     /// path. Ports parsed beyond this cap are dropped.
     max_endpoints_per_pod: usize,
-    /// Pod annotation key whose value is the metrics-namespace identifier to
-    /// attach to each endpoint discovered for that pod, or `None` to disable
-    /// metrics-namespace discovery. Pods that lack the annotation produce
-    /// endpoints with `metrics_namespace = None`.
-    metrics_ns_annotation_name: Option<String>,
+    /// Per-namespace mapping of pod annotation key → label name (see
+    /// [`NamespaceAnnotationLabels`]). When the map is empty the feature is a
+    /// no-op and every endpoint carries `extra_labels = {}`.
+    namespace_annotation_labels: NamespaceAnnotationLabels,
 }
 
 impl K8sEndpointProvider {
@@ -90,21 +100,21 @@ impl K8sEndpointProvider {
     /// * `max_endpoints_per_pod` - Caps the number of endpoints a single pod
     ///   can contribute via the annotation path; additional parsed ports are
     ///   silently dropped
-    /// * `metrics_ns_annotation_name` - Pod annotation key whose value is recorded as
-    ///   the endpoint's `metrics_namespace`; `None` disables metrics-namespace discovery
+    /// * `namespace_annotation_labels` - Per-namespace map of annotation key
+    ///   → label name; empty disables the feature
     pub fn new(
         pod_state: Store<Pod>,
         named_port: Option<String>,
         annotation_name: Option<String>,
         max_endpoints_per_pod: usize,
-        metrics_ns_annotation_name: Option<String>,
+        namespace_annotation_labels: NamespaceAnnotationLabels,
     ) -> Self {
         Self {
             pod_state,
             named_port,
             annotation_name,
             max_endpoints_per_pod,
-            metrics_ns_annotation_name,
+            namespace_annotation_labels,
         }
     }
 }
@@ -119,7 +129,7 @@ impl EndpointProvider for K8sEndpointProvider {
             self.named_port.as_deref(),
             self.annotation_name.as_deref(),
             self.max_endpoints_per_pod,
-            self.metrics_ns_annotation_name.as_deref(),
+            &self.namespace_annotation_labels,
         )
     }
 }
@@ -139,21 +149,22 @@ impl EndpointProvider for K8sEndpointProvider {
 ///   numbers. Pass `None` to disable annotation-based discovery entirely.
 /// * `max_endpoints_per_pod` - Caps the number of endpoints contributed per pod
 ///   by the annotation path; additional parsed ports are silently dropped.
-/// * `metrics_ns_annotation_name` - Pod annotation key whose value is recorded as the
-///   endpoint's `metrics_namespace`; `None` disables metrics-namespace discovery so
-///   all endpoints have `metrics_namespace = None`.
+/// * `namespace_annotation_labels` - Per-namespace map of annotation key → label
+///   name. When empty, every endpoint carries `extra_labels = {}`.
 fn compute_endpoints(
     state: &[Arc<Pod>],
     named_port: Option<&str>,
     annotation_name: Option<&str>,
     max_endpoints_per_pod: usize,
-    metrics_ns_annotation_name: Option<&str>,
+    namespace_annotation_labels: &NamespaceAnnotationLabels,
 ) -> Vec<Endpoint> {
     let named_port_endpoints: Vec<Endpoint> = match named_port {
         Some(port) => state
             .iter()
             .filter(|pod| pod_has_named_port(pod.as_ref(), port))
-            .filter_map(|pod| extract_metrics_endpoint(pod.as_ref(), port, metrics_ns_annotation_name))
+            .filter_map(|pod| {
+                extract_metrics_endpoint(pod.as_ref(), port, namespace_annotation_labels)
+            })
             .collect(),
         None => vec![],
     };
@@ -166,7 +177,7 @@ fn compute_endpoints(
                     pod.as_ref(),
                     name,
                     max_endpoints_per_pod,
-                    metrics_ns_annotation_name,
+                    namespace_annotation_labels,
                 )
             })
             .collect(),
@@ -210,27 +221,43 @@ fn pod_has_named_port(pod: &Pod, port_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Read the metrics-namespace value for a pod from the configured annotation.
+/// Build the per-pod `extra_labels` map from the configured
+/// `namespace_annotation_labels`.
 ///
-/// The returned value is emitted on each scraped metric as the `tenant` tag
-/// (see [`super::k8s_scrape::METRICS_NAMESPACE_TAG`]) — the user-visible label
-/// is named `tenant` because that is the label name the downstream metrics
-/// system expects, even though everything in code refers to it as the metrics
-/// namespace.
+/// Looks up the pod's namespace (exact match) in the outer map; for each
+/// (annotation_key → label_name) entry, reads the annotation off the pod and,
+/// if present, records `label_name → annotation_value` on the returned map.
+/// Annotations that are absent contribute no label.
 ///
-/// Returns `None` when metrics-namespace discovery is disabled
-/// (`metrics_ns_annotation_name` is `None`), when the pod carries no
-/// annotations, or when the configured annotation key is absent. The
-/// annotation value is returned verbatim with no parsing — empty strings are
-/// returned as `Some("".to_string())` since the caller may want to treat that
-/// as "explicitly empty".
-fn extract_metrics_namespace(pod: &Pod, metrics_ns_annotation_name: Option<&str>) -> Option<String> {
-    let key = metrics_ns_annotation_name?;
-    pod.metadata
-        .annotations
-        .as_ref()?
-        .get(key)
-        .cloned()
+/// Returns an empty map when the outer config is empty, when the pod's
+/// namespace has no entry, when the pod carries no annotations, or when none
+/// of the configured annotations are present. Annotation values are taken
+/// verbatim (no parsing); an empty annotation value produces an empty label
+/// value.
+fn extract_extra_labels(
+    pod: &Pod,
+    namespace_annotation_labels: &NamespaceAnnotationLabels,
+) -> BTreeMap<String, String> {
+    if namespace_annotation_labels.is_empty() {
+        return BTreeMap::new();
+    }
+    let Some(ns) = pod.metadata.namespace.as_deref() else {
+        return BTreeMap::new();
+    };
+    let Some(rules) = namespace_annotation_labels.get(ns) else {
+        return BTreeMap::new();
+    };
+    let Some(annotations) = pod.metadata.annotations.as_ref() else {
+        return BTreeMap::new();
+    };
+
+    let mut out = BTreeMap::new();
+    for (annotation_key, label_name) in rules {
+        if let Some(value) = annotations.get(annotation_key) {
+            out.insert(label_name.clone(), value.clone());
+        }
+    }
+    out
 }
 
 /// Extract the endpoint (pod_ip:port) for pods with the specified named port
@@ -239,8 +266,7 @@ fn extract_metrics_namespace(pod: &Pod, metrics_ns_annotation_name: Option<&str>
 ///
 /// * `pod` - The Kubernetes pod to extract the endpoint from
 /// * `port_name` - The name of the port to look for
-/// * `metrics_ns_annotation_name` - Pod annotation key whose value is recorded as the
-///   endpoint's `metrics_namespace`; `None` disables metrics-namespace discovery
+/// * `namespace_annotation_labels` - Per-namespace map driving `extra_labels`
 ///
 /// # Returns
 ///
@@ -249,7 +275,7 @@ fn extract_metrics_namespace(pod: &Pod, metrics_ns_annotation_name: Option<&str>
 fn extract_metrics_endpoint(
     pod: &Pod,
     port_name: &str,
-    metrics_ns_annotation_name: Option<&str>,
+    namespace_annotation_labels: &NamespaceAnnotationLabels,
 ) -> Option<Endpoint> {
     let pod_ip = pod.status.as_ref()?.pod_ip.as_ref()?;
     let name = pod.metadata.name.clone().unwrap_or_default();
@@ -266,7 +292,7 @@ fn extract_metrics_endpoint(
     })?;
 
     let url = format!("http://{}:{}/metrics", pod_ip, port_number);
-    let metrics_ns = extract_metrics_namespace(pod, metrics_ns_annotation_name);
+    let extra_labels = extract_extra_labels(pod, namespace_annotation_labels);
 
     trace!(
         message = "Created endpoint for pod with named port.",
@@ -274,14 +300,14 @@ fn extract_metrics_endpoint(
         namespace = %namespace,
         port_name,
         endpoint = %url,
-        metrics_namespace = ?metrics_ns,
+        extra_labels = ?extra_labels,
     );
 
     Some(Endpoint {
         url,
         name,
         namespace,
-        metrics_namespace: metrics_ns,
+        extra_labels,
     })
 }
 
@@ -300,7 +326,7 @@ fn extract_endpoints_from_annotation(
     pod: &Pod,
     annotation_name: &str,
     max_ports: usize,
-    metrics_ns_annotation_name: Option<&str>,
+    namespace_annotation_labels: &NamespaceAnnotationLabels,
 ) -> Vec<Endpoint> {
     let Some(annotations) = pod.metadata.annotations.as_ref() else {
         return vec![];
@@ -313,7 +339,7 @@ fn extract_endpoints_from_annotation(
     };
     let name = pod.metadata.name.clone().unwrap_or_default();
     let namespace = pod.metadata.namespace.clone().unwrap_or_default();
-    let metrics_ns = extract_metrics_namespace(pod, metrics_ns_annotation_name);
+    let extra_labels = extract_extra_labels(pod, namespace_annotation_labels);
 
     // Parse, drop invalid entries, then dedupe (first-seen wins). Deduplication
     // runs before the cap so accidental duplicates in the annotation don't
@@ -351,13 +377,13 @@ fn extract_endpoints_from_annotation(
                 namespace = %namespace,
                 port = port_number,
                 endpoint = %url,
-                metrics_namespace = ?metrics_ns,
+                extra_labels = ?extra_labels,
             );
             Endpoint {
                 url,
                 name: name.clone(),
                 namespace: namespace.clone(),
-                metrics_namespace: metrics_ns.clone(),
+                extra_labels: extra_labels.clone(),
             }
         })
         .collect()
@@ -372,11 +398,16 @@ mod tests {
         api::core::v1::{Container, ContainerPort, PodSpec, PodStatus},
         apimachinery::pkg::apis::meta::v1::ObjectMeta,
     };
-    use rstest::rstest;
 
     /// Effectively-unlimited cap used in tests whose intent is unrelated to the
     /// `max_endpoints_per_pod` enforcement.
     const UNLIMITED: usize = usize::MAX;
+
+    /// Empty per-namespace label config, for tests whose intent is unrelated
+    /// to `namespace_annotation_labels`.
+    fn no_labels() -> NamespaceAnnotationLabels {
+        HashMap::new()
+    }
 
     #[test]
     fn test_pod_has_named_port_with_matching_port() {
@@ -435,14 +466,14 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoint = extract_metrics_endpoint(&pod, "user-metrics", None);
+        let endpoint = extract_metrics_endpoint(&pod, "user-metrics", &no_labels());
         assert_eq!(
             endpoint,
             Some(Endpoint {
                 url: "http://10.244.1.5:9090/metrics".to_string(),
                 name: "test-pod".to_string(),
                 namespace: "test-namespace".to_string(),
-                metrics_namespace: None,
+                extra_labels: BTreeMap::new(),
             })
         );
     }
@@ -466,7 +497,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoint = extract_metrics_endpoint(&pod, "user-metrics", None);
+        let endpoint = extract_metrics_endpoint(&pod, "user-metrics", &no_labels());
         assert_eq!(endpoint, None);
     }
 
@@ -489,14 +520,14 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, &no_labels());
         assert_eq!(
             endpoints,
             vec![Endpoint {
                 url: "http://10.244.2.3:9091/metrics".to_string(),
                 name: "annotated-pod".to_string(),
                 namespace: "default".to_string(),
-                metrics_namespace: None,
+                extra_labels: BTreeMap::new(),
             }]
         );
     }
@@ -520,7 +551,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, &no_labels());
         assert_eq!(endpoints.len(), 2);
         let urls: HashSet<&str> = endpoints.iter().map(|e| e.url.as_str()).collect();
         assert!(urls.contains("http://10.244.2.4:9091/metrics"));
@@ -553,7 +584,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, &no_labels());
         let urls: HashSet<&str> = endpoints.iter().map(|e| e.url.as_str()).collect();
         assert_eq!(urls.len(), 3);
         assert!(urls.contains("http://10.244.2.5:9091/metrics"));
@@ -583,7 +614,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, &no_labels());
         let urls: HashSet<&str> = endpoints.iter().map(|e| e.url.as_str()).collect();
         assert_eq!(urls.len(), 2);
         assert!(urls.contains("http://10.244.2.6:9091/metrics"));
@@ -612,7 +643,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, &no_labels());
         assert!(endpoints.is_empty());
     }
 
@@ -632,7 +663,7 @@ mod tests {
             ..Default::default()
         };
 
-        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
+        let endpoints = extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, &no_labels());
         assert!(endpoints.is_empty());
     }
 
@@ -661,7 +692,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, &no_labels());
         assert_eq!(endpoints.len(), 2);
         // Order preserved: first two declared ports survive.
         assert_eq!(endpoints[0].url, "http://10.244.2.8:9091/metrics");
@@ -689,7 +720,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 0, None);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 0, &no_labels());
         assert!(endpoints.is_empty());
     }
 
@@ -715,7 +746,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 5, None);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 5, &no_labels());
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].url, "http://10.244.2.10:9091/metrics");
     }
@@ -745,7 +776,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, &no_labels());
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].url, "http://10.244.2.11:9091/metrics");
         assert_eq!(endpoints[1].url, "http://10.244.2.11:9092/metrics");
@@ -782,7 +813,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, &no_labels());
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].url, "http://10.244.3.1:9091/metrics");
         assert_eq!(endpoints[1].url, "http://10.244.3.1:9092/metrics");
@@ -813,7 +844,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, &no_labels());
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].url, "http://10.244.3.2:9091/metrics");
         assert_eq!(endpoints[1].url, "http://10.244.3.2:9092/metrics");
@@ -843,7 +874,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, &no_labels());
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].url, "http://10.244.3.3:9091/metrics");
     }
@@ -873,7 +904,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, None);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", UNLIMITED, &no_labels());
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].url, "http://10.244.3.4:9092/metrics");
         assert_eq!(endpoints[1].url, "http://10.244.3.4:9091/metrics");
@@ -905,7 +936,7 @@ mod tests {
         };
 
         let endpoints =
-            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, None);
+            extract_endpoints_from_annotation(&pod, "system_metrics_enabled", 2, &no_labels());
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints[0].url, "http://10.244.3.5:9091/metrics");
         assert_eq!(endpoints[1].url, "http://10.244.3.5:9092/metrics");
@@ -980,7 +1011,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
-            None,
+            &no_labels(),
         );
 
         assert_eq!(endpoints.len(), 1);
@@ -1000,7 +1031,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
-            None,
+            &no_labels(),
         );
 
         assert_eq!(endpoints.len(), 1);
@@ -1020,7 +1051,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
-            None,
+            &no_labels(),
         );
 
         assert_eq!(endpoints.len(), 1);
@@ -1040,7 +1071,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
-            None,
+            &no_labels(),
         );
 
         assert!(endpoints.is_empty());
@@ -1065,7 +1096,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
-            None,
+            &no_labels(),
         );
 
         assert_eq!(endpoints.len(), 2);
@@ -1089,7 +1120,7 @@ mod tests {
         );
         let state = vec![pod];
 
-        let endpoints = compute_endpoints(&state, Some("user-metrics"), None, UNLIMITED, None);
+        let endpoints = compute_endpoints(&state, Some("user-metrics"), None, UNLIMITED, &no_labels());
 
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].url, "http://10.0.0.7:9090/metrics");
@@ -1110,7 +1141,7 @@ mod tests {
         );
         let state = vec![pod];
 
-        let endpoints = compute_endpoints(&state, None, Some("system_metrics_enabled"), UNLIMITED, None);
+        let endpoints = compute_endpoints(&state, None, Some("system_metrics_enabled"), UNLIMITED, &no_labels());
 
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].url, "http://10.0.0.8:9091/metrics");
@@ -1128,7 +1159,7 @@ mod tests {
         );
         let state = vec![pod];
 
-        let endpoints = compute_endpoints(&state, None, None, UNLIMITED, None);
+        let endpoints = compute_endpoints(&state, None, None, UNLIMITED, &no_labels());
 
         assert!(endpoints.is_empty());
     }
@@ -1153,7 +1184,7 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
-            None,
+            &no_labels(),
         );
 
         assert_eq!(endpoints.len(), 2);
@@ -1171,7 +1202,7 @@ mod tests {
         let pod_b = make_pod("pod-b", "10.0.0.21", None, None, Some("9091,9092,9093,9094"));
         let state = vec![pod_a, pod_b];
 
-        let endpoints = compute_endpoints(&state, None, Some("system_metrics_enabled"), 2, None);
+        let endpoints = compute_endpoints(&state, None, Some("system_metrics_enabled"), 2, &no_labels());
 
         // 2 ports * 2 pods = 4 endpoints total.
         assert_eq!(endpoints.len(), 4);
@@ -1194,38 +1225,35 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
-            None,
+            &no_labels(),
         );
 
         assert!(endpoints.is_empty());
     }
 
     // -----------------------------------------------------------------------
-    // Tenant-annotation discovery
+    // namespace_annotation_labels: per-namespace annotation → label mapping
     // -----------------------------------------------------------------------
 
-    /// Build a pod that carries an additional annotation `key=value` alongside
-    /// whatever the standard helper already configures.
-    fn make_pod_with_extra_annotation(
+    /// Build a pod with an arbitrary namespace, annotations, and IP. Spec is
+    /// optional so tests can exercise both discovery paths.
+    fn make_pod_in_ns(
         name: &str,
+        ns: &str,
         ip: &str,
         port_name: Option<&str>,
         port_number: Option<i32>,
-        annotation_port: Option<&str>,
-        extra_key: &str,
-        extra_value: &str,
+        annotations: BTreeMap<String, String>,
     ) -> Arc<Pod> {
-        let mut annotations = BTreeMap::new();
-        if let Some(v) = annotation_port {
-            annotations.insert("system_metrics_enabled".to_string(), v.to_string());
-        }
-        annotations.insert(extra_key.to_string(), extra_value.to_string());
-
         Arc::new(Pod {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
-                namespace: Some("default".to_string()),
-                annotations: Some(annotations),
+                namespace: Some(ns.to_string()),
+                annotations: if annotations.is_empty() {
+                    None
+                } else {
+                    Some(annotations)
+                },
                 ..Default::default()
             },
             spec: match (port_name, port_number) {
@@ -1251,153 +1279,215 @@ mod tests {
         })
     }
 
-    /// Build a pod carrying at most one annotation; `None` means no
-    /// annotations map is set on the pod at all (distinct from "empty map").
-    fn pod_with_optional_annotation(kv: Option<(&str, &str)>) -> Pod {
-        Pod {
-            metadata: ObjectMeta {
-                annotations: kv.map(|(k, v)| {
-                    let mut m = BTreeMap::new();
-                    m.insert(k.to_string(), v.to_string());
-                    m
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+    fn ann(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
-    /// Exercises every branch of `extract_metrics_namespace`:
-    /// 1. discovery disabled (caller passes `None`) — pod content irrelevant
-    /// 2. pod has no annotations map at all
-    /// 3. pod has annotations but the configured key is absent
-    /// 4. pod has the configured key — value returned verbatim
-    #[rstest]
-    #[case::disabled(Some(("databricks_tenant", "alpha")), None,                      None)]
-    #[case::no_annotations_map(None,                       Some("databricks_tenant"), None)]
-    #[case::key_absent(Some(("other_key", "ignored")),     Some("databricks_tenant"), None)]
-    #[case::present(Some(("databricks_tenant", "alpha")),  Some("databricks_tenant"), Some("alpha".to_string()))]
-    fn test_extract_metrics_namespace(
-        #[case] annotation: Option<(&str, &str)>,
-        #[case] metrics_ns_annotation_name: Option<&str>,
-        #[case] expected: Option<String>,
-    ) {
-        let pod = pod_with_optional_annotation(annotation);
-        assert_eq!(extract_metrics_namespace(&pod, metrics_ns_annotation_name), expected);
+    fn labels_map(entries: &[(&str, &[(&str, &str)])]) -> NamespaceAnnotationLabels {
+        entries
+            .iter()
+            .map(|(ns, rules)| {
+                (
+                    ns.to_string(),
+                    rules
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
-    /// Named-port path attaches the metrics-namespace value when the pod
-    /// carries the configured annotation.
+    /// Empty config → no extra labels regardless of pod annotations.
     #[test]
-    fn test_extract_metrics_endpoint_with_metrics_namespace() {
-        let pod = make_pod_with_extra_annotation(
+    fn test_extract_extra_labels_empty_config() {
+        let pod = make_pod_in_ns(
+            "p",
+            "team-a",
+            "10.0.0.1",
+            None,
+            None,
+            ann(&[("databricks_tenant", "alpha")]),
+        );
+        assert!(extract_extra_labels(pod.as_ref(), &HashMap::new()).is_empty());
+    }
+
+    /// Pod namespace does not appear in the outer map → no extra labels.
+    #[test]
+    fn test_extract_extra_labels_unmatched_namespace() {
+        let pod = make_pod_in_ns(
+            "p",
+            "team-c",
+            "10.0.0.1",
+            None,
+            None,
+            ann(&[("databricks_tenant", "alpha")]),
+        );
+        let cfg = labels_map(&[("team-a", &[("databricks_tenant", "tenant")])]);
+        assert!(extract_extra_labels(pod.as_ref(), &cfg).is_empty());
+    }
+
+    /// Namespace match is exact — `team-a-prod` does not match a rule for `team-a`.
+    #[test]
+    fn test_extract_extra_labels_namespace_exact_match() {
+        let pod = make_pod_in_ns(
+            "p",
+            "team-a-prod",
+            "10.0.0.1",
+            None,
+            None,
+            ann(&[("databricks_tenant", "alpha")]),
+        );
+        let cfg = labels_map(&[("team-a", &[("databricks_tenant", "tenant")])]);
+        assert!(extract_extra_labels(pod.as_ref(), &cfg).is_empty());
+    }
+
+    /// Annotation listed in the rule is missing on the pod → that label is
+    /// not added. Annotations present on the pod produce labels; absent ones
+    /// are skipped.
+    #[test]
+    fn test_extract_extra_labels_missing_annotation_skipped() {
+        let pod = make_pod_in_ns(
+            "p",
+            "team-a",
+            "10.0.0.1",
+            None,
+            None,
+            ann(&[("service", "checkout")]),
+        );
+        let cfg = labels_map(&[(
+            "team-a",
+            &[("service", "service"), ("version", "version")],
+        )]);
+        let got = extract_extra_labels(pod.as_ref(), &cfg);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got.get("service").map(String::as_str), Some("checkout"));
+    }
+
+    /// Multiple matching annotations → multiple labels emitted with the
+    /// configured names.
+    #[test]
+    fn test_extract_extra_labels_multiple_present() {
+        let pod = make_pod_in_ns(
+            "p",
+            "team-a",
+            "10.0.0.1",
+            None,
+            None,
+            ann(&[("service", "checkout"), ("version", "1.2.3")]),
+        );
+        let cfg = labels_map(&[(
+            "team-a",
+            &[("service", "svc"), ("version", "ver")],
+        )]);
+        let got = extract_extra_labels(pod.as_ref(), &cfg);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.get("svc").map(String::as_str), Some("checkout"));
+        assert_eq!(got.get("ver").map(String::as_str), Some("1.2.3"));
+    }
+
+    /// Pod has no annotations map at all → no extra labels even when the
+    /// namespace matches a rule.
+    #[test]
+    fn test_extract_extra_labels_no_annotations_map() {
+        let pod = make_pod_in_ns("p", "team-a", "10.0.0.1", None, None, BTreeMap::new());
+        let cfg = labels_map(&[("team-a", &[("databricks_tenant", "tenant")])]);
+        assert!(extract_extra_labels(pod.as_ref(), &cfg).is_empty());
+    }
+
+    /// Named-port path: `extra_labels` populated from the configured rule.
+    #[test]
+    fn test_extract_metrics_endpoint_attaches_extra_labels() {
+        let pod = make_pod_in_ns(
             "tenant-pod",
+            "team-a",
             "10.244.1.5",
             Some("user-metrics"),
             Some(9090),
-            None,
-            "databricks_tenant",
-            "alpha",
+            ann(&[("databricks_tenant", "alpha")]),
         );
+        let cfg = labels_map(&[("team-a", &[("databricks_tenant", "tenant")])]);
 
-        let endpoint =
-            extract_metrics_endpoint(pod.as_ref(), "user-metrics", Some("databricks_tenant"));
-        assert_eq!(
-            endpoint,
-            Some(Endpoint {
-                url: "http://10.244.1.5:9090/metrics".to_string(),
-                name: "tenant-pod".to_string(),
-                namespace: "default".to_string(),
-                metrics_namespace: Some("alpha".to_string()),
-            })
-        );
+        let endpoint = extract_metrics_endpoint(pod.as_ref(), "user-metrics", &cfg).unwrap();
+        assert_eq!(endpoint.extra_labels.get("tenant").map(String::as_str), Some("alpha"));
     }
 
-    /// Named-port path: pod missing the annotation yields `metrics_namespace = None`.
+    /// Annotation-discovery path: every endpoint produced from one pod
+    /// carries the same `extra_labels` map.
     #[test]
-    fn test_extract_metrics_endpoint_without_metrics_ns_annotation_name() {
-        let pod = make_pod(
-            "no-tenant-pod",
-            "10.244.1.6",
-            Some("user-metrics"),
-            Some(9090),
-            None,
-        );
-
-        let endpoint =
-            extract_metrics_endpoint(pod.as_ref(), "user-metrics", Some("databricks_tenant"));
-        assert_eq!(endpoint.unwrap().metrics_namespace, None);
-    }
-
-    /// Annotation-discovery path: every endpoint produced from one pod shares
-    /// the same metrics-namespace value.
-    #[test]
-    fn test_extract_endpoints_from_annotation_propagates_metrics_namespace() {
-        let pod = make_pod_with_extra_annotation(
+    fn test_extract_endpoints_from_annotation_propagates_extra_labels() {
+        let pod = make_pod_in_ns(
             "tenant-multi-pod",
+            "team-a",
             "10.244.2.4",
             None,
             None,
-            Some("9091,9092"),
-            "databricks_tenant",
-            "beta",
+            ann(&[
+                ("system_metrics_enabled", "9091,9092"),
+                ("databricks_tenant", "beta"),
+            ]),
         );
+        let cfg = labels_map(&[("team-a", &[("databricks_tenant", "tenant")])]);
 
         let endpoints = extract_endpoints_from_annotation(
             pod.as_ref(),
             "system_metrics_enabled",
             UNLIMITED,
-            Some("databricks_tenant"),
+            &cfg,
         );
         assert_eq!(endpoints.len(), 2);
         for ep in &endpoints {
-            assert_eq!(ep.metrics_namespace.as_deref(), Some("beta"));
+            assert_eq!(ep.extra_labels.get("tenant").map(String::as_str), Some("beta"));
         }
     }
 
-    /// `compute_endpoints` propagates the metrics-namespace value through both
-    /// discovery paths. Pod has a named port (9090) and a different-port
-    /// annotation (9091); both resulting endpoints inherit the value.
+    /// `compute_endpoints` propagates `extra_labels` through both discovery
+    /// paths. Pod has a named port (9090) and a different-port annotation
+    /// (9091); both resulting endpoints carry the configured label.
     #[test]
-    fn test_compute_endpoints_metrics_namespace_propagates_through_both_paths() {
-        let pod = make_pod_with_extra_annotation(
+    fn test_compute_endpoints_extra_labels_propagate_through_both_paths() {
+        let pod = make_pod_in_ns(
             "tenant-both-pod",
+            "team-a",
             "10.244.5.5",
             Some("user-metrics"),
             Some(9090),
-            Some("9091"),
-            "databricks_tenant",
-            "gamma",
+            ann(&[
+                ("system_metrics_enabled", "9091"),
+                ("databricks_tenant", "gamma"),
+            ]),
         );
         let state = vec![pod];
+        let cfg = labels_map(&[("team-a", &[("databricks_tenant", "tenant")])]);
 
         let endpoints = compute_endpoints(
             &state,
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
-            Some("databricks_tenant"),
+            &cfg,
         );
 
         assert_eq!(endpoints.len(), 2);
         for ep in &endpoints {
-            assert_eq!(ep.metrics_namespace.as_deref(), Some("gamma"));
+            assert_eq!(ep.extra_labels.get("tenant").map(String::as_str), Some("gamma"));
         }
     }
 
-    /// `compute_endpoints` produces endpoints with `metrics_namespace = None`
-    /// when metrics-namespace discovery is disabled, even if the pod happens
-    /// to carry the annotation that would otherwise match.
+    /// Empty `namespace_annotation_labels` is a no-op: endpoints are produced
+    /// normally but carry no extra labels.
     #[test]
-    fn test_compute_endpoints_metrics_namespace_disabled_ignores_annotation() {
-        let pod = make_pod_with_extra_annotation(
-            "would-be-tenant-pod",
+    fn test_compute_endpoints_empty_map_is_noop() {
+        let pod = make_pod_in_ns(
+            "p",
+            "team-a",
             "10.244.5.6",
             Some("user-metrics"),
             Some(9090),
-            None,
-            "databricks_tenant",
-            "delta",
+            ann(&[("databricks_tenant", "delta")]),
         );
         let state = vec![pod];
 
@@ -1406,53 +1496,101 @@ mod tests {
             Some("user-metrics"),
             Some("system_metrics_enabled"),
             UNLIMITED,
-            None, // metrics-namespace discovery disabled
+            &HashMap::new(),
         );
 
         assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints[0].metrics_namespace, None);
+        assert!(endpoints[0].extra_labels.is_empty());
     }
 
-    /// Per-pod metrics-namespace isolation: two pods with different values
-    /// produce endpoints carrying their own value.
+    /// Per-pod isolation: pods in different namespaces resolve to different
+    /// rule sets and carry their own labels.
     #[test]
-    fn test_compute_endpoints_per_pod_metrics_namespace_isolation() {
-        let pod_a = make_pod_with_extra_annotation(
+    fn test_compute_endpoints_per_namespace_isolation() {
+        let pod_a = make_pod_in_ns(
             "pod-a",
+            "team-a",
             "10.0.0.30",
             None,
             None,
-            Some("9091"),
-            "databricks_tenant",
-            "alpha",
+            ann(&[
+                ("system_metrics_enabled", "9091"),
+                ("service", "checkout"),
+            ]),
         );
-        let pod_b = make_pod_with_extra_annotation(
+        let pod_b = make_pod_in_ns(
             "pod-b",
+            "team-b",
             "10.0.0.31",
             None,
             None,
-            Some("9091"),
-            "databricks_tenant",
-            "beta",
+            ann(&[
+                ("system_metrics_enabled", "9091"),
+                ("app", "billing"),
+            ]),
         );
         let state = vec![pod_a, pod_b];
+        let cfg = labels_map(&[
+            ("team-a", &[("service", "service_label")]),
+            ("team-b", &[("app", "app_label")]),
+        ]);
 
-        let endpoints = compute_endpoints(
-            &state,
-            None,
-            Some("system_metrics_enabled"),
-            UNLIMITED,
-            Some("databricks_tenant"),
-        );
+        let endpoints =
+            compute_endpoints(&state, None, Some("system_metrics_enabled"), UNLIMITED, &cfg);
 
         assert_eq!(endpoints.len(), 2);
-        let metrics_ns_for = |name: &str| -> Option<String> {
-            endpoints
-                .iter()
-                .find(|e| e.name == name)
-                .and_then(|e| e.metrics_namespace.clone())
-        };
-        assert_eq!(metrics_ns_for("pod-a").as_deref(), Some("alpha"));
-        assert_eq!(metrics_ns_for("pod-b").as_deref(), Some("beta"));
+        let by_name = |n: &str| endpoints.iter().find(|e| e.name == n).unwrap();
+        assert_eq!(
+            by_name("pod-a").extra_labels.get("service_label").map(String::as_str),
+            Some("checkout"),
+        );
+        assert_eq!(
+            by_name("pod-b").extra_labels.get("app_label").map(String::as_str),
+            Some("billing"),
+        );
+    }
+
+    /// End-to-end through `compute_endpoints`: a pod that carries several
+    /// annotations all listed in its namespace's rule yields an endpoint
+    /// whose `extra_labels` map contains every matching label — and no
+    /// labels for annotations the pod carries that aren't in the rule, nor
+    /// for annotations the rule lists that the pod doesn't carry.
+    #[test]
+    fn test_compute_endpoints_multiple_matching_annotations() {
+        let pod = make_pod_in_ns(
+            "multi-ann-pod",
+            "team-a",
+            "10.0.0.40",
+            Some("user-metrics"),
+            Some(9090),
+            ann(&[
+                ("service", "checkout"),
+                ("version", "1.2.3"),
+                ("owner", "team-a"),
+                ("unrelated", "ignored"), // not in the rule
+            ]),
+        );
+        let state = vec![pod];
+        let cfg = labels_map(&[(
+            "team-a",
+            &[
+                ("service", "svc"),
+                ("version", "ver"),
+                ("owner", "owner_label"),
+                ("missing", "missing_label"), // not on the pod
+            ],
+        )]);
+
+        let endpoints =
+            compute_endpoints(&state, Some("user-metrics"), None, UNLIMITED, &cfg);
+
+        assert_eq!(endpoints.len(), 1);
+        let labels = &endpoints[0].extra_labels;
+        assert_eq!(labels.len(), 3, "exactly the three matching annotations should produce labels");
+        assert_eq!(labels.get("svc").map(String::as_str), Some("checkout"));
+        assert_eq!(labels.get("ver").map(String::as_str), Some("1.2.3"));
+        assert_eq!(labels.get("owner_label").map(String::as_str), Some("team-a"));
+        assert!(labels.get("missing_label").is_none(), "rule entry with no matching annotation must not emit a label");
+        assert!(labels.get("unrelated").is_none(), "pod annotation not in the rule must not become a label");
     }
 }

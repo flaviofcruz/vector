@@ -55,6 +55,8 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
         secret,
         graceful_shutdown_duration,
         graceful_data_source_shutdown_duration,
+        graceful_data_sink_shutdown_duration,
+        graceful_internal_source_shutdown_duration,
         allow_empty: _,
     } = builder;
     let all_sinks = sinks
@@ -141,6 +143,8 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
             secret,
             graceful_shutdown_duration,
             graceful_data_source_shutdown_duration,
+            graceful_data_sink_shutdown_duration,
+            graceful_internal_source_shutdown_duration,
         };
 
         config.propagate_acknowledgements()?;

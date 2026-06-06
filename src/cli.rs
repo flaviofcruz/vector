@@ -221,18 +221,44 @@ pub struct RootOpts {
     )]
     pub graceful_shutdown_limit_secs: NonZeroU64,
 
-    /// Set the duration in seconds to wait for non-internal (data) sources to shut down during
+    /// Set the duration in seconds at which non-internal (data) sources are force-closed during
     /// the first wave of graceful shutdown. This must be strictly less than
     /// `--graceful-shutdown-limit-secs` to take effect. If greater than or equal to the main
-    /// limit, it is ignored. After this duration, data sources are force-closed, transforms
-    /// and sinks drain, and then internal sources (e.g. internal_logs, internal_metrics) are
-    /// shut down in a second wave within the remaining time of the main limit.
+    /// limit, two-wave shutdown is disabled and the legacy single-pass path is used. At this
+    /// deadline data *sources* (only) are force-closed; their downstream transforms and sinks
+    /// are then given until `--graceful-data-sink-shutdown-limit-secs` to drain before wave 2
+    /// begins.
     #[arg(
         long,
         default_value = "20",
         env = "VECTOR_GRACEFUL_DATA_SOURCE_SHUTDOWN_LIMIT_SECS"
     )]
     pub graceful_data_source_shutdown_limit_secs: NonZeroU64,
+
+    /// Set the duration in seconds at which the first wave of graceful shutdown ends and the
+    /// second wave begins. Between `--graceful-data-source-shutdown-limit-secs` and this
+    /// deadline, wave-1 transforms and sinks are allowed to keep flushing; they are NOT
+    /// force-closed at this deadline (they continue draining until the overall
+    /// `--graceful-shutdown-limit-secs`). Silently clamped to sit strictly between the
+    /// data-source limit and the internal-source limit.
+    #[arg(
+        long,
+        default_value = "30",
+        env = "VECTOR_GRACEFUL_DATA_SINK_SHUTDOWN_LIMIT_SECS"
+    )]
+    pub graceful_data_sink_shutdown_limit_secs: NonZeroU64,
+
+    /// Set the duration in seconds at which deferred (internal) sources are force-closed during
+    /// the second wave of graceful shutdown (e.g. internal_logs, internal_metrics). At this
+    /// deadline internal *sources* (only) are force-closed; their downstream transforms and
+    /// sinks keep flushing until the overall `--graceful-shutdown-limit-secs`. Silently clamped
+    /// to sit strictly between the data-sink limit and the overall limit.
+    #[arg(
+        long,
+        default_value = "50",
+        env = "VECTOR_GRACEFUL_INTERNAL_SOURCE_SHUTDOWN_LIMIT_SECS"
+    )]
+    pub graceful_internal_source_shutdown_limit_secs: NonZeroU64,
 
     /// Never time out while waiting for graceful shutdown after SIGINT or SIGTERM received.
     /// This is useful when you would like for Vector to attempt to send data until terminated

@@ -395,6 +395,7 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
             // Similarly the exact blob isn't determined here yet
             blob: "".to_string(),
             container: self.bucket.clone(),
+            bucket: Some(self.bucket.clone()),
             count_map: generate_count_map(&events, false),
         };
 

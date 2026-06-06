@@ -24,6 +24,7 @@ use crate::{
 #[derive(Clone)]
 pub struct AzureBlobRequestOptions {
     pub container_name: String,
+    pub storage_account: Option<String>,
     pub blob_time_format: String,
     pub blob_append_uuid: bool,
     pub blob_prepend_crypto_nonce: bool,
@@ -64,6 +65,10 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
             // Similarly the exact blob isn't determined here yet
             blob: "".to_string(),
             container: self.container_name.clone(),
+            // For vector-event-log parity with log-daemon, the new `bucket`
+            // field carries the Azure storage account name (log-daemon's
+            // destination_bucket). `container` keeps powering the URL.
+            bucket: self.storage_account.clone(),
             count_map: generate_count_map(&events, false),
         };
 

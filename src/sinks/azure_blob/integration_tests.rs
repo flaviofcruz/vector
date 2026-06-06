@@ -224,6 +224,7 @@ impl AzureBlobSinkConfig {
         let config = AzureBlobSinkConfig {
             connection_string: format!("UseDevelopmentStorage=true;DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://{address}:10000/devstoreaccount1;QueueEndpoint=http://{address}:10001/devstoreaccount1;TableEndpoint=http://{address}:10002/devstoreaccount1;").into(),
                 container_name: "logs".to_string(),
+                storage_account: Some("devstoreaccount1".to_string()),
                 blob_prefix: Default::default(),
                 blob_time_format: None,
                 blob_append_uuid: None,

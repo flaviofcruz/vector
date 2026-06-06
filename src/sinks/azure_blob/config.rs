@@ -72,6 +72,17 @@ pub struct AzureBlobSinkConfig {
     #[configurable(metadata(docs::examples = "my-logs"))]
     pub(super) container_name: String,
 
+    /// The Azure Storage account name.
+    ///
+    /// Emitted as the `bucket` field of `VectorSendMessagesEvent` so it matches
+    /// log-daemon's `destination_bucket`, which is the storage account name on
+    /// Azure (not the container). Optional so missing config doesn't crashloop
+    /// the daemon; jsonnet is expected to always populate it, and unset shows
+    /// up as an empty bucket in vector-event-log (loud-fail, not silent).
+    #[configurable(metadata(docs::examples = "mylogstorage"))]
+    #[serde(default)]
+    pub(super) storage_account: Option<String>,
+
     /// A prefix to apply to all blob keys.
     ///
     /// Prefixes are useful for partitioning objects, such as by creating a blob key that
@@ -164,6 +175,7 @@ impl GenerateConfig for AzureBlobSinkConfig {
         toml::Value::try_from(Self {
             connection_string: String::from("DefaultEndpointsProtocol=https;AccountName=some-account-name;AccountKey=some-account-key;").into(),
             container_name: String::from("logs"),
+            storage_account: Some(String::from("some-account-name")),
             blob_prefix: default_blob_prefix(),
             blob_time_format: Some(String::from("%s")),
             blob_append_uuid: Some(true),
@@ -242,6 +254,7 @@ impl AzureBlobSinkConfig {
 
         let request_options = AzureBlobRequestOptions {
             container_name: self.container_name.clone(),
+            storage_account: self.storage_account.clone(),
             blob_time_format,
             blob_append_uuid,
             blob_prepend_crypto_nonce: self.blob_prepend_crypto_nonce,
