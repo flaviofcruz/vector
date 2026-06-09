@@ -220,6 +220,24 @@ pub fn delivery_flush_interval() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Whether delivery-event VEL `info!` logs are batched through the process-global
+/// [`DeliveryEventSingleton`] (one aggregated log per flush window) or emitted
+/// inline at each event site (one log per line read / per sink request — the
+/// original pre-singleton behavior).
+///
+/// Controlled by `VECTOR_BATCH_DELIVERY_EVENT_LOGS` (`true`/`1` to batch);
+/// defaults to `false` (inline). Read once and cached. Regardless of this flag,
+/// the `delivery_events_total` counters are always emitted inline at the event
+/// sites, so the SLI metrics are unaffected by the choice.
+pub fn delivery_event_batching_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env::var("VECTOR_BATCH_DELIVERY_EVENT_LOGS")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Which sink leg a count map belongs to.
 #[derive(Clone, Copy)]
 enum SinkLeg {
@@ -325,20 +343,42 @@ impl DeliveryEventSingleton {
 
         // Counter emitted inline, bucketed on the read-time `time_parity` the
         // event is stamped with — not batched through the flush.
-        {
-            let empty = HashMap::new();
-            let ctx = source_context.as_ref().unwrap_or(&empty);
-            counter!(
-                "delivery_events_total",
-                "delivery_event_type" => "VECTOR_SOURCE_READ",
-                "time_parity" => time_parity.to_string(),
-                "delivery_method" => delivery_method_for_source_type(source_type),
-                "topic" => resolve_received_topic(ctx, &path, source_type),
-            )
-            .increment(lines_read as u64);
+        let empty = HashMap::new();
+        let ctx = source_context.as_ref().unwrap_or(&empty);
+        counter!(
+            "delivery_events_total",
+            "delivery_event_type" => "VECTOR_SOURCE_READ",
+            "time_parity" => time_parity.to_string(),
+            "delivery_method" => delivery_method_for_source_type(source_type),
+            "topic" => resolve_received_topic(ctx, &path, source_type),
+        )
+        .increment(lines_read as u64);
+
+        // Inline mode (default): emit the VEL log immediately in the current
+        // source span, one per read — the original pre-singleton behavior. No
+        // accumulation, so the background flush task is never spawned.
+        if !delivery_event_batching_enabled() {
+            emit_read_log(&path, bytes_read, lines_read, ctx, time_parity);
+            return;
         }
 
         self.ensure_flush_task();
+        self.record_read(path, bytes_read, lines_read, source_context, source_type, time_parity);
+    }
+
+    /// Merges one read into the `(source_type, path, time_parity)` accumulator.
+    /// Split out from [`accumulate_read`] so the merge/bucketing behavior can be
+    /// unit-tested directly, independent of the `VECTOR_BATCH_DELIVERY_EVENT_LOGS`
+    /// routing and the inline counter.
+    fn record_read(
+        &self,
+        path: String,
+        bytes_read: usize,
+        lines_read: usize,
+        source_context: &Option<HashMap<String, String>>,
+        source_type: &'static str,
+        time_parity: i64,
+    ) {
         let mut reads = self.reads.lock().expect("delivery reads lock poisoned");
         let entry = reads
             .entry((source_type, path, time_parity))
@@ -367,6 +407,26 @@ impl DeliveryEventSingleton {
         if count_map.is_empty() {
             return;
         }
+        let (message, delivery_event_type) = match leg {
+            SinkLeg::Staged => (
+                "Delivery event: SINK_STAGED_MESSAGES",
+                "VECTOR_SINK_UPLOAD_STAGED",
+            ),
+            SinkLeg::Delivered => (
+                "Delivery event: SINK_DELIVERED_MESSAGES",
+                "VECTOR_SINK_UPLOAD_DELIVERED",
+            ),
+        };
+
+        // Inline mode (default): emit one VEL log per count-map entry in the
+        // current sink span, per request — the original pre-singleton behavior.
+        if !delivery_event_batching_enabled() {
+            for value in count_map.values() {
+                emit_sink_delivery_log(value, message, delivery_event_type);
+            }
+            return;
+        }
+
         self.ensure_flush_task();
         // One emit call comes from a single sink, so the component span is the
         // same for every key in this count map; captured once and stored per key.
@@ -405,19 +465,12 @@ impl DeliveryEventSingleton {
             // Re-enter the source's component span so the trace BroadcastLayer
             // copies `.vector.component_{id,type,kind}` onto the log.
             let _entered = accum.span.enter();
-            info!(
-                message = "Delivery event: READ_MESSAGES.",
-                file = %path,
-                num_bytes = accum.bytes_read,
-                num_events = accum.lines_read,
-                delivery_event_type = "VECTOR_SOURCE_READ",
-                vector_event_type = "VECTOR_LOG_DELIVERY_EVENT",
-                // Read-time hour bucket carried onto the batched log so the universe
-                // VRL buckets the read leg on the same `timeParity` as staged/delivered,
-                // instead of recomputing it from the (up-to-flush-interval-late) timestamp.
-                time_parity = time_parity,
-                internal_log_rate_limit = false,
-                source_context = serde_json::to_string(&accum.source_context).unwrap(),
+            emit_read_log(
+                &path,
+                accum.bytes_read,
+                accum.lines_read,
+                &accum.source_context,
+                time_parity,
             );
         }
 
@@ -442,6 +495,54 @@ impl DeliveryEventSingleton {
     }
 }
 
+/// Emits a single source-read VEL `info!` log. Shared by the singleton flush
+/// (which re-enters the captured component span first) and the inline path in
+/// [`DeliveryEventSingleton::accumulate_read`] (which is already in the source
+/// span), so both modes emit the identical log shape.
+fn emit_read_log(
+    path: &str,
+    bytes_read: usize,
+    lines_read: usize,
+    source_context: &HashMap<String, String>,
+    time_parity: i64,
+) {
+    info!(
+        message = "Delivery event: READ_MESSAGES.",
+        file = %path,
+        num_bytes = bytes_read,
+        num_events = lines_read,
+        delivery_event_type = "VECTOR_SOURCE_READ",
+        vector_event_type = "VECTOR_LOG_DELIVERY_EVENT",
+        // Read-time hour bucket carried onto the log so the universe VRL buckets
+        // the read leg on the same `timeParity` as staged/delivered, instead of
+        // recomputing it from the (up-to-flush-interval-late) timestamp.
+        time_parity = time_parity,
+        internal_log_rate_limit = false,
+        source_context = serde_json::to_string(source_context).unwrap(),
+    );
+}
+
+/// Emits a single sink-delivery VEL `info!` log for one aggregated `value_map`.
+/// Shared by the singleton flush (via [`emit_sink_delivery_logs`], which
+/// re-enters the captured span first) and the inline path in
+/// [`DeliveryEventSingleton::merge_sink`] (already in the sink span).
+fn emit_sink_delivery_log(
+    value: &MetadataValuesCount,
+    message: &'static str,
+    delivery_event_type: &'static str,
+) {
+    info!(
+        message = message,
+        keys = serde_json::to_string(&value.value_map).unwrap(),
+        delivery_event_type = delivery_event_type,
+        vector_event_type = "VECTOR_LOG_DELIVERY_EVENT",
+        num_events = value.count,
+        num_bytes = value.size,
+        // Specifying this allows us to emit without rate limiting (needed for high throughput sinks)
+        internal_log_rate_limit = false,
+    );
+}
+
 /// Emits one VEL `info!` log per aggregated `value_map`. Used by the sink
 /// delivery legs of the singleton flush. Each entry's component span is
 /// re-entered so the trace BroadcastLayer copies `.vector.component_*` onto the
@@ -453,18 +554,8 @@ fn emit_sink_delivery_logs<'a>(
     delivery_event_type: &'static str,
 ) {
     for accum in accums {
-        let value = &accum.value;
         let _entered = accum.span.enter();
-        info!(
-            message = message,
-            keys = serde_json::to_string(&value.value_map).unwrap(),
-            delivery_event_type = delivery_event_type,
-            vector_event_type = "VECTOR_LOG_DELIVERY_EVENT",
-            num_events = value.count,
-            num_bytes = value.size,
-            // Specifying this allows us to emit without rate limiting (needed for high throughput sinks)
-            internal_log_rate_limit = false,
-        );
+        emit_sink_delivery_log(&accum.value, message, delivery_event_type);
     }
 }
 
@@ -800,23 +891,21 @@ mod read_accumulation_tests {
     #[test]
     fn same_bucket_aggregates() {
         let s = empty_singleton();
-        s.accumulate_read(
+        s.record_read(
             "/f.log".to_string(),
             10,
             1,
             &None::<HashMap<String, String>>,
             SOURCE_TYPE_FILE,
             TP,
-            false,
         );
-        s.accumulate_read(
+        s.record_read(
             "/f.log".to_string(),
             25,
             2,
             &None::<HashMap<String, String>>,
             SOURCE_TYPE_FILE,
             TP,
-            false,
         );
 
         let reads = s.reads.lock().unwrap();
@@ -839,23 +928,21 @@ mod read_accumulation_tests {
     fn hour_boundary_buckets_separately() {
         let s = empty_singleton();
         let tp_next = TP + 60 * 60 * 1000;
-        s.accumulate_read(
+        s.record_read(
             "/f.log".to_string(),
             10,
             1,
             &None::<HashMap<String, String>>,
             SOURCE_TYPE_FILE,
             TP,
-            false,
         );
-        s.accumulate_read(
+        s.record_read(
             "/f.log".to_string(),
             10,
             1,
             &None::<HashMap<String, String>>,
             SOURCE_TYPE_FILE,
             tp_next,
-            false,
         );
 
         let reads = s.reads.lock().unwrap();
@@ -868,9 +955,12 @@ mod read_accumulation_tests {
         assert!(reads.contains_key(&(SOURCE_TYPE_FILE, "/f.log".to_string(), tp_next)));
     }
 
-    // flush() drains the read registry so each bucket is emitted exactly once.
+    // With `VECTOR_BATCH_DELIVERY_EVENT_LOGS` unset (the default), the public
+    // `accumulate_read` routes to the inline emit path and accumulates nothing,
+    // so the registry stays empty. (CI does not set the env var; the flag is
+    // cached on first read.)
     #[test]
-    fn flush_drains_reads() {
+    fn inline_mode_does_not_accumulate() {
         let s = empty_singleton();
         s.accumulate_read(
             "/f.log".to_string(),
@@ -880,6 +970,24 @@ mod read_accumulation_tests {
             SOURCE_TYPE_FILE,
             TP,
             false,
+        );
+        assert!(
+            s.reads.lock().unwrap().is_empty(),
+            "inline mode (default) must not accumulate reads"
+        );
+    }
+
+    // flush() drains the read registry so each bucket is emitted exactly once.
+    #[test]
+    fn flush_drains_reads() {
+        let s = empty_singleton();
+        s.record_read(
+            "/f.log".to_string(),
+            10,
+            1,
+            &None::<HashMap<String, String>>,
+            SOURCE_TYPE_FILE,
+            TP,
         );
         assert_eq!(s.reads.lock().unwrap().len(), 1);
 
