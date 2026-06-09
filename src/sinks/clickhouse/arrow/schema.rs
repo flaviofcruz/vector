@@ -1,15 +1,19 @@
 //! Schema fetching and Arrow schema construction for ClickHouse tables.
 
+use std::collections::HashMap;
+
 use arrow::datatypes::{Field, Schema};
 use async_trait::async_trait;
 use http::{Request, StatusCode};
 use hyper::Body;
 use serde::Deserialize;
-use vector_lib::codecs::encoding::format::{ArrowEncodingError, SchemaProvider};
+use vector_lib::codecs::encoding::format::{
+    ArrowEncodingError, COERCE_DEFAULT_METADATA_KEY, SchemaProvider,
+};
 
 use crate::http::{Auth, HttpClient};
 
-use super::parser::clickhouse_type_to_arrow;
+use super::parser::{clickhouse_type_to_arrow, unwrap_type_modifiers};
 
 #[derive(Debug, Deserialize)]
 struct ColumnInfo {
@@ -91,10 +95,39 @@ fn parse_schema_from_response(response: &str) -> crate::Result<Schema> {
     for column in columns {
         let (arrow_type, nullable) = clickhouse_type_to_arrow(&column.column_type)
             .map_err(|e| format!("Failed to convert column '{}': {}", column.name, e))?;
-        fields.push(Field::new(&column.name, arrow_type, nullable));
+        let mut field = Field::new(&column.name, arrow_type, nullable);
+        // Tag the column with the value to substitute for a missing/null instance, matching
+        // ClickHouse's JSONEachRow omitted-column defaults (applied only when coercion is on).
+        if let Some(default) = clickhouse_omitted_default(&column.column_type) {
+            field = field.with_metadata(HashMap::from([(
+                COERCE_DEFAULT_METADATA_KEY.to_string(),
+                default,
+            )]));
+        }
+        fields.push(field);
     }
 
     Ok(Schema::new(fields))
+}
+
+/// Default the Arrow encoder appends for a missing/null instance of a non-nullable column,
+/// matching ClickHouse's JSONEachRow omitted-column fill. `None` for nullable or uncovered
+/// types. Covers String/FixedString/LowCardinality -> `""`, JSON -> `"{}"` (CH rejects `""`),
+/// Int64 -> `"0"`.
+fn clickhouse_omitted_default(ch_type: &str) -> Option<String> {
+    let (base, is_nullable) = unwrap_type_modifiers(ch_type);
+    if is_nullable {
+        return None;
+    }
+    if base.starts_with("JSON") {
+        Some("{}".to_string())
+    } else if base == "String" || base.starts_with("FixedString") {
+        Some(String::new())
+    } else if base == "Int64" {
+        Some("0".to_string())
+    } else {
+        None
+    }
 }
 
 /// Schema provider implementation for ClickHouse tables.
@@ -166,6 +199,32 @@ mod tests {
             schema.field(2).data_type(),
             &DataType::Timestamp(TimeUnit::Second, None)
         );
+    }
+
+    #[test]
+    fn test_coerce_default_metadata_tagging() {
+        // Each coercible column is tagged with its omitted-column default; others get no tag.
+        let response = r#"{"name":"s","type":"String"}
+{"name":"lc","type":"LowCardinality(String)"}
+{"name":"j","type":"JSON(a UInt64, b UInt64)"}
+{"name":"ws","type":"Int64"}
+{"name":"n","type":"Nullable(String)"}
+{"name":"f","type":"Float64"}
+"#;
+        let schema = parse_schema_from_response(response).unwrap();
+        let default = |i: usize| {
+            schema
+                .field(i)
+                .metadata()
+                .get(COERCE_DEFAULT_METADATA_KEY)
+                .cloned()
+        };
+        assert_eq!(default(0).as_deref(), Some("")); // String -> ""
+        assert_eq!(default(1).as_deref(), Some("")); // LowCardinality(String) -> ""
+        assert_eq!(default(2).as_deref(), Some("{}")); // JSON -> "{}" (CH rejects "")
+        assert_eq!(default(3).as_deref(), Some("0")); // Int64 -> "0"
+        assert_eq!(default(4), None); // Nullable -> no default, stays NULL
+        assert_eq!(default(5), None); // Float64 -> not a coerced type
     }
 
     #[test]

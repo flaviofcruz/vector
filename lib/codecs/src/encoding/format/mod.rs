@@ -28,8 +28,9 @@ use std::fmt::Debug;
 
 #[cfg(feature = "arrow")]
 pub use arrow::{
-    ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig, SchemaProvider,
-    build_record_batch, record_batch_to_arrow_ipc_stream,
+    ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig,
+    COERCE_DEFAULT_METADATA_KEY, SchemaProvider, build_record_batch,
+    record_batch_to_arrow_ipc_stream,
 };
 #[cfg(feature = "arrow")]
 pub use wire_to_arrow::{
