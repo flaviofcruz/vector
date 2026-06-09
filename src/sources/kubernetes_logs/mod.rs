@@ -792,6 +792,10 @@ struct Source {
     line_delimiter: String,
     encoding: Option<EncodingConfig>,
     archive_extensions: Vec<String>,
+    /// When true, run the file server directly on the async runtime (cancellable) instead of the
+    /// legacy `spawn_blocking` wrapper. Sourced from the `async_kubernetes_logs_file_server` global
+    /// flag; default off.
+    async_file_server: bool,
 }
 
 /// Wrapper that aborts owned reflector tasks on drop, preventing leaks if the
@@ -1064,6 +1068,7 @@ impl Source {
             line_delimiter: config.line_delimiter.clone(),
             encoding: config.encoding.clone(),
             archive_extensions: config.archive_extensions.clone(),
+            async_file_server: globals.async_kubernetes_logs_file_server.enabled(),
         })
     }
 
@@ -1113,6 +1118,7 @@ impl Source {
             line_delimiter,
             encoding,
             archive_extensions,
+            async_file_server,
         } = self;
 
         let hostname = host_key.as_ref().and_then(|_| {
@@ -1340,15 +1346,21 @@ impl Source {
         let mut lifecycle = Lifecycle::new();
         {
             let (slot, shutdown) = lifecycle.add();
-            let fut = util::run_file_server(file_server, file_source_tx, shutdown, checkpointer)
-                .map(|result| match result {
-                    Ok(FileServerShutdown) => info!(message = "File server completed gracefully."),
-                    Err(error) => emit!(KubernetesLifecycleError {
-                        message: "File server exited with an error.",
-                        error,
-                        count: events_count,
-                    }),
-                });
+            let fut = util::run_file_server(
+                file_server,
+                file_source_tx,
+                shutdown,
+                checkpointer,
+                async_file_server,
+            )
+            .map(|result| match result {
+                Ok(FileServerShutdown) => info!(message = "File server completed gracefully."),
+                Err(error) => emit!(KubernetesLifecycleError {
+                    message: "File server exited with an error.",
+                    error,
+                    count: events_count,
+                }),
+            });
             slot.bind(Box::pin(fut));
         }
         {
