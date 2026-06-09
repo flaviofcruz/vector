@@ -9,12 +9,12 @@ use arrow::{
         ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Date64Builder, Decimal128Builder,
         Decimal256Builder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder,
         Int64Builder, LargeBinaryBuilder, LargeStringBuilder, ListArray, MapArray, StringBuilder,
-        StructArray, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
-        TimestampNanosecondBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
-        UInt32Builder, UInt64Builder,
+        StringDictionaryBuilder, StructArray, TimestampMicrosecondBuilder,
+        TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
+        UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
     },
     buffer::{NullBuffer, OffsetBuffer, ScalarBuffer},
-    datatypes::{DataType, Field, Fields, Schema, TimeUnit, i256},
+    datatypes::{DataType, Field, Fields, Int32Type, Schema, TimeUnit, i256},
     ipc::writer::StreamWriter,
     record_batch::RecordBatch,
 };
@@ -533,6 +533,56 @@ fn build_string_array(
     Ok(Arc::new(builder.finish()))
 }
 
+/// Builds a dictionary-encoded string array (`Dictionary(Int32, Utf8)`) for a
+/// `LowCardinality(String)` column, so ClickHouse stores it as `LowCardinality` without rebuilding.
+fn build_string_dictionary_array(
+    events: &[Event],
+    field_name: &str,
+    nullable: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+
+    for event in events {
+        if let Event::Log(log) = event {
+            let mut appended = false;
+            if let Some(value) = log.get(field_name) {
+                match value {
+                    Value::Bytes(bytes) => {
+                        match std::str::from_utf8(bytes) {
+                            Ok(s) => builder.append_value(s),
+                            Err(_) => builder.append_value(&String::from_utf8_lossy(bytes)),
+                        }
+                        appended = true;
+                    }
+                    Value::Object(obj) => {
+                        if let Ok(s) = serde_json::to_string(&obj) {
+                            builder.append_value(s);
+                            appended = true;
+                        }
+                    }
+                    Value::Array(arr) => {
+                        if let Ok(s) = serde_json::to_string(&arr) {
+                            builder.append_value(s);
+                            appended = true;
+                        }
+                    }
+                    Value::Null => {}
+                    _ => {
+                        builder.append_value(&value.to_string_lossy());
+                        appended = true;
+                    }
+                }
+            }
+
+            if !appended {
+                handle_null_constraints!(builder, nullable, field_name);
+            }
+        }
+    }
+
+    Ok(Arc::new(builder.finish()))
+}
+
 define_build_primitive_array_fn!(
     build_int8_array,
     Int8Builder,
@@ -823,6 +873,12 @@ fn build_column_for_path(
         }
         DataType::Decimal256(precision, scale) => {
             build_decimal256_array(events, path, *precision, *scale, nullable)
+        }
+        DataType::Dictionary(key, value)
+            if matches!(key.as_ref(), DataType::Int32)
+                && matches!(value.as_ref(), DataType::Utf8) =>
+        {
+            build_string_dictionary_array(events, path, nullable)
         }
         other_type => Err(ArrowEncodingError::UnsupportedType {
             field_name: path.into(),
@@ -1502,6 +1558,44 @@ mod tests {
                 .unwrap()
                 .is_null(0)
         );
+    }
+
+    #[test]
+    fn test_encode_low_cardinality_dictionary() {
+        use arrow::array::{DictionaryArray, StringArray};
+
+        // Three rows, two distinct values -> dictionary of 2 entries, keys [0,0,1].
+        let events: Vec<Event> = ["a", "a", "b"]
+            .iter()
+            .map(|v| {
+                let mut log = LogEvent::default();
+                log.insert("lc", *v);
+                Event::Log(log)
+            })
+            .collect();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "lc",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+
+        let batch = build_record_batch(schema, &events).expect("dictionary batch builds");
+        assert_eq!(batch.num_rows(), 3);
+        let dict = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("column is a dictionary array");
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("dictionary values are strings");
+        assert_eq!(values.len(), 2); // deduped: "a","b"
+        let keys = dict.keys();
+        assert_eq!(keys.value(0), keys.value(1)); // both "a"
+        assert_ne!(keys.value(0), keys.value(2)); // "a" != "b"
     }
 
     #[test]
