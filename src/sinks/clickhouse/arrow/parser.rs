@@ -111,6 +111,10 @@ pub fn clickhouse_type_to_arrow(ch_type: &str) -> Result<(DataType, bool), Strin
         // Strings
         "String" | "FixedString" => DataType::Utf8,
 
+        // JSON is sent as a string; ClickHouse parses it into the JSON column on
+        // insert (Arrow Utf8 -> JSON is converted server-side).
+        "JSON" => DataType::Utf8,
+
         // Date and time types (timezones not currently handled, defaults to UTC)
         "Date" | "Date32" => DataType::Date32,
         "DateTime" => DataType::Timestamp(TimeUnit::Second, None),

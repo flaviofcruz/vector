@@ -31,9 +31,11 @@ pub async fn fetch_table_schema(
     table: &str,
     auth: Option<&Auth>,
 ) -> crate::Result<Schema> {
+    // Skip MATERIALIZED/ALIAS columns: not insertable, and matched by name so they'd fail the insert.
     let query = "SELECT name, type \
                  FROM system.columns \
                  WHERE database = {db:String} AND table = {tbl:String} \
+                   AND default_kind NOT IN ('MATERIALIZED', 'ALIAS') \
                  ORDER BY position \
                  FORMAT JSONEachRow";
 
