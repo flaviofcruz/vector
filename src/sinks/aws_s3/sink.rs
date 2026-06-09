@@ -20,7 +20,7 @@ use crate::{
         },
         util::{
             Compression, RequestBuilder, metadata::RequestMetadataBuilder,
-            request_builder::EncodeResult,
+            request_builder::EncodeResult, vector_event_log::use_event_log_sink_wrapping,
         },
     },
 };
@@ -60,10 +60,18 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
     ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
         let (partition_key, mut events) = input;
         // We don't need to pass file metadata here especially since it isn't fully populated yet
-        let builder = RequestMetadataBuilder::from_events_with_event_log(
-            &events,
-            Some(FileEventMetadata::default()),
-        );
+        // Gate the expensive per-event computation (event cloning + field lookups) on whether
+        // sink event logging is enabled. When disabled the count_map is empty and all emit_*
+        // calls become no-ops, so skipping the build is safe.
+        let vel_enabled = use_event_log_sink_wrapping();
+        let builder = if vel_enabled {
+            RequestMetadataBuilder::from_events_with_event_log(
+                &events,
+                Some(FileEventMetadata::default()),
+            )
+        } else {
+            RequestMetadataBuilder::from_events(&events)
+        };
 
         let finalizers = events.take_finalizers();
         let s3_key_prefix = partition_key.key_prefix.clone();
@@ -83,7 +91,11 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
             blob: "".to_string(),
             container: self.bucket.clone(),
             bucket: Some(self.bucket.clone()),
-            count_map: generate_count_map(&events, false),
+            count_map: if vel_enabled {
+                generate_count_map(&events, false)
+            } else {
+                Default::default()
+            },
         };
 
         let metadata = S3Metadata {
