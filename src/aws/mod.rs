@@ -93,8 +93,6 @@ fn check_response(res: &HttpResponse) -> bool {
             "RequestTimeout",
             "RequestExpired",
             "ThrottlingException",
-            "ExpiredToken",
-            "AccessDenied",
         ])
         .expect("invalid regex")
     });

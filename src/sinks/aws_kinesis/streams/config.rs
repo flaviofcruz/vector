@@ -184,10 +184,14 @@ impl RetryLogic for KinesisRetryLogic {
             // request.
             //
             // https://github.com/vectordotdev/vector/issues/359
+
+            // if we do not want to retry partial failure due to ProvisionedThroughputExceededException
+            // we should also not retry when whole request is failed due to ProvisionedThroughputExceededException
+            // using retry_partial to gate not retrying due to quota failure.
             if matches!(
                 inner.err(),
                 PutRecordsError::ProvisionedThroughputExceededException(_)
-            ) {
+            ) && self.retry_partial {
                 return true;
             }
         }
