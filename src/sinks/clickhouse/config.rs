@@ -535,8 +535,8 @@ impl ClickhouseConfig {
 
         config.schema = Some(schema);
 
-        // Match the JSONEachRow path's leniency (omitted-column defaults + quoted-integer parsing)
-        // so a missing/null or string-typed value doesn't fail the batch on a non-nullable column.
+        // Enable coercion: without it, a missing/null or string-typed value would fail the batch
+        // on a non-nullable column.
         config.coerce_missing_to_default = true;
 
         debug!(

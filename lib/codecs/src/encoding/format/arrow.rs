@@ -30,7 +30,7 @@ use vector_config::configurable_component;
 use vector_core::event::{Event, Value};
 
 /// Field-metadata key holding a column's coercion default. Consumed when
-/// `coerce_missing_to_default` is set; stripped from the schema before the wire.
+/// `coerce_missing_to_default` is set; always stripped from the schema before the wire.
 pub const COERCE_DEFAULT_METADATA_KEY: &str = "databricks.arrow.coerce_default";
 
 /// Provides Arrow schema for encoding.
@@ -67,7 +67,7 @@ pub struct ArrowStreamSerializerConfig {
     pub allow_nullable_fields: bool,
 
     /// Coerce a missing/null/incompatible value for a non-nullable column to its default (from
-    /// `COERCE_DEFAULT_METADATA_KEY` metadata) and parse numeric strings to integers. Off by default.
+    /// `COERCE_DEFAULT_METADATA_KEY` metadata) and parse numeric strings into `Int64` columns. Off by default.
     #[serde(default)]
     #[configurable(derived)]
     pub coerce_missing_to_default: bool,
@@ -140,9 +140,12 @@ impl ArrowStreamSerializer {
             )
         });
 
-        // Transform the schema once (not per batch): strip the internal coerce marker so it
-        // never reaches the wire, and relax nullability if enabled.
-        let needs_strip = coerce_defaults.is_some();
+        // Strip the internal coerce marker (it must not reach the wire) and, if enabled, relax
+        // nullability. Done once here, not per batch.
+        let needs_strip = schema
+            .fields()
+            .iter()
+            .any(|f| f.metadata().contains_key(COERCE_DEFAULT_METADATA_KEY));
         let needs_nullable = config.allow_nullable_fields;
         let schema = if needs_strip || needs_nullable {
             let fields = schema
@@ -400,6 +403,7 @@ macro_rules! define_build_primitive_array_fn {
             events: &[Event],
             field_name: &str,
             nullable: bool,
+            missing_default: Option<&str>,
         ) -> Result<ArrayRef, ArrowEncodingError> {
             let mut builder = <$builder_ty>::with_capacity(events.len());
 
@@ -409,8 +413,11 @@ macro_rules! define_build_primitive_array_fn {
                         $(
                             $value_pat $(if $guard)? => builder.append_value($append_expr),
                         )+
-                        // All other patterns are treated as null/invalid
-                        _ => handle_null_constraints!(builder, nullable, field_name),
+                        // Missing/invalid: coerce to the type's zero default if enabled, else null/error.
+                        _ => match missing_default {
+                            Some(_) => builder.append_value(Default::default()),
+                            None => handle_null_constraints!(builder, nullable, field_name),
+                        },
                     }
                 }
             }
@@ -436,6 +443,7 @@ fn build_timestamp_array(
     time_unit: TimeUnit,
     timezone: Option<Arc<str>>,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     macro_rules! build_array {
         ($builder:ty, $converter:expr) => {{
@@ -457,13 +465,13 @@ fn build_timestamp_array(
                         }
                     });
 
-                    if value_to_append.is_none() && !nullable {
-                        return Err(ArrowEncodingError::NullConstraint {
-                            field_name: field_name.into(),
-                        });
+                    match value_to_append {
+                        Some(v) => builder.append_value(v),
+                        None => match missing_default {
+                            Some(_) => builder.append_value(0), // epoch
+                            None => handle_null_constraints!(builder, nullable, field_name),
+                        },
                     }
-
-                    builder.append_option(value_to_append);
                 }
             }
             let array = builder.finish();
@@ -509,6 +517,7 @@ fn build_date32_array(
     events: &[Event],
     field_name: &str,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let mut builder = Date32Builder::with_capacity(events.len());
     for event in events {
@@ -522,12 +531,13 @@ fn build_date32_array(
                     None
                 }
             });
-            if value_to_append.is_none() && !nullable {
-                return Err(ArrowEncodingError::NullConstraint {
-                    field_name: field_name.into(),
-                });
+            match value_to_append {
+                Some(days) => builder.append_value(days),
+                None => match missing_default {
+                    Some(_) => builder.append_value(0), // epoch (1970-01-01)
+                    None => handle_null_constraints!(builder, nullable, field_name),
+                },
             }
-            builder.append_option(value_to_append);
         }
     }
     Ok(Arc::new(builder.finish()))
@@ -537,6 +547,7 @@ fn build_date64_array(
     events: &[Event],
     field_name: &str,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let mut builder = Date64Builder::with_capacity(events.len());
     for event in events {
@@ -553,12 +564,13 @@ fn build_date64_array(
                     None
                 }
             });
-            if value_to_append.is_none() && !nullable {
-                return Err(ArrowEncodingError::NullConstraint {
-                    field_name: field_name.into(),
-                });
+            match value_to_append {
+                Some(ms) => builder.append_value(ms),
+                None => match missing_default {
+                    Some(_) => builder.append_value(0), // epoch (1970-01-01)
+                    None => handle_null_constraints!(builder, nullable, field_name),
+                },
             }
-            builder.append_option(value_to_append);
         }
     }
     Ok(Arc::new(builder.finish()))
@@ -625,7 +637,8 @@ fn build_string_dictionary_array(
     nullable: bool,
     missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
-    let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+    // One dictionary key per row; pre-size the keys buffer. Distinct values grow on demand.
+    let mut builder = StringDictionaryBuilder::<Int32Type>::with_capacity(events.len(), 0, 0);
 
     for event in events {
         if let Event::Log(log) = event {
@@ -700,6 +713,10 @@ fn build_int64_array(
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let mut builder = Int64Builder::with_capacity(events.len());
 
+    // Parse the default once; an unparseable default stays `None`, so a missing value then hits
+    // the nullable/non-nullable handling.
+    let default_value: Option<i64> = missing_default.and_then(|d| d.trim().parse::<i64>().ok());
+
     for event in events {
         if let Event::Log(log) = event {
             let value = match log.get(field_name) {
@@ -714,11 +731,8 @@ fn build_int64_array(
 
             match value {
                 Some(i) => builder.append_value(i),
-                None => match missing_default {
-                    // `missing_default` is the column's integer default rendered as a string.
-                    Some(default) => {
-                        builder.append_value(default.trim().parse::<i64>().unwrap_or(0))
-                    }
+                None => match default_value {
+                    Some(d) => builder.append_value(d),
                     None => handle_null_constraints!(builder, nullable, field_name),
                 },
             }
@@ -876,6 +890,7 @@ fn build_decimal128_array(
     precision: u8,
     scale: i8,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let mut builder = Decimal128Builder::with_capacity(events.len())
         .with_precision_and_scale(precision, scale)
@@ -909,7 +924,10 @@ fn build_decimal128_array(
             }
 
             if !appended {
-                handle_null_constraints!(builder, nullable, field_name);
+                match missing_default {
+                    Some(_) => builder.append_value(0), // 0 at the column scale
+                    None => handle_null_constraints!(builder, nullable, field_name),
+                }
             }
         }
     }
@@ -923,6 +941,7 @@ fn build_decimal256_array(
     precision: u8,
     scale: i8,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let mut builder = Decimal256Builder::with_capacity(events.len())
         .with_precision_and_scale(precision, scale)
@@ -957,7 +976,10 @@ fn build_decimal256_array(
             }
 
             if !appended {
-                handle_null_constraints!(builder, nullable, field_name);
+                match missing_default {
+                    Some(_) => builder.append_value(i256::from_i128(0)),
+                    None => handle_null_constraints!(builder, nullable, field_name),
+                }
             }
         }
     }
@@ -982,31 +1004,36 @@ fn build_column_for_path(
             build_map_array(events, path, entries_field, nullable)
         }
         DataType::List(item_field) => build_list_array(events, path, item_field, nullable),
-        DataType::Timestamp(time_unit, tz) => {
-            build_timestamp_array(events, path, *time_unit, tz.clone(), nullable)
-        }
-        DataType::Date32 => build_date32_array(events, path, nullable),
-        DataType::Date64 => build_date64_array(events, path, nullable),
+        DataType::Timestamp(time_unit, tz) => build_timestamp_array(
+            events,
+            path,
+            *time_unit,
+            tz.clone(),
+            nullable,
+            missing_default,
+        ),
+        DataType::Date32 => build_date32_array(events, path, nullable, missing_default),
+        DataType::Date64 => build_date64_array(events, path, nullable, missing_default),
         DataType::Utf8 => build_string_array(events, path, nullable, missing_default),
         DataType::LargeUtf8 => build_large_string_array(events, path, nullable, missing_default),
-        DataType::Int8 => build_int8_array(events, path, nullable),
-        DataType::Int16 => build_int16_array(events, path, nullable),
-        DataType::Int32 => build_int32_array(events, path, nullable),
+        DataType::Int8 => build_int8_array(events, path, nullable, missing_default),
+        DataType::Int16 => build_int16_array(events, path, nullable, missing_default),
+        DataType::Int32 => build_int32_array(events, path, nullable, missing_default),
         DataType::Int64 => build_int64_array(events, path, nullable, missing_default),
-        DataType::UInt8 => build_uint8_array(events, path, nullable),
-        DataType::UInt16 => build_uint16_array(events, path, nullable),
-        DataType::UInt32 => build_uint32_array(events, path, nullable),
-        DataType::UInt64 => build_uint64_array(events, path, nullable),
-        DataType::Float32 => build_float32_array(events, path, nullable),
-        DataType::Float64 => build_float64_array(events, path, nullable),
-        DataType::Boolean => build_boolean_array(events, path, nullable),
+        DataType::UInt8 => build_uint8_array(events, path, nullable, missing_default),
+        DataType::UInt16 => build_uint16_array(events, path, nullable, missing_default),
+        DataType::UInt32 => build_uint32_array(events, path, nullable, missing_default),
+        DataType::UInt64 => build_uint64_array(events, path, nullable, missing_default),
+        DataType::Float32 => build_float32_array(events, path, nullable, missing_default),
+        DataType::Float64 => build_float64_array(events, path, nullable, missing_default),
+        DataType::Boolean => build_boolean_array(events, path, nullable, missing_default),
         DataType::Binary => build_binary_array(events, path, nullable, missing_default),
         DataType::LargeBinary => build_large_binary_array(events, path, nullable, missing_default),
         DataType::Decimal128(precision, scale) => {
-            build_decimal128_array(events, path, *precision, *scale, nullable)
+            build_decimal128_array(events, path, *precision, *scale, nullable, missing_default)
         }
         DataType::Decimal256(precision, scale) => {
-            build_decimal256_array(events, path, *precision, *scale, nullable)
+            build_decimal256_array(events, path, *precision, *scale, nullable, missing_default)
         }
         DataType::Dictionary(key, value)
             if matches!(key.as_ref(), DataType::Int32)
@@ -1838,6 +1865,54 @@ mod tests {
     }
 
     #[test]
+    fn test_coerce_fills_zero_for_all_scalar_types() {
+        // With coercion on, a missing value on a non-nullable column of any covered scalar type
+        // is filled with the type's zero default instead of failing the whole batch.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i32", DataType::Int32, false),
+            Field::new("u64", DataType::UInt64, false),
+            Field::new("f64", DataType::Float64, false),
+            Field::new("b", DataType::Boolean, false),
+            Field::new("d", DataType::Date32, false),
+            Field::new("dec", DataType::Decimal128(18, 2), false),
+        ]));
+        let coerce: HashMap<String, String> = schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), "0".to_string()))
+            .collect();
+
+        let events = vec![Event::Log(LogEvent::default())]; // every field missing
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce))
+            .expect("coercion fills defaults instead of erroring");
+
+        assert_eq!(batch.num_rows(), 1);
+        for i in 0..schema.fields().len() {
+            assert!(
+                !batch.column(i).is_null(0),
+                "column {i} should be a zero default, not null"
+            );
+        }
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            0.0
+        );
+        assert!(
+            !batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(0)
+        );
+    }
+
+    #[test]
     fn test_serializer_builds_coerce_map_and_strips_metadata() {
         // new() reads the default from field metadata, strips the metadata, and applies it.
         let field =
@@ -1861,6 +1936,33 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(col.value(0), "{}");
+    }
+
+    #[test]
+    fn test_encode_off_path_byte_identical_to_default() {
+        use tokio_util::codec::Encoder;
+
+        // With coercion off and no coerce metadata, encode() matches encode_events_to_arrow_ipc_stream byte for byte.
+        let mut log = LogEvent::default();
+        log.insert("s", "hello");
+        log.insert("n", 7);
+        let events = vec![Event::Log(log)];
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]);
+
+        let config = ArrowStreamSerializerConfig::new(schema.clone());
+        let mut serializer = ArrowStreamSerializer::new(config).expect("serializer builds");
+        let mut buffer = BytesMut::new();
+        serializer
+            .encode(events.clone(), &mut buffer)
+            .expect("encodes");
+
+        let expected =
+            encode_events_to_arrow_ipc_stream(&events, Some(Arc::new(schema))).expect("encodes");
+
+        assert_eq!(buffer.as_ref(), expected.as_ref());
     }
 
     #[test]
