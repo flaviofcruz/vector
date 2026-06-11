@@ -244,7 +244,7 @@ vector-config-macros.workspace = true
 vector-vrl-functions = { workspace = true, features = ["vrl-metrics"] }
 vector-vrl-metrics = { path = "lib/vector-vrl-metrics" }
 loki-logproto = { path = "lib/loki-logproto", optional = true }
-databricks-zerobus-ingest-sdk = { git = "https://github.com/databricks/zerobus-sdk-rs", version = "2.0.1", optional = true }
+databricks-zerobus-ingest-sdk = { version = "2.0.1", optional = true, features = ["arrow-flight"] }
 
 # Tokio / Futures
 async-stream.workspace = true
@@ -605,7 +605,7 @@ enrichment-tables-mmdb = ["dep:maxminddb"]
 enrichment-tables-memory = ["dep:evmap", "dep:evmap-derive", "dep:thread_local"]
 
 # Codecs
-codecs-arrow = ["dep:arrow", "dep:arrow-schema", "vector-lib/arrow", "databricks-zerobus-ingest-sdk?/arrow-flight"]
+codecs-arrow = ["dep:arrow", "dep:arrow-schema", "vector-lib/arrow"]
 codecs-opentelemetry = ["vector-lib/opentelemetry"]
 codecs-syslog = ["vector-lib/syslog"]
 
@@ -929,7 +929,7 @@ sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost"]
 sinks-websocket = ["dep:tokio-tungstenite"]
 sinks-websocket-server = ["dep:tokio-tungstenite", "sources-utils-http-auth", "sources-utils-http-error", "sources-utils-http-prelude"]
 sinks-webhdfs = ["dep:opendal"]
-sinks-databricks-zerobus = ["dep:databricks-zerobus-ingest-sdk", "codecs-arrow"]
+sinks-databricks-zerobus = ["dep:databricks-zerobus-ingest-sdk", "codecs-arrow", "arrow/ipc_compression"]
 
 # Identifies that the build is a nightly build
 nightly = []

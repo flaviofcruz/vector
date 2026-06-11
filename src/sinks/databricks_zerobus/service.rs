@@ -1,19 +1,60 @@
 //! Zerobus service wrapper for Vector sink integration.
 
+use crate::config::ProxyConfig;
 use crate::event::Event;
+use crate::http::HttpClient;
 use crate::sinks::util::retries::RetryLogic;
-use databricks_zerobus_ingest_sdk::{ZerobusArrowStream, ZerobusSdk};
+use crate::tls::TlsSettings;
+use databricks_zerobus_ingest_sdk::{
+    ConnectorFactory, ProxyConnector, ZerobusArrowStream, ZerobusSdk,
+};
 use futures::future::BoxFuture;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell, RwLock};
-use tower::Service;
-use tracing::{info, warn};
+use tower::{Layer, Service};
+use tracing::warn;
 use vector_lib::codecs::encoding::{BatchEncoder, BatchOutput, BatchSerializerConfig};
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 
 use super::{config::ZerobusSinkConfig, error::ZerobusSinkError, unity_catalog_schema};
+
+/// Build a connector factory that routes Zerobus gRPC traffic through
+/// Vector's configured proxy, honoring `no_proxy` rules.
+///
+/// The Zerobus endpoint is always HTTPS gRPC, so the `https` proxy is
+/// preferred; the `http` proxy is used as a fallback if only that is set.
+/// The returned factory fully replaces the SDK's default env-var proxy
+/// detection — Vector's `ProxyConfig` has already merged the process
+/// environment at a higher layer and is the single source of truth.
+///
+/// When proxying is disabled or no proxy URL is configured, returns a
+/// factory that unconditionally yields `None`, forcing direct connections.
+/// Returns an error if the configured proxy URL is malformed, so the
+/// problem surfaces at sink startup rather than per-connection.
+fn build_connector_factory(proxy: &ProxyConfig) -> Result<ConnectorFactory, ZerobusSinkError> {
+    let proxy_url = if proxy.enabled {
+        proxy.https.clone().or_else(|| proxy.http.clone())
+    } else {
+        None
+    };
+    let Some(proxy_url) = proxy_url else {
+        return Ok(Arc::new(|_host: &str| None));
+    };
+    // Validate the proxy URL once up-front so a malformed value surfaces at
+    // sink startup rather than per-connection.
+    ProxyConnector::new(&proxy_url).map_err(|e| ZerobusSinkError::ConfigError {
+        message: format!("Invalid proxy URL '{}': {}", proxy_url, e),
+    })?;
+    let no_proxy = proxy.no_proxy.clone();
+    Ok(Arc::new(move |host: &str| {
+        if no_proxy.matches(host) {
+            return None;
+        }
+        ProxyConnector::new(&proxy_url).ok()
+    }))
+}
 
 /// The payload for a Zerobus request: an Arrow `RecordBatch` for Arrow Flight ingestion.
 #[derive(Clone, Debug)]
@@ -34,14 +75,40 @@ pub struct ZerobusRequest {
 }
 
 /// Response type for the Zerobus service.
+///
+/// Carries the final `EventStatus` so the driver can mark finalizers correctly:
+/// `Delivered` on success, `Errored` when the retry budget was exhausted on a
+/// transient failure (asking the source / disk buffer to replay), and `Err`
+/// from `Service::call` reserved for permanent failures (driver maps to
+/// `Rejected`).
 #[derive(Debug)]
 pub struct ZerobusResponse {
     pub events_byte_size: GroupedCountByteSize,
+    pub status: vector_lib::event::EventStatus,
+}
+
+impl ZerobusResponse {
+    const fn delivered(events_byte_size: GroupedCountByteSize) -> Self {
+        Self {
+            events_byte_size,
+            status: vector_lib::event::EventStatus::Delivered,
+        }
+    }
+
+    /// Synthesize a response signalling a transient failure that exhausted the
+    /// retry budget. Carries a telemetry-aware zero `events_byte_size` because
+    /// the driver only consumes `events_sent()` on the `Delivered` path.
+    fn errored() -> Self {
+        Self {
+            events_byte_size: vector_lib::config::telemetry().create_request_count_byte_size(),
+            status: vector_lib::event::EventStatus::Errored,
+        }
+    }
 }
 
 impl DriverResponse for ZerobusResponse {
     fn event_status(&self) -> vector_lib::event::EventStatus {
-        vector_lib::event::EventStatus::Delivered
+        self.status
     }
 
     fn events_sent(&self) -> &GroupedCountByteSize {
@@ -222,42 +289,44 @@ pub(super) struct ResolvedSchema {
 pub struct ZerobusService {
     sdk: Arc<ZerobusSdk>,
     config: Arc<ZerobusSinkConfig>,
+    http_client: HttpClient,
     stream: Arc<Mutex<Option<Arc<ActiveStream>>>>,
     schema: Arc<OnceCell<ResolvedSchema>>,
-    /// When true, the service waits for server-side acknowledgment after each
-    /// ingest call. Derived from `AcknowledgementsConfig`.
-    require_acknowledgements: bool,
 }
 
 impl ZerobusService {
     pub async fn new(
         config: ZerobusSinkConfig,
-        require_acknowledgements: bool,
+        proxy: &ProxyConfig,
     ) -> Result<Self, ZerobusSinkError> {
-        // Validate configuration
-        config.validate()?;
-
-        // Create SDK instance
-        let sdk = ZerobusSdk::builder()
+        let mut builder = ZerobusSdk::builder()
             .endpoint(&config.ingestion_endpoint)
             .unity_catalog_url(&config.unity_catalog_endpoint)
-            .build()
-            .map_err(|e| ZerobusSinkError::ConfigError {
-                message: format!("Failed to create Zerobus SDK: {}", e),
-            })?;
+            .application_name(config.user_agent_suffix());
+        builder = builder.connector_factory(build_connector_factory(proxy)?);
+        let sdk = builder.build().map_err(|e| ZerobusSinkError::ConfigError {
+            message: format!("Failed to create Zerobus SDK: {}", e),
+        })?;
+
+        let http_client = HttpClient::new(TlsSettings::default(), proxy).map_err(|e| {
+            ZerobusSinkError::ConfigError {
+                message: format!("Failed to create HTTP client: {}", e),
+            }
+        })?;
 
         Ok(Self {
             sdk: Arc::new(sdk),
             config: Arc::new(config),
+            http_client,
             stream: Arc::new(Mutex::new(None)),
             schema: Arc::new(OnceCell::new()),
-            require_acknowledgements,
         })
     }
 
     /// Resolve the Arrow schema for the configured Unity Catalog table.
     pub async fn resolve_arrow_schema(
         config: &ZerobusSinkConfig,
+        http_client: &HttpClient,
     ) -> Result<arrow::datatypes::Schema, ZerobusSinkError> {
         match &config.schema {
             super::config::SchemaSource::Path { .. } => Err(ZerobusSinkError::ConfigError {
@@ -277,6 +346,7 @@ impl ZerobusService {
                     &config.table_name,
                     client_id,
                     client_secret,
+                    http_client,
                 )
                 .await?;
 
@@ -294,7 +364,8 @@ impl ZerobusService {
     pub(super) async fn ensure_schema(&self) -> Result<&ResolvedSchema, ZerobusSinkError> {
         self.schema
             .get_or_try_init(|| async {
-                let arrow_schema = Self::resolve_arrow_schema(&self.config).await?;
+                let arrow_schema =
+                    Self::resolve_arrow_schema(&self.config, &self.http_client).await?;
                 let mut batch_encoding = self.config.batch_encoding.clone();
                 match &mut batch_encoding {
                     BatchSerializerConfig::ArrowStream(config) => {
@@ -356,32 +427,24 @@ impl ZerobusService {
                 ),
             };
 
+            // We override only the two timeouts that `stream_options` exposes and
+            // otherwise accept the SDK's Arrow-stream defaults — notably
+            // `recovery = true`, so the SDK transparently reconnects and replays
+            // in-flight batches on transient stream errors. That layers under
+            // Vector's own retry: the SDK absorbs brief blips, and only surfaces a
+            // retryable error (triggering a fresh stream via Tower retry) once its
+            // own recovery budget is exhausted. Both layers are at-least-once, so
+            // a reconnect may re-send unacknowledged batches.
             let stream_options = &self.config.stream_options;
-            let arrow_schema = &schema.arrow_schema;
-            // Log Arrow IPC schema size to help diagnose large-schema issues.
-            {
-                use arrow::ipc::writer::StreamWriter;
-                let mut buf = Vec::new();
-                if let Ok(mut w) = StreamWriter::try_new(&mut buf, arrow_schema) {
-                    let _ = w.finish();
-                }
-                info!(
-                    schema_fields = arrow_schema.fields().len(),
-                    ipc_bytes = buf.len(),
-                    "Arrow schema IPC size for stream setup"
-                );
-            }
             let stream = self
                 .sdk
                 .stream_builder()
                 .table(self.config.table_name.clone())
                 .oauth(client_id, client_secret)
-                .arrow(Arc::clone(arrow_schema))
-                .recovery(true)
-                .recovery_retries(4)
+                .arrow(Arc::clone(&schema.arrow_schema))
                 .server_lack_of_ack_timeout_ms(stream_options.server_lack_of_ack_timeout_ms)
                 .flush_timeout_ms(stream_options.flush_timeout_ms)
-                .ipc_compression(stream_options.compression.map(Into::into))
+                .ipc_compression(stream_options.compression.into())
                 .build_arrow()
                 .await
                 .map_err(|e| ZerobusSinkError::StreamInitError { source: e })?;
@@ -429,10 +492,7 @@ impl ZerobusService {
                     return Err(ZerobusSinkError::StreamClosed);
                 };
                 match s.ingest_batch(record_batch).await {
-                    Ok(offset) if self.require_acknowledgements => {
-                        s.wait_for_offset(offset).await.map(|_| ())
-                    }
-                    Ok(_) => Ok(()),
+                    Ok(offset) => s.wait_for_offset(offset).await.map(|_| ()),
                     Err(e) => Err(e),
                 }
             }
@@ -441,7 +501,7 @@ impl ZerobusService {
         };
 
         match result {
-            Ok(()) => Ok(ZerobusResponse { events_byte_size }),
+            Ok(()) => Ok(ZerobusResponse::delivered(events_byte_size)),
             Err(e) => {
                 if e.is_retryable() {
                     // Clear the slot so the next attempt creates a fresh stream,
@@ -502,9 +562,9 @@ impl Clone for ZerobusService {
         Self {
             sdk: Arc::clone(&self.sdk),
             config: Arc::clone(&self.config),
+            http_client: self.http_client.clone(),
             stream: Arc::clone(&self.stream),
             schema: Arc::clone(&self.schema),
-            require_acknowledgements: self.require_acknowledgements,
         }
     }
 }
@@ -524,7 +584,6 @@ impl ZerobusService {
     pub async fn new_with_mock(
         config: ZerobusSinkConfig,
         mock: MockStream,
-        require_acknowledgements: bool,
     ) -> Result<Self, ZerobusSinkError> {
         config.validate()?;
 
@@ -536,12 +595,17 @@ impl ZerobusService {
                 message: format!("Failed to create Zerobus SDK: {}", e),
             })?;
 
+        let http_client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default())
+            .map_err(|e| ZerobusSinkError::ConfigError {
+                message: format!("Failed to create HTTP client: {}", e),
+            })?;
+
         Ok(Self {
             sdk: Arc::new(sdk),
             config: Arc::new(config),
+            http_client,
             stream: Arc::new(Mutex::new(Some(Arc::new(ActiveStream::Mock(mock))))),
             schema: Arc::new(OnceCell::new()),
-            require_acknowledgements,
         })
     }
 
@@ -557,13 +621,81 @@ impl RetryLogic for ZerobusRetryLogic {
     type Response = ZerobusResponse;
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
-        match error {
-            ZerobusSinkError::ZerobusError { source }
-            | ZerobusSinkError::StreamInitError { source }
-            | ZerobusSinkError::IngestionError { source } => source.is_retryable(),
-            ZerobusSinkError::StreamClosed => true,
-            ZerobusSinkError::ConfigError { .. } | ZerobusSinkError::EncodingError { .. } => false,
-        }
+        error.is_retryable()
+    }
+}
+
+/// Tower layer that converts retry-budget-exhausted retryable errors into a
+/// successful `ZerobusResponse` carrying `EventStatus::Errored`.
+///
+/// Wraps the retry layer from the outside. When the retry layer returns:
+/// - `Ok(resp)` — pass through unchanged.
+/// - `Err(e)` where `e.is_retryable()` — convert to `Ok(ZerobusResponse::errored())`
+///   so the driver marks finalizers `Errored` (transient — source / disk
+///   buffer may replay) rather than `Rejected` (permanent drop).
+/// - `Err(e)` permanent — propagate so the driver maps to `Rejected`.
+///
+/// Without this layer the driver maps every `Err` from `Service::call` to
+/// `EventStatus::Rejected`, which would drop transient-but-exhausted failures
+/// as if they were permanent.
+#[derive(Clone, Debug, Default)]
+pub struct RetryableErrorAsErroredLayer;
+
+impl<S> Layer<S> for RetryableErrorAsErroredLayer {
+    type Service = RetryableErrorAsErrored<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RetryableErrorAsErrored { inner }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RetryableErrorAsErrored<S> {
+    inner: S,
+}
+
+impl<S> Service<ZerobusRequest> for RetryableErrorAsErrored<S>
+where
+    S: Service<ZerobusRequest, Response = ZerobusResponse, Error = crate::Error>,
+    S::Future: Send + 'static,
+{
+    type Response = ZerobusResponse;
+    type Error = crate::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: ZerobusRequest) -> Self::Future {
+        let fut = self.inner.call(req);
+        Box::pin(async move {
+            match fut.await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    // The Tower stack boxes errors above us (retry, timeout,
+                    // adaptive-concurrency). Downcast to inspect retryability;
+                    // anything that isn't a `ZerobusSinkError` (e.g. a timeout
+                    // `Elapsed`) is conservatively treated as transient.
+                    let retryable = match e.downcast_ref::<ZerobusSinkError>() {
+                        Some(zb) => zb.is_retryable(),
+                        None => true,
+                    };
+                    if retryable {
+                        warn!(
+                            message = "Zerobus retry budget exhausted on transient error; signaling Errored so source or buffer may replay.",
+                            error = %e,
+                        );
+                        Ok(ZerobusResponse::errored())
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -585,6 +717,7 @@ mod tests {
                 client_id: SensitiveString::from("id".to_string()),
                 client_secret: SensitiveString::from("secret".to_string()),
             },
+            user_agent: None,
             schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
             batch_encoding: vector_lib::codecs::encoding::BatchSerializerConfig::ArrowStream(
@@ -609,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_succeeds_with_mock_stream() {
-        let service = ZerobusService::new_with_mock(test_config(), MockStream::succeeding(), false)
+        let service = ZerobusService::new_with_mock(test_config(), MockStream::succeeding())
             .await
             .unwrap();
 
@@ -631,7 +764,7 @@ mod tests {
         let mock = MockStream::failing(ZerobusError::ChannelCreationError(
             "connection reset".to_string(),
         ));
-        let service = ZerobusService::new_with_mock(test_config(), mock, false)
+        let service = ZerobusService::new_with_mock(test_config(), mock)
             .await
             .unwrap();
 
@@ -656,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn non_retryable_error_keeps_stream() {
         let mock = MockStream::failing(ZerobusError::InvalidArgument("bad field".to_string()));
-        let service = ZerobusService::new_with_mock(test_config(), mock, false)
+        let service = ZerobusService::new_with_mock(test_config(), mock)
             .await
             .unwrap();
 
@@ -682,7 +815,7 @@ mod tests {
     async fn stream_recovers_after_retryable_failure() {
         // Simulate: success → retryable failure → success again.
         let mock = MockStream::succeeding();
-        let service = ZerobusService::new_with_mock(test_config(), mock, false)
+        let service = ZerobusService::new_with_mock(test_config(), mock)
             .await
             .unwrap();
 
@@ -747,7 +880,7 @@ mod tests {
         let mock = MockStream::succeeding();
         let closed = mock.closed_flag();
 
-        let service = ZerobusService::new_with_mock(test_config(), mock, false)
+        let service = ZerobusService::new_with_mock(test_config(), mock)
             .await
             .unwrap();
 
@@ -774,7 +907,7 @@ mod tests {
         .with_gate();
         let closed = mock.closed_flag();
 
-        let service = ZerobusService::new_with_mock(test_config(), mock, false)
+        let service = ZerobusService::new_with_mock(test_config(), mock)
             .await
             .unwrap();
 
@@ -823,5 +956,103 @@ mod tests {
         );
         // And the slot was cleared so the next ingest creates a fresh stream.
         assert!(!service.has_active_stream().await);
+    }
+
+    fn dummy_request() -> ZerobusRequest {
+        ZerobusRequest {
+            events: Arc::new(vec![]),
+            metadata: RequestMetadata::default(),
+            finalizers: EventFinalizers::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retryable_err_after_exhaustion_becomes_ok_errored() {
+        use tower::ServiceExt;
+        let inner = tower::service_fn(|_req: ZerobusRequest| async move {
+            let err: crate::Error = Box::new(ZerobusSinkError::SchemaError {
+                message: "UC 503".to_string(),
+                retryable: true,
+            });
+            Err::<ZerobusResponse, _>(err)
+        });
+        let mut svc = RetryableErrorAsErrored { inner };
+        let resp = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(dummy_request())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, vector_lib::event::EventStatus::Errored);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_err_propagates() {
+        use tower::ServiceExt;
+        let inner = tower::service_fn(|_req: ZerobusRequest| async move {
+            let err: crate::Error = Box::new(ZerobusSinkError::EncodingError {
+                message: "bad".to_string(),
+            });
+            Err::<ZerobusResponse, _>(err)
+        });
+        let mut svc = RetryableErrorAsErrored { inner };
+        let err = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(dummy_request())
+            .await
+            .unwrap_err();
+        let zb = err.downcast_ref::<ZerobusSinkError>().unwrap();
+        assert!(matches!(zb, ZerobusSinkError::EncodingError { .. }));
+    }
+
+    #[tokio::test]
+    async fn unknown_err_treated_as_transient() {
+        use tower::ServiceExt;
+        // Simulate a Tower-layer error that isn't a ZerobusSinkError (e.g.
+        // timeout `Elapsed`): conservatively becomes Errored, not Rejected.
+        #[derive(Debug)]
+        struct Other;
+        impl std::fmt::Display for Other {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "other")
+            }
+        }
+        impl std::error::Error for Other {}
+
+        let inner = tower::service_fn(|_req: ZerobusRequest| async move {
+            let err: crate::Error = Box::new(Other);
+            Err::<ZerobusResponse, _>(err)
+        });
+        let mut svc = RetryableErrorAsErrored { inner };
+        let resp = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(dummy_request())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, vector_lib::event::EventStatus::Errored);
+    }
+
+    #[tokio::test]
+    async fn ok_response_passes_through() {
+        use tower::ServiceExt;
+        let inner = tower::service_fn(|_req: ZerobusRequest| async move {
+            Ok::<_, crate::Error>(ZerobusResponse::delivered(
+                GroupedCountByteSize::new_untagged(),
+            ))
+        });
+        let mut svc = RetryableErrorAsErrored { inner };
+        let resp = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(dummy_request())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, vector_lib::event::EventStatus::Delivered);
     }
 }

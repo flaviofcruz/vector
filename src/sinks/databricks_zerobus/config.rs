@@ -79,20 +79,24 @@ impl Default for SchemaSource {
 
 /// Arrow IPC compression codec for Zerobus Arrow Flight payloads.
 #[configurable_component]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Compression {
+    /// No compression.
+    #[default]
+    None,
     /// LZ4 frame compression.
     Lz4Frame,
     /// Zstandard compression.
     Zstd,
 }
 
-impl From<Compression> for arrow::ipc::CompressionType {
+impl From<Compression> for Option<arrow::ipc::CompressionType> {
     fn from(value: Compression) -> Self {
         match value {
-            Compression::Lz4Frame => arrow::ipc::CompressionType::LZ4_FRAME,
-            Compression::Zstd => arrow::ipc::CompressionType::ZSTD,
+            Compression::None => None,
+            Compression::Lz4Frame => Some(arrow::ipc::CompressionType::LZ4_FRAME),
+            Compression::Zstd => Some(arrow::ipc::CompressionType::ZSTD),
         }
     }
 }
@@ -115,9 +119,10 @@ pub struct ZerobusStreamOptions {
     #[configurable(metadata(docs::examples = 60000))]
     pub server_lack_of_ack_timeout_ms: u64,
 
-    /// Optional Arrow IPC compression for Flight payloads. Defaults to no compression.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compression: Option<Compression>,
+    /// Arrow IPC compression for Flight payloads. Defaults to no compression.
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    pub compression: Compression,
 }
 
 impl Default for ZerobusStreamOptions {
@@ -125,7 +130,7 @@ impl Default for ZerobusStreamOptions {
         Self {
             flush_timeout_ms: default_flush_timeout_ms(),
             server_lack_of_ack_timeout_ms: default_server_ack_timeout_ms(),
-            compression: None,
+            compression: Compression::None,
         }
     }
 }
@@ -164,6 +169,14 @@ pub struct ZerobusSinkConfig {
     /// Databricks authentication configuration.
     #[configurable(derived)]
     pub auth: DatabricksAuthentication,
+
+    /// Custom identifier appended to the `user-agent` header sent to Databricks.
+    ///
+    /// The header always includes `Vector/<version>`; when set, this value is
+    /// appended after it (e.g. `my-service/1.2`).
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "my-service/1.2"))]
+    pub user_agent: Option<String>,
 
     /// Schema definition for the table.
     ///
@@ -212,6 +225,7 @@ impl GenerateConfig for ZerobusSinkConfig {
                 client_id: SensitiveString::from("${DATABRICKS_CLIENT_ID}".to_string()),
                 client_secret: SensitiveString::from("${DATABRICKS_CLIENT_SECRET}".to_string()),
             },
+            user_agent: None,
             schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
             batch_encoding: default_batch_encoding(),
@@ -226,8 +240,10 @@ impl GenerateConfig for ZerobusSinkConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "databricks_zerobus")]
 impl SinkConfig for ZerobusSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let service = ZerobusService::new(self.clone(), self.acknowledgements.enabled()).await?;
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        self.validate()?;
+
+        let service = ZerobusService::new(self.clone(), cx.proxy()).await?;
         let healthcheck_service = service.clone();
 
         let request_limits = self.request.into_settings();
@@ -316,6 +332,17 @@ impl ZerobusSinkConfig {
 
         Ok(())
     }
+
+    /// The user-agent suffix to hand the Zerobus SDK: `Vector/<version>`
+    /// alone, or with the user's configured `user_agent` appended. The SDK
+    /// prepends its own `zerobus-sdk-rs/<version>` prefix to this value.
+    pub fn user_agent_suffix(&self) -> String {
+        let vector = format!("Vector/{}", crate::vector_version());
+        match self.user_agent.as_deref().filter(|s| !s.is_empty()) {
+            Some(ua) => format!("{vector} {ua}"),
+            None => vector,
+        }
+    }
 }
 
 // Default value functions
@@ -345,6 +372,7 @@ mod tests {
                 client_id: SensitiveString::from("test-client-id".to_string()),
                 client_secret: SensitiveString::from("test-client-secret".to_string()),
             },
+            user_agent: None,
             schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
             batch_encoding: default_batch_encoding(),
@@ -620,6 +648,48 @@ mod tests {
         assert_eq!(
             batch.column(2).as_string::<i64>().value(0),
             "alice@example.com"
+        );
+    }
+
+    #[test]
+    fn test_user_agent_suffix_without_user_value() {
+        let config = create_test_config();
+        let suffix = config.user_agent_suffix();
+        assert!(
+            suffix.starts_with("Vector/"),
+            "expected Vector/<version> prefix, got {suffix:?}"
+        );
+        // No user value configured, so nothing is appended.
+        assert!(
+            !suffix.contains(' '),
+            "unexpected appended value in {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn test_user_agent_suffix_with_user_value() {
+        let mut config = create_test_config();
+        config.user_agent = Some("my-service/1.2".to_string());
+        let suffix = config.user_agent_suffix();
+        assert!(
+            suffix.starts_with("Vector/"),
+            "expected Vector/<version> prefix, got {suffix:?}"
+        );
+        assert!(
+            suffix.ends_with(" my-service/1.2"),
+            "expected user value appended, got {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn test_user_agent_suffix_empty_user_value_ignored() {
+        let mut config = create_test_config();
+        config.user_agent = Some(String::new());
+        let suffix = config.user_agent_suffix();
+        // An empty string is treated the same as no value: no trailing space.
+        assert!(
+            !suffix.contains(' '),
+            "empty user_agent should be ignored, got {suffix:?}"
         );
     }
 }
