@@ -952,8 +952,16 @@ fn create_event(
     // Carry the discovery-time bucket downstream; the woodchuck VRL wrappers copy
     // `.time_parity` into `logMetadata.timeParity` instead of recomputing it.
     // Stamped after the byte-size measurements above so it does not inflate the
-    // reported read byte count.
-    event.insert("time_parity", time_parity);
+    // reported read byte count. Namespace-aware: Legacy keeps the top-level
+    // `time_parity` field; Vector carries it as `%file.time_parity` metadata
+    // instead of clobbering the non-object event root (the message bytes).
+    log_namespace.insert_source_metadata(
+        FileConfig::NAME,
+        &mut event,
+        Some(LegacyKey::Overwrite("time_parity")),
+        path!("time_parity"),
+        time_parity,
+    );
 
     event
 }
@@ -1256,6 +1264,7 @@ mod tests {
         assert_eq!(*log.get_message().unwrap(), "hello world".into());
         assert_eq!(*log.get_source_type().unwrap(), "file".into());
         assert!(log[log_schema().timestamp_key().unwrap().to_string()].is_timestamp());
+        assert!(log["time_parity"].is_integer());
     }
 
     #[test]
@@ -1319,6 +1328,13 @@ mod tests {
                 .get(path!(FileConfig::NAME, "path"))
                 .unwrap(),
             &value!("some_file.rs")
+        );
+        assert!(
+            log.metadata()
+                .value()
+                .get(path!(FileConfig::NAME, "time_parity"))
+                .unwrap()
+                .is_integer()
         );
     }
 
@@ -1749,6 +1765,7 @@ mod tests {
                 received[0].as_log().keys().unwrap().collect::<HashSet<_>>(),
                 vec![
                     "file_id".into(),
+                    "time_parity".into(),
                     default_file_key()
                         .path
                         .expect("file key to exist")
