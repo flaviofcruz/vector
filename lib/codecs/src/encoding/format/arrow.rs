@@ -267,6 +267,16 @@ pub enum ArrowEncodingError {
         field_name: String,
     },
 
+    /// A present value cannot be represented as the column's type
+    #[snafu(display(
+        "Field '{}': present value cannot be encoded as the target column type",
+        field_name
+    ))]
+    InvalidValue {
+        /// The field name
+        field_name: String,
+    },
+
     /// IO error during encoding
     #[snafu(display("IO error: {}", source))]
     Io {
@@ -391,6 +401,21 @@ macro_rules! handle_null_constraints {
     }};
 }
 
+/// Handles a present value that cannot be represented as the target type: errors when coercion
+/// is enabled, otherwise applies the null/non-nullable handling.
+macro_rules! present_value_invalid {
+    ($builder:expr, $nullable:expr, $field_name:expr, $missing_default:expr) => {{
+        match $missing_default {
+            Some(_) => {
+                return Err(ArrowEncodingError::InvalidValue {
+                    field_name: $field_name.into(),
+                });
+            }
+            None => handle_null_constraints!($builder, $nullable, $field_name),
+        }
+    }};
+}
+
 /// Macro to generate a `build_*_array` function for primitive types.
 macro_rules! define_build_primitive_array_fn {
     (
@@ -413,11 +438,15 @@ macro_rules! define_build_primitive_array_fn {
                         $(
                             $value_pat $(if $guard)? => builder.append_value($append_expr),
                         )+
-                        // Missing/invalid: coerce to the type's zero default if enabled, else null/error.
-                        _ => match missing_default {
+                        // Absent or null: default when coercing, else null/error.
+                        None | Some(Value::Null) => match missing_default {
                             Some(_) => builder.append_value(Default::default()),
                             None => handle_null_constraints!(builder, nullable, field_name),
                         },
+                        // Present but invalid for this type.
+                        Some(_) => {
+                            present_value_invalid!(builder, nullable, field_name, missing_default)
+                        }
                     }
                 }
             }
@@ -450,27 +479,31 @@ fn build_timestamp_array(
             let mut builder = <$builder>::with_capacity(events.len());
             for event in events {
                 if let Event::Log(log) = event {
-                    let value_to_append = log.get(field_name).and_then(|value| {
-                        // First, try to extract it as a native or string timestamp
-                        if let Some(ts) = extract_timestamp(value) {
-                            $converter(&ts)
-                        }
-                        // Else, fall back to a raw integer
-                        else if let Value::Integer(i) = value {
-                            Some(*i)
-                        }
-                        // Else, it's an unsupported type (e.g., Bool, Float)
-                        else {
-                            None
-                        }
-                    });
-
-                    match value_to_append {
-                        Some(v) => builder.append_value(v),
-                        None => match missing_default {
+                    match log.get(field_name) {
+                        // Absent or null: epoch when coercing, else null/error.
+                        None | Some(Value::Null) => match missing_default {
                             Some(_) => builder.append_value(0), // epoch
                             None => handle_null_constraints!(builder, nullable, field_name),
                         },
+                        Some(value) => {
+                            // Try a native or string timestamp, else a raw integer.
+                            let parsed = if let Some(ts) = extract_timestamp(value) {
+                                $converter(&ts)
+                            } else if let Value::Integer(i) = value {
+                                Some(*i)
+                            } else {
+                                None
+                            };
+                            match parsed {
+                                Some(v) => builder.append_value(v),
+                                None => present_value_invalid!(
+                                    builder,
+                                    nullable,
+                                    field_name,
+                                    missing_default
+                                ),
+                            }
+                        }
                     }
                 }
             }
@@ -522,21 +555,27 @@ fn build_date32_array(
     let mut builder = Date32Builder::with_capacity(events.len());
     for event in events {
         if let Event::Log(log) = event {
-            let value_to_append = log.get(field_name).and_then(|value| {
-                if let Some(ts) = extract_timestamp(value) {
-                    Some(days_since_epoch(ts.date_naive()))
-                } else if let Value::Integer(i) = value {
-                    i32::try_from(*i).ok()
-                } else {
-                    None
-                }
-            });
-            match value_to_append {
-                Some(days) => builder.append_value(days),
-                None => match missing_default {
+            match log.get(field_name) {
+                // Absent or null: epoch when coercing, else null/error.
+                None | Some(Value::Null) => match missing_default {
                     Some(_) => builder.append_value(0), // epoch (1970-01-01)
                     None => handle_null_constraints!(builder, nullable, field_name),
                 },
+                Some(value) => {
+                    let parsed = if let Some(ts) = extract_timestamp(value) {
+                        Some(days_since_epoch(ts.date_naive()))
+                    } else if let Value::Integer(i) = value {
+                        i32::try_from(*i).ok()
+                    } else {
+                        None
+                    };
+                    match parsed {
+                        Some(days) => builder.append_value(days),
+                        None => {
+                            present_value_invalid!(builder, nullable, field_name, missing_default)
+                        }
+                    }
+                }
             }
         }
     }
@@ -552,24 +591,29 @@ fn build_date64_array(
     let mut builder = Date64Builder::with_capacity(events.len());
     for event in events {
         if let Event::Log(log) = event {
-            let value_to_append = log.get(field_name).and_then(|value| {
-                // Date64 must be midnight-aligned; truncate timestamps to the
-                // date component. Integers pass through: caller is responsible
-                // for supplying a valid millis-since-epoch midnight value.
-                if let Some(ts) = extract_timestamp(value) {
-                    Some(i64::from(days_since_epoch(ts.date_naive())) * 86_400_000)
-                } else if let Value::Integer(i) = value {
-                    Some(*i)
-                } else {
-                    None
-                }
-            });
-            match value_to_append {
-                Some(ms) => builder.append_value(ms),
-                None => match missing_default {
+            match log.get(field_name) {
+                // Absent or null: epoch when coercing, else null/error.
+                None | Some(Value::Null) => match missing_default {
                     Some(_) => builder.append_value(0), // epoch (1970-01-01)
                     None => handle_null_constraints!(builder, nullable, field_name),
                 },
+                Some(value) => {
+                    // Date64 is midnight-aligned millis since epoch; timestamps are truncated to
+                    // the date, and integers pass through as-is.
+                    let parsed = if let Some(ts) = extract_timestamp(value) {
+                        Some(i64::from(days_since_epoch(ts.date_naive())) * 86_400_000)
+                    } else if let Value::Integer(i) = value {
+                        Some(*i)
+                    } else {
+                        None
+                    };
+                    match parsed {
+                        Some(ms) => builder.append_value(ms),
+                        None => {
+                            present_value_invalid!(builder, nullable, field_name, missing_default)
+                        }
+                    }
+                }
             }
         }
     }
@@ -719,22 +763,29 @@ fn build_int64_array(
 
     for event in events {
         if let Event::Log(log) = event {
-            let value = match log.get(field_name) {
-                Some(Value::Integer(i)) => Some(*i),
+            match log.get(field_name) {
+                Some(Value::Integer(i)) => builder.append_value(*i),
                 Some(Value::Bytes(bytes)) if missing_default.is_some() => {
-                    std::str::from_utf8(bytes)
+                    match std::str::from_utf8(bytes)
                         .ok()
                         .and_then(|s| s.trim().parse::<i64>().ok())
+                    {
+                        Some(parsed) => builder.append_value(parsed),
+                        // Present string that does not parse as an integer.
+                        None => {
+                            present_value_invalid!(builder, nullable, field_name, missing_default)
+                        }
+                    }
                 }
-                _ => None,
-            };
-
-            match value {
-                Some(i) => builder.append_value(i),
-                None => match default_value {
+                // Absent or null: parsed default when coercing, else null/error.
+                None | Some(Value::Null) => match default_value {
                     Some(d) => builder.append_value(d),
                     None => handle_null_constraints!(builder, nullable, field_name),
                 },
+                // Present, non-integer value.
+                Some(_) => {
+                    present_value_invalid!(builder, nullable, field_name, missing_default)
+                }
             }
         }
     }
@@ -903,30 +954,30 @@ fn build_decimal128_array(
 
     for event in events {
         if let Event::Log(log) = event {
-            let mut appended = false;
             match log.get(field_name) {
-                Some(Value::Float(f)) => {
-                    if let Ok(mut decimal) = Decimal::try_from(f.into_inner()) {
+                Some(Value::Float(f)) => match Decimal::try_from(f.into_inner()) {
+                    Ok(mut decimal) => {
                         decimal.rescale(target_scale);
-                        let mantissa = decimal.mantissa();
-                        builder.append_value(mantissa);
-                        appended = true;
+                        builder.append_value(decimal.mantissa());
                     }
-                }
+                    // Present but not a finite decimal (NaN/Inf).
+                    Err(_) => {
+                        present_value_invalid!(builder, nullable, field_name, missing_default)
+                    }
+                },
                 Some(Value::Integer(i)) => {
                     let mut decimal = Decimal::from(*i);
                     decimal.rescale(target_scale);
-                    let mantissa = decimal.mantissa();
-                    builder.append_value(mantissa);
-                    appended = true;
+                    builder.append_value(decimal.mantissa());
                 }
-                _ => {}
-            }
-
-            if !appended {
-                match missing_default {
-                    Some(_) => builder.append_value(0), // 0 at the column scale
+                // Absent or null: 0 when coercing, else null/error.
+                None | Some(Value::Null) => match missing_default {
+                    Some(_) => builder.append_value(0),
                     None => handle_null_constraints!(builder, nullable, field_name),
+                },
+                // Present but not numeric.
+                Some(_) => {
+                    present_value_invalid!(builder, nullable, field_name, missing_default)
                 }
             }
         }
@@ -954,31 +1005,31 @@ fn build_decimal256_array(
 
     for event in events {
         if let Event::Log(log) = event {
-            let mut appended = false;
             match log.get(field_name) {
-                Some(Value::Float(f)) => {
-                    if let Ok(mut decimal) = Decimal::try_from(f.into_inner()) {
+                Some(Value::Float(f)) => match Decimal::try_from(f.into_inner()) {
+                    Ok(mut decimal) => {
                         decimal.rescale(target_scale);
-                        let mantissa = decimal.mantissa();
                         // rust_decimal does not support i256 natively so we upcast here
-                        builder.append_value(i256::from_i128(mantissa));
-                        appended = true;
+                        builder.append_value(i256::from_i128(decimal.mantissa()));
                     }
-                }
+                    // Present but not a finite decimal (NaN/Inf).
+                    Err(_) => {
+                        present_value_invalid!(builder, nullable, field_name, missing_default)
+                    }
+                },
                 Some(Value::Integer(i)) => {
                     let mut decimal = Decimal::from(*i);
                     decimal.rescale(target_scale);
-                    let mantissa = decimal.mantissa();
-                    builder.append_value(i256::from_i128(mantissa));
-                    appended = true;
+                    builder.append_value(i256::from_i128(decimal.mantissa()));
                 }
-                _ => {}
-            }
-
-            if !appended {
-                match missing_default {
+                // Absent or null: 0 when coercing, else null/error.
+                None | Some(Value::Null) => match missing_default {
                     Some(_) => builder.append_value(i256::from_i128(0)),
                     None => handle_null_constraints!(builder, nullable, field_name),
+                },
+                // Present but not numeric.
+                Some(_) => {
+                    present_value_invalid!(builder, nullable, field_name, missing_default)
                 }
             }
         }
@@ -1913,6 +1964,118 @@ mod tests {
     }
 
     #[test]
+    fn test_coerce_present_unparseable_int64_errors() {
+        // Coercion errors on a present unparseable value but still fills the default when absent.
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let coerce: HashMap<String, String> = HashMap::from([("n".to_string(), "0".to_string())]);
+
+        let mut bad = LogEvent::default();
+        bad.insert("n", "abc");
+        let result =
+            build_record_batch_inner(Arc::clone(&schema), &[Event::Log(bad)], Some(&coerce));
+        assert!(matches!(
+            result,
+            Err(ArrowEncodingError::InvalidValue { .. })
+        ));
+
+        // An absent field still fills the default.
+        let batch =
+            build_record_batch_inner(schema, &[Event::Log(LogEvent::default())], Some(&coerce))
+                .expect("absent field fills the default");
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            0
+        );
+    }
+
+    #[test]
+    fn test_coerce_present_out_of_range_errors() {
+        // Coercion errors on a present out-of-range value but still fills the default when absent.
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int8, false)]));
+        let coerce: HashMap<String, String> = HashMap::from([("n".to_string(), "0".to_string())]);
+
+        let mut big = LogEvent::default();
+        big.insert("n", 999); // out of Int8 range
+        let result =
+            build_record_batch_inner(Arc::clone(&schema), &[Event::Log(big)], Some(&coerce));
+        assert!(matches!(
+            result,
+            Err(ArrowEncodingError::InvalidValue { .. })
+        ));
+
+        // An absent field still fills the default (unchanged).
+        let batch =
+            build_record_batch_inner(schema, &[Event::Log(LogEvent::default())], Some(&coerce))
+                .expect("absent field fills the default");
+        assert!(!batch.column(0).is_null(0));
+    }
+
+    #[test]
+    fn test_metadata_stripping_is_wire_invariant() {
+        // With coercion off, a schema carrying the coerce marker encodes to the same bytes as a
+        // clean schema. The marker is stripped from the wire, not shipped.
+        use tokio_util::codec::Encoder;
+
+        let mut log = LogEvent::default();
+        log.insert("s", "hi");
+        log.insert("n", 7);
+        let events = vec![Event::Log(log)];
+
+        let fields = || {
+            vec![
+                Field::new("s", DataType::Utf8, false),
+                Field::new("n", DataType::Int64, false),
+            ]
+        };
+
+        // Golden: a clean schema with no metadata.
+        let golden =
+            encode_events_to_arrow_ipc_stream(&events, Some(Arc::new(Schema::new(fields()))))
+                .expect("clean schema encodes");
+
+        // The same schema with the coerce marker on every field.
+        let marked_schema = Schema::new(
+            fields()
+                .into_iter()
+                .map(|f| {
+                    f.with_metadata(HashMap::from([(
+                        COERCE_DEFAULT_METADATA_KEY.to_string(),
+                        "0".to_string(),
+                    )]))
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // Without stripping, the marker is part of the wire schema, so the bytes differ.
+        let unstripped =
+            encode_events_to_arrow_ipc_stream(&events, Some(Arc::new(marked_schema.clone())))
+                .expect("marked schema encodes");
+        assert_ne!(
+            unstripped.as_ref(),
+            golden.as_ref(),
+            "marker should be on the wire when not stripped"
+        );
+
+        // The serializer (coercion off by default) strips it and reproduces the clean wire.
+        let config = ArrowStreamSerializerConfig::new(marked_schema);
+        let mut serializer = ArrowStreamSerializer::new(config).expect("serializer builds");
+        let mut buffer = BytesMut::new();
+        serializer
+            .encode(events.clone(), &mut buffer)
+            .expect("serializer encodes");
+        assert_eq!(
+            buffer.as_ref(),
+            golden.as_ref(),
+            "stripping the marker must yield the clean wire"
+        );
+    }
+
+    #[test]
     fn test_serializer_builds_coerce_map_and_strips_metadata() {
         // new() reads the default from field metadata, strips the metadata, and applies it.
         let field =
@@ -1936,33 +2099,6 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(col.value(0), "{}");
-    }
-
-    #[test]
-    fn test_encode_off_path_byte_identical_to_default() {
-        use tokio_util::codec::Encoder;
-
-        // With coercion off and no coerce metadata, encode() matches encode_events_to_arrow_ipc_stream byte for byte.
-        let mut log = LogEvent::default();
-        log.insert("s", "hello");
-        log.insert("n", 7);
-        let events = vec![Event::Log(log)];
-        let schema = Schema::new(vec![
-            Field::new("s", DataType::Utf8, false),
-            Field::new("n", DataType::Int64, false),
-        ]);
-
-        let config = ArrowStreamSerializerConfig::new(schema.clone());
-        let mut serializer = ArrowStreamSerializer::new(config).expect("serializer builds");
-        let mut buffer = BytesMut::new();
-        serializer
-            .encode(events.clone(), &mut buffer)
-            .expect("encodes");
-
-        let expected =
-            encode_events_to_arrow_ipc_stream(&events, Some(Arc::new(schema))).expect("encodes");
-
-        assert_eq!(buffer.as_ref(), expected.as_ref());
     }
 
     #[test]
