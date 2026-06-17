@@ -47,6 +47,12 @@ pub struct BricklensIngestRequest {
 #[derive(Debug)]
 pub struct BricklensIngestResponse {
     pub accepted_count: usize,
+    /// Count + estimated byte size of the events in this request, for
+    /// `component_sent_events_total` / `component_sent_event_bytes_total`. Populated in `call()`
+    /// from request metadata.
+    events_sent: GroupedCountByteSize,
+    /// Actual protobuf wire bytes sent, for `component_sent_bytes_total`.
+    bytes_sent: usize,
 }
 
 impl Finalizable for BricklensIngestRequest {
@@ -67,18 +73,23 @@ impl MetaDescriptive for BricklensIngestRequest {
 
 impl DriverResponse for BricklensIngestResponse {
     fn event_status(&self) -> vector_lib::event::EventStatus {
-        vector_lib::event::EventStatus::Delivered
+        // The server reports how many records it durably accepted. If it accepted none, treat the
+        // whole request as rejected so the events are not acked as delivered (which would silently
+        // lose data). Partial acceptance is still reported as Delivered; per-record partial-failure
+        // accounting would require record-level status the current API does not expose.
+        if self.accepted_count > 0 {
+            vector_lib::event::EventStatus::Delivered
+        } else {
+            vector_lib::event::EventStatus::Rejected
+        }
     }
 
     fn events_sent(&self) -> &GroupedCountByteSize {
-        use std::sync::LazyLock;
-        static ZERO_SIZE: LazyLock<GroupedCountByteSize> =
-            LazyLock::new(|| GroupedCountByteSize::new_untagged());
-        &ZERO_SIZE
+        &self.events_sent
     }
 
     fn bytes_sent(&self) -> Option<usize> {
-        None
+        Some(self.bytes_sent)
     }
 }
 
@@ -128,7 +139,12 @@ impl BricklensIngestService {
         )
     }
 
-    fn build_grpc_request(&self, request: BricklensIngestRequest) -> crate::Result<Request<Body>> {
+    /// Builds the gRPC HTTP/2 request and returns it alongside the encoded protobuf payload size
+    /// (used for `bytes_sent` telemetry).
+    fn build_grpc_request(
+        &self,
+        request: BricklensIngestRequest,
+    ) -> crate::Result<(Request<Body>, usize)> {
         let input_desc = self.method.input();
         use vrl::protobuf::encode::encode_message;
 
@@ -198,6 +214,7 @@ impl BricklensIngestService {
 
         // Encode to bytes
         let buf = dynamic_msg.encode_to_vec();
+        let byte_size = buf.len();
 
         // Build gRPC HTTP/2 request
         let path = self.grpc_path();
@@ -212,7 +229,7 @@ impl BricklensIngestService {
             .body(Body::from(encode_grpc_message(buf)))
             .map_err(|e| format!("Failed to build request: {}", e))?;
 
-        Ok(req)
+        Ok((req, byte_size))
     }
 
     fn parse_grpc_response(
@@ -256,7 +273,13 @@ impl BricklensIngestService {
             .and_then(|f| f.as_list().map(|l| l.len()))
             .unwrap_or(0);
 
-        Ok(BricklensIngestResponse { accepted_count })
+        // events_sent / bytes_sent are populated by `call()` from request metadata; this method
+        // only knows the accepted count.
+        Ok(BricklensIngestResponse {
+            accepted_count,
+            events_sent: GroupedCountByteSize::new_untagged(),
+            bytes_sent: 0,
+        })
     }
 }
 
@@ -274,7 +297,14 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
         let service = self.clone();
 
         Box::pin(async move {
-            let http_req = service.build_grpc_request(req)?;
+            // Capture the events' count + estimated byte size before `req` is consumed, for
+            // `component_sent_events_total` telemetry.
+            let events_sent = req
+                .get_metadata()
+                .events_estimated_json_encoded_byte_size()
+                .clone();
+
+            let (http_req, bytes_sent) = service.build_grpc_request(req)?;
 
             let response = client
                 .request(http_req)
@@ -308,7 +338,9 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
                 .await
                 .map_err(|e| format!("Failed to read response body: {}", e))?;
 
-            let response = service.parse_grpc_response(body)?;
+            let mut response = service.parse_grpc_response(body)?;
+            response.events_sent = events_sent;
+            response.bytes_sent = bytes_sent;
 
             // Log accepted count for observability
             debug!(
@@ -500,7 +532,7 @@ mod tests {
     #[test]
     fn test_build_grpc_request_sets_grpc_headers_and_path() {
         let svc = make_test_service("https://example.com:443");
-        let req = svc
+        let (req, _) = svc
             .build_grpc_request(make_request(vec![log_event("hello")]))
             .unwrap();
         assert_eq!(req.method(), "POST");
@@ -515,7 +547,7 @@ mod tests {
         // server_name is used only for TLS SNI (via the TLS callback), not for URI authority.
         // The TCP connection always goes to the endpoint so the s2s-proxy sidecar is not bypassed.
         let svc = make_test_service("https://127.0.0.3:443");
-        let req = svc
+        let (req, _) = svc
             .build_grpc_request(make_request(vec![log_event("hello")]))
             .unwrap();
         assert_eq!(req.uri().host(), Some("127.0.0.3"));
@@ -543,7 +575,7 @@ mod tests {
         // Build an event whose structure matches test.BatchRequest { repeated Record records }
         let mut log = LogEvent::default();
         log.insert("records[0].message", "hello");
-        let req = svc
+        let (req, _) = svc
             .build_grpc_request(make_request(vec![Event::Log(log)]))
             .unwrap();
 
@@ -604,5 +636,49 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // DriverResponse: event_status + sent-events telemetry
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_event_status_rejected_when_zero_records_accepted() {
+        // A successful gRPC call that durably accepts zero records must NOT be acked as
+        // Delivered, or the events are silently lost.
+        let resp = BricklensIngestResponse {
+            accepted_count: 0,
+            events_sent: GroupedCountByteSize::new_untagged(),
+            bytes_sent: 0,
+        };
+        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
+    }
+
+    #[test]
+    fn test_event_status_delivered_when_records_accepted() {
+        let resp = BricklensIngestResponse {
+            accepted_count: 3,
+            events_sent: GroupedCountByteSize::new_untagged(),
+            bytes_sent: 0,
+        };
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Delivered
+        );
+    }
+
+    #[test]
+    fn test_response_reports_bytes_sent() {
+        use vector_lib::internal_event::CountByteSize;
+        use vector_lib::json_size::JsonSize;
+
+        let resp = BricklensIngestResponse {
+            accepted_count: 1,
+            events_sent: CountByteSize(2, JsonSize::new(42)).into(),
+            bytes_sent: 128,
+        };
+        // bytes_sent feeds component_sent_bytes_total; the sink previously hard-coded None here,
+        // making throughput invisible.
+        assert_eq!(resp.bytes_sent(), Some(128));
     }
 }
