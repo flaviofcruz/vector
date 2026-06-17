@@ -117,6 +117,41 @@ fn encode_grpc_message(message: Vec<u8>) -> Vec<u8> {
     framed
 }
 
+/// Extracts the `grpc-status` code from a header or trailer map, if present and parseable.
+fn grpc_status_code(headers: &http::HeaderMap) -> Option<i32> {
+    headers
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i32>().ok())
+}
+
+/// Extracts the `grpc-message` text from a header or trailer map, if present.
+fn grpc_status_message(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get("grpc-message")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Resolves the effective gRPC status and message for a response.
+///
+/// The status can arrive in the initial response HEADERS frame (a "Trailers-Only" response —
+/// typical for fast errors) or in the HTTP/2 trailers sent after the body. A status in the headers
+/// takes precedence; otherwise the trailer status is used; absent from both, the call is treated as
+/// OK (status 0). Reading the trailers matters because an intermediary (e.g. the s2s-proxy/Envoy
+/// hop) can deliver a transient status there — and missing it would misreport the error and skip
+/// the retry.
+fn resolve_grpc_status(
+    headers: &http::HeaderMap,
+    trailers: Option<&http::HeaderMap>,
+) -> (i32, Option<String>) {
+    let status = grpc_status_code(headers)
+        .or_else(|| trailers.and_then(grpc_status_code))
+        .unwrap_or(0);
+    let message = grpc_status_message(headers).or_else(|| trailers.and_then(grpc_status_message));
+    (status, message)
+}
+
 // `Clone` is required by the Tower retry layer (`Request: Clone`), which clones the request to
 // replay it on a retry. This is safe: the driver calls `take_finalizers()` before the request
 // enters the service stack (see vector-stream `Driver::run`), so the request being cloned for
@@ -425,39 +460,42 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
                 }
             })?;
 
-            // Check gRPC status
-            let status = response
-                .headers()
-                .get("grpc-status")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(0);
+            // The gRPC status can arrive in the initial HEADERS frame (a "Trailers-Only" response,
+            // typical for fast errors) or in the HTTP/2 trailers sent after the body. Snapshot the
+            // initial headers, then drain the body and read the trailers, and let
+            // resolve_grpc_status() prefer the header status over the trailer status.
+            //
+            // hyper::body::to_bytes() discards trailers, so we poll the data frames and the
+            // trailers explicitly via the HttpBody trait (still hyper 0.14; no http-body-util).
+            let response_headers = response.headers().clone();
 
+            use hyper::body::HttpBody as _;
+            let mut response_body = response.into_body();
+            let mut body = bytes::BytesMut::new();
+            while let Some(chunk) =
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut response_body).poll_data(cx)).await
+            {
+                let chunk = chunk.map_err(|e| BricklensIngestError::Transport {
+                    message: format!("Failed to read response body: {}", e),
+                })?;
+                body.extend_from_slice(&chunk);
+            }
+            let trailers =
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut response_body).poll_trailers(cx))
+                    .await
+                    .map_err(|e| BricklensIngestError::Transport {
+                        message: format!("Failed to read response trailers: {}", e),
+                    })?;
+
+            let (status, message) = resolve_grpc_status(&response_headers, trailers.as_ref());
             if status != 0 {
-                let message = response
-                    .headers()
-                    .get("grpc-message")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("Unknown error");
                 return Err(BricklensIngestError::Grpc {
                     status,
-                    message: message.to_string(),
+                    message: message.unwrap_or_else(|| "Unknown error".to_string()),
                 });
             }
 
-            // Using hyper::body::to_bytes which is deprecated in favor of http_body_util::BodyExt.
-            // We continue using this API because:
-            // 1. The replacement requires migrating to hyper 1.0 and http-body-util crate
-            // 2. Vector's ecosystem is currently on hyper 0.14
-            // 3. This API is stable and will remain available until Vector migrates to hyper 1.0
-            #[allow(deprecated)]
-            let body = hyper::body::to_bytes(response.into_body())
-                .await
-                .map_err(|e| BricklensIngestError::Transport {
-                    message: format!("Failed to read response body: {}", e),
-                })?;
-
-            let mut response = service.parse_grpc_response(body)?;
+            let mut response = service.parse_grpc_response(body.freeze())?;
             response.events_sent = events_sent;
             response.bytes_sent = bytes_sent;
 
@@ -855,5 +893,33 @@ mod tests {
             .build_grpc_request(make_request(vec![log_event("hello")]))
             .unwrap();
         assert_eq!(req.headers()["grpc-timeout"], "60S");
+    }
+
+    #[test]
+    fn test_resolve_grpc_status_prefers_header_then_trailer() {
+        use http::HeaderMap;
+
+        // Trailers-Only response: status + message in the initial headers.
+        let mut headers = HeaderMap::new();
+        headers.insert("grpc-status", "7".parse().unwrap());
+        headers.insert("grpc-message", "denied".parse().unwrap());
+        let (status, message) = resolve_grpc_status(&headers, None);
+        assert_eq!(status, 7);
+        assert_eq!(message.as_deref(), Some("denied"));
+
+        // Status delivered only in the trailers (initial headers carry none). This is the case the
+        // old header-only read silently missed — treating a real error as OK (status 0) and
+        // skipping the retry.
+        let empty = HeaderMap::new();
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", "14".parse().unwrap());
+        trailers.insert("grpc-message", "unavailable".parse().unwrap());
+        let (status, message) = resolve_grpc_status(&empty, Some(&trailers));
+        assert_eq!(status, 14);
+        assert_eq!(message.as_deref(), Some("unavailable"));
+
+        // No status in either map → treated as success.
+        let (status, _) = resolve_grpc_status(&empty, None);
+        assert_eq!(status, 0);
     }
 }
