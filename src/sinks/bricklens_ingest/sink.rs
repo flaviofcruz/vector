@@ -1,17 +1,19 @@
 use futures::{StreamExt, stream::BoxStream};
 use prost_reflect::{DescriptorPool, prost::Message};
+use tower::ServiceBuilder;
 use vector_lib::stream::BatcherSettings;
 
 use crate::{
     codecs::{Encoder, Transformer},
     config::SinkContext,
     event::Event,
-    sinks::util::{Compression, StreamSink, builder::SinkBuilderExt},
+    sinks::util::{Compression, ServiceBuilderExt, StreamSink, builder::SinkBuilderExt},
 };
 
 use super::{
-    config::BricklensIngestConfig, request_builder::BricklensIngestRequestBuilder,
-    service::BricklensIngestService,
+    config::BricklensIngestConfig,
+    request_builder::BricklensIngestRequestBuilder,
+    service::{BricklensIngestService, BricklensRetryLogic},
 };
 
 pub struct BricklensIngestSink {
@@ -122,16 +124,19 @@ impl BricklensIngestSink {
             .parse()
             .map_err(|e| format!("Invalid endpoint: {}", e))?;
 
+        let request_limits = config.request.into_settings();
+
         // No field extraction or enum lookups here - the VRL transform shapes the data
         // to match the proto structure. The service just blindly encodes whatever it receives.
-        let service = BricklensIngestService::new(client, endpoint, method.clone());
+        // The per-request timeout is forwarded to the server as a grpc-timeout header so it
+        // matches the client-side Tower `Timeout` applied in run_inner().
+        let service =
+            BricklensIngestService::new(client, endpoint, method.clone(), request_limits.timeout);
 
         let batch_settings = config
             .batch
             .into_batcher_settings()
             .map_err(|e| format!("Invalid batch settings: {}", e))?;
-
-        let request_limits = config.request.into_settings();
 
         let compression = Compression::None; // gRPC doesn't use transport-level compression
 
@@ -170,13 +175,26 @@ impl BricklensIngestSink {
         let encoder_inner = Encoder::<Framer>::new(framer, serializer);
         let encoder = (Transformer::default(), encoder_inner);
 
+        let request_builder_concurrency = self
+            .request_limits
+            .concurrency
+            .and_then(|n| std::num::NonZeroUsize::new(n))
+            .unwrap_or_else(|| std::num::NonZeroUsize::new(10).unwrap());
+
+        // Wrap the gRPC service in the Tower request-middleware stack so the configured
+        // retry / timeout / rate-limit / adaptive-concurrency settings actually take effect.
+        // Transient gRPC statuses (UNAVAILABLE, RESOURCE_EXHAUSTED, DEADLINE_EXCEEDED) and
+        // transport errors are retried with Fibonacci backoff + jitter; permanent failures are
+        // dropped. Without this wrapping the `request` settings are inert and every transient
+        // failure becomes a permanent drop.
+        let service = ServiceBuilder::new()
+            .settings(self.request_limits, BricklensRetryLogic)
+            .service(self.service);
+
         input
             .batched(self.batch_settings.as_byte_size_config())
             .request_builder(
-                self.request_limits
-                    .concurrency
-                    .and_then(|n| std::num::NonZeroUsize::new(n))
-                    .unwrap_or_else(|| std::num::NonZeroUsize::new(10).unwrap()),
+                request_builder_concurrency,
                 BricklensIngestRequestBuilder::new(self.compression, encoder),
             )
             .filter_map(|request| async move {
@@ -188,7 +206,7 @@ impl BricklensIngestSink {
                     Ok(req) => Some(req),
                 }
             })
-            .into_driver(self.service)
+            .into_driver(service)
             .run()
             .await
     }

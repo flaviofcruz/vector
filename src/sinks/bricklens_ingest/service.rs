@@ -1,9 +1,11 @@
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use http::{Request, Uri};
 use hyper::Body;
 use prost_reflect::{MethodDescriptor, prost::Message};
+use snafu::Snafu;
 use tower::Service;
 use tracing::debug;
 
@@ -11,6 +13,84 @@ use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::internal_event::{ComponentEventsDropped, INTENTIONAL, UNINTENTIONAL};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
+
+use crate::sinks::util::retries::RetryLogic;
+
+// gRPC status codes (https://grpc.io/docs/guides/status-codes/) that represent transient
+// conditions worth retrying. Everything else is treated as a permanent failure.
+const GRPC_STATUS_DEADLINE_EXCEEDED: i32 = 4;
+const GRPC_STATUS_RESOURCE_EXHAUSTED: i32 = 8;
+const GRPC_STATUS_UNAVAILABLE: i32 = 14;
+
+/// Errors returned by [`BricklensIngestService::call`].
+///
+/// This is a concrete error type (rather than a boxed `crate::Error`) specifically so the Tower
+/// retry middleware can downcast it back from the boxed error produced by the `Timeout` layer and
+/// consult [`BricklensIngestError::is_retriable`] in [`BricklensRetryLogic::is_retriable_error`].
+/// A stringly-typed error cannot be downcast and would force the retry policy into its
+/// "retry everything" fallback, defeating the retriable/permanent distinction.
+#[derive(Debug, Snafu)]
+pub enum BricklensIngestError {
+    /// The protobuf message could not be built or encoded. This is a deterministic client-side
+    /// shaping error and will never succeed on retry.
+    #[snafu(display("{}", message))]
+    Encode { message: String },
+
+    /// The HTTP/2 transport failed before a gRPC status was received (connection reset, DNS, TLS
+    /// handshake, etc.). Transient — safe to retry.
+    #[snafu(display("gRPC request failed: {}", message))]
+    Transport { message: String },
+
+    /// The server returned a non-OK gRPC status.
+    #[snafu(display("gRPC error {}: {}", status, message))]
+    Grpc { status: i32, message: String },
+
+    /// The gRPC response framing or body could not be parsed. Deterministic — not retriable.
+    #[snafu(display("{}", message))]
+    ResponseParse { message: String },
+}
+
+impl BricklensIngestError {
+    /// Whether this error is retriable — i.e. a transient condition where retrying the request
+    /// could succeed.
+    fn is_retriable(&self) -> bool {
+        match self {
+            // Transport-level failures are virtually always transient.
+            Self::Transport { .. } => true,
+            // Retry only the gRPC status codes that indicate a transient condition.
+            Self::Grpc { status, .. } => matches!(
+                *status,
+                GRPC_STATUS_DEADLINE_EXCEEDED
+                    | GRPC_STATUS_RESOURCE_EXHAUSTED
+                    | GRPC_STATUS_UNAVAILABLE
+            ),
+            // Encoding and response-parse failures are deterministic; retrying cannot help.
+            Self::Encode { .. } | Self::ResponseParse { .. } => false,
+        }
+    }
+}
+
+/// Retry policy for the `bricklens_ingest` sink. Drives the Tower `Retry` layer wired up in
+/// `config.rs`, retrying transport failures and transient gRPC statuses while dropping permanent
+/// failures immediately.
+#[derive(Clone, Default)]
+pub struct BricklensRetryLogic;
+
+impl RetryLogic for BricklensRetryLogic {
+    type Error = BricklensIngestError;
+    type Request = BricklensIngestRequest;
+    type Response = BricklensIngestResponse;
+
+    fn is_retriable_error(&self, error: &Self::Error) -> bool {
+        error.is_retriable()
+    }
+
+    // NOTE: `should_retry_response` is intentionally left at its default (`Successful`). A response
+    // with `accepted_count == 0` is reported as `Rejected` by `event_status()` (so the loss is
+    // accounted for) but is NOT retried: the current API does not distinguish a transient
+    // server-side rejection from a permanent validation failure, and blindly retrying risks
+    // duplicate writes on an ambiguous partial success.
+}
 
 /// Builds the gRPC request URI from the endpoint and RPC path.
 /// The TCP connection always goes to `endpoint` (e.g. 127.0.0.3:443 for the s2s-proxy sidecar).
@@ -37,7 +117,11 @@ fn encode_grpc_message(message: Vec<u8>) -> Vec<u8> {
     framed
 }
 
-#[derive(Debug)]
+// `Clone` is required by the Tower retry layer (`Request: Clone`), which clones the request to
+// replay it on a retry. This is safe: the driver calls `take_finalizers()` before the request
+// enters the service stack (see vector-stream `Driver::run`), so the request being cloned for
+// retries always carries an empty finalizer set — acknowledgement happens once, from the driver.
+#[derive(Clone, Debug)]
 pub struct BricklensIngestRequest {
     pub events: Vec<vector_lib::event::Event>,
     pub metadata: RequestMetadata,
@@ -98,6 +182,9 @@ pub struct BricklensIngestService {
     client: hyper::Client<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>,
     endpoint: Uri,
     method: MethodDescriptor,
+    /// Per-request deadline, sent to the server as a `grpc-timeout` header. Mirrors the client-side
+    /// Tower `Timeout` layer so the server can abandon work the client has already given up on.
+    request_timeout: Duration,
 }
 
 impl BricklensIngestService {
@@ -105,11 +192,13 @@ impl BricklensIngestService {
         client: hyper::Client<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>,
         endpoint: Uri,
         method: MethodDescriptor,
+        request_timeout: Duration,
     ) -> Self {
         Self {
             client,
             endpoint,
             method,
+            request_timeout,
         }
     }
 
@@ -144,7 +233,7 @@ impl BricklensIngestService {
     fn build_grpc_request(
         &self,
         request: BricklensIngestRequest,
-    ) -> crate::Result<(Request<Body>, usize)> {
+    ) -> Result<(Request<Body>, usize), BricklensIngestError> {
         let input_desc = self.method.input();
         use vrl::protobuf::encode::encode_message;
 
@@ -188,7 +277,9 @@ impl BricklensIngestService {
         }
 
         if event_values.is_empty() {
-            return Err("No events to encode".into());
+            return Err(BricklensIngestError::Encode {
+                message: "No events to encode".to_string(),
+            });
         }
 
         // The event is expected to already be the full proto message, shaped by a VRL
@@ -209,7 +300,9 @@ impl BricklensIngestService {
         let dynamic_msg =
             encode_message(&input_desc, event_value, &encode_options).map_err(|e| {
                 tracing::error!("Encode failed: {}", e);
-                format!("Failed to encode message: {}", e)
+                BricklensIngestError::Encode {
+                    message: format!("Failed to encode message: {}", e),
+                }
             })?;
 
         // Encode to bytes
@@ -218,7 +311,17 @@ impl BricklensIngestService {
 
         // Build gRPC HTTP/2 request
         let path = self.grpc_path();
-        let uri = build_request_uri(&self.endpoint, &path)?;
+        let uri = build_request_uri(&self.endpoint, &path).map_err(|e| {
+            BricklensIngestError::Encode {
+                message: format!("Failed to build request URI: {}", e),
+            }
+        })?;
+
+        // Tell the server the same deadline the client enforces via the Tower `Timeout` layer.
+        // The timeout is configured in whole seconds (TowerRequestConfig::timeout_secs), so second
+        // granularity is exact; gRPC caps this value at 8 digits, which seconds only exceed past
+        // ~3.17 years.
+        let grpc_timeout = format!("{}S", self.request_timeout.as_secs());
 
         let req = Request::builder()
             .uri(uri)
@@ -226,8 +329,11 @@ impl BricklensIngestService {
             .header("content-type", "application/grpc+proto")
             .header("te", "trailers")
             .header("grpc-encoding", "identity")
+            .header("grpc-timeout", grpc_timeout)
             .body(Body::from(encode_grpc_message(buf)))
-            .map_err(|e| format!("Failed to build request: {}", e))?;
+            .map_err(|e| BricklensIngestError::Encode {
+                message: format!("Failed to build request: {}", e),
+            })?;
 
         Ok((req, byte_size))
     }
@@ -235,29 +341,34 @@ impl BricklensIngestService {
     fn parse_grpc_response(
         &self,
         mut body: impl bytes::Buf,
-    ) -> crate::Result<BricklensIngestResponse> {
+    ) -> Result<BricklensIngestResponse, BricklensIngestError> {
         use prost_reflect::DynamicMessage;
 
         // Parse gRPC framing (5-byte prefix: 1 byte compression flag + 4 bytes message length)
         if body.remaining() < 5 {
-            return Err("Response too short".into());
+            return Err(BricklensIngestError::ResponseParse {
+                message: "Response too short".to_string(),
+            });
         }
 
         let compression_flag = body.get_u8();
 
         // Validate compression - we only support uncompressed messages (flag = 0)
         if compression_flag != 0 {
-            return Err(format!(
-                "Compressed responses not supported (compression flag: {})",
-                compression_flag
-            )
-            .into());
+            return Err(BricklensIngestError::ResponseParse {
+                message: format!(
+                    "Compressed responses not supported (compression flag: {})",
+                    compression_flag
+                ),
+            });
         }
 
         let message_len = body.get_u32() as usize;
 
         if body.remaining() < message_len {
-            return Err("Incomplete message".into());
+            return Err(BricklensIngestError::ResponseParse {
+                message: "Incomplete message".to_string(),
+            });
         }
 
         let message_bytes = body.copy_to_bytes(message_len);
@@ -265,7 +376,9 @@ impl BricklensIngestService {
         // Decode using dynamic message
         let output_desc = self.method.output();
         let dynamic_response = DynamicMessage::decode(output_desc, message_bytes.as_ref())
-            .map_err(|e| format!("Failed to decode response: {}", e))?;
+            .map_err(|e| BricklensIngestError::ResponseParse {
+                message: format!("Failed to decode response: {}", e),
+            })?;
 
         // Count successfully accepted records from BatchCreateLogRecordsResponse.results
         let accepted_count = dynamic_response
@@ -285,7 +398,7 @@ impl BricklensIngestService {
 
 impl Service<BricklensIngestRequest> for BricklensIngestService {
     type Response = BricklensIngestResponse;
-    type Error = crate::Error;
+    type Error = BricklensIngestError;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -306,10 +419,11 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
 
             let (http_req, bytes_sent) = service.build_grpc_request(req)?;
 
-            let response = client
-                .request(http_req)
-                .await
-                .map_err(|e| format!("gRPC request failed: {}", e))?;
+            let response = client.request(http_req).await.map_err(|e| {
+                BricklensIngestError::Transport {
+                    message: e.to_string(),
+                }
+            })?;
 
             // Check gRPC status
             let status = response
@@ -325,7 +439,10 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
                     .get("grpc-message")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("Unknown error");
-                return Err(format!("gRPC error {}: {}", status, message).into());
+                return Err(BricklensIngestError::Grpc {
+                    status,
+                    message: message.to_string(),
+                });
             }
 
             // Using hyper::body::to_bytes which is deprecated in favor of http_body_util::BodyExt.
@@ -336,7 +453,9 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
             #[allow(deprecated)]
             let body = hyper::body::to_bytes(response.into_body())
                 .await
-                .map_err(|e| format!("Failed to read response body: {}", e))?;
+                .map_err(|e| BricklensIngestError::Transport {
+                    message: format!("Failed to read response body: {}", e),
+                })?;
 
             let mut response = service.parse_grpc_response(body)?;
             response.events_sent = events_sent;
@@ -508,6 +627,7 @@ mod tests {
             client,
             endpoint: endpoint.parse().unwrap(),
             method,
+            request_timeout: Duration::from_secs(60),
         }
     }
 
@@ -680,5 +800,60 @@ mod tests {
         // bytes_sent feeds component_sent_bytes_total; the sink previously hard-coded None here,
         // making throughput invisible.
         assert_eq!(resp.bytes_sent(), Some(128));
+    }
+
+    // ---------------------------------------------------------------------------
+    // BricklensRetryLogic + grpc-timeout
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_retry_logic_retries_transient_drops_permanent() {
+        let logic = BricklensRetryLogic;
+
+        // Transport-level failures (connection reset, TLS, DNS) are always transient.
+        assert!(logic.is_retriable_error(&BricklensIngestError::Transport {
+            message: "connection reset".to_string(),
+        }));
+
+        // Retriable gRPC statuses: DEADLINE_EXCEEDED(4), RESOURCE_EXHAUSTED(8), UNAVAILABLE(14).
+        for status in [4, 8, 14] {
+            assert!(
+                logic.is_retriable_error(&BricklensIngestError::Grpc {
+                    status,
+                    message: "x".to_string(),
+                }),
+                "gRPC status {status} should be retriable"
+            );
+        }
+
+        // Permanent gRPC statuses must NOT retry: e.g. INVALID_ARGUMENT(3), NOT_FOUND(5),
+        // PERMISSION_DENIED(7), INTERNAL(13).
+        for status in [3, 5, 7, 13] {
+            assert!(
+                !logic.is_retriable_error(&BricklensIngestError::Grpc {
+                    status,
+                    message: "x".to_string(),
+                }),
+                "gRPC status {status} should not be retriable"
+            );
+        }
+
+        // Deterministic client-side errors never retry.
+        assert!(!logic.is_retriable_error(&BricklensIngestError::Encode {
+            message: "x".to_string(),
+        }));
+        assert!(!logic.is_retriable_error(&BricklensIngestError::ResponseParse {
+            message: "x".to_string(),
+        }));
+    }
+
+    #[test]
+    fn test_build_grpc_request_sets_grpc_timeout_header() {
+        // make_test_service builds the service with a 60s request timeout.
+        let svc = make_test_service("https://example.com:443");
+        let (req, _) = svc
+            .build_grpc_request(make_request(vec![log_event("hello")]))
+            .unwrap();
+        assert_eq!(req.headers()["grpc-timeout"], "60S");
     }
 }
