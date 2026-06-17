@@ -7,7 +7,7 @@ use hyper::Body;
 use prost_reflect::{MethodDescriptor, prost::Message};
 use snafu::Snafu;
 use tower::Service;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::internal_event::{ComponentEventsDropped, INTENTIONAL, UNINTENTIONAL};
@@ -415,11 +415,64 @@ impl BricklensIngestService {
                 message: format!("Failed to decode response: {}", e),
             })?;
 
-        // Count successfully accepted records from BatchCreateLogRecordsResponse.results
-        let accepted_count = dynamic_response
-            .get_field_by_name("results")
-            .and_then(|f| f.as_list().map(|l| l.len()))
-            .unwrap_or(0);
+        // Count only records the server durably accepted (`success == true`) — NOT the length of
+        // the results list. The batch RPC can return a 200/OK gRPC status while individual records
+        // fail (e.g. KM/encryption errors surface as a per-record `success=false` with an
+        // `error_message`). Counting list length would treat those as accepted, so `event_status()`
+        // would ack them as Delivered and the loss would be silent. Counting successes lets a
+        // fully-rejected batch (`accepted_count == 0`) become `Rejected`, and we log each failed
+        // record's reason so the rejection is visible instead of swallowed.
+        let results = dynamic_response.get_field_by_name("results");
+        let result_list = results.as_ref().and_then(|f| f.as_list());
+        let total = result_list.map_or(0, |l| l.len());
+        // Keep only a small sample of per-record reasons for logging: a fully-rejected 100-record
+        // batch would otherwise build and emit 100 strings on one line. The sample is enough to
+        // diagnose the failure; `rejected_count` carries the true total.
+        const MAX_REASON_SAMPLE: usize = 3;
+        let mut accepted_count = 0usize;
+        let mut rejected_count = 0usize;
+        let mut reason_sample: Vec<String> = Vec::new();
+        if let Some(list) = result_list {
+            for item in list {
+                let Some(record) = item.as_message() else {
+                    continue;
+                };
+                let success = record
+                    .get_field_by_name("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if success {
+                    accepted_count += 1;
+                } else {
+                    rejected_count += 1;
+                    if reason_sample.len() < MAX_REASON_SAMPLE {
+                        let record_id = record
+                            .get_field_by_name("record_id")
+                            .and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or_default();
+                        let error_message = record
+                            .get_field_by_name("error_message")
+                            .and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or_default();
+                        reason_sample.push(format!("record_id={record_id}: {error_message}"));
+                    }
+                }
+            }
+        }
+        if rejected_count > 0 {
+            // Rate-limited: tracing-limit is on by default (10s); widen to once/minute since a
+            // systematic rejection would otherwise fire on every batch. The dropped records are
+            // already counted via event_status -> component_discarded_events_total, so this log is
+            // only for diagnosis — a throttled sample of reasons is enough.
+            warn!(
+                accepted_count,
+                rejected_count,
+                total,
+                reason_sample = ?reason_sample,
+                internal_log_rate_secs = 60,
+                "bricklens_ingest: server rejected one or more records in the batch"
+            );
+        }
 
         // events_sent / bytes_sent are populated by `call()` from request metadata; this method
         // only knows the accepted count.
@@ -611,7 +664,16 @@ mod tests {
                 },
                 DescriptorProto {
                     name: Some("Result".to_string()),
-                    field: vec![],
+                    // Mirrors the real LogRecordResult field number for `success` (2) so
+                    // parse_grpc_response can distinguish accepted from rejected records.
+                    field: vec![FieldDescriptorProto {
+                        name: Some("success".to_string()),
+                        number: Some(2),
+                        label: Some(field_descriptor_proto::Label::Optional as i32),
+                        r#type: Some(field_descriptor_proto::Type::Bool as i32),
+                        json_name: Some("success".to_string()),
+                        ..Default::default()
+                    }],
                     ..Default::default()
                 },
                 DescriptorProto {
@@ -761,14 +823,35 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_parse_grpc_response_counts_results() {
+    fn test_parse_grpc_response_counts_only_successful_records() {
         let svc = make_test_service("https://example.com:443");
-        // proto3 hand-encoding of: Response { results: [{}, {}, {}] } (3 empty Result messages)
-        // field 1, wire type 2 (length-delimited): tag = (1 << 3) | 2 = 0x0A, length = 0x00
-        let msg_bytes = vec![0x0A, 0x00, 0x0A, 0x00, 0x0A, 0x00];
+        // proto3 hand-encoding of: Response { results: [ {success:true}, {success:true},
+        // {success:false} ] }. Each results entry is field 1, wire type 2 (tag 0x0A) + length.
+        // A Result with success=true encodes field 2 (bool, wire type 0): tag 0x10, value 0x01
+        // (2 bytes). A success=false Result omits the proto3 default → empty message (length 0).
+        let ok = [0x0A, 0x02, 0x10, 0x01]; // results[i] = { success: true }
+        let fail = [0x0A, 0x00]; // results[i] = {} (success defaults to false)
+        let mut msg_bytes = Vec::new();
+        msg_bytes.extend_from_slice(&ok);
+        msg_bytes.extend_from_slice(&ok);
+        msg_bytes.extend_from_slice(&fail);
         let body = bytes::Bytes::from(encode_grpc_message(msg_bytes));
         let resp = svc.parse_grpc_response(body).unwrap();
-        assert_eq!(resp.accepted_count, 3);
+        // Only the two success=true records are counted; the failed one is excluded so a
+        // partially-failed batch isn't acked as fully delivered.
+        assert_eq!(resp.accepted_count, 2);
+    }
+
+    #[test]
+    fn test_parse_grpc_response_all_failed_yields_zero_accepted() {
+        let svc = make_test_service("https://example.com:443");
+        // Response { results: [ {} ] } — one record, success defaults to false. accepted_count
+        // must be 0 so event_status() reports Rejected instead of silently acking the loss.
+        let msg_bytes = vec![0x0A, 0x00];
+        let body = bytes::Bytes::from(encode_grpc_message(msg_bytes));
+        let resp = svc.parse_grpc_response(body).unwrap();
+        assert_eq!(resp.accepted_count, 0);
+        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
     }
 
     #[test]
