@@ -9,6 +9,8 @@ use snafu::Snafu;
 use tower::Service;
 use tracing::{debug, warn};
 
+use vector_lib::EstimatedJsonEncodedSizeOf;
+use vector_lib::config::telemetry;
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::internal_event::{ComponentEventsDropped, INTENTIONAL, UNINTENTIONAL};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
@@ -498,12 +500,23 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
         let service = self.clone();
 
         Box::pin(async move {
-            // Capture the events' count + estimated byte size before `req` is consumed, for
-            // `component_sent_events_total` telemetry.
-            let events_sent = req
-                .get_metadata()
-                .events_estimated_json_encoded_byte_size()
-                .clone();
+            // Compute the events' count + estimated JSON byte size directly from the events here,
+            // for `component_sent_events_total` / `component_sent_event_bytes_total`.
+            //
+            // We deliberately do NOT read
+            // `req.get_metadata().events_estimated_json_encoded_byte_size()`: this sink's
+            // `RequestBuilder::split_input` hands the payload encoder an empty `Vec` (the events are
+            // carried in metadata and protobuf-encoded here, not re-encoded by the unused payload
+            // encoder), so `RequestMetadataBuilder::build()` derives that field from the empty
+            // encoder output and it is always `CountByteSize(0, 0)`. Reading it would leave
+            // `component_sent_events_total` stuck at 0 even on fully-delivered batches. Instead we
+            // recompute the grouped size from the real events with the same logic as
+            // `RequestMetadataBuilder::from_events` (telemetry-aware tagging + estimated JSON size),
+            // mirroring how `bytes_sent` is sourced from the real encoded payload at this call site.
+            let mut events_sent = telemetry().create_request_count_byte_size();
+            for event in &req.events {
+                events_sent.add_event(event, event.estimated_json_encoded_size_of());
+            }
 
             let (http_req, bytes_sent) = service.build_grpc_request(req)?;
 
@@ -921,6 +934,104 @@ mod tests {
         // bytes_sent feeds component_sent_bytes_total; the sink previously hard-coded None here,
         // making throughput invisible.
         assert_eq!(resp.bytes_sent(), Some(128));
+    }
+
+    #[test]
+    fn test_response_reports_events_sent() {
+        use vector_lib::internal_event::CountByteSize;
+        use vector_lib::json_size::JsonSize;
+
+        let resp = BricklensIngestResponse {
+            accepted_count: 3,
+            events_sent: CountByteSize(3, JsonSize::new(99)).into(),
+            bytes_sent: 256,
+        };
+        // events_sent feeds component_sent_events_total on the Delivered path; the sink previously
+        // sourced this from the request metadata's estimated-JSON size, which is always 0 here
+        // because split_input hands the payload encoder an empty Vec. A zeroed count meant
+        // component_sent_events_total never advanced despite successful delivery.
+        assert_eq!(
+            resp.events_sent().size(),
+            Some(CountByteSize(3, JsonSize::new(99)))
+        );
+    }
+
+    #[test]
+    fn test_events_sent_computed_from_events_not_zeroed_metadata() {
+        // Reproduces the metric bug at its source: a BricklensIngestRequest built through the real
+        // RequestBuilder carries metadata whose events_estimated_json_encoded_byte_size is
+        // CountByteSize(0, 0) (split_input encodes an empty payload), yet the request still holds
+        // the real events. The call() path must derive events_sent from req.events, so the count is
+        // the true number of delivered events rather than the zeroed metadata field.
+        use crate::sinks::util::RequestBuilder;
+        use vector_lib::EstimatedJsonEncodedSizeOf;
+        use vector_lib::config::telemetry;
+
+        let events = vec![log_event("a"), log_event("b"), log_event("c")];
+
+        // Build request metadata exactly as the sink does: via the request builder, whose payload
+        // encoder sees an empty event list.
+        let builder =
+            crate::sinks::bricklens_ingest::request_builder::BricklensIngestRequestBuilder::new(
+                crate::sinks::util::Compression::None,
+                {
+                    use vector_lib::codecs::encoding::{
+                        Framer, FramingConfig, JsonSerializerConfig, SerializerConfig,
+                    };
+                    let serializer = SerializerConfig::Json(JsonSerializerConfig::default())
+                        .build()
+                        .expect("serializer");
+                    let framer = FramingConfig::NewlineDelimited.build();
+                    (
+                        crate::codecs::Transformer::default(),
+                        crate::codecs::Encoder::<Framer>::new(framer, serializer),
+                    )
+                },
+            );
+        let (metadata, meta_builder, encoder_events) = builder.split_input(events.clone());
+        let payload = builder
+            .encode_events(encoder_events)
+            .expect("encode empty payload");
+        let request_metadata = meta_builder.build(&payload);
+        let request = builder.build_request(metadata, request_metadata, payload);
+
+        // The metadata field the old code read is zeroed...
+        assert_eq!(
+            request
+                .get_metadata()
+                .events_estimated_json_encoded_byte_size()
+                .size(),
+            Some(vector_lib::internal_event::CountByteSize(
+                0,
+                vector_lib::json_size::JsonSize::zero()
+            )),
+            "metadata estimated-JSON size is expected to be zero for this sink"
+        );
+
+        // The events handed to call() arrive with their JSON-size cache already warmed by
+        // `RequestMetadataBuilder::from_events` inside `split_input`. That warming is what makes
+        // the recompute below an atomic cache load rather than a second structural walk per event.
+        // If split_input ever stops warming the cache (or starts giving call() cloned/mutated
+        // events that drop it), this fails before the cost regression ships.
+        for event in &request.events {
+            assert!(
+                event.as_log().estimated_json_encoded_size_is_cached(),
+                "split_input must warm each event's JSON-size cache before the events_sent loop",
+            );
+        }
+
+        // ...and recomputing from the request's real events (what call() now does) yields the true
+        // count, so component_sent_events_total advances.
+        let mut events_sent = telemetry().create_request_count_byte_size();
+        for event in &request.events {
+            events_sent.add_event(event, event.estimated_json_encoded_size_of());
+        }
+        let computed = events_sent.size().expect("untagged size");
+        assert_eq!(computed.0, 3, "all delivered events must be counted");
+        assert!(
+            computed.1.get() > 0,
+            "estimated JSON byte size must be non-zero"
+        );
     }
 
     // ---------------------------------------------------------------------------
