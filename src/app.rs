@@ -285,6 +285,8 @@ impl Application {
 
         emit!(VectorStarted);
         handle.spawn(heartbeat::heartbeat());
+        #[cfg(feature = "tikv-jemallocator")]
+        handle.spawn(crate::jemalloc_stats::report_jemalloc_stats());
 
         let Self {
             root_opts,
@@ -577,7 +579,7 @@ pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtim
         .filter(|&v| v > 0)
         .unwrap_or(20_000);
     rt_builder.max_blocking_threads(max_blocking_threads);
-    rt_builder.enable_all().thread_name(thread_name);
+    rt_builder.enable_all();
 
     let threads = threads.unwrap_or_else(crate::num_threads);
     if threads == 0 {
@@ -588,6 +590,25 @@ pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtim
         .compare_exchange(0, threads, Ordering::Acquire, Ordering::Relaxed)
         .unwrap_or_else(|_| panic!("double thread initialization"));
     rt_builder.worker_threads(threads);
+
+    // Name worker vs blocking-pool threads distinctly. tokio applies a single
+    // thread name to BOTH the (eagerly-spawned) worker pool and the (on-demand)
+    // blocking pool, so we differentiate by spawn order: the first `threads`
+    // threads are the workers, the rest are blocking threads. The names differ
+    // early so they remain distinguishable after the kernel truncates
+    // /proc/<pid>/comm to 15 chars (e.g. "vector-worker" vs "vector-blocking").
+    let base = thread_name.trim_end_matches("-worker").to_string();
+    let worker_name = format!("{base}-worker");
+    let blocking_name = format!("{base}-blocking-worker");
+    let worker_count = threads;
+    let spawned = std::sync::Arc::new(AtomicUsize::new(0));
+    rt_builder.thread_name_fn(move || {
+        if spawned.fetch_add(1, Ordering::SeqCst) < worker_count {
+            worker_name.clone()
+        } else {
+            blocking_name.clone()
+        }
+    });
 
     debug!(message = "Building runtime.", worker_threads = threads);
     Ok(rt_builder.build().expect("Unable to create async runtime"))

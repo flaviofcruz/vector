@@ -76,6 +76,8 @@ mod http_client_source;
 mod influxdb;
 #[cfg(feature = "sources-internal_logs")]
 mod internal_logs;
+#[cfg(feature = "tikv-jemallocator")]
+mod jemalloc_stats;
 #[cfg(all(unix, feature = "sources-journald"))]
 mod journald;
 #[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]
@@ -245,6 +247,8 @@ pub(crate) use self::http_client_source::*;
 pub(crate) use self::influxdb::*;
 #[cfg(feature = "sources-internal_logs")]
 pub(crate) use self::internal_logs::*;
+#[cfg(feature = "tikv-jemallocator")]
+pub use self::jemalloc_stats::*;
 #[cfg(all(unix, feature = "sources-journald"))]
 pub(crate) use self::journald::*;
 #[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]

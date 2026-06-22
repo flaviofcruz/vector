@@ -115,6 +115,15 @@ struct Metrics {
     histogram: Histogram,
     gauge: Gauge,
     mean_gauge: Gauge,
+    // Current bytes held in the buffer, tracked independently of the limit unit
+    // (events or bytes) so source/transform buffers always report their memory
+    // footprint. Mirrors the sink buffer's `buffer_byte_size`.
+    byte_size_gauge: Gauge,
+    // Current event count held in the buffer, also tracked independently of the
+    // limit unit. In byte-limited mode `_utilization_level` reports bytes, so this
+    // is the only view of how many events are buffered; in event-limited mode it
+    // mirrors `_utilization_level`. Mirrors the sink buffer's `buffer_events`.
+    events_gauge: Gauge,
     ewma: Arc<AtomicEwma>,
     // We hold a handle to the max gauge to avoid it being dropped by the metrics collector, but
     // since the value is static, we never need to update it. The compiler detects this as an unused
@@ -125,6 +134,8 @@ struct Metrics {
     legacy_max_gauge: Gauge,
     #[cfg(test)]
     recorded_values: Arc<Mutex<Vec<usize>>>,
+    #[cfg(test)]
+    recorded_events: Arc<Mutex<Vec<usize>>>,
 }
 
 impl Metrics {
@@ -150,9 +161,13 @@ impl Metrics {
         let histogram_name = format!("{prefix}_utilization");
         let gauge_name = format!("{prefix}_utilization_level");
         let mean_name = format!("{prefix}_utilization_mean");
+        let byte_size_name = format!("{prefix}_byte_size");
+        let events_name = format!("{prefix}_events");
         let ewma = Arc::new(AtomicEwma::new(ewma_alpha.unwrap_or(DEFAULT_EWMA_ALPHA)));
         #[cfg(test)]
         let recorded_values = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(test)]
+        let recorded_events = Arc::new(Mutex::new(Vec::new()));
         if let Some(label_value) = output {
             let max_gauge = gauge!(max_gauge_name, "output" => label_value.clone());
             max_gauge.set(max_value);
@@ -163,11 +178,15 @@ impl Metrics {
                 histogram: histogram!(histogram_name, "output" => label_value.clone()),
                 gauge: gauge!(gauge_name, "output" => label_value.clone()),
                 mean_gauge: gauge!(mean_name, "output" => label_value.clone()),
+                byte_size_gauge: gauge!(byte_size_name, "output" => label_value.clone()),
+                events_gauge: gauge!(events_name, "output" => label_value.clone()),
                 max_gauge,
                 ewma,
                 legacy_max_gauge,
                 #[cfg(test)]
                 recorded_values,
+                #[cfg(test)]
+                recorded_events,
             }
         } else {
             let max_gauge = gauge!(max_gauge_name);
@@ -179,11 +198,15 @@ impl Metrics {
                 histogram: histogram!(histogram_name),
                 gauge: gauge!(gauge_name),
                 mean_gauge: gauge!(mean_name),
+                byte_size_gauge: gauge!(byte_size_name),
+                events_gauge: gauge!(events_name),
                 max_gauge,
                 ewma,
                 legacy_max_gauge,
                 #[cfg(test)]
                 recorded_values,
+                #[cfg(test)]
+                recorded_events,
             }
         }
     }
@@ -199,15 +222,53 @@ impl Metrics {
             recorded.push(value);
         }
     }
+
+    /// Update the instantaneous fill gauge only (no histogram/EWMA sample).
+    ///
+    /// Used on the receive path so the `*_utilization_level` gauge reflects the buffer
+    /// draining, not just filling. The histogram and EWMA remain send-driven so their
+    /// distribution semantics are unchanged.
+    #[expect(clippy::cast_precision_loss)]
+    fn record_fill(&self, value: usize) {
+        self.gauge.set(value as f64);
+        #[cfg(test)]
+        if let Ok(mut recorded) = self.recorded_values.lock() {
+            recorded.push(value);
+        }
+    }
+
+    /// Set the current buffered-bytes gauge (`<prefix>_byte_size`).
+    #[expect(clippy::cast_precision_loss)]
+    fn record_bytes(&self, value: usize) {
+        self.byte_size_gauge.set(value as f64);
+    }
+
+    /// Set the current buffered-events gauge (`<prefix>_events`).
+    #[expect(clippy::cast_precision_loss)]
+    fn record_events(&self, value: usize) {
+        self.events_gauge.set(value as f64);
+        #[cfg(test)]
+        if let Ok(mut recorded) = self.recorded_events.lock() {
+            recorded.push(value);
+        }
+    }
 }
 
 #[derive(Debug)]
 struct Inner<T> {
-    data: Arc<dyn QueueImpl<(OwnedSemaphorePermit, T)>>,
+    // Each queued item carries its allocated byte size and event count alongside its
+    // permit, so the receive path can decrement both counters without needing T's traits.
+    data: Arc<dyn QueueImpl<(OwnedSemaphorePermit, u64, u64, T)>>,
     limit: MemoryBufferSize,
     limiter: Arc<Semaphore>,
     read_waker: Arc<Notify>,
     metrics: Option<Metrics>,
+    // Current total allocated bytes of items in the queue (tracked regardless of
+    // whether the buffer is event- or byte-limited).
+    bytes_in_use: Arc<AtomicUsize>,
+    // Current total event count of items in the queue (tracked regardless of the
+    // limit unit), so event count stays observable even when byte-limited.
+    events_in_use: Arc<AtomicUsize>,
 }
 
 impl<T> Clone for Inner<T> {
@@ -218,6 +279,8 @@ impl<T> Clone for Inner<T> {
             limiter: self.limiter.clone(),
             read_waker: self.read_waker.clone(),
             metrics: self.metrics.clone(),
+            bytes_in_use: self.bytes_in_use.clone(),
+            events_in_use: self.events_in_use.clone(),
         }
     }
 }
@@ -230,6 +293,8 @@ impl<T: InMemoryBufferable> Inner<T> {
     ) -> Self {
         let read_waker = Arc::new(Notify::new());
         let metrics = metric_metadata.map(|metadata| Metrics::new(limit, metadata, ewma_alpha));
+        let bytes_in_use = Arc::new(AtomicUsize::new(0));
+        let events_in_use = Arc::new(AtomicUsize::new(0));
         match limit {
             MemoryBufferSize::MaxEvents(max_events) => Inner {
                 data: Arc::new(ArrayQueue::new(max_events.get())),
@@ -237,6 +302,8 @@ impl<T: InMemoryBufferable> Inner<T> {
                 limiter: Arc::new(Semaphore::new(max_events.get())),
                 read_waker,
                 metrics,
+                bytes_in_use,
+                events_in_use,
             },
             MemoryBufferSize::MaxSize(max_bytes) => Inner {
                 data: Arc::new(SegQueue::new()),
@@ -244,6 +311,8 @@ impl<T: InMemoryBufferable> Inner<T> {
                 limiter: Arc::new(Semaphore::new(max_bytes.get())),
                 read_waker,
                 metrics,
+                bytes_in_use,
+                events_in_use,
             },
         }
     }
@@ -254,13 +323,67 @@ impl<T: InMemoryBufferable> Inner<T> {
     /// greater than the configured limit because the channel intentionally allows a single
     /// oversized payload to flow through rather than forcing the sender to split it.
     fn send_with_permit(&mut self, total: usize, permits: OwnedSemaphorePermit, item: T) {
-        self.data.push((permits, item));
+        let bytes = item.allocated_bytes() as u64;
+        let events = item.event_count() as u64;
+        self.bytes_in_use
+            .fetch_add(bytes as usize, Ordering::Relaxed);
+        self.events_in_use
+            .fetch_add(events as usize, Ordering::Relaxed);
+        self.data.push((permits, bytes, events, item));
         self.read_waker.notify_one();
         // Due to the race between getting the available capacity, acquiring the permits, and the
         // above push, the total may be inaccurate. Record it anyways as the histogram totals will
         // _eventually_ converge on a true picture of the buffer utilization.
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.record(total);
+            metrics.record_bytes(self.bytes_in_use.load(Ordering::Relaxed));
+            metrics.record_events(self.events_in_use.load(Ordering::Relaxed));
+        }
+    }
+}
+
+impl<T> Inner<T> {
+    /// Configured limit, in the same unit (events or bytes) the buffer is bounded by.
+    fn limit_value(&self) -> usize {
+        match self.limit {
+            MemoryBufferSize::MaxEvents(max_events) => max_events.get(),
+            MemoryBufferSize::MaxSize(max_bytes) => max_bytes.get(),
+        }
+    }
+
+    /// Record the true current fill (`limit - available_permits`) to the utilization-level
+    /// gauge. Called from the receive path so the gauge decreases as the buffer drains.
+    fn record_current_fill(&self) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            // Permits are released as items are popped, so available_permits reflects free
+            // capacity; the difference from the limit is the current fill. saturating_sub
+            // guards the empty-queue-overshoot case where an oversized item was admitted.
+            let fill = self
+                .limit_value()
+                .saturating_sub(self.limiter.available_permits());
+            metrics.record_fill(fill);
+        }
+    }
+
+    /// Decrement the buffered-bytes counter by `bytes` (an item was popped) and
+    /// update the `<prefix>_byte_size` gauge to the new total.
+    fn release_bytes(&self, bytes: u64) {
+        let prev = self
+            .bytes_in_use
+            .fetch_sub(bytes as usize, Ordering::Relaxed);
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_bytes(prev.saturating_sub(bytes as usize));
+        }
+    }
+
+    /// Decrement the buffered-event counter by `events` (an item was popped) and
+    /// update the `<prefix>_events` gauge to the new total.
+    fn release_events(&self, events: u64) {
+        let prev = self
+            .events_in_use
+            .fetch_sub(events as usize, Ordering::Relaxed);
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_events(prev.saturating_sub(events as usize));
         }
     }
 }
@@ -383,7 +506,14 @@ impl<T: Send + 'static> LimitedReceiver<T> {
 
     pub async fn next(&mut self) -> Option<T> {
         loop {
-            if let Some((_permit, item)) = self.inner.data.pop() {
+            if let Some((permit, bytes, events, item)) = self.inner.data.pop() {
+                // Release the permit(s) this item held, then record the now-current fill so
+                // the utilization-level gauge reflects draining, not just filling. Also drop
+                // the item's bytes and event count from their respective gauges.
+                drop(permit);
+                self.inner.record_current_fill();
+                self.inner.release_bytes(bytes);
+                self.inner.release_events(events);
                 return Some(item);
             }
 
@@ -493,6 +623,105 @@ mod tests {
         assert_eq!(metrics.lock().unwrap().last().copied(), Some(1));
 
         let _ = rx.next().await;
+    }
+
+    #[tokio::test]
+    async fn records_fill_decrements_on_receive() {
+        // The utilization-level gauge must reflect draining: after we pop items the
+        // recorded fill should fall back toward zero, not stay at the send-time high.
+        let limit = MemoryBufferSize::MaxEvents(NonZeroUsize::new(4).unwrap());
+        let (mut tx, mut rx) = limited(
+            limit,
+            Some(ChannelMetricMetadata::new("test_channel", None)),
+            None,
+        );
+
+        let recorded = tx.inner.metrics.as_ref().unwrap().recorded_values.clone();
+
+        // Fill the buffer with three single-event items; fill rises to 3.
+        tx.send(Sample::new(1)).await.expect("send");
+        tx.send(Sample::new(2)).await.expect("send");
+        tx.send(Sample::new(3)).await.expect("send");
+        assert_eq!(recorded.lock().unwrap().last().copied(), Some(3));
+
+        // Drain one: fill must drop to 2 (would stay at 3 without the receive-path fix).
+        let _ = rx.next().await;
+        assert_eq!(recorded.lock().unwrap().last().copied(), Some(2));
+
+        // Drain the rest: fill reaches 0.
+        let _ = rx.next().await;
+        let _ = rx.next().await;
+        assert_eq!(recorded.lock().unwrap().last().copied(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn records_fill_decrements_on_receive_byte_mode() {
+        // Same draining behavior when the buffer is byte-bounded (MaxSize).
+        let msg = Sample::new_with_heap_allocated_values(10);
+        let msg_size = msg.allocated_bytes();
+        let limit = MemoryBufferSize::MaxSize(NonZeroUsize::new(msg_size * 4).unwrap());
+        let (mut tx, mut rx) = limited(
+            limit,
+            Some(ChannelMetricMetadata::new("test_channel", None)),
+            None,
+        );
+
+        let recorded = tx.inner.metrics.as_ref().unwrap().recorded_values.clone();
+
+        tx.send(Sample::new_with_heap_allocated_values(10))
+            .await
+            .expect("send");
+        tx.send(Sample::new_with_heap_allocated_values(10))
+            .await
+            .expect("send");
+        // After two sends, fill is roughly two messages' worth of bytes.
+        let after_sends = recorded.lock().unwrap().last().copied().unwrap();
+        assert!(
+            after_sends >= msg_size,
+            "fill should reflect bytes buffered"
+        );
+
+        // Drain everything; fill must return to 0.
+        let _ = rx.next().await;
+        let _ = rx.next().await;
+        assert_eq!(recorded.lock().unwrap().last().copied(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn tracks_event_count_in_byte_mode() {
+        // When byte-limited, `_utilization_level` reports bytes, so `_events` is the
+        // only view of how many events are buffered. It must still track sends and drains.
+        let msg = Sample::new_with_heap_allocated_values(10);
+        let limit =
+            MemoryBufferSize::MaxSize(NonZeroUsize::new(msg.allocated_bytes() * 8).unwrap());
+        let (mut tx, mut rx) = limited(
+            limit,
+            Some(ChannelMetricMetadata::new("test_channel", None)),
+            None,
+        );
+
+        let events = tx.inner.metrics.as_ref().unwrap().recorded_events.clone();
+
+        // Each Sample is one event; the event-count gauge rises 1 -> 3 even though the
+        // buffer is bounded by bytes, not events.
+        tx.send(Sample::new_with_heap_allocated_values(10))
+            .await
+            .expect("send");
+        assert_eq!(events.lock().unwrap().last().copied(), Some(1));
+        tx.send(Sample::new_with_heap_allocated_values(10))
+            .await
+            .expect("send");
+        tx.send(Sample::new_with_heap_allocated_values(10))
+            .await
+            .expect("send");
+        assert_eq!(events.lock().unwrap().last().copied(), Some(3));
+
+        // Drain decrements the event-count gauge back toward zero.
+        let _ = rx.next().await;
+        assert_eq!(events.lock().unwrap().last().copied(), Some(2));
+        let _ = rx.next().await;
+        let _ = rx.next().await;
+        assert_eq!(events.lock().unwrap().last().copied(), Some(0));
     }
 
     #[test]
