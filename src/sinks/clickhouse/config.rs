@@ -535,6 +535,10 @@ impl ClickhouseConfig {
 
         config.schema = Some(schema);
 
+        // Enable coercion: without it, a missing/null or string-typed value would fail the batch
+        // on a non-nullable column.
+        config.coerce_missing_to_default = true;
+
         debug!(
             "Successfully fetched Arrow schema with {} fields.",
             config

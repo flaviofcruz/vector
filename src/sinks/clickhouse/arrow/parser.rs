@@ -88,8 +88,18 @@ fn unsupported(ch_type: &str, kind: &str) -> String {
 /// Converts a ClickHouse type string to an Arrow DataType.
 /// Returns a tuple of (DataType, is_nullable).
 pub fn clickhouse_type_to_arrow(ch_type: &str) -> Result<(DataType, bool), String> {
+    let is_low_cardinality = matches!(parse_ch_type(ch_type), ClickHouseType::LowCardinality(_));
     let (base_type, is_nullable) = unwrap_type_modifiers(ch_type);
     let (type_name, _) = extract_identifier(base_type);
+
+    // LowCardinality(String) -> Arrow dictionary so ClickHouse ingests it directly without
+    // rebuilding; other LowCardinality inner types fall through to the inner mapping.
+    if is_low_cardinality && matches!(type_name, "String" | "FixedString") {
+        return Ok((
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            is_nullable,
+        ));
+    }
 
     let data_type = match type_name {
         // Numeric
@@ -110,6 +120,10 @@ pub fn clickhouse_type_to_arrow(ch_type: &str) -> Result<(DataType, bool), Strin
 
         // Strings
         "String" | "FixedString" => DataType::Utf8,
+
+        // JSON is sent as a string; ClickHouse parses it into the JSON column on
+        // insert (Arrow Utf8 -> JSON is converted server-side).
+        "JSON" => DataType::Utf8,
 
         // Date and time types (timezones not currently handled, defaults to UTC)
         "Date" | "Date32" => DataType::Date32,
@@ -393,21 +407,23 @@ mod tests {
 
     #[test]
     fn test_lowcardinality_type_mapping() {
+        // LowCardinality(String) maps to an Arrow dictionary, not the plain inner Utf8.
+        let dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
         assert_eq!(
             convert_type_no_metadata("LowCardinality(String)")
                 .expect("Failed to convert ClickHouse type to Arrow"),
-            (DataType::Utf8, false)
+            (dict.clone(), false)
         );
         assert_eq!(
             convert_type_no_metadata("LowCardinality(FixedString(10))")
                 .expect("Failed to convert ClickHouse type to Arrow"),
-            (DataType::Utf8, false)
+            (dict.clone(), false)
         );
         // Nullable + LowCardinality
         assert_eq!(
             convert_type_no_metadata("LowCardinality(Nullable(String))")
                 .expect("Failed to convert ClickHouse type to Arrow"),
-            (DataType::Utf8, true)
+            (dict, true)
         );
     }
 
