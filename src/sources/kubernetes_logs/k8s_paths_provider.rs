@@ -201,12 +201,12 @@ fn extract_pod_logs_directory(pod: &Pod) -> Option<PathBuf> {
 
     // Pods running inside microVMs (brickvisor runtime) have their kubelet pod
     // log tree rooted at /var/log/microvms instead of /var/log/pods. The dblet
-    // runtime mode is surfaced via a pod annotation; default to /var/log/pods
+    // runtime mode is surfaced via a pod label; default to /var/log/pods
     // when it is unset or set to anything other than "brickvisor".
     let use_microvms_path = metadata
-        .annotations
+        .labels
         .as_ref()
-        .and_then(|annotations| annotations.get(RUNTIME_MODE_ANNOTATION_KEY))
+        .and_then(|labels| labels.get(RUNTIME_MODE_LABEL_KEY))
         .is_some_and(|mode| mode == RUNTIME_MODE_BRICKVISOR);
 
     Some(build_pod_logs_directory(
@@ -236,9 +236,9 @@ const DATABRICKS_HOSTPATH_LOG_DIRECTORY_PREFIX: &str = "/databricks/host-root";
 /// The annotation key for the pod name (used when metadata.name includes node suffix).
 const POD_NAME_ANNOTATION_KEY: &str = "dblet.dev/pod-name";
 
-/// The annotation key describing the dblet runtime mode of the pod.
-const RUNTIME_MODE_ANNOTATION_KEY: &str = "dblet.dev/runtime-mode";
-/// The runtime-mode annotation value indicating the pod runs inside a microVM,
+/// The label key describing the dblet runtime mode of the pod.
+const RUNTIME_MODE_LABEL_KEY: &str = "dblet.dev/runtime-mode";
+/// The runtime-mode label value indicating the pod runs inside a microVM,
 /// whose kubelet pod log tree is rooted at `/var/log/microvms`.
 const RUNTIME_MODE_BRICKVISOR: &str = "brickvisor";
 
@@ -640,7 +640,7 @@ mod tests {
                         namespace: Some("sandbox0-ns".to_owned()),
                         name: Some("sandbox0-name".to_owned()),
                         uid: Some("sandbox0-uid".to_owned()),
-                        annotations: Some(
+                        labels: Some(
                             vec![("dblet.dev/runtime-mode".to_owned(), "brickvisor".to_owned())]
                                 .into_iter()
                                 .collect(),
@@ -658,7 +658,7 @@ mod tests {
                         namespace: Some("sandbox0-ns".to_owned()),
                         name: Some("sandbox0-name".to_owned()),
                         uid: Some("sandbox0-uid".to_owned()),
-                        annotations: Some(
+                        labels: Some(
                             vec![("dblet.dev/runtime-mode".to_owned(), "default".to_owned())]
                                 .into_iter()
                                 .collect(),
