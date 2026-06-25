@@ -77,6 +77,8 @@ pub mod aws;
 pub mod common;
 pub mod completion;
 mod convert_config;
+#[cfg(feature = "sinks-databricks-zerobus")]
+pub mod databricks_auth;
 pub mod encoding_transcode;
 pub mod enrichment_tables;
 pub mod extra_context;
