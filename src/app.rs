@@ -579,6 +579,29 @@ pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtim
         .filter(|&v| v > 0)
         .unwrap_or(20_000);
     rt_builder.max_blocking_threads(max_blocking_threads);
+
+    // Apply a reduced thread stack size when VECTOR_THREAD_STACK_SIZE is set.
+    // This matters because tokio's default Rust stack is 2 MB per thread, and
+    // vector pins one blocking thread per file/kubernetes_logs source for its
+    // lifetime (via spawn_blocking). With ~250 such sources in production that
+    // amounts to ~500 MB of committed stack space at startup. Setting a smaller
+    // value (e.g. 512 KB) recovers ~375 MB with no behavioral change for
+    // sources that do not recurse deeply. The setting applies to both worker
+    // threads and blocking-pool threads, so choose a value safe for both
+    // (≥256 KB is the practical minimum; anything smaller risks stack overflow
+    // in deeply recursive VRL scripts or large-config reload paths).
+    //
+    // When unset, the Rust/tokio default (2 MB) is preserved exactly — this env
+    // var is intentionally absent from the deploy config by default (G4: zero-diff
+    // default behavior).
+    if let Some(stack_size) = std::env::var("VECTOR_THREAD_STACK_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+    {
+        rt_builder.thread_stack_size(stack_size);
+    }
+
     rt_builder.enable_all();
 
     let threads = threads.unwrap_or_else(crate::num_threads);
