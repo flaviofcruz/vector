@@ -87,6 +87,7 @@ pub enum ComponentType {
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct ComponentConfig {
     pub config_paths: Vec<PathBuf>,
+    canonicalized_paths: Vec<PathBuf>,
     pub component_key: ComponentKey,
     pub component_type: ComponentType,
 }
@@ -98,12 +99,13 @@ impl ComponentConfig {
         component_type: ComponentType,
     ) -> Self {
         let canonicalized_paths = config_paths
-            .into_iter()
+            .iter()
             .filter_map(|p| fs::canonicalize(p).ok())
             .collect();
 
         Self {
-            config_paths: canonicalized_paths,
+            config_paths,
+            canonicalized_paths,
             component_key,
             component_type,
         }
@@ -113,7 +115,13 @@ impl ComponentConfig {
         &self,
         config_paths: &HashSet<PathBuf>,
     ) -> Option<(ComponentKey, ComponentType)> {
-        if config_paths.iter().any(|p| self.config_paths.contains(p)) {
+        if config_paths.iter().any(|p| {
+            self.config_paths.contains(p)
+                || self.canonicalized_paths.contains(p)
+                || fs::canonicalize(p)
+                    .ok()
+                    .map_or(false, |p| self.canonicalized_paths.contains(&p))
+        }) {
             return Some((self.component_key.clone(), self.component_type.clone()));
         }
         None
