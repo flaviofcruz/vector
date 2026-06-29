@@ -154,9 +154,24 @@ impl InternalMetrics<'_> {
     async fn run(mut self) -> Result<(), ()> {
         let events_received = register!(EventsReceived);
         let bytes_received = register!(BytesReceived::from(Protocol::INTERNAL));
-        let mut interval =
-            IntervalStream::new(time::interval(self.interval)).take_until(self.shutdown);
-        while interval.next().await.is_some() {
+        let mut interval = IntervalStream::new(time::interval(self.interval));
+        let mut shutdown = self.shutdown;
+
+        // Capture and emit metrics on every interval tick, plus one FINAL
+        // capture when `shutdown` fires. `internal_metrics` is a deferred
+        // (wave-2) source, so its shutdown arrives only after wave 1 has
+        // drained the data sinks — the final DELIVERED counts are already
+        // recorded in the controller by then. Emitting that last snapshot is
+        // what makes the post-drain values reach the exporter cache (M3
+        // scrape) and the remote-write sink (Hydra push). A plain
+        // `take_until(shutdown)` drops this snapshot, which is the same
+        // failure mode the drain-on-shutdown loop in `internal_logs` fixes.
+        loop {
+            let is_final = tokio::select! {
+                _ = interval.next() => false,
+                _ = &mut shutdown => true,
+            };
+
             let hostname = crate::get_hostname();
             let pid = std::process::id().to_string();
 
@@ -190,6 +205,10 @@ impl InternalMetrics<'_> {
                 emit!(StreamClosedError { count });
                 return Err(());
             }
+
+            if is_final {
+                break;
+            }
         }
 
         Ok(())
@@ -205,6 +224,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::ComponentKey,
         event::{
             Event,
             metric::{Metric, MetricValue},
@@ -287,6 +307,70 @@ mod tests {
 
         let labels = metric_tags!("host" => "foo");
         assert_eq!(Some(&labels), output["quux"].tags());
+    }
+
+    /// Regression test for the wave 1 → wave 2 final-metrics drop — the metrics
+    /// analogue of `internal_logs`' `drains_buffered_events_on_shutdown`.
+    /// `internal_metrics` is a deferred (wave-2) source; the old
+    /// `take_until(shutdown)` loop exited without a last capture, so any metric
+    /// change recorded after the most recent interval tick was dropped when the
+    /// source was cancelled at the wave boundary. With a long scrape interval
+    /// the only periodic emit is the immediate first tick, so a counter
+    /// incremented afterwards can reach the output only via the
+    /// shutdown-triggered final capture.
+    #[tokio::test]
+    async fn emits_final_capture_on_shutdown() {
+        test_util::trace_init();
+
+        let (tx, rx) = SourceSender::new_test();
+        let key = ComponentKey::from("internal_metrics_final_capture_test");
+        let (cx, coordinator) = SourceContext::new_shutdown(&key, tx);
+
+        let config = InternalMetricsConfig {
+            // Long enough that no periodic tick fires during the test window;
+            // only the immediate first tick and the shutdown-triggered final
+            // capture emit.
+            scrape_interval_secs: time::Duration::from_secs(3600),
+            ..Default::default()
+        };
+        let source = config.build(cx).await.expect("failed to build source");
+
+        // Drain the output concurrently so the source never blocks on a full
+        // test channel; the stream ends when the source drops its sender on exit.
+        let collector = tokio::spawn(rx.collect::<Vec<Event>>());
+        tokio::spawn(source);
+
+        // Let the immediate first interval tick capture+emit before mutating the
+        // metric, so the new value can surface only via the final capture.
+        time::sleep(time::Duration::from_millis(100)).await;
+        counter!("internal_metrics_final_capture_total").increment(42);
+
+        // Drive shutdown the same way `topology::running::shutdown` cancels
+        // deferred sources at the wave boundary.
+        coordinator.shutdown_all(None).await;
+
+        let events = time::timeout(time::Duration::from_secs(5), collector)
+            .await
+            .expect("source did not finish draining within timeout")
+            .expect("collector task panicked");
+
+        let captured = events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Metric(metric)
+                    if metric.name() == "internal_metrics_final_capture_total" =>
+                {
+                    Some(metric.value().clone())
+                }
+                _ => None,
+            })
+            .last();
+
+        assert_eq!(
+            captured,
+            Some(MetricValue::Counter { value: 42.0 }),
+            "shutdown-triggered final capture should emit the post-drain counter value",
+        );
     }
 
     async fn event_from_config(config: InternalMetricsConfig) -> Event {
