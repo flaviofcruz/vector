@@ -160,15 +160,37 @@ where
 
         checkpointer.read_checkpoints(self.ignore_before).await;
 
+        // Obtain the view early so the startup fingerprint loop can use the
+        // archive_paths cache loaded from disk by read_checkpoints above.
+        let checkpoints = checkpointer.view();
+
         let mut known_small_files: HashMap<PathBuf, time::Instant> = HashMap::new();
 
         let mut existing_files = Vec::new();
         for (log_file_info_opt, path) in self.paths_provider.paths().into_iter() {
-            if let Some(file_id) = self
-                .fingerprinter
-                .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
-                .await
-            {
+            // For archive files whose path→fingerprint mapping was restored from
+            // the checkpoint, skip the expensive gzip decompression + CRC64 and
+            // use the cached fingerprint directly.
+            let file_id = if !self.ignore_checkpoints && self.is_archive(&path) {
+                match checkpoints.get_archive_fingerprint(&path) {
+                    Some(id) => Some(id),
+                    None => {
+                        let id = self
+                            .fingerprinter
+                            .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
+                            .await;
+                        if let Some(id) = id {
+                            checkpoints.set_archive_path(id, &path);
+                        }
+                        id
+                    }
+                }
+            } else {
+                self.fingerprinter
+                    .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
+                    .await
+            };
+            if let Some(file_id) = file_id {
                 self.update_file_to_pod_map(path.clone(), log_file_info_opt);
                 existing_files.push((path, file_id));
             }
@@ -194,8 +216,6 @@ where
             .collect();
 
         existing_files.sort_by_key(|(key, _, _)| *key);
-
-        let checkpoints = checkpointer.view();
 
         for (_key, path, file_id) in existing_files {
             self.watch_new_file(path, file_id, &mut fp_map, &checkpoints, true)
@@ -338,17 +358,12 @@ where
                                 }
                             }
                         } else {
-                            // untracked file fingerprint. For archives, skip
-                            // entirely if the checkpoint says this fingerprint
-                            // has already been fully read — the file is
-                            // immutable and there is nothing new to consume.
-                            if !self.ignore_checkpoints
+                            let is_done_archive = !self.ignore_checkpoints
                                 && self.is_archive(&path)
-                                && checkpoints.get_done(file_id)
-                            {
-                                continue;
+                                && checkpoints.get_done(file_id);
+                            if !is_done_archive {
+                                self.update_file_to_pod_map(path.clone(), log_file_info_opt);
                             }
-                            self.update_file_to_pod_map(path.clone(), log_file_info_opt);
                             self.watch_new_file(path, file_id, &mut fp_map, &checkpoints, false)
                                 .await;
                             self.emitter.emit_files_open(fp_map.len());
@@ -409,6 +424,8 @@ where
             // Collect lines by polling files.
             let mut global_bytes_read: usize = 0;
             let mut maxed_out_reading_single_file = false;
+            // Archives that reached EOF this cycle — removed from fp_map after the loop.
+            let mut done_archives: Vec<(FileFingerprint, PathBuf)> = Vec::new();
             for (&file_id, watcher) in &mut fp_map {
                 if !watcher.should_read() {
                     continue;
@@ -480,6 +497,7 @@ where
                     //TODO: a vector event for done. important for debugging
                     debug!(message = "File reached eof. Marking it done.", path = ?watcher.path);
                     checkpoints.set_done(file_id, &watcher.path);
+                    done_archives.push((file_id, watcher.path.clone()));
                 }
 
                 if bytes_read > 0 {
@@ -519,6 +537,14 @@ where
                 if self.oldest_first && maxed_out_reading_single_file {
                     break;
                 }
+            }
+
+            // Drop done-archive watchers: emit unwatched metric and remove directly
+            // from fp_map without calling checkpoints.set_dead so that the done/
+            // archive_paths entries survive until remove_after actually deletes the file.
+            for (fng, path) in done_archives {
+                self.emitter.emit_file_unwatched(&path, true);
+                fp_map.swap_remove(&fng);
             }
 
             for (_, watcher) in &mut fp_map {
@@ -807,9 +833,47 @@ where
             fallback
         };
 
-        // Skip opening gzip files that have already been fully read.
+        // For done archives found without an existing watcher (restart scenario), apply
+        // remove_after directly against the file's mtime — no watcher needed in fp_map.
+        // The live-run case (archive that just reached EOF this process lifetime) is handled
+        // separately: the reading loop removes the watcher via done_archives so the OS fd
+        // is dropped immediately, and the next glob cycle calls back here for TTL cleanup.
         if !self.ignore_checkpoints && checkpoints.get_done(file_id) && self.is_archive(&path) {
-            debug!(message = "Skipping already-done archive file.", ?path,);
+            if let Some(remove_after) = self.remove_after {
+                match tokio::fs::metadata(&path).await {
+                    Ok(metadata) => {
+                        let elapsed = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|mtime| mtime.elapsed().ok())
+                            .unwrap_or_default();
+                        if elapsed >= remove_after && self.should_ttl_delete(&path) {
+                            debug!(
+                                message = "Removing done archive past remove_after TTL.",
+                                ?path
+                            );
+                            match tokio::fs::remove_file(&path).await {
+                                Ok(()) => {
+                                    self.emitter.emit_file_deleted(&path);
+                                    checkpoints.set_dead(file_id);
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    checkpoints.set_dead(file_id);
+                                }
+                                Err(e) => {
+                                    warn!(message = "Failed to remove done archive.", ?path, error = %e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Already gone — nothing to do.
+                    }
+                    Err(e) => {
+                        warn!(message = "Could not stat done archive for remove_after.", ?path, error = %e);
+                    }
+                }
+            }
             return;
         }
 
@@ -1675,5 +1739,201 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     fn snapshot_deleted_fds(_unlinked_path: &Path) -> DeletedFdSnapshot {
         DeletedFdSnapshot::default()
+    }
+
+    /// Count open file descriptors in `/proc/self/fd` whose readlink target
+    /// equals `path` exactly (no `" (deleted)"` suffix — the file is still
+    /// on disk). Returns 0 on non-Linux platforms, making the assertion
+    /// vacuously true there.
+    #[cfg(target_os = "linux")]
+    fn count_open_fds_for_path(path: &Path) -> usize {
+        let target = path.to_string_lossy().to_string();
+        if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    std::fs::read_link(entry.path())
+                        .ok()
+                        .map(|t| t.to_string_lossy() == target)
+                        .unwrap_or(false)
+                })
+                .count()
+        } else {
+            0
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn count_open_fds_for_path(_path: &Path) -> usize {
+        0
+    }
+
+    /// Verifies that after a .gz archive is read to EOF and marked done,
+    /// the FileServer holds zero OS file descriptors open for that file
+    /// while the server is still running.
+    #[tokio::test]
+    async fn gz_no_fd_leak_after_file_marked_done() {
+        use async_compression::tokio::bufread::GzipEncoder;
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::oneshot;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let gz_path = tmp.path().join("app.log.gz");
+        let payload: &[u8] = b"first line\nsecond line\n";
+        let mut encoder = GzipEncoder::new(payload);
+        let mut gz_bytes = Vec::new();
+        encoder.read_to_end(&mut gz_bytes).await.unwrap();
+        fs::write(&gz_path, &gz_bytes).await.unwrap();
+
+        let file_server = make_file_server(vec![gz_path.clone()], data_dir.clone(), false);
+        let (tx, rx) = mpsc::channel::<Vec<Line>>(8);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_data: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+            });
+        let checkpointer = Checkpointer::new(data_dir.as_path());
+
+        let collector = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            let mut rx = rx;
+            while let Some(batch) = rx.next().await {
+                lines.extend(batch);
+            }
+            lines
+        });
+
+        let gz_probe = gz_path.clone();
+        let probe = tokio::spawn(async move {
+            // Give the server time to fully read the gz file and call set_done.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            // Probe while the server is still running so we see steady-state fd usage.
+            let open_count = count_open_fds_for_path(&gz_probe);
+            let _ = shutdown_tx.send(());
+            open_count
+        });
+
+        file_server
+            .run(tx, shutdown_data, futures::future::ready(()), checkpointer)
+            .await
+            .unwrap();
+
+        let open_count = probe.await.unwrap();
+        let received = collector.await.unwrap();
+
+        let texts: Vec<String> = received
+            .iter()
+            .map(|l| String::from_utf8_lossy(&l.text).into_owned())
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "first line"),
+            "expected gz content to be delivered; got: {texts:?}"
+        );
+
+        assert_eq!(
+            open_count, 0,
+            "expected 0 open fds on done gz file while server was still \
+             running, found {open_count}"
+        );
+    }
+
+    /// Verifies that a .gz archive previously marked done (checkpoint written by
+    /// an earlier run) is deleted within its `remove_after` TTL when the server
+    /// restarts, even though no new lines are delivered.
+    #[tokio::test]
+    async fn gz_honor_remove_after_on_restart_when_done() {
+        use async_compression::tokio::bufread::GzipEncoder;
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::oneshot;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let gz_path = tmp.path().join("app.log.gz");
+        let payload: &[u8] = b"only line\n";
+        let mut encoder = GzipEncoder::new(payload);
+        let mut gz_bytes = Vec::new();
+        encoder.read_to_end(&mut gz_bytes).await.unwrap();
+        fs::write(&gz_path, &gz_bytes).await.unwrap();
+
+        // Precondition: write a checkpoint that marks this file as done, exactly
+        // as a previous Vector run would have left on disk.  Building it directly
+        // avoids any timing dependency on a real FileServer run.
+        //
+        // get_state() only serialises fingerprints that are in the positions map,
+        // so we must call both update_checkpoint (position) and set_done (done
+        // flag + archive_paths) before writing.
+        {
+            let mut fingerprinter = Fingerprinter::new(
+                FingerprintStrategy::FirstLinesChecksum {
+                    ignored_header_bytes: 0,
+                    lines: 1,
+                },
+                1024,
+                true,
+            );
+            let mut known = HashMap::new();
+            let fng = fingerprinter
+                .fingerprint_or_emit(&gz_path, &mut known, &NoErrors)
+                .await
+                .expect("should fingerprint gz");
+
+            let cp = Checkpointer::new(data_dir.as_path());
+            let view = cp.view();
+            view.update(fng, 10); // decompressed byte position after full read
+            view.set_done(fng, &gz_path);
+            cp.write_checkpoints()
+                .await
+                .expect("should write checkpoints");
+
+            assert!(
+                view.get_done(fng),
+                "sanity: checkpoint should record is_done=true"
+            );
+        }
+
+        // Run: restart with remove_after=1ms.  The checkpoint marks the file as
+        // done, so watch_new_file returns early — no watcher, no remove_after.
+        {
+            let mut file_server = make_file_server(vec![gz_path.clone()], data_dir.clone(), false);
+            // 1 ms grace period — the reading loop triggers removal immediately
+            // on the first visit if a watcher exists.
+            file_server.remove_after = Some(Duration::from_millis(1));
+
+            let (tx, rx) = mpsc::channel::<Vec<Line>>(8);
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            let shutdown_data: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                Box::pin(async move {
+                    let _ = shutdown_rx.await;
+                });
+
+            // Allow several glob cycles for remove_after to fire if it were going to.
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let _ = shutdown_tx.send(());
+            });
+
+            let checkpointer = Checkpointer::new(data_dir.as_path());
+            let _drain = tokio::spawn(async move {
+                let mut rx = rx;
+                while let Some(_) = rx.next().await {}
+            });
+
+            file_server
+                .run(tx, shutdown_data, futures::future::ready(()), checkpointer)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            !gz_path.exists(),
+            "expected done gz archive to be deleted by remove_after on restart, \
+             but it still exists"
+        );
     }
 }
