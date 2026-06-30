@@ -279,6 +279,21 @@ impl RunningTopology {
             .graceful_internal_source_shutdown_duration
             .map(|grace_period| Instant::now() + grace_period);
 
+        // Stamp T+0 for this shutdown and log the resolved staged grace periods. They are
+        // config-driven (derived from terminationGracePeriodSeconds, not fixed), so logging them
+        // lets a captured shutdown be aligned to T+0 and read against the actual deadlines. The
+        // per-stage `[shutdown-trace]` elapsed logs below make graceful-shutdown wall-time
+        // attributable to a specific wave/component instead of an opaque "rode to the deadline".
+        let shutdown_trace_start = Instant::now();
+        info!(
+            overall_secs = ?self.graceful_shutdown_duration.map(|d| d.as_secs_f64()),
+            data_source_secs = ?self.graceful_data_source_shutdown_duration.map(|d| d.as_secs_f64()),
+            data_sink_secs = ?self.graceful_data_sink_shutdown_duration.map(|d| d.as_secs_f64()),
+            internal_source_secs = ?self.graceful_internal_source_shutdown_duration.map(|d| d.as_secs_f64()),
+            message = "[shutdown-trace] staged shutdown deadlines (resolved from config).",
+            internal_log_rate_limit = false,
+        );
+
         // Cancel utilization and metrics tasks.
         if let Some(trigger) = self.utilization_task_shutdown_trigger {
             trigger.cancel();
@@ -495,6 +510,10 @@ impl RunningTopology {
                     remaining_transforms = ?remaining_transforms,
                     remaining_sinks = ?remaining_sinks,
                     time_remaining = ?time_remaining,
+                    // Un-rate-limit so every periodic tick is emitted during the (bounded, ≤overall-
+                    // deadline) shutdown. Rate-limiting was suppressing the early ticks "to avoid
+                    // flooding", which hid which component holds a slow wave-1 shutdown.
+                    internal_log_rate_limit = false,
                     "Shutting down... Waiting on running components."
                 );
 
@@ -595,6 +614,12 @@ impl RunningTopology {
                 // that fires at `data_source_deadline`. It is internally bounded by that
                 // deadline, so this await cannot outlast it.
                 wave1_complete.await;
+                info!(
+                    elapsed_ms = shutdown_trace_start.elapsed().as_millis() as u64,
+                    message = "[shutdown-trace] wave-1 source handshake complete \
+                               (all non-deferred sources tripped, or data_source_deadline hit).",
+                    internal_log_rate_limit = false,
+                );
 
                 // Wave 1, phase A — data SOURCES. A source can handshake shutdown (which
                 // `.disable()`s its force-trigger) yet keep its task body alive — e.g.
@@ -627,6 +652,14 @@ impl RunningTopology {
                     // Defensive: use_two_wave implies data_source_deadline.is_some().
                     futures::future::join_all(wave1_source_wait_handles).await;
                 }
+
+                info!(
+                    elapsed_ms = shutdown_trace_start.elapsed().as_millis() as u64,
+                    wave1_sources_clean = wave1_sources_clean,
+                    message = "[shutdown-trace] wave-1 source TASKS exited; entering phase B \
+                               (sink drain).",
+                    internal_log_rate_limit = false,
+                );
 
                 // Data sources are now closed, so ask the wave-1 (disk-buffered) sinks to flush
                 // their open batches instead of sitting on them until the batch timeout. This
@@ -676,6 +709,14 @@ impl RunningTopology {
                     // Defensive: use_two_wave implies data_sink_deadline.is_some().
                     futures::future::join_all(wave1_sink_wait_handles).await;
                 }
+
+                info!(
+                    elapsed_ms = shutdown_trace_start.elapsed().as_millis() as u64,
+                    wave1_sinks_clean = wave1_sinks_clean,
+                    message = "[shutdown-trace] wave-1 sink-drain phase resolved (all drained, \
+                               or data_sink_deadline hit).",
+                    internal_log_rate_limit = false,
+                );
 
                 // `gracefully_closed` is true only when wave 1 drained fully within its
                 // deadlines — neither the sources nor the sinks had to be timed out.
