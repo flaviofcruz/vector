@@ -550,7 +550,7 @@ target-x86_64-unknown-linux-gnu = ["api", "api-client", "rdkafka?/cmake_build", 
 target-x86_64-unknown-linux-musl = ["api", "api-client", "rdkafka?/cmake_build", "enrichment-tables", "sinks", "sources", "sources-dnstap", "transforms", "unix", "secrets"]
 
 # Enables features that work only on systems providing `cfg(unix)`
-unix = ["tikv-jemallocator", "tikv-jemalloc-ctl", "allocation-tracing"]
+unix = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 allocation-tracing = ["vector-lib/allocation-tracing"]
 
 # Enables kubernetes dependencies and shared code. Kubernetes-related sources,
