@@ -144,20 +144,21 @@ pub struct Config {
     #[serde(default = "default_extract_databricks_logs")]
     extract_databricks_logs: bool,
 
-    /// Specifies whether or not to rely on the HostPath logging-annotation-override directory to
-    /// extract Databricks logs.
-    ///
-    /// If set to `true`, we will assume the Databricks logs are located in the
-    /// HostPath logging-annotation-override directory.
-    /// If set to `false`, we will assume the Databricks logs are located in the
-    /// kubelet log directory.
-    /// Deprecated: use `hostpath_logging_annotation_key` instead.
+    /// Deprecated and ignored. The kubernetes_logs source now always discovers the hostPath
+    /// logging directory via `hostpath_logging_annotation_key` (defaulting to
+    /// `logging.databricks.com/dblet-logs-path`). Pods without the annotation are silently
+    /// skipped for hostPath discovery; the emptyDir kubelet log directory is still scraped.
+    /// The field is retained for configuration backwards compatibility and will be removed
+    /// in a future release.
     #[serde(default = "default_use_hostpath_logging_annotation_override")]
     use_hostpath_logging_annotation_override: bool,
 
-    /// When set, specifies the pod annotation key to read for hostPath-based log directory
-    /// discovery. The annotation value is resolved to `/databricks/host-root/{value}/` and
-    /// glob patterns are applied there. Overrides `use_hostpath_logging_annotation_override`.
+    /// Pod annotation key to read for hostPath-based log directory discovery. The annotation
+    /// value is resolved to `/databricks/host-root/{value}/` and glob patterns are applied
+    /// there. Pods without this annotation are silently skipped for hostPath discovery; the
+    /// emptyDir kubelet log directory is always scraped regardless.
+    ///
+    /// Defaults to `logging.databricks.com/dblet-logs-path` when unset.
     /// Examples:
     ///   "logging.databricks.com/dblet-logs-path" — internal/service logs
     ///   "logging.databricks.com/dblet-customer-logs-path" — customer-sensitive logs
@@ -1031,17 +1032,14 @@ impl Source {
             node_field_spec: config.node_annotation_fields.clone(),
             insert_namespace_fields,
             extract_databricks_logs: config.extract_databricks_logs,
-            // New field takes precedence; fall back to legacy boolean for backwards compat.
+            // Always default to the dblet-logs-path annotation when no key is explicitly
+            // configured. Pods without the annotation are silently skipped for hostPath
+            // discovery in `get_databricks_pod_logs_directories`, so the emptyDir scrape
+            // path is unchanged.
             hostpath_logging_annotation_key: config
                 .hostpath_logging_annotation_key
                 .clone()
-                .or_else(|| {
-                    if config.use_hostpath_logging_annotation_override {
-                        Some("logging.databricks.com/dblet-logs-path".to_string())
-                    } else {
-                        None
-                    }
-                }),
+                .or_else(|| Some("logging.databricks.com/dblet-logs-path".to_string())),
             ttl_removal_config: config.ttl_removal_config.clone(),
             self_node_name,
             pod_logs_glob_patterns,
