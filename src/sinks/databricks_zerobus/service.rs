@@ -6,7 +6,7 @@ use crate::http::HttpClient;
 use crate::sinks::util::retries::RetryLogic;
 use crate::tls::TlsSettings;
 use databricks_zerobus_ingest_sdk::{
-    ConnectorFactory, ProxyConnector, ZerobusArrowStream, ZerobusSdk,
+    ConnectorFactory, HeadersProvider, ProxyConnector, ZerobusArrowStream, ZerobusSdk,
 };
 use futures::future::BoxFuture;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use vector_lib::codecs::encoding::{BatchEncoder, BatchOutput, BatchSerializerCon
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
+use crate::databricks_auth::{LoginServiceHeadersProvider, TokenManager};
 
 use super::{config::ZerobusSinkConfig, error::ZerobusSinkError, unity_catalog_schema};
 
@@ -292,6 +293,8 @@ pub struct ZerobusService {
     http_client: HttpClient,
     stream: Arc<Mutex<Option<Arc<ActiveStream>>>>,
     schema: Arc<OnceCell<ResolvedSchema>>,
+    /// Optional token manager for Login service auth.
+    token_manager: Option<Arc<TokenManager>>,
 }
 
 impl ZerobusService {
@@ -314,12 +317,34 @@ impl ZerobusService {
             }
         })?;
 
+        // Initialize token manager for Login service auth. The first call to
+        // `LoginServiceHeadersProvider::get_headers` (during the healthcheck stream-create
+        // below) triggers the initial bootstrap. `TokenManager::get_token` re-bootstraps on
+        // demand when the cached token is within 60s of expiry, so no background refresh
+        // loop is needed.
+        //
+        // `TokenManager::new` is async because it loads the OAuth proto FileDescriptorSet
+        // from disk at startup (mounted into the container) — vector no longer carries a
+        // snapshot of the OAuth proto via build-time codegen. See databricks_auth::TokenManager.
+        let token_manager = match &config.auth {
+            super::config::DatabricksAuthentication::LoginService(auth_config) => {
+                let tm = TokenManager::new(auth_config.clone()).await.map_err(|e| {
+                    ZerobusSinkError::ConfigError {
+                        message: format!("Failed to initialize TokenManager: {}", e),
+                    }
+                })?;
+                Some(Arc::new(tm))
+            }
+            _ => None,
+        };
+
         Ok(Self {
             sdk: Arc::new(sdk),
             config: Arc::new(config),
             http_client,
             stream: Arc::new(Mutex::new(None)),
             schema: Arc::new(OnceCell::new()),
+            token_manager,
         })
     }
 
@@ -339,6 +364,14 @@ impl ZerobusService {
                         client_id,
                         client_secret,
                     } => (client_id.inner(), client_secret.inner()),
+                    super::config::DatabricksAuthentication::LoginService(_) => {
+                        return Err(ZerobusSinkError::ConfigError {
+                            message:
+                                "LoginService auth does not support Unity Catalog schema fetch. \
+                                 Use schema type 'path' with a protobuf descriptor file instead."
+                                    .to_string(),
+                        });
+                    }
                 };
 
                 let table_schema = unity_catalog_schema::fetch_table_schema(
@@ -417,16 +450,6 @@ impl ZerobusService {
         let mut stream_guard = self.stream.lock().await;
 
         if stream_guard.is_none() {
-            let (client_id, client_secret) = match &self.config.auth {
-                super::config::DatabricksAuthentication::OAuth {
-                    client_id,
-                    client_secret,
-                } => (
-                    client_id.inner().to_string(),
-                    client_secret.inner().to_string(),
-                ),
-            };
-
             // We override only the two timeouts that `stream_options` exposes and
             // otherwise accept the SDK's Arrow-stream defaults — notably
             // `recovery = true`, so the SDK transparently reconnects and replays
@@ -435,19 +458,61 @@ impl ZerobusService {
             // retryable error (triggering a fresh stream via Tower retry) once its
             // own recovery budget is exhausted. Both layers are at-least-once, so
             // a reconnect may re-send unacknowledged batches.
+            //
+            // Two auth flows reach Zerobus stream-create:
+            //   - `OAuth` (personal OAuth) — long-lived `client_id` / `client_secret`
+            //     are exchanged for an access token by the Zerobus SDK on every call.
+            //     Standard upstream path used by external customers.
+            //   - `LoginService` (internal OAuth) — mTLS bootstraps a JWT against the
+            //     Databricks Login service on the s2s-proxy network path; the JWT is
+            //     refreshed lazily by `TokenManager` and injected via
+            //     `LoginServiceHeadersProvider`. Used by the Databricks logging-agent
+            //     (bricklens-agent on Nimbus serverless) for the SSP-acted-as flow.
+            // TODO(LP-1615): For native OTEL ingestion endpoints, distinguish stream
+            // creation here (e.g. emit OTLP-shaped streams). Tracked separately.
             let stream_options = &self.config.stream_options;
-            let stream = self
-                .sdk
-                .stream_builder()
-                .table(self.config.table_name.clone())
-                .oauth(client_id, client_secret)
-                .arrow(Arc::clone(&schema.arrow_schema))
-                .server_lack_of_ack_timeout_ms(stream_options.server_lack_of_ack_timeout_ms)
-                .flush_timeout_ms(stream_options.flush_timeout_ms)
-                .ipc_compression(stream_options.compression.into())
-                .build_arrow()
-                .await
-                .map_err(|e| ZerobusSinkError::StreamInitError { source: e })?;
+            let stream = match &self.config.auth {
+                super::config::DatabricksAuthentication::LoginService(_) => {
+                    let tm = self
+                        .token_manager
+                        .as_ref()
+                        .expect("token_manager initialized for LoginService auth");
+                    let headers_provider: Arc<dyn HeadersProvider> =
+                        Arc::new(LoginServiceHeadersProvider::new(
+                            Arc::clone(tm),
+                            self.config.table_name.clone(),
+                        ));
+                    self.sdk
+                        .stream_builder()
+                        .table(self.config.table_name.clone())
+                        .headers_provider(headers_provider)
+                        .arrow(Arc::clone(&schema.arrow_schema))
+                        .server_lack_of_ack_timeout_ms(stream_options.server_lack_of_ack_timeout_ms)
+                        .flush_timeout_ms(stream_options.flush_timeout_ms)
+                        .ipc_compression(stream_options.compression.into())
+                        .build_arrow()
+                        .await
+                        .map_err(|e| ZerobusSinkError::StreamInitError { source: e })?
+                }
+                super::config::DatabricksAuthentication::OAuth {
+                    client_id,
+                    client_secret,
+                } => self
+                    .sdk
+                    .stream_builder()
+                    .table(self.config.table_name.clone())
+                    .oauth(
+                        client_id.inner().to_string(),
+                        client_secret.inner().to_string(),
+                    )
+                    .arrow(Arc::clone(&schema.arrow_schema))
+                    .server_lack_of_ack_timeout_ms(stream_options.server_lack_of_ack_timeout_ms)
+                    .flush_timeout_ms(stream_options.flush_timeout_ms)
+                    .ipc_compression(stream_options.compression.into())
+                    .build_arrow()
+                    .await
+                    .map_err(|e| ZerobusSinkError::StreamInitError { source: e })?,
+            };
 
             *stream_guard = Some(Arc::new(ActiveStream::arrow(stream)));
         }
@@ -565,6 +630,7 @@ impl Clone for ZerobusService {
             http_client: self.http_client.clone(),
             stream: Arc::clone(&self.stream),
             schema: Arc::clone(&self.schema),
+            token_manager: self.token_manager.clone(),
         }
     }
 }
@@ -606,6 +672,7 @@ impl ZerobusService {
             http_client,
             stream: Arc::new(Mutex::new(Some(Arc::new(ActiveStream::Mock(mock))))),
             schema: Arc::new(OnceCell::new()),
+            token_manager: None,
         })
     }
 

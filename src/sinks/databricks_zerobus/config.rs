@@ -31,6 +31,13 @@ pub enum DatabricksAuthentication {
         #[configurable(metadata(docs::examples = "secret123..."))]
         client_secret: SensitiveString,
     },
+
+    /// Authenticate via Login service using mTLS bootstrap.
+    ///
+    /// Used by logging-agent to obtain internal OAuth tokens by authenticating
+    /// as a System Service Principal via s2s-proxy.
+    #[serde(rename = "login_service")]
+    LoginService(crate::databricks_auth::LoginServiceAuthConfig),
 }
 
 /// Schema source configuration for defining table schema.
@@ -312,6 +319,19 @@ impl ZerobusSinkConfig {
                 if client_secret.inner().is_empty() {
                     return Err(ZerobusSinkError::ConfigError {
                         message: "OAuth client_secret cannot be empty".to_string(),
+                    });
+                }
+            }
+            DatabricksAuthentication::LoginService(config) => {
+                if config.user.service_principal_resource.is_empty() {
+                    return Err(ZerobusSinkError::ConfigError {
+                        message: "LoginService service_principal_resource cannot be empty"
+                            .to_string(),
+                    });
+                }
+                if config.login_service.login_endpoint.is_empty() {
+                    return Err(ZerobusSinkError::ConfigError {
+                        message: "LoginService login_endpoint cannot be empty".to_string(),
                     });
                 }
             }
