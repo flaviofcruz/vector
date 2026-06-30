@@ -150,6 +150,12 @@ pub struct RemapConfig {
     #[configurable(metadata(docs::human_name = "Reroute Dropped Events"))]
     pub reroute_dropped: bool,
 
+    /// When Vector is started with `--watch-config`, reload this transform whenever a configured
+    /// VRL source file (`file`/`files`) changes or the config is reloaded from disk.
+    #[serde(default = "crate::serde::default_false")]
+    #[configurable(metadata(docs::human_name = "Enable VRL File Hot Reload"))]
+    pub enable_hot_reload: bool,
+
     #[configurable(derived, metadata(docs::hidden))]
     #[serde(default)]
     pub runtime: VrlRuntime,
@@ -174,6 +180,7 @@ impl Clone for RemapConfig {
             drop_on_error: self.drop_on_error,
             drop_on_abort: self.drop_on_abort,
             reroute_dropped: self.reroute_dropped,
+            enable_hot_reload: self.enable_hot_reload,
             runtime: self.runtime,
             cache: Mutex::new(Default::default()),
         }
@@ -390,10 +397,14 @@ impl TransformConfig for RemapConfig {
     }
 
     fn files_to_watch(&self) -> Vec<&PathBuf> {
-        self.file
-            .iter()
-            .chain(self.files.iter().flatten())
-            .collect()
+        if self.enable_hot_reload {
+            self.file
+                .iter()
+                .chain(self.files.iter().flatten())
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 }
 
