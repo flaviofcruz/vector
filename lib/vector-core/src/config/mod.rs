@@ -433,6 +433,51 @@ impl From<bool> for AsyncKubernetesLogsFileServerConfig {
     }
 }
 
+/// Controls whether the `file` source runs its file server directly on the async runtime
+/// instead of inside a `spawn_blocking` + `Handle::block_on` wrapper.
+///
+/// When disabled (the default), the legacy `spawn_blocking` wrapper is used — preserving the
+/// historical behavior exactly and pinning one 2 MB blocking-pool thread per `file` source for
+/// its lifetime (~214 threads / ~428 MB on a busy pod). When enabled, the file server runs as a
+/// normal async task so no blocking-pool thread is held, freeing the ~2 MB stack reservation for
+/// each source. Gated so the change can be ramped gradually via config.
+#[configurable_component]
+#[configurable(title = "Controls whether the file source file server runs on the async runtime.")]
+#[configurable(
+    description = "When enabled, the `file` source runs its file server directly on the async runtime (no `spawn_blocking` wrapper), eliminating one pinned 2 MB blocking thread per source (~214 threads / ~428 MB on a busy pod). Disabled by default to preserve historical behavior."
+)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AsyncFileSourceFileServerConfig {
+    /// Whether or not the async (non-`spawn_blocking`) file server is enabled.
+    enabled: Option<bool>,
+}
+
+impl AsyncFileSourceFileServerConfig {
+    pub const DEFAULT: Self = Self { enabled: None };
+
+    #[must_use]
+    pub fn merge_default(&self, other: &Self) -> Self {
+        let enabled = self.enabled.or(other.enabled);
+        Self { enabled }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+}
+
+impl From<Option<bool>> for AsyncFileSourceFileServerConfig {
+    fn from(enabled: Option<bool>) -> Self {
+        Self { enabled }
+    }
+}
+
+impl From<bool> for AsyncFileSourceFileServerConfig {
+    fn from(enabled: bool) -> Self {
+        Some(enabled).into()
+    }
+}
+
 /// End-to-end acknowledgements configuration.
 #[configurable_component]
 #[configurable(title = "Controls how acknowledgements are handled for this sink.")]

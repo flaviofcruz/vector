@@ -485,6 +485,7 @@ impl SourceConfig for FileConfig {
             cx.out,
             acknowledgements,
             log_namespace,
+            cx.globals.async_file_source_file_server.enabled(),
         ))
     }
 
@@ -546,6 +547,11 @@ pub fn file_source(
     mut out: SourceSender,
     acknowledgements: bool,
     log_namespace: LogNamespace,
+    // When true, run the file server directly on the async runtime instead of inside
+    // tokio::task::spawn_blocking. This eliminates one pinned 2 MB blocking-pool thread per
+    // source (~214 sources × 2 MB ≈ 428 MB on a busy pod). Sourced from the
+    // `async_file_source_file_server` global flag; default OFF to preserve historical behavior.
+    run_async: bool,
 ) -> super::Source {
     // the include option must be specified but also must contain at least one entry.
     if config.include.is_empty() {
@@ -762,19 +768,49 @@ pub fn file_source(
         });
 
         let span = info_span!("file_server");
-        tokio::task::spawn_blocking(move || {
-            let _enter = span.enter();
-            let rt = tokio::runtime::Handle::current();
-            let result =
-                rt.block_on(file_server.run(tx, shutdown, shutdown_checkpointer, checkpointer));
+        if run_async {
+            // Async path: run the file server directly on the tokio runtime as a normal
+            // async task. No blocking-pool thread is held for the source's lifetime,
+            // freeing the ~2 MB stack reservation per source (~214 sources × 2 MB ≈ 428
+            // MB on a busy pod). The one synchronous call is the directory glob in
+            // `Glob::paths()`, which `FileServer::run` performs at startup and once per
+            // `glob_minimum_cooldown` (default 60 s) — a brief sync hop on a worker
+            // thread roughly once a minute rather than a dedicated blocking thread for life.
+            // Enabled via `async_file_source_file_server` global flag; default OFF.
+            let result = file_server
+                .run(tx, shutdown, shutdown_checkpointer, checkpointer)
+                .instrument(span)
+                .await;
             emit!(FileOpen { count: 0 });
-            // Panic if we encounter any error originating from the file server.
-            // We're at the `spawn_blocking` call, the panic will be caught and
-            // passed to the `JoinHandle` error, similar to the usual threads.
-            result.expect("file server exited with an error");
-        })
-        .map_err(|error| error!(message="File server unexpectedly stopped.", %error, internal_log_rate_limit = false))
-        .await
+            // Propagate a file-server failure as `Err(())` rather than swallowing it as
+            // `Ok(())`. This mirrors both the blocking path below (which surfaces the error
+            // via `spawn_blocking`'s panic -> `JoinError`) and `kubernetes_logs`'
+            // `util::run_file_server`, which `map_err`s the error back to its caller.
+            result.map(|_| ()).map_err(|error| {
+                error!(
+                    message = "File server exited with an error.",
+                    %error,
+                    internal_log_rate_limit = false
+                );
+            })
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let _enter = span.enter();
+                let rt = tokio::runtime::Handle::current();
+                let result = rt.block_on(
+                    file_server.run(tx, shutdown, shutdown_checkpointer, checkpointer),
+                );
+                emit!(FileOpen { count: 0 });
+                // Panic if we encounter any error originating from the file server.
+                // We're at the `spawn_blocking` call, the panic will be caught and
+                // passed to the `JoinHandle` error, similar to the usual threads.
+                result.expect("file server exited with an error");
+            })
+            .map_err(
+                |error| error!(message="File server unexpectedly stopped.", %error, internal_log_rate_limit = false),
+            )
+            .await
+        }
     })
 }
 
@@ -1382,6 +1418,64 @@ mod tests {
         let path2 = dir.path().join("file2");
 
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
+            let mut file1 = File::create(&path1).unwrap();
+            let mut file2 = File::create(&path2).unwrap();
+
+            for i in 0..n {
+                writeln!(&mut file1, "hello {i}").unwrap();
+                writeln!(&mut file2, "goodbye {i}").unwrap();
+            }
+
+            file1.flush().unwrap();
+            file2.flush().unwrap();
+
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let mut hello_i = 0;
+        let mut goodbye_i = 0;
+
+        for event in received {
+            let line =
+                event.as_log()[log_schema().message_key().unwrap().to_string()].to_string_lossy();
+            if line.starts_with("hello") {
+                assert_eq!(line, format!("hello {}", hello_i));
+                assert_eq!(
+                    event.as_log()["file"].to_string_lossy(),
+                    path1.to_str().unwrap()
+                );
+                hello_i += 1;
+            } else {
+                assert_eq!(line, format!("goodbye {}", goodbye_i));
+                assert_eq!(
+                    event.as_log()["file"].to_string_lossy(),
+                    path2.to_str().unwrap()
+                );
+                goodbye_i += 1;
+            }
+        }
+        assert_eq!(hello_i, n);
+        assert_eq!(goodbye_i, n);
+    }
+
+    // Parity check for the async (no-spawn_blocking) file-server path gated by
+    // `async_file_source_file_server`: the same happy-path workload must deliver the same
+    // events and shut down cleanly when the source runs directly on the async runtime.
+    #[tokio::test]
+    async fn file_happy_path_async() {
+        let n = 5;
+
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            ..test_default_file_config(&dir)
+        };
+
+        let path1 = dir.path().join("file1");
+        let path2 = dir.path().join("file2");
+
+        let received = run_file_source_async(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file1 = File::create(&path1).unwrap();
             let mut file2 = File::create(&path2).unwrap();
 
@@ -2820,6 +2914,47 @@ mod tests {
         log_namespace: LogNamespace,
         inner: impl Future<Output = ()>,
     ) -> Vec<Event> {
+        // Default to the legacy spawn_blocking path; `run_file_source_async` covers run_async.
+        run_file_source_with_mode(
+            config,
+            wait_shutdown,
+            acking_mode,
+            log_namespace,
+            false,
+            inner,
+        )
+        .await
+    }
+
+    // Same as `run_file_source` but drives the source on the async (no-spawn_blocking) path,
+    // i.e. with the `async_file_source_file_server` flag enabled, so tests can assert the
+    // run_async behavior is observably identical to the legacy path.
+    async fn run_file_source_async(
+        config: &FileConfig,
+        wait_shutdown: bool,
+        acking_mode: AckingMode,
+        log_namespace: LogNamespace,
+        inner: impl Future<Output = ()>,
+    ) -> Vec<Event> {
+        run_file_source_with_mode(
+            config,
+            wait_shutdown,
+            acking_mode,
+            log_namespace,
+            true,
+            inner,
+        )
+        .await
+    }
+
+    async fn run_file_source_with_mode(
+        config: &FileConfig,
+        wait_shutdown: bool,
+        acking_mode: AckingMode,
+        log_namespace: LogNamespace,
+        run_async: bool,
+        inner: impl Future<Output = ()>,
+    ) -> Vec<Event> {
         assert_source_compliance(&FILE_SOURCE_TAGS, async move {
             let (tx, rx) = if acking_mode == Acks {
                 let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
@@ -2840,6 +2975,7 @@ mod tests {
                 tx,
                 acks,
                 log_namespace,
+                run_async,
             ));
 
             inner.await;
@@ -3287,6 +3423,7 @@ start_reading_at: "not-a-timestamp"
                 tx,
                 true,
                 LogNamespace::Legacy,
+                false, // run_async: use legacy spawn_blocking path in tests
             ));
 
             sleep_500_millis().await;
