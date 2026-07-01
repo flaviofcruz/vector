@@ -794,8 +794,8 @@ struct Source {
     encoding: Option<EncodingConfig>,
     archive_extensions: Vec<String>,
     /// When true, run the file server directly on the async runtime (cancellable) instead of the
-    /// legacy `spawn_blocking` wrapper. Sourced from the `async_kubernetes_logs_file_server` global
-    /// flag; default off.
+    /// legacy `spawn_blocking` wrapper. Sourced from the `async_file_server` global flag; default
+    /// off.
     async_file_server: bool,
 }
 
@@ -1066,7 +1066,7 @@ impl Source {
             line_delimiter: config.line_delimiter.clone(),
             encoding: config.encoding.clone(),
             archive_extensions: config.archive_extensions.clone(),
-            async_file_server: globals.async_kubernetes_logs_file_server.enabled(),
+            async_file_server: globals.async_file_server.enabled(),
         })
     }
 
