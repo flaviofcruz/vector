@@ -5,9 +5,8 @@ use vector_common::TimeZone;
 use vector_config::{configurable_component, impl_generate_config_from_default};
 
 use super::{
-    super::default_data_dir, AcknowledgementsConfig, AsyncFileSourceFileServerConfig,
-    AsyncKubernetesLogsFileServerConfig, LogSchema, Telemetry, TwoWaveShutdownConfig,
-    metrics_expiration::PerMetricSetExpiration, proxy::ProxyConfig,
+    super::default_data_dir, AcknowledgementsConfig, AsyncFileServerConfig, LogSchema, Telemetry,
+    TwoWaveShutdownConfig, metrics_expiration::PerMetricSetExpiration, proxy::ProxyConfig,
 };
 use crate::serde::bool_or_struct;
 
@@ -130,10 +129,12 @@ pub struct GlobalOptions {
     #[configurable(metadata(docs::common = false, docs::required = false))]
     pub two_wave_shutdown: TwoWaveShutdownConfig,
 
-    /// Controls whether the `kubernetes_logs` source runs its file server directly on the async
-    /// runtime instead of inside a `spawn_blocking` wrapper.
+    /// Controls whether the file-backed sources (`file` and `kubernetes_logs`) run their file
+    /// server directly on the async runtime instead of inside a `spawn_blocking` wrapper.
     ///
-    /// Disabled by default (legacy `spawn_blocking` behavior). When enabled, the source becomes
+    /// Disabled by default (legacy `spawn_blocking` behavior). When enabled, each source no longer
+    /// pins a dedicated ~2 MB blocking-pool thread for its lifetime (~214 `file` + ~37
+    /// `kubernetes_logs` sources ≈ ~500 MB of virtual address space on a busy pod) and becomes
     /// promptly cancellable on shutdown. Gated so the change can be ramped gradually via config.
     #[serde(
         default,
@@ -141,22 +142,7 @@ pub struct GlobalOptions {
         skip_serializing_if = "crate::serde::is_default"
     )]
     #[configurable(metadata(docs::common = false, docs::required = false))]
-    pub async_kubernetes_logs_file_server: AsyncKubernetesLogsFileServerConfig,
-
-    /// Controls whether the `file` source runs its file server directly on the async runtime
-    /// instead of inside a `spawn_blocking` wrapper.
-    ///
-    /// Disabled by default (legacy `spawn_blocking` behavior). When enabled, each `file` source
-    /// no longer pins a dedicated 2 MB blocking-pool thread for its lifetime, saving ~428 MB of
-    /// virtual address space on a busy pod (~214 sources × 2 MB). Gated so the change can be
-    /// ramped gradually via config.
-    #[serde(
-        default,
-        deserialize_with = "bool_or_struct",
-        skip_serializing_if = "crate::serde::is_default"
-    )]
-    #[configurable(metadata(docs::common = false, docs::required = false))]
-    pub async_file_source_file_server: AsyncFileSourceFileServerConfig,
+    pub async_file_server: AsyncFileServerConfig,
 
     /// The amount of time, in seconds, that internal metrics will persist after having not been
     /// updated before they expire and are removed.
@@ -304,19 +290,10 @@ impl GlobalOptions {
         }
 
         if conflicts(
-            self.async_kubernetes_logs_file_server.enabled.as_ref(),
-            with.async_kubernetes_logs_file_server.enabled.as_ref(),
+            self.async_file_server.enabled.as_ref(),
+            with.async_file_server.enabled.as_ref(),
         ) {
-            errors.push(
-                "conflicting values for 'async_kubernetes_logs_file_server' found".to_owned(),
-            );
-        }
-
-        if conflicts(
-            self.async_file_source_file_server.enabled.as_ref(),
-            with.async_file_source_file_server.enabled.as_ref(),
-        ) {
-            errors.push("conflicting values for 'async_file_source_file_server' found".to_owned());
+            errors.push("conflicting values for 'async_file_server' found".to_owned());
         }
 
         if conflicts(self.expire_metrics.as_ref(), with.expire_metrics.as_ref()) {
@@ -371,12 +348,9 @@ impl GlobalOptions {
                 two_wave_shutdown: self
                     .two_wave_shutdown
                     .merge_default(&with.two_wave_shutdown),
-                async_kubernetes_logs_file_server: self
-                    .async_kubernetes_logs_file_server
-                    .merge_default(&with.async_kubernetes_logs_file_server),
-                async_file_source_file_server: self
-                    .async_file_source_file_server
-                    .merge_default(&with.async_file_source_file_server),
+                async_file_server: self
+                    .async_file_server
+                    .merge_default(&with.async_file_server),
                 timezone: self.timezone.or(with.timezone),
                 proxy: self.proxy.merge(&with.proxy),
                 expire_metrics: self.expire_metrics.or(with.expire_metrics),
@@ -566,27 +540,14 @@ mod tests {
     }
 
     #[test]
-    fn async_kubernetes_logs_file_server_defaults_off_and_parses_bool() {
+    fn async_file_server_defaults_off_and_parses_bool() {
         // Default: flag absent -> disabled (legacy spawn_blocking path).
         let default: GlobalOptions = toml::from_str("").unwrap();
-        assert!(!default.async_kubernetes_logs_file_server.enabled());
+        assert!(!default.async_file_server.enabled());
 
         // `bool_or_struct` accepts the bare-bool form a config would set.
-        let enabled: GlobalOptions =
-            toml::from_str("async_kubernetes_logs_file_server = true").unwrap();
-        assert!(enabled.async_kubernetes_logs_file_server.enabled());
-    }
-
-    #[test]
-    fn async_file_source_file_server_defaults_off_and_parses_bool() {
-        // Default: flag absent -> disabled (legacy spawn_blocking path).
-        let default: GlobalOptions = toml::from_str("").unwrap();
-        assert!(!default.async_file_source_file_server.enabled());
-
-        // `bool_or_struct` accepts the bare-bool form a config would set.
-        let enabled: GlobalOptions =
-            toml::from_str("async_file_source_file_server = true").unwrap();
-        assert!(enabled.async_file_source_file_server.enabled());
+        let enabled: GlobalOptions = toml::from_str("async_file_server = true").unwrap();
+        assert!(enabled.async_file_server.enabled());
     }
 
     fn merge<P: Debug, T>(

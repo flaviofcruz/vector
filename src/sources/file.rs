@@ -485,7 +485,7 @@ impl SourceConfig for FileConfig {
             cx.out,
             acknowledgements,
             log_namespace,
-            cx.globals.async_file_source_file_server.enabled(),
+            cx.globals.async_file_server.enabled(),
         ))
     }
 
@@ -550,7 +550,7 @@ pub fn file_source(
     // When true, run the file server directly on the async runtime instead of inside
     // tokio::task::spawn_blocking. This eliminates one pinned 2 MB blocking-pool thread per
     // source (~214 sources × 2 MB ≈ 428 MB on a busy pod). Sourced from the
-    // `async_file_source_file_server` global flag; default OFF to preserve historical behavior.
+    // `async_file_server` global flag; default OFF to preserve historical behavior.
     run_async: bool,
 ) -> super::Source {
     // the include option must be specified but also must contain at least one entry.
@@ -776,7 +776,7 @@ pub fn file_source(
             // `Glob::paths()`, which `FileServer::run` performs at startup and once per
             // `glob_minimum_cooldown` (default 60 s) — a brief sync hop on a worker
             // thread roughly once a minute rather than a dedicated blocking thread for life.
-            // Enabled via `async_file_source_file_server` global flag; default OFF.
+            // Enabled via `async_file_server` global flag; default OFF.
             let result = file_server
                 .run(tx, shutdown, shutdown_checkpointer, checkpointer)
                 .instrument(span)
@@ -1460,7 +1460,7 @@ mod tests {
     }
 
     // Parity check for the async (no-spawn_blocking) file-server path gated by
-    // `async_file_source_file_server`: the same happy-path workload must deliver the same
+    // `async_file_server`: the same happy-path workload must deliver the same
     // events and shut down cleanly when the source runs directly on the async runtime.
     #[tokio::test]
     async fn file_happy_path_async() {
@@ -2927,7 +2927,7 @@ mod tests {
     }
 
     // Same as `run_file_source` but drives the source on the async (no-spawn_blocking) path,
-    // i.e. with the `async_file_source_file_server` flag enabled, so tests can assert the
+    // i.e. with the `async_file_server` flag enabled, so tests can assert the
     // run_async behavior is observably identical to the legacy path.
     async fn run_file_source_async(
         config: &FileConfig,
