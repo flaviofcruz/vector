@@ -173,10 +173,12 @@ pub struct BricklensIngestResponse {
     /// bricklens response provides this count; a 0 here means the batch did not land.
     pub accepted_count: usize,
     /// Count + estimated byte size of the events in this request, for
-    /// `component_sent_events_total` / `component_sent_event_bytes_total`. Populated in `call()`
-    /// from request metadata.
+    /// `component_sent_events_total` / `component_sent_event_bytes_total`. Set at construction in
+    /// `parse_grpc_response` from the real events `call()` computes (it recomputes the grouped size
+    /// rather than reading the always-zero request-metadata field — see `call()`).
     events_sent: GroupedCountByteSize,
-    /// Actual protobuf wire bytes sent, for `component_sent_bytes_total`.
+    /// Actual protobuf wire bytes sent, for `component_sent_bytes_total`. Like `events_sent`, set at
+    /// construction in `parse_grpc_response` from the encoded payload size `call()` computes.
     bytes_sent: usize,
 }
 
@@ -382,6 +384,9 @@ impl BricklensIngestService {
     fn parse_grpc_response(
         &self,
         mut body: impl bytes::Buf,
+        event_count: usize,
+        events_sent: GroupedCountByteSize,
+        bytes_sent: usize,
     ) -> Result<BricklensIngestResponse, BricklensIngestError> {
         use prost_reflect::DynamicMessage;
 
@@ -425,11 +430,15 @@ impl BricklensIngestService {
         // than implicit in field-name probing. Adding a new bricklens RPC requires extending this
         // match — the unknown branch will warn + Reject until that happens, which is louder than
         // a silent field-probe miss and easier to audit.
-        match self.method.output().name() {
-            "BatchCreateLogRecordsResponse" => {
-                Ok(self.count_log_record_results(&dynamic_response))
-            }
-            "WriteMetricsResponse" => Ok(self.count_write_metrics_result(&dynamic_response)),
+        let accepted_count = match self.method.output().name() {
+            "BatchCreateLogRecordsResponse" => self.count_log_record_results(&dynamic_response),
+            "WriteMetricsResponse" => self.count_write_metrics_result(&dynamic_response),
+            // bricklens-ingest-external is an atomic (all-or-nothing) forwarder: its Export* RPCs
+            // return an empty `ExportResponse` with no partial-success channel, and this code is
+            // reached only on a gRPC-OK status, so a response means the destination accepted the
+            // whole batch. There is no per-record accounting to fold in (unlike
+            // `BatchCreateLogRecords`); every event is accepted.
+            "ExportResponse" => event_count,
             other => {
                 // The sink is pointed at a method whose response type we don't know how to
                 // interpret. Treat as Rejected (accepted_count = 0) rather than silently acking
@@ -438,26 +447,25 @@ impl BricklensIngestService {
                     response_type = other,
                     internal_log_rate_secs = 60,
                     "bricklens_ingest: response proto type is not supported (expected \
-                     BatchCreateLogRecordsResponse or WriteMetricsResponse); treating batch as \
-                     Rejected so events are not silently lost"
+                     BatchCreateLogRecordsResponse, WriteMetricsResponse, or ExportResponse); \
+                     treating batch as Rejected so events are not silently lost"
                 );
-                Ok(BricklensIngestResponse {
-                    accepted_count: 0,
-                    events_sent: GroupedCountByteSize::new_untagged(),
-                    bytes_sent: 0,
-                })
+                0
             }
-        }
+        };
+
+        Ok(BricklensIngestResponse {
+            accepted_count,
+            events_sent,
+            bytes_sent,
+        })
     }
 
-    /// Counts `success == true` entries in `BatchCreateLogRecordsResponse.results` and logs
-    /// (rate-limited) a sample of per-record rejection reasons. Counts list length — NOT just
-    /// successes — would silently ack KM/encryption per-record failures (which surface as
+    /// Returns the number of `success == true` entries in `BatchCreateLogRecordsResponse.results`
+    /// and logs (rate-limited) a sample of per-record rejection reasons. Returning the list length —
+    /// NOT just successes — would silently ack KM/encryption per-record failures (which surface as
     /// `success=false` with an `error_message` while the gRPC status stays 0/OK).
-    fn count_log_record_results(
-        &self,
-        response: &prost_reflect::DynamicMessage,
-    ) -> BricklensIngestResponse {
+    fn count_log_record_results(&self, response: &prost_reflect::DynamicMessage) -> usize {
         let results = response.get_field_by_name("results");
         let Some(result_list) = results.as_ref().and_then(|f| f.as_list()) else {
             // The dispatcher already verified the response is BatchCreateLogRecordsResponse, so a
@@ -468,11 +476,7 @@ impl BricklensIngestService {
                 "bricklens_ingest: BatchCreateLogRecordsResponse missing `results` field; \
                  proto descriptor likely out of sync with server. Treating batch as Rejected."
             );
-            return BricklensIngestResponse {
-                accepted_count: 0,
-                events_sent: GroupedCountByteSize::new_untagged(),
-                bytes_sent: 0,
-            };
+            return 0;
         };
 
         let total = result_list.len();
@@ -523,23 +527,16 @@ impl BricklensIngestService {
             );
         }
 
-        BricklensIngestResponse {
-            accepted_count,
-            events_sent: GroupedCountByteSize::new_untagged(),
-            bytes_sent: 0,
-        }
+        accepted_count
     }
 
     /// Reads `metrics_written` / `metrics_failed` / `status` out of a `WriteMetricsResponse`-shaped
-    /// message and folds them into a `BricklensIngestResponse`. The batch is reported as accepted
-    /// only when `status != FAILED` AND `metrics_written > 0`; otherwise `accepted_count` is 0 so
+    /// message and returns the accepted count. The batch is reported as accepted only when
+    /// `status != FAILED` AND `metrics_written > 0`; otherwise the returned count is 0 so
     /// `event_status()` reports Rejected and the loss is not silently acked. A rate-limited warning
     /// surfaces per-metric failures (`metrics_failed > 0`) without depending on the per-record
     /// detail that the `WriteMetrics` response does not carry.
-    fn count_write_metrics_result(
-        &self,
-        response: &prost_reflect::DynamicMessage,
-    ) -> BricklensIngestResponse {
+    fn count_write_metrics_result(&self, response: &prost_reflect::DynamicMessage) -> usize {
         // WriteResult::FAILED — hardcoded to avoid importing a generated enum for one comparison.
         const WRITE_RESULT_FAILED: i32 = 3;
 
@@ -574,11 +571,7 @@ impl BricklensIngestService {
             );
         }
 
-        BricklensIngestResponse {
-            accepted_count,
-            events_sent: GroupedCountByteSize::new_untagged(),
-            bytes_sent: 0,
-        }
+        accepted_count
     }
 }
 
@@ -613,6 +606,9 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
             for event in &req.events {
                 events_sent.add_event(event, event.estimated_json_encoded_size_of());
             }
+            // Captured before `build_grpc_request` consumes `req`: the empty `ExportResponse`
+            // carries no per-record counts, so the whole-batch accept is sized from the request.
+            let event_count = req.events.len();
 
             let (http_req, bytes_sent) = service.build_grpc_request(req)?;
 
@@ -657,9 +653,12 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
                 });
             }
 
-            let mut response = service.parse_grpc_response(body.freeze())?;
-            response.events_sent = events_sent;
-            response.bytes_sent = bytes_sent;
+            // Parse the response for the accepted count and build it with the real telemetry values
+            // computed above: the grouped size of the events actually sent and the encoded payload's
+            // byte size. For the atomic `ExportResponse` forwarder this is the whole batch on a
+            // gRPC-OK response.
+            let response =
+                service.parse_grpc_response(body.freeze(), event_count, events_sent, bytes_sent)?;
 
             // Log accepted count for observability.
             debug!(
@@ -1089,7 +1088,9 @@ mod tests {
         msg_bytes.extend_from_slice(&ok);
         msg_bytes.extend_from_slice(&fail);
         let body = bytes::Bytes::from(encode_grpc_message(msg_bytes));
-        let resp = svc.parse_grpc_response(body).unwrap();
+        let resp = svc
+            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
         // Only the two success=true records are counted; the failed one is excluded so a
         // partially-failed batch isn't acked as fully delivered.
         assert_eq!(resp.accepted_count, 2);
@@ -1102,7 +1103,9 @@ mod tests {
         // must be 0 so event_status() reports Rejected instead of silently acking the loss.
         let msg_bytes = vec![0x0A, 0x00];
         let body = bytes::Bytes::from(encode_grpc_message(msg_bytes));
-        let resp = svc.parse_grpc_response(body).unwrap();
+        let resp = svc
+            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
         assert_eq!(resp.accepted_count, 0);
         assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
     }
@@ -1145,7 +1148,9 @@ mod tests {
             make_test_pool_with_write_metrics_shape(),
         );
         let body = bytes::Bytes::from(encode_grpc_message(encode_write_metrics_body(1, 5, 0)));
-        let resp = svc.parse_grpc_response(body).unwrap();
+        let resp = svc
+            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
         assert_eq!(resp.accepted_count, 5);
         assert_eq!(
             resp.event_status(),
@@ -1164,7 +1169,9 @@ mod tests {
             make_test_pool_with_write_metrics_shape(),
         );
         let body = bytes::Bytes::from(encode_grpc_message(encode_write_metrics_body(1, 0, 0)));
-        let resp = svc.parse_grpc_response(body).unwrap();
+        let resp = svc
+            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
         assert_eq!(resp.accepted_count, 0);
         assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
     }
@@ -1179,7 +1186,9 @@ mod tests {
             make_test_pool_with_write_metrics_shape(),
         );
         let body = bytes::Bytes::from(encode_grpc_message(encode_write_metrics_body(3, 5, 0)));
-        let resp = svc.parse_grpc_response(body).unwrap();
+        let resp = svc
+            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
         assert_eq!(resp.accepted_count, 0);
         assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
     }
@@ -1194,7 +1203,9 @@ mod tests {
             make_test_pool_with_write_metrics_shape(),
         );
         let body = bytes::Bytes::from(encode_grpc_message(encode_write_metrics_body(2, 3, 2)));
-        let resp = svc.parse_grpc_response(body).unwrap();
+        let resp = svc
+            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
         assert_eq!(resp.accepted_count, 3);
         assert_eq!(
             resp.event_status(),
@@ -1216,16 +1227,98 @@ mod tests {
         );
         // Empty Response message — the proto has no fields at all.
         let body = bytes::Bytes::from(encode_grpc_message(Vec::new()));
-        let resp = svc.parse_grpc_response(body).unwrap();
+        let resp = svc
+            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
         assert_eq!(resp.accepted_count, 0);
         assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
+    }
+
+    /// Builds a descriptor pool whose method response is the empty `ExportResponse` (the
+    /// bricklens-ingest-external Export* RPCs), so `parse_grpc_response` exercises the
+    /// `ExportResponse` branch.
+    fn make_test_pool_with_export_response_shape() -> prost_reflect::DescriptorPool {
+        let file = FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("ExportLogsRequest".to_string()),
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("ExportResponse".to_string()),
+                    field: vec![],
+                    ..Default::default()
+                },
+            ],
+            service: vec![ServiceDescriptorProto {
+                name: Some("TestService".to_string()),
+                method: vec![MethodDescriptorProto {
+                    name: Some("ExportLogs".to_string()),
+                    input_type: Some(".test.ExportLogsRequest".to_string()),
+                    output_type: Some(".test.ExportResponse".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        prost_reflect::DescriptorPool::from_file_descriptor_set(FileDescriptorSet {
+            file: vec![file],
+        })
+        .expect("test descriptor pool with ExportResponse")
+    }
+
+    #[test]
+    fn test_parse_grpc_response_export_response_yields_delivered() {
+        use vector_lib::internal_event::CountByteSize;
+        use vector_lib::json_size::JsonSize;
+
+        // bricklens-ingest-external is an atomic (all-or-nothing) forwarder: its Export* RPCs return
+        // an empty ExportResponse, and a gRPC-OK response means the destination accepted the whole
+        // batch (there is no partial-success channel). So the batch must be reported Delivered with
+        // every event accepted -- accepted_count == the request's event count -- not Rejected, which
+        // is what the unknown-name fallback did before the ExportResponse branch existed.
+        let svc = make_test_service_with_pool(
+            "https://example.com:443",
+            make_test_pool_with_export_response_shape(),
+        );
+        // Empty ExportResponse message body.
+        let body = bytes::Bytes::from(encode_grpc_message(Vec::new()));
+        // Pass non-trivial telemetry the way call() does so we also pin that parse_grpc_response
+        // threads the real events_sent/bytes_sent straight onto the response (no placeholder, no
+        // post-parse overwrite). On this atomic path that is the whole batch.
+        let events_sent: GroupedCountByteSize = CountByteSize(5, JsonSize::new(321)).into();
+        let resp = svc.parse_grpc_response(body, 5, events_sent, 654).unwrap();
+        assert_eq!(
+            resp.accepted_count, 5,
+            "atomic forwarder accepts the whole batch"
+        );
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Delivered
+        );
+        assert_eq!(
+            resp.events_sent().size(),
+            Some(CountByteSize(5, JsonSize::new(321))),
+            "events_sent must be the real value threaded in, not a placeholder"
+        );
+        assert_eq!(
+            resp.bytes_sent(),
+            Some(654),
+            "bytes_sent must be the real encoded payload size threaded in, not a placeholder"
+        );
     }
 
     #[test]
     fn test_parse_grpc_response_rejects_short_body() {
         let svc = make_test_service("https://example.com:443");
         let body = bytes::Bytes::from(vec![0x00, 0x00, 0x00, 0x00]); // 4 bytes, need 5
-        let err = svc.parse_grpc_response(body).unwrap_err();
+        let err = svc
+            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap_err();
         assert!(
             err.to_string().contains("too short"),
             "unexpected error: {}",
@@ -1238,7 +1331,9 @@ mod tests {
         let svc = make_test_service("https://example.com:443");
         // 5-byte gRPC frame with compression flag = 1 and empty body
         let body = bytes::Bytes::from(vec![0x01, 0x00, 0x00, 0x00, 0x00]);
-        let err = svc.parse_grpc_response(body).unwrap_err();
+        let err = svc
+            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap_err();
         assert!(
             err.to_string().contains("Compressed"),
             "unexpected error: {}",
