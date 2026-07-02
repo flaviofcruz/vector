@@ -1050,11 +1050,15 @@ fn build_column_for_path(
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let nullable = field.is_nullable();
     match field.data_type() {
-        DataType::Struct(fields) => build_struct_array(events, path, fields, nullable),
-        DataType::Map(entries_field, _sorted) => {
-            build_map_array(events, path, entries_field, nullable)
+        DataType::Struct(fields) => {
+            build_struct_array(events, path, fields, nullable, missing_default)
         }
-        DataType::List(item_field) => build_list_array(events, path, item_field, nullable),
+        DataType::Map(entries_field, _sorted) => {
+            build_map_array(events, path, entries_field, nullable, missing_default)
+        }
+        DataType::List(item_field) => {
+            build_list_array(events, path, item_field, nullable, missing_default)
+        }
         DataType::Timestamp(time_unit, tz) => build_timestamp_array(
             events,
             path,
@@ -1099,6 +1103,19 @@ fn build_column_for_path(
     }
 }
 
+/// Emits a metric and warning for `count` present but wrong-typed values at `path` that were
+/// coerced to an empty collection. Called once per column per batch.
+fn emit_malformed_collection_coerced(path: &str, count: u64, batch_size: usize) {
+    metrics::counter!("arrow_malformed_collection_coerced", "field" => path.to_string())
+        .increment(count);
+    tracing::warn!(
+        message = "Arrow encoder coerced present but wrong-typed value(s) to an empty collection",
+        field = %path,
+        coerced = count,
+        batch_size,
+    );
+}
+
 /// Builds an Arrow `StructArray` for a struct field at the given dot-separated path.
 ///
 /// Child fields are accessed via `path.child_name` using Vector's path lookup,
@@ -1108,33 +1125,48 @@ fn build_struct_array(
     path: &str,
     fields: &Fields,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
+    // Children are built for every event; under coercion a missing child takes its default.
     let child_arrays: Vec<ArrayRef> = fields
         .iter()
         .map(|child_field| {
             let child_path = format!("{}.{}", path, child_field.name());
-            build_column_for_path(events, &child_path, child_field, None)
+            build_column_for_path(events, &child_path, child_field, missing_default)
         })
         .collect::<Result<_, _>>()?;
 
     let mut has_null = false;
+    let mut coerced_malformed: u64 = 0;
     let mut validity: Vec<bool> = Vec::with_capacity(events.len());
     for event in events {
         if let Event::Log(log) = event {
-            let valid = log.get(path).is_some();
-            if !valid {
-                if !nullable {
-                    return Err(ArrowEncodingError::NullConstraint {
-                        field_name: path.into(),
-                    });
+            let valid = if let Some(value) = log.get(path) {
+                // Present non-object under coercion: valid row of child defaults, counted.
+                // Without coercion, any present value yields a valid row.
+                if missing_default.is_some() && !matches!(value, Value::Object(_) | Value::Null) {
+                    coerced_malformed += 1;
                 }
+                true
+            } else if missing_default.is_some() {
+                // Coerced absent struct -> valid row of child defaults.
+                true
+            } else if nullable {
                 has_null = true;
-            }
+                false
+            } else {
+                return Err(ArrowEncodingError::NullConstraint {
+                    field_name: path.into(),
+                });
+            };
             validity.push(valid);
         } else {
             validity.push(false);
             has_null = true;
         }
+    }
+    if coerced_malformed > 0 {
+        emit_malformed_collection_coerced(path, coerced_malformed, events.len());
     }
     let null_buffer = has_null.then(|| NullBuffer::from(validity));
 
@@ -1182,6 +1214,7 @@ fn build_map_array(
     path: &str,
     entries_field: &Field,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let DataType::Struct(kv_fields) = entries_field.data_type() else {
         return Err(ArrowEncodingError::UnsupportedType {
@@ -1204,6 +1237,7 @@ fn build_map_array(
     let mut offsets: Vec<i32> = Vec::with_capacity(events.len() + 1);
     let mut validity: Vec<bool> = Vec::with_capacity(events.len());
     let mut current_offset: i32 = 0;
+    let mut coerced_malformed: u64 = 0;
     offsets.push(0);
 
     for event in events {
@@ -1220,19 +1254,41 @@ fn build_map_array(
                         current_offset += 1;
                     }
                 }
-                _ => {
-                    if !nullable {
+                // Absent or explicit null: empty map under coercion (ClickHouse omitted-column
+                // default), else null (nullable) or error (non-nullable).
+                None | Some(Value::Null) => {
+                    if missing_default.is_some() {
+                        validity.push(true);
+                    } else if nullable {
+                        validity.push(false);
+                    } else {
                         return Err(ArrowEncodingError::NullConstraint {
                             field_name: path.into(),
                         });
                     }
-                    validity.push(false);
+                }
+                // Present non-object under coercion: empty map, counted. Without coercion: null
+                // (nullable) or error (non-nullable).
+                Some(_) => {
+                    if missing_default.is_some() {
+                        validity.push(true);
+                        coerced_malformed += 1;
+                    } else if nullable {
+                        validity.push(false);
+                    } else {
+                        return Err(ArrowEncodingError::NullConstraint {
+                            field_name: path.into(),
+                        });
+                    }
                 }
             }
         } else {
             validity.push(false);
         }
         offsets.push(current_offset);
+    }
+    if coerced_malformed > 0 {
+        emit_malformed_collection_coerced(path, coerced_malformed, events.len());
     }
 
     let key_array = build_map_value_array(&flat_keys, key_field)?;
@@ -1269,42 +1325,62 @@ fn build_list_array(
     path: &str,
     item_field: &Field,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let mut flat_items: Vec<Value> = Vec::new();
     let mut offsets: Vec<i32> = vec![0];
     let mut validity: Vec<bool> = Vec::with_capacity(events.len());
     let mut has_null = false;
+    let mut coerced_malformed: u64 = 0;
 
     for event in events {
-        let arr_opt = if let Event::Log(log) = event {
-            log.get(path).and_then(|v| {
-                if let Value::Array(a) = v {
-                    Some(a.clone())
-                } else {
-                    None
-                }
-            })
+        let value = if let Event::Log(log) = event {
+            log.get(path)
         } else {
             None
         };
 
-        match arr_opt {
-            Some(arr) => {
-                flat_items.extend(arr.into_iter());
+        match value {
+            Some(Value::Array(arr)) => {
+                flat_items.extend(arr.iter().cloned());
                 offsets.push(flat_items.len() as i32);
                 validity.push(true);
             }
-            None => {
-                if !nullable {
+            // Absent or explicit null: empty list under coercion (ClickHouse omitted-column
+            // default), else null (nullable) or error (non-nullable).
+            None | Some(Value::Null) => {
+                offsets.push(*offsets.last().unwrap_or(&0));
+                if missing_default.is_some() {
+                    validity.push(true);
+                } else if nullable {
+                    validity.push(false);
+                    has_null = true;
+                } else {
                     return Err(ArrowEncodingError::NullConstraint {
                         field_name: path.into(),
                     });
                 }
+            }
+            // Present non-array under coercion: empty list, counted. Without coercion: null
+            // (nullable) or error (non-nullable).
+            Some(_) => {
                 offsets.push(*offsets.last().unwrap_or(&0));
-                validity.push(false);
-                has_null = true;
+                if missing_default.is_some() {
+                    validity.push(true);
+                    coerced_malformed += 1;
+                } else if nullable {
+                    validity.push(false);
+                    has_null = true;
+                } else {
+                    return Err(ArrowEncodingError::NullConstraint {
+                        field_name: path.into(),
+                    });
+                }
             }
         }
+    }
+    if coerced_malformed > 0 {
+        emit_malformed_collection_coerced(path, coerced_malformed, events.len());
     }
 
     let child_array = build_list_item_array(&flat_items, item_field)?;
@@ -3368,6 +3444,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_encode_struct_present_non_object_coerces_to_defaults() {
+        use arrow::array::StructArray;
+        // A present non-object value coerces to a struct of child defaults.
+        let mut log = LogEvent::default();
+        log.insert("required", "not-a-struct");
+        let events = vec![Event::Log(log)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "required",
+            DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int64, true)])),
+            false,
+        )]));
+        let coerce = std::collections::HashMap::from([("required".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce)).expect(
+            "present non-object struct should coerce to child defaults, not fail the batch",
+        );
+        let s = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(
+            !s.is_null(0),
+            "coerced row should be a valid struct of child defaults"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // List encoding tests
     // -------------------------------------------------------------------------
@@ -3520,6 +3625,70 @@ mod tests {
             result,
             Err(ArrowEncodingError::NullConstraint { .. })
         ));
+    }
+
+    #[test]
+    fn test_encode_list_non_nullable_missing_coerces_to_empty() {
+        use arrow::array::ListArray;
+        // Absent non-nullable list under coercion -> empty list.
+        let events = vec![Event::Log(LogEvent::default())];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            false,
+        )]));
+        let coerce = std::collections::HashMap::from([("hashes".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce))
+            .expect("missing non-nullable list should coerce to empty, not fail");
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(
+            !list.is_null(0),
+            "coerced row should be a valid (empty) list"
+        );
+        assert_eq!(
+            list.value_length(0),
+            0,
+            "coerced missing list should be empty"
+        );
+    }
+
+    #[test]
+    fn test_encode_list_present_non_array_coerces_to_empty() {
+        use arrow::array::ListArray;
+        // A present non-array value coerces to an empty list.
+        let mut log = LogEvent::default();
+        log.insert("hashes", "not-an-array");
+        let events = vec![Event::Log(log)];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            false,
+        )]));
+        let coerce = std::collections::HashMap::from([("hashes".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce))
+            .expect("present non-array list should coerce to empty, not fail the batch");
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(
+            !list.is_null(0),
+            "coerced row should be a valid (empty) list"
+        );
+        assert_eq!(
+            list.value_length(0),
+            0,
+            "malformed list value should coerce to zero items"
+        );
     }
 
     /// `List<Struct>` — encodes a repeated nested message field.
@@ -3772,6 +3941,55 @@ mod tests {
             result,
             Err(ArrowEncodingError::NullConstraint { .. })
         ));
+    }
+
+    #[test]
+    fn test_encode_map_non_nullable_missing_coerces_to_empty() {
+        use arrow::array::MapArray;
+        // Under coercion, a missing non-nullable Map becomes an empty map; without coercion it
+        // errors (test_encode_map_non_nullable_missing_fails).
+        let events = vec![Event::Log(LogEvent::default())]; // "flags" map field absent
+        let schema = Arc::new(Schema::new(vec![map_field(DataType::Boolean, false)]));
+        let coerce = std::collections::HashMap::from([("flags".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce))
+            .expect("missing non-nullable map should coerce to empty, not fail");
+
+        assert_eq!(batch.num_rows(), 1);
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(
+            !map.is_null(0),
+            "coerced row should be a valid (empty) map, not null"
+        );
+        assert_eq!(
+            map.value_length(0),
+            0,
+            "coerced missing map should have zero entries"
+        );
+    }
+
+    #[test]
+    fn test_encode_map_present_non_object_coerces_to_empty() {
+        use arrow::array::MapArray;
+        // A present non-object value coerces to an empty map.
+        let mut log = LogEvent::default();
+        log.insert("flags", "not-a-map");
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field(DataType::Boolean, false)]));
+        let coerce = std::collections::HashMap::from([("flags".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce))
+            .expect("present non-object map should coerce to empty, not fail the batch");
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(
+            !map.is_null(0),
+            "coerced row should be a valid (empty) map, not null"
+        );
+        assert_eq!(
+            map.value_length(0),
+            0,
+            "malformed map value should coerce to zero entries"
+        );
     }
 
     #[test]
