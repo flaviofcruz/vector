@@ -653,8 +653,24 @@ pub fn combine_sink_delivery_events(
 impl Add<VectorSinkDeliveryEvent> for VectorSinkDeliveryEvent {
     type Output = VectorSinkDeliveryEvent;
 
-    fn add(self, other: VectorSinkDeliveryEvent) -> Self::Output {
-        combine_sink_delivery_events(vec![self, other])
+    fn add(mut self, other: VectorSinkDeliveryEvent) -> Self::Output {
+        self.merge(other);
+        self
+    }
+}
+
+impl VectorSinkDeliveryEvent {
+    /// Merge another event's count_map into self in-place, avoiding O(N²) cloning.
+    pub fn merge(&mut self, other: VectorSinkDeliveryEvent) {
+        for (key, value) in other.count_map {
+            self.count_map
+                .entry(key)
+                .and_modify(|existing| {
+                    existing.count += value.count;
+                    existing.size += value.size;
+                })
+                .or_insert(value);
+        }
     }
 }
 
