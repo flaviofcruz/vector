@@ -228,6 +228,7 @@ impl AzureBlobSinkConfig {
                 blob_prefix: Default::default(),
                 blob_time_format: None,
                 blob_append_uuid: None,
+                blob_prepend_crypto_nonce: false,
                 encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
                 compression: Compression::None,
                 batch: Default::default(),

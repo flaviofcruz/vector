@@ -294,20 +294,30 @@ impl<'a> Builder<'a> {
                 let pump = async move {
                     debug!("Source pump starting.");
 
-                    while let Some(SourceSenderItem {
-                        events: mut array,
-                        send_reference,
-                    }) = rx.next().await
-                    {
-                        array.set_output_id(&source);
-                        array.set_source_type(source_type);
-                        fanout
-                            .send(array, Some(send_reference))
-                            .await
-                            .map_err(|e| {
-                                debug!("Source pump finished with an error.");
-                                TaskError::wrapped(e)
-                            })?;
+                    let mut control_channel_open = true;
+                    loop {
+                        select! {
+                            biased;
+                            alive = fanout.recv_control_message(), if control_channel_open => {
+                                control_channel_open = alive;
+                            }
+                            item = rx.next() => {
+                                match item {
+                                    Some(SourceSenderItem { events: mut array, send_reference }) => {
+                                        array.set_output_id(&source);
+                                        array.set_source_type(source_type);
+                                        fanout
+                                            .send(array, Some(send_reference))
+                                            .await
+                                            .map_err(|e| {
+                                                debug!("Source pump finished with an error.");
+                                                TaskError::wrapped(e)
+                                            })?;
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
                     }
 
                     debug!("Source pump finished normally.");
