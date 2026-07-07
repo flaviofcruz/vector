@@ -278,10 +278,47 @@ fn parse_datetime64_precision(ch_type: &str) -> Result<DataType, String> {
     }
 }
 
-/// Builds an Arrow child `Field` for a nested inner ClickHouse type via `clickhouse_type_to_arrow`.
+/// Builds an Arrow child `Field` for a nested inner ClickHouse type via `clickhouse_type_to_arrow`,
+/// rejecting element types the codec cannot build in a collection so the failure surfaces at schema
+/// resolution (caught by the sink's JSONEachRow fallback) rather than on every batch at encode time.
 fn ch_type_to_arrow_field(name: &str, inner_ch_type: &str) -> Result<Field, String> {
     let (data_type, nullable) = clickhouse_type_to_arrow(inner_ch_type)?;
+    reject_unsupported_nested_type(inner_ch_type, &data_type)?;
     Ok(Field::new(name, data_type, nullable))
+}
+
+/// The collection builders (`build_map_value_array` / `build_list_item_array`) handle a narrower set
+/// than a top-level column. This admits only what they build, rejecting the rest (`Dictionary`/
+/// LowCardinality, `Int8/16`, `UInt8/16`, `Decimal`, `Date`/`DateTime`). `Struct`/`List`/`Map` pass
+/// through, and their own inner fields are validated recursively as they are parsed.
+fn reject_unsupported_nested_type(ch_type: &str, data_type: &DataType) -> Result<(), String> {
+    let supported = matches!(
+        data_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Boolean
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Struct(_)
+            | DataType::List(_)
+            | DataType::Map(_, _)
+    );
+    if supported {
+        Ok(())
+    } else {
+        Err(format!(
+            "ClickHouse type '{}' (Arrow {:?}) is not supported as a collection element/key/value; \
+             only String, Binary, Bool, Int32/64, UInt32/64, Float32/64, and nested \
+             Array/Tuple/Map are supported inside a collection.",
+            ch_type, data_type
+        ))
+    }
 }
 
 /// `Array(T)` -> Arrow `List<item: T>`. ClickHouse converts the Arrow List back to `Array` on insert.
@@ -311,7 +348,10 @@ fn parse_map_type(ch_type: &str) -> Result<DataType, String> {
             args.len()
         ));
     }
+    // Validate the key type against the collection-element set, then force it non-nullable
+    // (ClickHouse map keys cannot be null).
     let (key_type, _) = clickhouse_type_to_arrow(&args[0])?;
+    reject_unsupported_nested_type(&args[0], &key_type)?;
     let key_field = Field::new("key", key_type, false);
     let value_field = ch_type_to_arrow_field("value", &args[1])?;
     let entries = Field::new(
@@ -699,23 +739,67 @@ mod tests {
 
     #[test]
     fn test_nested_collection_recursion() {
-        // Map(LowCardinality(String), Array(Int64)) exercises dictionary key, list value, recursion.
-        let (dt, _) = convert_type_no_metadata("Map(LowCardinality(String), Array(Int64))")
-            .expect("nested Map should map");
+        // Map(String, Array(Int64)) exercises a string key + list value + recursion, all of which
+        // the codec's collection builders support.
+        let (dt, _) =
+            convert_type_no_metadata("Map(String, Array(Int64))").expect("nested Map should map");
         let DataType::Map(entries, _) = dt else {
             panic!("expected Map, got {:?}", dt);
         };
         let DataType::Struct(kv) = entries.data_type() else {
             panic!("expected Struct entries, got {:?}", entries.data_type());
         };
-        assert_eq!(
-            kv[0].data_type(),
-            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
-        );
+        assert_eq!(kv[0].data_type(), &DataType::Utf8);
         assert_eq!(
             kv[1].data_type(),
             &DataType::List(Arc::new(Field::new("item", DataType::Int64, false)))
         );
+    }
+
+    #[test]
+    fn test_unsupported_nested_element_types_rejected_at_parse() {
+        // Element/key/value types the codec's collection builders cannot build must be rejected at
+        // parse (schema resolution), so the sink's JSONEachRow fallback catches them instead of
+        // crashing on every batch at encode time.
+        for ty in [
+            "Array(Int8)",                         // Int8 not a supported list element
+            "Array(Decimal(10, 2))",               // Decimal not supported inside a collection
+            "Array(DateTime)",                     // Timestamp not supported inside a collection
+            "Map(LowCardinality(String), String)", // Dictionary key not supported
+            "Map(String, LowCardinality(String))", // Dictionary value not supported
+            "Map(Int64, DateTime64(3))",           // DateTime64 value not supported
+            "Tuple(a Int16, b String)",            // Int16 tuple element not supported
+        ] {
+            let result = convert_type_no_metadata(ty);
+            assert!(
+                result.is_err(),
+                "expected '{}' to be rejected as an unsupported collection element, got {:?}",
+                ty,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_supported_nested_element_types_accepted() {
+        // The element/key/value types the builders DO support must still parse.
+        for ty in [
+            "Array(String)",
+            "Array(Int64)",
+            "Array(Float64)",
+            "Array(Bool)",
+            "Map(String, String)",
+            "Map(Int64, String)",
+            "Map(String, Array(String))",
+            "Map(String, Map(String, String))",
+            "Tuple(a String, b Int64)",
+        ] {
+            assert!(
+                convert_type_no_metadata(ty).is_ok(),
+                "expected '{}' to be a supported collection element",
+                ty
+            );
+        }
     }
 
     #[test]
