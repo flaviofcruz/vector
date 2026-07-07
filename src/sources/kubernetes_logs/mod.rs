@@ -144,15 +144,6 @@ pub struct Config {
     #[serde(default = "default_extract_databricks_logs")]
     extract_databricks_logs: bool,
 
-    /// Deprecated and ignored. The kubernetes_logs source now always discovers the hostPath
-    /// logging directory via `hostpath_logging_annotation_key` (defaulting to
-    /// `logging.databricks.com/dblet-logs-path`). Pods without the annotation are silently
-    /// skipped for hostPath discovery; the emptyDir kubelet log directory is still scraped.
-    /// The field is retained for configuration backwards compatibility and will be removed
-    /// in a future release.
-    #[serde(default = "default_use_hostpath_logging_annotation_override")]
-    use_hostpath_logging_annotation_override: bool,
-
     /// Pod annotation key to read for hostPath-based log directory discovery. The annotation
     /// value is resolved to `/databricks/host-root/{value}/` and glob patterns are applied
     /// there. Pods without this annotation are silently skipped for hostPath discovery; the
@@ -465,7 +456,6 @@ impl Default for Config {
             extra_namespace_label_selector: "".to_string(),
             insert_namespace_fields: true,
             extract_databricks_logs: false,
-            use_hostpath_logging_annotation_override: false,
             hostpath_logging_annotation_key: None,
             ttl_removal_config: None,
             self_node_name: default_self_node_name_env_template(),
@@ -1527,10 +1517,6 @@ const fn default_insert_namespace_fields() -> bool {
 }
 
 const fn default_extract_databricks_logs() -> bool {
-    false
-}
-
-const fn default_use_hostpath_logging_annotation_override() -> bool {
     false
 }
 
