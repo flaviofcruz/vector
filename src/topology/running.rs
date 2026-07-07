@@ -249,9 +249,17 @@ impl RunningTopology {
     /// poll for when the tasks have completed. Once the returned future is
     /// dropped then everything from this RunningTopology instance is fully
     /// dropped.
-    pub fn stop(self) -> impl Future<Output = ()> {
+    ///
+    /// Resolves to the `gracefully_closed` verdict (same value as the `COMPONENTS_CLOSED` VEL
+    /// event): `true` only when two-wave shutdown was active and wave 1 drained within its
+    /// deadlines. Most callers discard it; tests assert the wave-1 no-drop invariant on it.
+    pub fn stop(self) -> impl Future<Output = bool> {
         // Update the API's health endpoint to signal shutdown
         self.running.store(false, Ordering::Relaxed);
+
+        // Written once by the wave orchestration, read after the shutdown future resolves so
+        // `stop()` can return the verdict.
+        let gracefully_closed_out = Arc::new(AtomicBool::new(false));
 
         let map_closure = |_result| ();
 
@@ -263,8 +271,9 @@ impl RunningTopology {
         // Staged wave deadlines, all relative to now. Ordering is guaranteed by `app.rs`:
         //   data_source < data_sink < internal_source < deadline (overall).
         // - data_source_deadline: force-close wave-1 (data) SOURCES only.
-        // - data_sink_deadline:   end of wave 1 / start of wave 2. Wave-1 transforms+sinks are
-        //                         NOT force-closed here — they keep flushing until `deadline`.
+        // - data_sink_deadline:   end of wave 1 / start of wave 2. Wave-1 transforms+sinks still
+        //                         draining here are force-terminated to bound the wave; sinks that
+        //                         drained in time have already exited and are untouched.
         // - internal_source_deadline: force-close wave-2 (internal) SOURCES only.
         // - deadline:             force-close everything still running.
         let data_source_deadline = self
@@ -278,21 +287,6 @@ impl RunningTopology {
         let internal_source_deadline = self
             .graceful_internal_source_shutdown_duration
             .map(|grace_period| Instant::now() + grace_period);
-
-        // Stamp T+0 for this shutdown and log the resolved staged grace periods. They are
-        // config-driven (derived from terminationGracePeriodSeconds, not fixed), so logging them
-        // lets a captured shutdown be aligned to T+0 and read against the actual deadlines. The
-        // per-stage `[shutdown-trace]` elapsed logs below make graceful-shutdown wall-time
-        // attributable to a specific wave/component instead of an opaque "rode to the deadline".
-        let shutdown_trace_start = Instant::now();
-        info!(
-            overall_secs = ?self.graceful_shutdown_duration.map(|d| d.as_secs_f64()),
-            data_source_secs = ?self.graceful_data_source_shutdown_duration.map(|d| d.as_secs_f64()),
-            data_sink_secs = ?self.graceful_data_sink_shutdown_duration.map(|d| d.as_secs_f64()),
-            internal_source_secs = ?self.graceful_internal_source_shutdown_duration.map(|d| d.as_secs_f64()),
-            message = "[shutdown-trace] staged shutdown deadlines (resolved from config).",
-            internal_log_rate_limit = false,
-        );
 
         // Cancel utilization and metrics tasks.
         if let Some(trigger) = self.utilization_task_shutdown_trigger {
@@ -353,6 +347,12 @@ impl RunningTopology {
         let mut all_abort_handles = HashMap::<ComponentKey, Vec<tokio::task::AbortHandle>>::new();
         let mut wave1_source_abort_handles =
             HashMap::<ComponentKey, Vec<tokio::task::AbortHandle>>::new();
+        // Wave-1 downstream (transform/sink) abort handles, so a straggler still draining at
+        // `data_sink_deadline` can be force-terminated to bound the wave — mirroring the source
+        // force-abort at `data_source_deadline`. A sink that drains in time exits before the
+        // deadline and is never aborted.
+        let mut wave1_sink_abort_handles =
+            HashMap::<ComponentKey, Vec<tokio::task::AbortHandle>>::new();
         let mut wave2_source_abort_handles =
             HashMap::<ComponentKey, Vec<tokio::task::AbortHandle>>::new();
 
@@ -378,6 +378,10 @@ impl RunningTopology {
                             .push(abort_handle.clone());
                     } else {
                         wave1_sink_wait_handles.push(task.clone());
+                        wave1_sink_abort_handles
+                            .entry(key.clone())
+                            .or_default()
+                            .push(abort_handle.clone());
                     }
                 }
                 if wave2_source_keys.contains(&key) {
@@ -510,10 +514,6 @@ impl RunningTopology {
                     remaining_transforms = ?remaining_transforms,
                     remaining_sinks = ?remaining_sinks,
                     time_remaining = ?time_remaining,
-                    // Un-rate-limit so every periodic tick is emitted during the (bounded, ≤overall-
-                    // deadline) shutdown. Rate-limiting was suppressing the early ticks "to avoid
-                    // flooding", which hid which component holds a slow wave-1 shutdown.
-                    internal_log_rate_limit = false,
                     "Shutting down... Waiting on running components."
                 );
 
@@ -556,6 +556,10 @@ impl RunningTopology {
             .cloned()
             .collect();
 
+        // A second owner: the writer is moved into the orchestration future (below), while
+        // `gracefully_closed_out` is moved into the returned future that reads it back.
+        let gracefully_closed_write = Arc::clone(&gracefully_closed_out);
+
         if use_two_wave {
             // Two-wave, staged shutdown. Each wave force-closes SOURCES at its deadline but lets
             // the downstream transforms/sinks keep flushing; everything still alive is finally
@@ -564,9 +568,10 @@ impl RunningTopology {
             // Wave 1 (data): non-deferred sources are signaled to stop. At
             // `data_source_deadline` any still-running data-source tasks are force-aborted
             // (phase A). Their exclusively-non-deferred transforms/sinks then drain until
-            // `data_sink_deadline` (phase B) but are NOT force-closed there. Components with any
-            // deferred source in their ancestry stay alive — their deferred input keeps the
-            // channel open.
+            // `data_sink_deadline` (phase B); any still draining at that deadline are
+            // force-terminated to bound the wave, mirroring the source abort at
+            // `data_source_deadline`. Components with any deferred source in their ancestry stay
+            // alive — their deferred input keeps the channel open.
             //
             // Wave 2 (internal): deferred sources are signaled to stop. At
             // `internal_source_deadline` any still-running internal-source tasks are
@@ -614,12 +619,6 @@ impl RunningTopology {
                 // that fires at `data_source_deadline`. It is internally bounded by that
                 // deadline, so this await cannot outlast it.
                 wave1_complete.await;
-                info!(
-                    elapsed_ms = shutdown_trace_start.elapsed().as_millis() as u64,
-                    message = "[shutdown-trace] wave-1 source handshake complete \
-                               (all non-deferred sources tripped, or data_source_deadline hit).",
-                    internal_log_rate_limit = false,
-                );
 
                 // Wave 1, phase A — data SOURCES. A source can handshake shutdown (which
                 // `.disable()`s its force-trigger) yet keep its task body alive — e.g.
@@ -653,24 +652,19 @@ impl RunningTopology {
                     futures::future::join_all(wave1_source_wait_handles).await;
                 }
 
-                info!(
-                    elapsed_ms = shutdown_trace_start.elapsed().as_millis() as u64,
-                    wave1_sources_clean = wave1_sources_clean,
-                    message = "[shutdown-trace] wave-1 source TASKS exited; entering phase B \
-                               (sink drain).",
-                    internal_log_rate_limit = false,
-                );
-
                 // Data sources are now closed, so ask the wave-1 (disk-buffered) sinks to flush
                 // their open batches instead of sitting on them until the batch timeout. This
                 // happens at data_source_deadline and gives them the phase-B window to drain.
                 signal_sink_flush(&wave1_sink_flush_signals);
 
                 // Wave 1, phase B — data transforms/SINKS. Give them until `data_sink_deadline`
-                // to flush whatever the (now-closed) data sources produced. Crucially we do NOT
-                // force-close them on timeout: a slow-but-progressing sink should keep draining
-                // through wave 2, right up to the overall deadline. We only name the stragglers
-                // and proceed to wave 2.
+                // to flush whatever the (now-closed) data sources produced. `timeout_at` resolves
+                // as soon as every task drains, so this finishes early rather than sleeping to the
+                // deadline. If the deadline passes with any straggler still draining, force-abort
+                // it to bound the wave — the same contract wave-1 sources follow at
+                // `data_source_deadline`. That miss already set `wave1_sinks_clean = false`, so the
+                // abort only bounds an already-non-graceful shutdown; a sink that drained in time
+                // has exited and is not in the still-active set.
                 info!(
                     message = "Wave 1: data sources closed. Waiting for downstream transforms \
                                and sinks to drain.",
@@ -697,11 +691,15 @@ impl RunningTopology {
                             !handles.is_empty()
                         });
                         let stragglers = wave1_sink_check_handles.keys().sorted().join(", ");
+                        let (aborted_components, aborted_tasks) =
+                            abort_active_tasks(&wave1_sink_abort_handles);
                         warn!(
                             components = ?stragglers,
-                            message = "Wave 1 sink-drain deadline exceeded; starting wave 2 \
-                                       without force-closing wave-1 sinks (they keep flushing \
-                                       until the overall deadline).",
+                            aborted_components = aborted_components,
+                            aborted_tasks = aborted_tasks,
+                            message = "Wave 1 sink-drain deadline exceeded; force-terminated \
+                                       still-draining wave-1 transforms/sinks to bound the wave \
+                                       (shutdown is already non-graceful).",
                             internal_log_rate_limit = false,
                         );
                     }
@@ -710,17 +708,21 @@ impl RunningTopology {
                     futures::future::join_all(wave1_sink_wait_handles).await;
                 }
 
-                info!(
-                    elapsed_ms = shutdown_trace_start.elapsed().as_millis() as u64,
-                    wave1_sinks_clean = wave1_sinks_clean,
-                    message = "[shutdown-trace] wave-1 sink-drain phase resolved (all drained, \
-                               or data_sink_deadline hit).",
-                    internal_log_rate_limit = false,
-                );
-
-                // `gracefully_closed` is true only when wave 1 drained fully within its
-                // deadlines — neither the sources nor the sinks had to be timed out.
+                // `gracefully_closed` is true only when wave 1 drained fully within its deadlines —
+                // neither the sources nor the sinks had to be timed out. This implies no wave-1 data
+                // was dropped, because:
+                //   - Source pumps land in `wave1_source_wait_handles` and exit Ok only after their
+                //     last `fanout.send().await` landed the event downstream, so a pulled-but-
+                //     unlanded event keeps the pump parked ⟹ force-abort ⟹ `wave1_sources_clean =
+                //     false`. This holds even for no-acks sources (kubernetes_logs; file by default),
+                //     whose checkpoint advances at pull time.
+                //   - Transforms + sinks land in `wave1_sink_wait_handles` and exit only on buffer-
+                //     drain, so a joined wave-1 sink holds no buffered data.
+                //   - Any force-terminate at a wave deadline flips the corresponding `*_clean` flag
+                //     false, so a bounded-but-incomplete wave is never reported graceful.
+                // Each mechanism is covered by a test in src/topology/test/mod.rs.
                 let gracefully_closed = wave1_sources_clean && wave1_sinks_clean;
+                gracefully_closed_write.store(gracefully_closed, Ordering::Relaxed);
 
                 // Flush any batched delivery-event VEL logs now, while data
                 // sources/sinks have all emitted their final counts (wave 1 is
@@ -828,7 +830,9 @@ impl RunningTopology {
             // completion signal (all drained, or the overall deadline force-aborted the rest). The
             // reporter is driven for logging only and abandoned once the gate resolves.
             let gate = futures::future::join(source_shutdown_complete, completion).map(|_| ());
-            drive_shutdown_to_completion(gate, reporter).boxed()
+            drive_shutdown_to_completion(gate, reporter)
+                .map(move |()| gracefully_closed_out.load(Ordering::Relaxed))
+                .boxed()
         } else {
             // No deferred sources or no data source deadline: use original single-pass behavior.
             let source_shutdown_complete = async move {
@@ -870,7 +874,11 @@ impl RunningTopology {
             // runtime to cancel on drop: same instant, same cancel-at-next-await semantics, just
             // deterministic rather than drop-driven.
             let gate = futures::future::join(source_shutdown_complete, completion).map(|_| ());
-            drive_shutdown_to_completion(gate, reporter).boxed()
+            // Single-pass path never sets `gracefully_closed`; it stays false, matching the VEL
+            // event emitted above.
+            drive_shutdown_to_completion(gate, reporter)
+                .map(move |()| gracefully_closed_out.load(Ordering::Relaxed))
+                .boxed()
         }
     }
 
