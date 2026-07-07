@@ -1175,23 +1175,22 @@ async fn topology_two_wave_aborts_stuck_wave1_source_at_data_source_deadline() {
     );
 }
 
-/// Regression: a permanently-stuck wave-1 SINK (here `backpressure_sink(0)`, whose task pends
-/// forever) must NOT be force-closed at the wave-1 sink-drain deadline. Wave-1 sinks are allowed
-/// to keep flushing until the overall deadline; only there is everything force-aborted. This is
-/// the staged-shutdown distinction from sources, which are force-closed at their (earlier) wave
-/// deadline.
+/// Regression: a permanently-stuck wave-1 SINK (`backpressure_sink(0)`, whose task pends forever)
+/// is force-terminated at the wave-1 sink-drain deadline (`data_sink_deadline`), bounding wave 1
+/// rather than letting the straggler run until the overall deadline. This mirrors the wave-1
+/// SOURCE force-abort at `data_source_deadline`. The sink never drains, so the shutdown is already
+/// non-graceful (`wave1_sinks_clean=false`) and force-terminating it costs no delivery guarantee.
 ///
 /// Topology:
 /// - clean_source (non-deferred) → stuck_sink (backpressure, never drains)
 /// - internal_logs (deferred)    → internal_sink
 ///
-/// Deadlines: data-source 1s < data-sink 2s < internal-source 3s < overall 5s. The stuck sink is
-/// force-aborted only by the overall-deadline backstop, so shutdown completes around 5s. Asserting
-/// `>= 4s` proves the sink was not force-closed early (at the 2s sink deadline or 3s internal
-/// deadline); asserting `< 9s` proves shutdown still terminates rather than hanging on the stuck
-/// sink forever.
+/// Deadlines: data-source 1s < data-sink 2s < internal-source 3s < overall 8s. The stuck sink is
+/// force-terminated at the 2s sink deadline (then wave 2 drains near-instantly), so shutdown
+/// completes shortly after ~2s. Asserting `< 5s` discriminates the force-terminate from the old
+/// ~8s overall-deadline backstop; `>= 2s` confirms the in-time drain window is honored first.
 #[tokio::test]
-async fn topology_two_wave_does_not_force_close_wave1_sinks_before_overall_deadline() {
+async fn topology_two_wave_force_terminates_stuck_wave1_sink_at_data_sink_deadline() {
     trace_init();
 
     let (mut ext_tx, ext_source) = basic_source();
@@ -1202,7 +1201,7 @@ async fn topology_two_wave_does_not_force_close_wave1_sinks_before_overall_deadl
 
     let mut config = Config::builder();
     config.global.two_wave_shutdown = true.into();
-    config.graceful_shutdown_duration = Some(Duration::from_secs(5));
+    config.graceful_shutdown_duration = Some(Duration::from_secs(8));
     config.graceful_data_source_shutdown_duration = Some(Duration::from_secs(1));
     config.graceful_data_sink_shutdown_duration = Some(Duration::from_secs(2));
     config.graceful_internal_source_shutdown_duration = Some(Duration::from_secs(3));
@@ -1227,17 +1226,104 @@ async fn topology_two_wave_does_not_force_close_wave1_sinks_before_overall_deadl
     drop(internal_tx);
 
     let start = Instant::now();
-    topology.stop().await;
+    let gracefully_closed = topology.stop().await;
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed >= Duration::from_secs(4),
-        "Shutdown took {elapsed:?}; expected the stuck wave-1 sink to keep flushing until the 5s \
-         overall deadline, not be force-closed at the 2s sink or 3s internal-source deadline."
+        elapsed >= Duration::from_secs(2),
+        "Shutdown took {elapsed:?}; expected the wave-1 sink to get its full drain window up to the \
+         2s sink deadline before being force-terminated."
     );
     assert!(
-        elapsed < Duration::from_secs(9),
-        "Shutdown took {elapsed:?}; expected the overall-deadline backstop to force-abort the \
-         stuck sink near 5s rather than hang."
+        elapsed < Duration::from_secs(5),
+        "Shutdown took {elapsed:?}; expected the stuck wave-1 sink to be force-terminated at the 2s \
+         sink deadline (then wave 2 drains fast), NOT left to run until the 8s overall deadline."
+    );
+    // A sink that never drained is not a graceful close.
+    assert!(
+        !gracefully_closed,
+        "stuck wave-1 sink never drained, so gracefully_closed must be false"
+    );
+}
+
+/// Shutdown must finish the instant all flushing components report drained, NOT sleep to the
+/// wave/overall deadline. Each wave wait is a `timeout_at(deadline, join_all(tasks))`, which
+/// resolves as soon as its `join_all` completes and only sleeps to the deadline when a task is
+/// still stuck — so a topology that drains quickly returns at ~completion-time, far below the
+/// configured deadlines.
+///
+/// This drives a healthy wave-1 pipeline (source→transform→sink, continuously drained) plus a
+/// deferred internal source, all stopping cleanly once their inputs close. The staged deadlines
+/// are deliberately large (data-source 30s < data-sink 40s < internal-source 50s < overall 60s):
+/// a deadline-sleep would take tens of seconds, so asserting `< 5s` (margin for CI jitter)
+/// discriminates completion-based finish from deadline-sleep, and `gracefully_closed=true`
+/// confirms the clean wave-1 close.
+#[tokio::test]
+async fn topology_shutdown_finishes_on_completion_not_deadline() {
+    trace_init();
+
+    // Wave-1 pipeline, continuously drained so nothing backpressures: source → transform → sink.
+    let (mut ext_tx, ext_source) = basic_source();
+    let wave1_transform = basic_transform(" w1", 0.0);
+    let (sink_out, wave1_sink) = basic_sink(10);
+    // Drain the sink output so the sink task exits cleanly on input close (no buffered stall).
+    tokio::spawn(sink_out.for_each(|_| async {}));
+
+    // Deferred internal source: engages the two-wave path where `gracefully_closed` is computed.
+    let (mut internal_tx, internal_source) = deferred_source();
+    let (internal_out, internal_sink) = basic_sink(10);
+    tokio::spawn(internal_out.for_each(|_| async {}));
+
+    let mut config = Config::builder();
+    config.global.two_wave_shutdown = true.into();
+    // Deliberately LARGE staged deadlines. A finish-on-completion shutdown must return far below
+    // these; a deadline-sleep implementation would take tens of seconds.
+    config.graceful_shutdown_duration = Some(Duration::from_secs(60));
+    config.graceful_data_source_shutdown_duration = Some(Duration::from_secs(30));
+    config.graceful_data_sink_shutdown_duration = Some(Duration::from_secs(40));
+    config.graceful_internal_source_shutdown_duration = Some(Duration::from_secs(50));
+
+    config.add_source("ext_source", ext_source);
+    config.add_source("internal_logs", internal_source);
+    config.add_transform("wave1_transform", &["ext_source"], wave1_transform);
+    config.add_sink("wave1_sink", &["wave1_transform"], wave1_sink);
+    config.add_sink("internal_sink", &["internal_logs"], internal_sink);
+
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
+
+    // Push a few events through both pipelines so the components did real work, then close the
+    // ingress at the checkpoint. Everything is drained continuously, so all tasks exit cleanly.
+    for i in 0..4 {
+        ext_tx
+            .send_event(Event::Log(LogEvent::from(format!("w1_{i}"))))
+            .await
+            .unwrap();
+        internal_tx
+            .send_event(Event::Log(LogEvent::from(format!("int_{i}"))))
+            .await
+            .unwrap();
+    }
+    sleep(Duration::from_millis(50)).await;
+    drop(ext_tx);
+    drop(internal_tx);
+
+    let start = Instant::now();
+    let gracefully_closed = topology.stop().await;
+    let elapsed = start.elapsed();
+
+    // Shutdown returns at ~completion-time, not at any staged deadline: the smallest deadline is
+    // 30s but a healthy topology drains in milliseconds, so a completion-based finish is well under
+    // 5s while a deadline-sleep would be >= 30s.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "Shutdown took {elapsed:?}; expected finish-on-completion (< 5s) since all components drain \
+         immediately. A time near a staged deadline (30s+) would mean stop() sleeps to the deadline \
+         instead of returning when components complete."
+    );
+    // A fully-drained wave-1 within its deadlines is a graceful close.
+    assert!(
+        gracefully_closed,
+        "all wave-1 components drained cleanly well within their deadlines, so gracefully_closed \
+         must be true (got false)"
     );
 }
