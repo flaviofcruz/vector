@@ -469,20 +469,39 @@ impl ClickhouseConfig {
             };
             let mut arrow_config = arrow_config.clone();
 
-            self.resolve_arrow_schema(
-                client,
-                endpoint.to_string(),
-                database,
-                auth,
-                &mut arrow_config,
-            )
-            .await?;
+            let arrow_encoder = match self
+                .resolve_arrow_schema(
+                    client,
+                    endpoint.to_string(),
+                    database,
+                    auth,
+                    &mut arrow_config,
+                )
+                .await
+            {
+                Ok(()) => BatchSerializerConfig::ArrowStream(arrow_config)
+                    .build()
+                    .map(|s| EncoderKind::Batch(BatchEncoder::new(s))),
+                Err(e) => Err(e),
+            };
 
-            let resolved_batch_config = BatchSerializerConfig::ArrowStream(arrow_config);
-            let batch_serializer = resolved_batch_config.build()?;
-            let encoder = EncoderKind::Batch(BatchEncoder::new(batch_serializer));
-
-            return Ok((Format::ArrowStream, encoder));
+            match arrow_encoder {
+                Ok(encoder) => return Ok((Format::ArrowStream, encoder)),
+                // Arrow setup failed: fall back to JSONEachRow. Return JsonEachRow, not self.format
+                // (ArrowStream here), so the FORMAT clause matches the JSON encoder.
+                Err(error) => {
+                    metrics::counter!("clickhouse_arrow_setup_failed_fallback_json").increment(1);
+                    warn!(
+                        message = "ClickHouse Arrow setup failed; falling back to JSONEachRow.",
+                        %error,
+                    );
+                    let encoder = EncoderKind::Framed(Box::new(Encoder::<Framer>::new(
+                        NewlineDelimitedEncoderConfig.build().into(),
+                        JsonSerializerConfig::default().build().into(),
+                    )));
+                    return Ok((Format::JsonEachRow, encoder));
+                }
+            }
         }
 
         let encoder = EncoderKind::Framed(Box::new(Encoder::<Framer>::new(
@@ -679,5 +698,35 @@ mod tests {
                 "format should match configured value"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_arrow_schema_failure_falls_back_to_json() {
+        use crate::http::HttpClient;
+        use crate::tls::TlsSettings;
+
+        let tls = TlsSettings::default();
+        let client = HttpClient::new(tls, &Default::default()).unwrap();
+        // Unroutable port so the schema fetch fails.
+        let endpoint: http::Uri = "http://127.0.0.1:1".parse().unwrap();
+        let database: Template = "test_db".try_into().unwrap();
+
+        let config = create_test_config(
+            Format::ArrowStream,
+            Some(BatchSerializerConfig::ArrowStream(
+                ArrowStreamSerializerConfig::default(),
+            )),
+        );
+
+        let (format, _encoder) = config
+            .resolve_strategy(&client, &endpoint, &database, None)
+            .await
+            .expect("Arrow setup failure should fall back, not error");
+
+        assert_eq!(
+            format,
+            Format::JsonEachRow,
+            "on Arrow setup failure the sink must fall back to JSONEachRow"
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! ClickHouse type parsing and conversion to Arrow types.
 
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Field, TimeUnit};
+use std::sync::Arc;
 
 const DECIMAL32_PRECISION: u8 = 9;
 const DECIMAL64_PRECISION: u8 = 18;
@@ -78,13 +79,6 @@ pub fn unwrap_type_modifiers(ch_type: &str) -> (&str, bool) {
     }
 }
 
-fn unsupported(ch_type: &str, kind: &str) -> String {
-    format!(
-        "{kind} type '{ch_type}' is not supported. \
-         ClickHouse {kind} types cannot be automatically converted to Arrow format."
-    )
-}
-
 /// Converts a ClickHouse type string to an Arrow DataType.
 /// Returns a tuple of (DataType, is_nullable).
 pub fn clickhouse_type_to_arrow(ch_type: &str) -> Result<(DataType, bool), String> {
@@ -130,10 +124,10 @@ pub fn clickhouse_type_to_arrow(ch_type: &str) -> Result<(DataType, bool), Strin
         "DateTime" => DataType::Timestamp(TimeUnit::Second, None),
         "DateTime64" => parse_datetime64_precision(base_type)?,
 
-        // Unsupported
-        "Array" => return Err(unsupported(ch_type, "Array")),
-        "Tuple" => return Err(unsupported(ch_type, "Tuple")),
-        "Map" => return Err(unsupported(ch_type, "Map")),
+        // Arrow List/Struct/Map; ClickHouse converts these back to Array/Tuple/Map on insert.
+        "Array" => parse_array_type(base_type)?,
+        "Tuple" => parse_tuple_type(base_type)?,
+        "Map" => parse_map_type(base_type)?,
 
         // Unknown
         _ => {
@@ -282,6 +276,123 @@ fn parse_datetime64_precision(ch_type: &str) -> Result<DataType, String> {
             ch_type
         )),
     }
+}
+
+/// Builds an Arrow child `Field` for a nested inner ClickHouse type via `clickhouse_type_to_arrow`,
+/// rejecting element types the codec cannot build in a collection so the failure surfaces at schema
+/// resolution (caught by the sink's JSONEachRow fallback) rather than on every batch at encode time.
+fn ch_type_to_arrow_field(name: &str, inner_ch_type: &str) -> Result<Field, String> {
+    let (data_type, nullable) = clickhouse_type_to_arrow(inner_ch_type)?;
+    reject_unsupported_nested_type(inner_ch_type, &data_type)?;
+    Ok(Field::new(name, data_type, nullable))
+}
+
+/// The collection builders (`build_map_value_array` / `build_list_item_array`) handle a narrower set
+/// than a top-level column. This admits only what they build, rejecting the rest (`Dictionary`/
+/// LowCardinality, `Int8/16`, `UInt8/16`, `Decimal`, `Date`/`DateTime`). `Struct`/`List`/`Map` pass
+/// through, and their own inner fields are validated recursively as they are parsed.
+fn reject_unsupported_nested_type(ch_type: &str, data_type: &DataType) -> Result<(), String> {
+    let supported = matches!(
+        data_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Boolean
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Struct(_)
+            | DataType::List(_)
+            | DataType::Map(_, _)
+    );
+    if supported {
+        Ok(())
+    } else {
+        Err(format!(
+            "ClickHouse type '{}' (Arrow {:?}) is not supported as a collection element/key/value; \
+             only String, Binary, Bool, Int32/64, UInt32/64, Float32/64, and nested \
+             Array/Tuple/Map are supported inside a collection.",
+            ch_type, data_type
+        ))
+    }
+}
+
+/// `Array(T)` -> Arrow `List<item: T>`. ClickHouse converts the Arrow List back to `Array` on insert.
+fn parse_array_type(ch_type: &str) -> Result<DataType, String> {
+    let (_, args_str) = extract_identifier(ch_type);
+    let args = parse_args(args_str)?;
+    if args.len() != 1 {
+        return Err(format!(
+            "Array type '{}' must have exactly one element type, found {}",
+            ch_type,
+            args.len()
+        ));
+    }
+    Ok(DataType::List(Arc::new(ch_type_to_arrow_field(
+        "item", &args[0],
+    )?)))
+}
+
+/// `Map(K, V)` -> Arrow `Map<entries: Struct<key: K, value: V>>`. Keys are non-nullable.
+fn parse_map_type(ch_type: &str) -> Result<DataType, String> {
+    let (_, args_str) = extract_identifier(ch_type);
+    let args = parse_args(args_str)?;
+    if args.len() != 2 {
+        return Err(format!(
+            "Map type '{}' must have exactly a key and a value type, found {}",
+            ch_type,
+            args.len()
+        ));
+    }
+    // Validate the key type against the collection-element set, then force it non-nullable
+    // (ClickHouse map keys cannot be null).
+    let (key_type, _) = clickhouse_type_to_arrow(&args[0])?;
+    reject_unsupported_nested_type(&args[0], &key_type)?;
+    let key_field = Field::new("key", key_type, false);
+    let value_field = ch_type_to_arrow_field("value", &args[1])?;
+    let entries = Field::new(
+        "entries",
+        DataType::Struct(vec![key_field, value_field].into()),
+        false,
+    );
+    Ok(DataType::Map(Arc::new(entries), false))
+}
+
+/// `Tuple(...)` -> Arrow `Struct`. Named elements become named fields; unnamed elements get
+/// positional names ("1", "2", ...). Only named elements populate from event data.
+fn parse_tuple_type(ch_type: &str) -> Result<DataType, String> {
+    let (_, args_str) = extract_identifier(ch_type);
+    let args = parse_args(args_str)?;
+    if args.is_empty() {
+        return Err(format!(
+            "Tuple type '{}' must have at least one element",
+            ch_type
+        ));
+    }
+    let mut fields = Vec::with_capacity(args.len());
+    for (i, arg) in args.iter().enumerate() {
+        let (name, elem_type) = split_tuple_element(arg, i);
+        fields.push(ch_type_to_arrow_field(&name, &elem_type)?);
+    }
+    Ok(DataType::Struct(fields.into()))
+}
+
+/// Splits one `Tuple` element into (field_name, element_type). A named element is `<name> <Type>`;
+/// an unnamed element is `<Type>`, named by its 1-based position.
+fn split_tuple_element(arg: &str, index: usize) -> (String, String) {
+    let arg = arg.trim();
+    if let Some(ws) = arg.find(char::is_whitespace) {
+        let (name, rest) = arg.split_at(ws);
+        let rest = rest.trim_start();
+        if !rest.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return (name.to_string(), rest.to_string());
+        }
+    }
+    ((index + 1).to_string(), arg.to_string())
 }
 
 #[cfg(test)]
@@ -567,33 +678,128 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_not_supported() {
-        // Array types should return an error
-        let result = convert_type_no_metadata("Array(Int32)");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("Array type"));
-        assert!(err.contains("not supported"));
+    fn test_array_type_maps_to_list() {
+        let (dt, nullable) =
+            convert_type_no_metadata("Array(Int32)").expect("Array should map to Arrow List");
+        assert_eq!(
+            dt,
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, false)))
+        );
+        assert!(!nullable);
     }
 
     #[test]
-    fn test_tuple_type_not_supported() {
-        // Tuple types should return an error
-        let result = convert_type_no_metadata("Tuple(String, Int64)");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("Tuple type"));
-        assert!(err.contains("not supported"));
+    fn test_tuple_type_maps_to_struct() {
+        // Unnamed elements get positional names "1", "2".
+        let (dt, _) = convert_type_no_metadata("Tuple(String, Int64)")
+            .expect("Tuple should map to Arrow Struct");
+        assert_eq!(
+            dt,
+            DataType::Struct(
+                vec![
+                    Field::new("1", DataType::Utf8, false),
+                    Field::new("2", DataType::Int64, false),
+                ]
+                .into()
+            )
+        );
+        // Named elements keep their names.
+        let (dt_named, _) = convert_type_no_metadata("Tuple(a String, b Int64)")
+            .expect("named Tuple should map to Arrow Struct");
+        assert_eq!(
+            dt_named,
+            DataType::Struct(
+                vec![
+                    Field::new("a", DataType::Utf8, false),
+                    Field::new("b", DataType::Int64, false),
+                ]
+                .into()
+            )
+        );
     }
 
     #[test]
-    fn test_map_type_not_supported() {
-        // Map types should return an error
-        let result = convert_type_no_metadata("Map(String, Int64)");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("Map type"));
-        assert!(err.contains("not supported"));
+    fn test_map_type_maps_to_map() {
+        let (dt, nullable) =
+            convert_type_no_metadata("Map(String, String)").expect("Map should map to Arrow Map");
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        assert_eq!(dt, DataType::Map(Arc::new(entries), false));
+        assert!(!nullable);
+    }
+
+    #[test]
+    fn test_nested_collection_recursion() {
+        // Map(String, Array(Int64)) exercises a string key + list value + recursion, all of which
+        // the codec's collection builders support.
+        let (dt, _) =
+            convert_type_no_metadata("Map(String, Array(Int64))").expect("nested Map should map");
+        let DataType::Map(entries, _) = dt else {
+            panic!("expected Map, got {:?}", dt);
+        };
+        let DataType::Struct(kv) = entries.data_type() else {
+            panic!("expected Struct entries, got {:?}", entries.data_type());
+        };
+        assert_eq!(kv[0].data_type(), &DataType::Utf8);
+        assert_eq!(
+            kv[1].data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Int64, false)))
+        );
+    }
+
+    #[test]
+    fn test_unsupported_nested_element_types_rejected_at_parse() {
+        // Element/key/value types the codec's collection builders cannot build must be rejected at
+        // parse (schema resolution), so the sink's JSONEachRow fallback catches them instead of
+        // crashing on every batch at encode time.
+        for ty in [
+            "Array(Int8)",                         // Int8 not a supported list element
+            "Array(Decimal(10, 2))",               // Decimal not supported inside a collection
+            "Array(DateTime)",                     // Timestamp not supported inside a collection
+            "Map(LowCardinality(String), String)", // Dictionary key not supported
+            "Map(String, LowCardinality(String))", // Dictionary value not supported
+            "Map(Int64, DateTime64(3))",           // DateTime64 value not supported
+            "Tuple(a Int16, b String)",            // Int16 tuple element not supported
+        ] {
+            let result = convert_type_no_metadata(ty);
+            assert!(
+                result.is_err(),
+                "expected '{}' to be rejected as an unsupported collection element, got {:?}",
+                ty,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_supported_nested_element_types_accepted() {
+        // The element/key/value types the builders DO support must still parse.
+        for ty in [
+            "Array(String)",
+            "Array(Int64)",
+            "Array(Float64)",
+            "Array(Bool)",
+            "Map(String, String)",
+            "Map(Int64, String)",
+            "Map(String, Array(String))",
+            "Map(String, Map(String, String))",
+            "Tuple(a String, b Int64)",
+        ] {
+            assert!(
+                convert_type_no_metadata(ty).is_ok(),
+                "expected '{}' to be a supported collection element",
+                ty
+            );
+        }
     }
 
     #[test]

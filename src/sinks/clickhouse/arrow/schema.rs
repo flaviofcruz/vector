@@ -113,9 +113,10 @@ fn parse_schema_from_response(response: &str) -> crate::Result<Schema> {
 
 /// Value to substitute for a missing/null instance of a non-nullable column, mirroring the
 /// type's ClickHouse omitted-column default. String/FixedString/LowCardinality -> `""`,
-/// JSON -> `"{}"`, numeric/temporal scalars -> the zero value. `None` for nullable columns
-/// (they stay NULL) and for complex/unsupported types, where a missing value errors the batch.
-/// A DEFAULT column gets this type-default, not its DEFAULT expression.
+/// JSON -> `"{}"`, numeric/temporal scalars -> the zero value, and Map/Array/Tuple -> an
+/// empty-collection signal (the codec emits an empty Map/List or a Struct of child defaults).
+/// `None` for nullable columns (they stay NULL) and for still-unsupported types, where a
+/// missing value errors the batch. A DEFAULT column gets this type-default, not its DEFAULT expr.
 fn clickhouse_omitted_default(ch_type: &str) -> Option<String> {
     let (base, is_nullable) = unwrap_type_modifiers(ch_type);
     if is_nullable {
@@ -127,6 +128,10 @@ fn clickhouse_omitted_default(ch_type: &str) -> Option<String> {
         Some(String::new())
     } else if is_zero_default_scalar(base) {
         Some("0".to_string())
+    } else if base.starts_with("Map") || base.starts_with("Array") || base.starts_with("Tuple") {
+        // Empty string is a coercion signal; the codec fills an empty Map/List (or a Struct of
+        // child defaults) for collection columns.
+        Some(String::new())
     } else {
         None
     }

@@ -757,9 +757,9 @@ fn build_int64_array(
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let mut builder = Int64Builder::with_capacity(events.len());
 
-    // Parse the default once; an unparseable default stays `None`, so a missing value then hits
-    // the nullable/non-nullable handling.
-    let default_value: Option<i64> = missing_default.and_then(|d| d.trim().parse::<i64>().ok());
+    // Coercion on: an unparseable default (the "" a collection column forwards to its children)
+    // coerces to 0, like the other numeric builders. Off (`None`): a missing value stays unset.
+    let default_value: Option<i64> = missing_default.map(|d| d.trim().parse::<i64>().unwrap_or(0));
 
     for event in events {
         if let Event::Log(log) = event {
@@ -1050,11 +1050,15 @@ fn build_column_for_path(
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let nullable = field.is_nullable();
     match field.data_type() {
-        DataType::Struct(fields) => build_struct_array(events, path, fields, nullable),
-        DataType::Map(entries_field, _sorted) => {
-            build_map_array(events, path, entries_field, nullable)
+        DataType::Struct(fields) => {
+            build_struct_array(events, path, fields, nullable, missing_default)
         }
-        DataType::List(item_field) => build_list_array(events, path, item_field, nullable),
+        DataType::Map(entries_field, _sorted) => {
+            build_map_array(events, path, entries_field, nullable, missing_default)
+        }
+        DataType::List(item_field) => {
+            build_list_array(events, path, item_field, nullable, missing_default)
+        }
         DataType::Timestamp(time_unit, tz) => build_timestamp_array(
             events,
             path,
@@ -1099,6 +1103,62 @@ fn build_column_for_path(
     }
 }
 
+/// Emits a metric and warning for `count` present but wrong-typed values at `path` that were
+/// coerced to an empty collection. Called once per column per batch.
+fn emit_malformed_collection_coerced(path: &str, count: u64, batch_size: usize) {
+    metrics::counter!("arrow_malformed_collection_coerced", "field" => path.to_string())
+        .increment(count);
+    tracing::warn!(
+        message = "Arrow encoder coerced present but wrong-typed value(s) to an empty collection",
+        field = %path,
+        coerced = count,
+        batch_size,
+    );
+}
+
+/// Emits a metric and warning for `count` map keys at `path` collapsed to 0/false because they did
+/// not convert to a non-string key type. Collapsing can produce duplicate keys in a row.
+fn emit_lossy_map_keys(path: &str, count: u64) {
+    metrics::counter!("arrow_map_key_coercion_lossy", "field" => path.to_string()).increment(count);
+    tracing::warn!(
+        message = "Arrow encoder collapsed map key(s) that did not parse to the key type, \
+                   so distinct keys may have merged",
+        field = %path,
+        lossy_keys = count,
+    );
+}
+
+/// Disposition of a map/list cell whose value is not a well-formed collection.
+enum CollectionCell {
+    /// Emit an empty collection. `malformed` is set for a present-but-wrong-shape value, which the
+    /// caller counts for the malformed-coercion metric.
+    Coerced { malformed: bool },
+    /// Emit a null row.
+    Null,
+}
+
+/// Shared missing/null/wrong-type cascade for `build_map_array` and `build_list_array`.
+/// `present_wrong_type` marks a present-but-wrong-shape value. A non-nullable column with coercion
+/// off errors, matching the scalar builders.
+fn classify_collection_presence(
+    present_wrong_type: bool,
+    nullable: bool,
+    missing_default: Option<&str>,
+    path: &str,
+) -> Result<CollectionCell, ArrowEncodingError> {
+    if missing_default.is_some() {
+        Ok(CollectionCell::Coerced {
+            malformed: present_wrong_type,
+        })
+    } else if nullable {
+        Ok(CollectionCell::Null)
+    } else {
+        Err(ArrowEncodingError::NullConstraint {
+            field_name: path.into(),
+        })
+    }
+}
+
 /// Builds an Arrow `StructArray` for a struct field at the given dot-separated path.
 ///
 /// Child fields are accessed via `path.child_name` using Vector's path lookup,
@@ -1108,33 +1168,48 @@ fn build_struct_array(
     path: &str,
     fields: &Fields,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
+    // Children are built for every event; under coercion a missing child takes its default.
     let child_arrays: Vec<ArrayRef> = fields
         .iter()
         .map(|child_field| {
             let child_path = format!("{}.{}", path, child_field.name());
-            build_column_for_path(events, &child_path, child_field, None)
+            build_column_for_path(events, &child_path, child_field, missing_default)
         })
         .collect::<Result<_, _>>()?;
 
     let mut has_null = false;
+    let mut coerced_malformed: u64 = 0;
     let mut validity: Vec<bool> = Vec::with_capacity(events.len());
     for event in events {
         if let Event::Log(log) = event {
-            let valid = log.get(path).is_some();
-            if !valid {
-                if !nullable {
-                    return Err(ArrowEncodingError::NullConstraint {
-                        field_name: path.into(),
-                    });
+            let valid = if let Some(value) = log.get(path) {
+                // Present non-object under coercion: valid row of child defaults, counted.
+                // Without coercion, any present value yields a valid row.
+                if missing_default.is_some() && !matches!(value, Value::Object(_) | Value::Null) {
+                    coerced_malformed += 1;
                 }
+                true
+            } else if missing_default.is_some() {
+                // Coerced absent struct -> valid row of child defaults.
+                true
+            } else if nullable {
                 has_null = true;
-            }
+                false
+            } else {
+                return Err(ArrowEncodingError::NullConstraint {
+                    field_name: path.into(),
+                });
+            };
             validity.push(valid);
         } else {
             validity.push(false);
             has_null = true;
         }
+    }
+    if coerced_malformed > 0 {
+        emit_malformed_collection_coerced(path, coerced_malformed, events.len());
     }
     let null_buffer = has_null.then(|| NullBuffer::from(validity));
 
@@ -1148,7 +1223,11 @@ fn build_struct_array(
 /// Protobuf map keys may be integer types (e.g. `map<int64, bool>` uses `Int64`).
 /// JSON object keys are always strings, so we parse them into the target type.
 /// Protobuf allows bool, int32/64, uint32/64, and string as map key types.
-fn coerce_string_key(k: &str, key_type: &DataType) -> Value {
+///
+/// Returns the converted `Value` and a `lossy` flag. `lossy` is true when the input did not
+/// represent the key type (a non-numeric string for an integer key, a non-boolean string for a bool
+/// key), so it collapses to 0/false and distinct keys may merge. The caller counts and reports it.
+fn coerce_string_key(k: &str, key_type: &DataType) -> (Value, bool) {
     match key_type {
         DataType::Int8
         | DataType::Int16
@@ -1157,31 +1236,29 @@ fn coerce_string_key(k: &str, key_type: &DataType) -> Value {
         | DataType::UInt8
         | DataType::UInt16
         | DataType::UInt32
-        | DataType::UInt64 => {
-            if let Ok(i) = k.parse::<i64>() {
-                Value::Integer(i)
-            } else {
-                Value::Integer(0)
-            }
-        }
-        DataType::Boolean => match k {
-            "true" | "1" => Value::Boolean(true),
-            _ => Value::Boolean(false),
+        | DataType::UInt64 => match k.parse::<i64>() {
+            Ok(i) => (Value::Integer(i), false),
+            Err(_) => (Value::Integer(0), true),
         },
-        _ => Value::Bytes(k.to_owned().into()),
+        DataType::Boolean => match k {
+            "true" | "1" => (Value::Boolean(true), false),
+            "false" | "0" => (Value::Boolean(false), false),
+            _ => (Value::Boolean(false), true),
+        },
+        _ => (Value::Bytes(k.to_owned().into()), false),
     }
 }
 
 /// Builds an Arrow `MapArray` for a map field at the given path.
 ///
-/// The Vector event value at `path` must be a `Value::Object` (string-keyed map).
-/// Supported map value types: `LargeUtf8`, `Utf8`, `Boolean`, `Int32`, `Int64`,
-/// `UInt32`, `UInt64`, `Float32`, `Float64`.
+/// The Vector event value at `path` must be a `Value::Object` (string-keyed map). Values may be any
+/// type `build_map_value_array` handles: the scalar types plus nested `Struct`, `List`, and `Map`.
 fn build_map_array(
     events: &[Event],
     path: &str,
     entries_field: &Field,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let DataType::Struct(kv_fields) = entries_field.data_type() else {
         return Err(ArrowEncodingError::UnsupportedType {
@@ -1204,6 +1281,8 @@ fn build_map_array(
     let mut offsets: Vec<i32> = Vec::with_capacity(events.len() + 1);
     let mut validity: Vec<bool> = Vec::with_capacity(events.len());
     let mut current_offset: i32 = 0;
+    let mut coerced_malformed: u64 = 0;
+    let mut lossy_keys: u64 = 0;
     offsets.push(0);
 
     for event in events {
@@ -1214,25 +1293,45 @@ fn build_map_array(
                     for (k, v) in obj.iter() {
                         // JSON object keys are always strings. Convert to the
                         // schema's key type (e.g. parse "123" → Int64 for map<int64, *>).
-                        let key_val = coerce_string_key(k.as_str(), key_field.data_type());
+                        let (key_val, lossy) = coerce_string_key(k.as_str(), key_field.data_type());
+                        if lossy {
+                            lossy_keys += 1;
+                        }
                         flat_keys.push(key_val);
                         flat_values.push(v.clone());
                         current_offset += 1;
                     }
                 }
-                _ => {
-                    if !nullable {
-                        return Err(ArrowEncodingError::NullConstraint {
-                            field_name: path.into(),
-                        });
+                // Not a well-formed object: empty map, null, or error per classify_collection_presence.
+                // An explicit null counts as absent, not malformed.
+                other => {
+                    let present_wrong_type = !matches!(other, None | Some(Value::Null));
+                    match classify_collection_presence(
+                        present_wrong_type,
+                        nullable,
+                        missing_default,
+                        path,
+                    )? {
+                        CollectionCell::Coerced { malformed } => {
+                            validity.push(true);
+                            if malformed {
+                                coerced_malformed += 1;
+                            }
+                        }
+                        CollectionCell::Null => validity.push(false),
                     }
-                    validity.push(false);
                 }
             }
         } else {
             validity.push(false);
         }
         offsets.push(current_offset);
+    }
+    if coerced_malformed > 0 {
+        emit_malformed_collection_coerced(path, coerced_malformed, events.len());
+    }
+    if lossy_keys > 0 {
+        emit_lossy_map_keys(path, lossy_keys);
     }
 
     let key_array = build_map_value_array(&flat_keys, key_field)?;
@@ -1262,49 +1361,61 @@ fn build_map_array(
 ///
 /// The Vector event value at `path` must be a `Value::Array`. Each element
 /// is encoded according to `item_field`, supporting all scalar types, `Struct`,
-/// and nested `List`.  Absent or non-array values produce a null list row when
-/// the field is nullable; non-nullable missing values return `NullConstraint`.
+/// and nested `List`. An absent or non-array value becomes an empty list under coercion, a null list
+/// row when the field is nullable, or a `NullConstraint` error when non-nullable.
 fn build_list_array(
     events: &[Event],
     path: &str,
     item_field: &Field,
     nullable: bool,
+    missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let mut flat_items: Vec<Value> = Vec::new();
     let mut offsets: Vec<i32> = vec![0];
     let mut validity: Vec<bool> = Vec::with_capacity(events.len());
     let mut has_null = false;
+    let mut coerced_malformed: u64 = 0;
 
     for event in events {
-        let arr_opt = if let Event::Log(log) = event {
-            log.get(path).and_then(|v| {
-                if let Value::Array(a) = v {
-                    Some(a.clone())
-                } else {
-                    None
-                }
-            })
+        let value = if let Event::Log(log) = event {
+            log.get(path)
         } else {
             None
         };
 
-        match arr_opt {
-            Some(arr) => {
-                flat_items.extend(arr.into_iter());
+        match value {
+            Some(Value::Array(arr)) => {
+                flat_items.extend(arr.iter().cloned());
                 offsets.push(flat_items.len() as i32);
                 validity.push(true);
             }
-            None => {
-                if !nullable {
-                    return Err(ArrowEncodingError::NullConstraint {
-                        field_name: path.into(),
-                    });
-                }
+            // Not a well-formed array: empty list, null, or error per classify_collection_presence.
+            // An explicit null counts as absent, not malformed.
+            other => {
                 offsets.push(*offsets.last().unwrap_or(&0));
-                validity.push(false);
-                has_null = true;
+                let present_wrong_type = !matches!(other, None | Some(Value::Null));
+                match classify_collection_presence(
+                    present_wrong_type,
+                    nullable,
+                    missing_default,
+                    path,
+                )? {
+                    CollectionCell::Coerced { malformed } => {
+                        validity.push(true);
+                        if malformed {
+                            coerced_malformed += 1;
+                        }
+                    }
+                    CollectionCell::Null => {
+                        validity.push(false);
+                        has_null = true;
+                    }
+                }
             }
         }
+    }
+    if coerced_malformed > 0 {
+        emit_malformed_collection_coerced(path, coerced_malformed, events.len());
     }
 
     let child_array = build_list_item_array(&flat_items, item_field)?;
@@ -1418,12 +1529,18 @@ fn build_list_item_array(items: &[Value], field: &Field) -> Result<ArrayRef, Arr
             let mut offsets: Vec<i32> = vec![0];
             let mut validity: Vec<bool> = Vec::with_capacity(items.len());
             let mut has_null = false;
+            let mut lossy_keys: u64 = 0;
 
             for item in items {
                 match item {
                     Value::Object(obj) => {
                         for (k, v) in obj.iter() {
-                            flat_keys.push(coerce_string_key(k.as_str(), key_field.data_type()));
+                            let (key_val, lossy) =
+                                coerce_string_key(k.as_str(), key_field.data_type());
+                            if lossy {
+                                lossy_keys += 1;
+                            }
+                            flat_keys.push(key_val);
                             flat_values.push(v.clone());
                         }
                         offsets.push(flat_keys.len() as i32);
@@ -1435,6 +1552,9 @@ fn build_list_item_array(items: &[Value], field: &Field) -> Result<ArrayRef, Arr
                         has_null = true;
                     }
                 }
+            }
+            if lossy_keys > 0 {
+                emit_lossy_map_keys(field.name(), lossy_keys);
             }
 
             let key_array = build_map_value_array(&flat_keys, key_field)?;
@@ -1585,8 +1705,10 @@ fn build_map_value_array(values: &[Value], field: &Field) -> Result<ArrayRef, Ar
             }
             Ok(Arc::new(builder.finish()))
         }
-        DataType::Struct(_) | DataType::List(_) => {
-            // Delegate to build_list_item_array which already handles Struct and List values.
+        DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _) => {
+            // build_list_item_array handles all three. Map is included so a Map-valued Map builds
+            // here instead of erroring, keeping this set equal to what
+            // parser::reject_unsupported_nested_type admits.
             build_list_item_array(values, field)
         }
         other => Err(ArrowEncodingError::UnsupportedType {
@@ -3368,6 +3490,195 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_encode_struct_present_non_object_coerces_to_defaults() {
+        use arrow::array::StructArray;
+        // A present non-object value coerces to a struct of child defaults.
+        let mut log = LogEvent::default();
+        log.insert("required", "not-a-struct");
+        let events = vec![Event::Log(log)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "required",
+            DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int64, true)])),
+            false,
+        )]));
+        let coerce = std::collections::HashMap::from([("required".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce)).expect(
+            "present non-object struct should coerce to child defaults, not fail the batch",
+        );
+        let s = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(
+            !s.is_null(0),
+            "coerced row should be a valid struct of child defaults"
+        );
+    }
+
+    #[test]
+    fn test_encode_struct_non_nullable_int_child_missing_coerces_to_zero() {
+        use arrow::array::{Int64Array, StructArray};
+        // An absent non-nullable Int64 struct child must coerce to 0, not fail the batch: the "" the
+        // parent forwards as its default must reach build_int64_array as 0, not NullConstraint.
+        let mut log = LogEvent::default();
+        log.insert("required.name", "alice"); // present child
+        // "required.count" (the non-nullable Int64 child) is intentionally absent.
+        let events = vec![Event::Log(log)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "required",
+            DataType::Struct(Fields::from(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("count", DataType::Int64, false),
+            ])),
+            false,
+        )]));
+        let coerce = std::collections::HashMap::from([("required".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce))
+            .expect("absent non-nullable int child should coerce to 0, not fail the batch");
+        let s = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(!s.is_null(0));
+        let count = s
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            count.value(0),
+            0,
+            "missing non-nullable int child should be 0"
+        );
+    }
+
+    #[test]
+    fn test_encode_map_of_list_roundtrip() {
+        use arrow::array::MapArray;
+        use serde_json::json;
+        // Map<Utf8, List<Int64>> round-trip across multiple rows, including an empty inner list.
+        // Exercises the recursive collection-value path that scalar-only map tests do not.
+        let item = Field::new("item", DataType::Int64, true);
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::List(Arc::new(item)), true),
+            ])),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "buckets",
+            DataType::Map(Arc::new(entries), false),
+            true,
+        )]));
+
+        let mut log0 = LogEvent::default();
+        log0.insert("buckets", json!({"a": [1, 2], "b": []})); // "b" is an empty inner list
+        let mut log1 = LogEvent::default();
+        log1.insert("buckets", json!({"c": [3]}));
+        let events = vec![Event::Log(log0), Event::Log(log1)];
+
+        let batch = build_record_batch(Arc::clone(&schema), &events)
+            .expect("Map<Utf8,List<Int64>> should encode");
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.value_length(0), 2, "row 0 has two keys (a, b)");
+        assert_eq!(map.value_length(1), 1, "row 1 has one key (c)");
+
+        // IPC round-trip: the whole batch must serialize and read back with the same shape.
+        let ipc = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)))
+            .expect("IPC serialize");
+        let mut reader = StreamReader::try_new(Cursor::new(ipc), None).expect("IPC reader");
+        let read_back = reader.next().expect("one batch").expect("valid batch");
+        assert_eq!(read_back.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_encode_map_of_map_roundtrip() {
+        use arrow::array::MapArray;
+        use serde_json::json;
+        // A Map used as a map value: build_map_value_array must build the inner Map, so the Map that
+        // parser::reject_unsupported_nested_type admits is backed by a real builder path.
+        let inner_entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+            false,
+        );
+        let outer_entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Map(Arc::new(inner_entries), false), true),
+            ])),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "outer",
+            DataType::Map(Arc::new(outer_entries), false),
+            true,
+        )]));
+
+        let mut log = LogEvent::default();
+        log.insert("outer", json!({"a": {"x": "1"}, "b": {}}));
+        let events = vec![Event::Log(log)];
+
+        let batch = build_record_batch(Arc::clone(&schema), &events)
+            .expect("Map<Utf8,Map<Utf8,Utf8>> should encode");
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.value_length(0), 2, "row 0 has two outer keys (a, b)");
+
+        let ipc = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)))
+            .expect("IPC serialize");
+        let mut reader = StreamReader::try_new(Cursor::new(ipc), None).expect("IPC reader");
+        let read_back = reader.next().expect("one batch").expect("valid batch");
+        assert_eq!(read_back.num_rows(), 1);
+    }
+
+    #[test]
+    fn test_encode_map_int_key_unparseable_is_signaled_not_dropped() {
+        use arrow::array::MapArray;
+        use serde_json::json;
+        // A non-numeric key for an Int64-keyed map collapses to 0 (lossy) but the entry is retained
+        // and the batch still encodes, rather than the whole batch failing.
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(Arc::new(entries), false),
+            true,
+        )]));
+
+        let mut log = LogEvent::default();
+        log.insert("m", json!({"not_a_number": "x"}));
+        let events = vec![Event::Log(log)];
+
+        let batch = build_record_batch(Arc::clone(&schema), &events)
+            .expect("lossy int key should not fail");
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(
+            map.value_length(0),
+            1,
+            "the entry is retained (key collapsed to 0)"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // List encoding tests
     // -------------------------------------------------------------------------
@@ -3520,6 +3831,70 @@ mod tests {
             result,
             Err(ArrowEncodingError::NullConstraint { .. })
         ));
+    }
+
+    #[test]
+    fn test_encode_list_non_nullable_missing_coerces_to_empty() {
+        use arrow::array::ListArray;
+        // Absent non-nullable list under coercion -> empty list.
+        let events = vec![Event::Log(LogEvent::default())];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            false,
+        )]));
+        let coerce = std::collections::HashMap::from([("hashes".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce))
+            .expect("missing non-nullable list should coerce to empty, not fail");
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(
+            !list.is_null(0),
+            "coerced row should be a valid (empty) list"
+        );
+        assert_eq!(
+            list.value_length(0),
+            0,
+            "coerced missing list should be empty"
+        );
+    }
+
+    #[test]
+    fn test_encode_list_present_non_array_coerces_to_empty() {
+        use arrow::array::ListArray;
+        // A present non-array value coerces to an empty list.
+        let mut log = LogEvent::default();
+        log.insert("hashes", "not-an-array");
+        let events = vec![Event::Log(log)];
+        let item_field = Field::new("item", DataType::Int64, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Arc::new(item_field)),
+            false,
+        )]));
+        let coerce = std::collections::HashMap::from([("hashes".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce))
+            .expect("present non-array list should coerce to empty, not fail the batch");
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(
+            !list.is_null(0),
+            "coerced row should be a valid (empty) list"
+        );
+        assert_eq!(
+            list.value_length(0),
+            0,
+            "malformed list value should coerce to zero items"
+        );
     }
 
     /// `List<Struct>` — encodes a repeated nested message field.
@@ -3772,6 +4147,55 @@ mod tests {
             result,
             Err(ArrowEncodingError::NullConstraint { .. })
         ));
+    }
+
+    #[test]
+    fn test_encode_map_non_nullable_missing_coerces_to_empty() {
+        use arrow::array::MapArray;
+        // Under coercion, a missing non-nullable Map becomes an empty map; without coercion it
+        // errors (test_encode_map_non_nullable_missing_fails).
+        let events = vec![Event::Log(LogEvent::default())]; // "flags" map field absent
+        let schema = Arc::new(Schema::new(vec![map_field(DataType::Boolean, false)]));
+        let coerce = std::collections::HashMap::from([("flags".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce))
+            .expect("missing non-nullable map should coerce to empty, not fail");
+
+        assert_eq!(batch.num_rows(), 1);
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(
+            !map.is_null(0),
+            "coerced row should be a valid (empty) map, not null"
+        );
+        assert_eq!(
+            map.value_length(0),
+            0,
+            "coerced missing map should have zero entries"
+        );
+    }
+
+    #[test]
+    fn test_encode_map_present_non_object_coerces_to_empty() {
+        use arrow::array::MapArray;
+        // A present non-object value coerces to an empty map.
+        let mut log = LogEvent::default();
+        log.insert("flags", "not-a-map");
+        let events = vec![Event::Log(log)];
+        let schema = Arc::new(Schema::new(vec![map_field(DataType::Boolean, false)]));
+        let coerce = std::collections::HashMap::from([("flags".to_string(), String::new())]);
+
+        let batch = build_record_batch_inner(Arc::clone(&schema), &events, Some(&coerce))
+            .expect("present non-object map should coerce to empty, not fail the batch");
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(
+            !map.is_null(0),
+            "coerced row should be a valid (empty) map, not null"
+        );
+        assert_eq!(
+            map.value_length(0),
+            0,
+            "malformed map value should coerce to zero entries"
+        );
     }
 
     #[test]
