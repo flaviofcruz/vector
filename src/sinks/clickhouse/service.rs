@@ -1,5 +1,7 @@
 //! Service implementation for the `Clickhouse` sink.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use http::{
     Request, StatusCode, Uri,
@@ -21,9 +23,39 @@ use crate::{
     },
 };
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ClickhouseRetryLogic {
     inner: HttpRetryLogic<HttpRequest<PartitionKey>>,
+    /// ClickHouse error codes (from the `Code: {n}` prefix of a 500 body) that
+    /// must not be retried. Shared behind an `Arc` so cloning the retry logic
+    /// per request is cheap.
+    non_retriable_codes: Arc<[u32]>,
+}
+
+impl Default for ClickhouseRetryLogic {
+    fn default() -> Self {
+        Self {
+            inner: HttpRetryLogic::default(),
+            non_retriable_codes: Arc::from(DEFAULT_NON_RETRIABLE_CLICKHOUSE_ERROR_CODES),
+        }
+    }
+}
+
+impl ClickhouseRetryLogic {
+    /// Builds a retry logic with a caller-supplied set of non-retriable error
+    /// codes. Passing `None` uses the built-in default set; passing `Some(list)`
+    /// uses exactly that list (an empty list means "retry every 500", i.e. the
+    /// pre-#618 behavior). Lets the universe config generator tune the set
+    /// per-shard without a Vector binary roll.
+    pub fn new(non_retriable_codes: Option<Vec<u32>>) -> Self {
+        match non_retriable_codes {
+            Some(codes) => Self {
+                inner: HttpRetryLogic::default(),
+                non_retriable_codes: Arc::from(codes),
+            },
+            None => Self::default(),
+        }
+    }
 }
 
 impl RetryLogic for ClickhouseRetryLogic {
@@ -57,7 +89,7 @@ impl RetryLogic for ClickhouseRetryLogic {
                 // Reference: https://github.com/vectordotdev/vector/pull/693#issuecomment-517332654
                 // Status mapping: src/Server/HTTP/exceptionCodeToHTTPStatus.cpp
                 match parse_clickhouse_error_code(body) {
-                    Some(code) if NON_RETRIABLE_CLICKHOUSE_ERROR_CODES.contains(&code) => {
+                    Some(code) if self.non_retriable_codes.contains(&code) => {
                         RetryAction::DontRetry(
                             format!("non-retriable ClickHouse error code {code}").into(),
                         )
@@ -70,12 +102,16 @@ impl RetryLogic for ClickhouseRetryLogic {
     }
 }
 
-/// ClickHouse error codes that represent deterministic, non-transient failures
-/// which ClickHouse returns over HTTP as 500. Retrying them can never succeed,
-/// so the sink drops the request immediately instead of exhausting its retry
-/// budget. Codes ClickHouse already returns as 4xx are intentionally not listed
-/// here (they short-circuit before this check) except where kept as
-/// defense-in-depth against version-dependent status remapping.
+/// Default set of ClickHouse error codes that represent deterministic,
+/// non-transient failures which ClickHouse returns over HTTP as 500. Retrying
+/// them can never succeed, so the sink drops the request immediately instead of
+/// exhausting its retry budget. Codes ClickHouse already returns as 4xx are
+/// intentionally not listed here (they short-circuit before this check) except
+/// where kept as defense-in-depth against version-dependent status remapping.
+///
+/// Overridable per-shard via the `non_retriable_error_codes` sink config field
+/// (see `ClickhouseConfig`), so the set can be tuned without a Vector binary
+/// roll.
 ///
 /// Codes (see ClickHouse `src/Common/ErrorCodes.cpp`):
 /// - 469 VIOLATED_CONSTRAINT       — row violates a table CHECK constraint
@@ -85,7 +121,8 @@ impl RetryLogic for ClickhouseRetryLogic {
 /// - 131 TOO_LARGE_STRING_SIZE     — string exceeds the column's fixed size
 /// - 53  TYPE_MISMATCH             — 4xx today; kept as defense-in-depth
 /// - 117 INCORRECT_DATA            — 4xx today; kept as defense-in-depth
-const NON_RETRIABLE_CLICKHOUSE_ERROR_CODES: &[u32] = &[469, 70, 69, 407, 131, 53, 117];
+pub(super) const DEFAULT_NON_RETRIABLE_CLICKHOUSE_ERROR_CODES: &[u32] =
+    &[469, 70, 69, 407, 131, 53, 117];
 
 /// Parses the leading numeric error code from a ClickHouse HTTP error body.
 ///
@@ -303,7 +340,7 @@ mod tests {
     fn parse_does_not_confuse_53_with_530() {
         // The old prefix match on `b"Code: 53"` would have matched 530..539.
         assert_eq!(parse_clickhouse_error_code(b"Code: 530. foo"), Some(530));
-        assert!(!NON_RETRIABLE_CLICKHOUSE_ERROR_CODES.contains(&530));
+        assert!(!DEFAULT_NON_RETRIABLE_CLICKHOUSE_ERROR_CODES.contains(&530));
     }
 
     #[test]
@@ -362,6 +399,37 @@ mod tests {
                 .should_retry_response(&http_response(503, "unavailable"))
                 .is_retryable()
         );
+    }
+
+    #[test]
+    fn new_with_none_uses_default_set() {
+        let logic = ClickhouseRetryLogic::new(None);
+        // Same behavior as ::default() — the built-in set applies.
+        assert!(logic.should_retry_response(&ch_500(469)).is_not_retryable());
+        assert!(logic.should_retry_response(&ch_500(241)).is_retryable());
+    }
+
+    #[test]
+    fn config_override_replaces_default_set() {
+        // A shard that only wants to block 469 (not the rest of the default set).
+        let logic = ClickhouseRetryLogic::new(Some(vec![469]));
+        assert!(logic.should_retry_response(&ch_500(469)).is_not_retryable());
+        // 70 is in the default set but NOT in this override — so it retries now.
+        assert!(logic.should_retry_response(&ch_500(70)).is_retryable());
+    }
+
+    #[test]
+    fn config_override_empty_retries_all_500s() {
+        // Empty list == pre-#618 behavior: every 500 is retried.
+        let logic = ClickhouseRetryLogic::new(Some(vec![]));
+        assert!(logic.should_retry_response(&ch_500(469)).is_retryable());
+    }
+
+    #[test]
+    fn config_override_can_add_new_codes() {
+        // A code not in the default set can be blocked per-shard.
+        let logic = ClickhouseRetryLogic::new(Some(vec![241]));
+        assert!(logic.should_retry_response(&ch_500(241)).is_not_retryable());
     }
 
     #[test]
