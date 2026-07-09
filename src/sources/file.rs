@@ -632,6 +632,7 @@ pub fn file_source(
         drain_on_shutdown: false,
         archive_extensions: config.archive_extensions.clone(),
         source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
+        read_loop_min_backoff: 1,
     };
 
     let event_metadata = EventMetadata {

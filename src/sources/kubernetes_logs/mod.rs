@@ -1220,6 +1220,7 @@ impl Source {
             drain_on_shutdown,
             archive_extensions,
             source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
+            read_loop_min_backoff: 1,
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
