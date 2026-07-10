@@ -192,13 +192,13 @@ impl SourceShutdownCoordinator {
         // `force_shutdown_tripwire` resolves even if canceled when we should *not* be shutting down.
         // `tripwire_handler` handles cancel by never resolving.
         let force_shutdown_tripwire = force_shutdown_tripwire.then(tripwire_handler);
-        if internal {
-            // For internal sources tripwire will never resolve, i.e. internal sources will never be shutdown.
-            // This will keep logs and metrics based pipeline working till forced shutdown.
-            (ShutdownSignal::noop(), force_shutdown_tripwire)
-        } else {
-            (shutdown_signal, force_shutdown_tripwire)
-        }
+        // Internal sources are still *deferred* — `shutdown_non_deferred` uses the `internal` flag
+        // in `begun_triggers` to shut them down in wave 2, after non-deferred sources drain. They
+        // get the same real wired `shutdown_signal` as external sources: cancelling their
+        // begun-trigger resolves the source's `_ = &mut shutdown` arm, it drains and drops its
+        // `ShutdownSignalToken`, and `shutdown_complete_tripwire` fires — so wave 2 completes on
+        // natural source completion rather than the force deadline.
+        (shutdown_signal, force_shutdown_tripwire)
     }
 
     /// Takes ownership of all internal state for the given source from another `ShutdownCoordinator`.
@@ -542,6 +542,97 @@ mod test {
         assert!(deferred.has_deferred_sources());
         let wave2_deadline = Instant::now() + Duration::from_millis(100);
         deferred.shutdown_all(Some(wave2_deadline)).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_internal_source_completes_on_token_drop_not_force() {
+        // A deferred (internal) source's wave-2 shutdown must complete when the source drains and
+        // drops its `ShutdownSignalToken`, not only via the force-trigger at the deadline.
+        let mut shutdown = SourceShutdownCoordinator::default();
+        let internal_id = ComponentKey::from("internal_metrics");
+
+        // Keep the signal alive, as a running source holds it for its whole lifetime.
+        let (internal_signal, _internal_force) = shutdown.register_source(&internal_id, true);
+
+        // No external sources, so wave 1 completes immediately and the internal source defers.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (wave1_future, deferred) = shutdown.shutdown_non_deferred(Some(deadline));
+        wave1_future.await;
+        assert!(deferred.deferred_keys().contains(&internal_id));
+
+        // Far-future deadline: wave-2 can only finish quickly by natural completion, so a prompt
+        // resolve below distinguishes the wired signal from a deadline force-abort.
+        let far_deadline = Instant::now() + Duration::from_secs(3600);
+        let mut shutdown_all = Box::pin(deferred.shutdown_all(Some(far_deadline)));
+
+        // Source still holds its token, so wave-2 must be pending (not completed at registration).
+        assert!(
+            futures::poll!(&mut shutdown_all).is_pending(),
+            "wave-2 shutdown completed before the internal source finished -- its \
+             completion is not wired to the source's real shutdown signal"
+        );
+
+        // Source finishes its drain and drops its token; wave-2 should resolve promptly.
+        let start = Instant::now();
+        drop(internal_signal);
+        shutdown_all.await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "wave-2 shutdown did not complete promptly after the internal source \
+             finished; it appears to be waiting on the force deadline instead of \
+             natural completion"
+        );
+    }
+
+    /// Guard the single-pass path (`SourceShutdownCoordinator::shutdown_all`).
+    ///
+    /// When `two_wave_shutdown` is disabled, `running.rs` calls the combined
+    /// `SourceShutdownCoordinator::shutdown_all` rather than the `shutdown_non_deferred` +
+    /// `DeferredSourceShutdowns::shutdown_all` pair. This confirms internal sources receiving the
+    /// real wired signal does not hang or regress that path: external sources complete in wave 1,
+    /// internal sources in wave 2, and `shutdown_all` resolves on the internal source dropping its
+    /// token — well before the deadline, no force-trigger required.
+    #[tokio::test]
+    async fn single_pass_shutdown_all_internal_source_completes_naturally() {
+        let mut coordinator = SourceShutdownCoordinator::default();
+        let external_id = ComponentKey::from("data_source");
+        let internal_id = ComponentKey::from("internal_metrics");
+
+        let (external_signal, _ext_force) = coordinator.register_source(&external_id, false);
+        // Keep the internal signal alive, simulating a running internal source.
+        let (internal_signal, _int_force) = coordinator.register_source(&internal_id, true);
+
+        // Use a far deadline: if the internal source is NOT properly wired, the future hangs
+        // to the deadline; if it IS wired it completes as soon as the source drops its token.
+        let far_deadline = Instant::now() + Duration::from_secs(3600);
+        let mut shutdown_all_fut = Box::pin(coordinator.shutdown_all(Some(far_deadline)));
+
+        // Pending while the external (wave-1) source is still held.
+        assert!(
+            futures::poll!(&mut shutdown_all_fut).is_pending(),
+            "single-pass shutdown_all completed while the external source was still running"
+        );
+
+        // External source finishes → wave 1 drains, wave 2 cancels the internal begun-trigger.
+        drop(external_signal);
+
+        // Still pending: the internal source hasn't dropped its token, so its completion tripwire
+        // hasn't fired. (A no-op signal would have fired it at registration, resolving here early.)
+        assert!(
+            futures::poll!(&mut shutdown_all_fut).is_pending(),
+            "single-pass shutdown_all completed before the internal source finished -- \
+             the internal source's completion is not wired to the real shutdown signal"
+        );
+
+        // Internal source finishes its drain; shutdown_all should resolve promptly (not at deadline).
+        let start = Instant::now();
+        drop(internal_signal);
+        shutdown_all_fut.await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "single-pass shutdown_all did not complete promptly after all sources finished; \
+             it appears to be waiting on the force deadline instead of natural completion"
+        );
     }
 
     #[tokio::test]
