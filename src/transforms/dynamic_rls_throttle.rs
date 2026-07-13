@@ -22,12 +22,32 @@ use crate::{
     config::{DataType, Input, OutputId, TransformConfig, TransformContext, TransformOutput},
     event::{Event, EventStatus},
     http::HttpClient,
+    internal_events::{DynamicRlsThrottleInflow, DynamicRlsThrottleOverLimit},
     schema,
     transforms::{TaskTransform, Transform},
 };
 
 /// The key a log is counted and throttled under: its `(topic, system)` combination.
 type Key = (String, String);
+
+/// Whether the transform is actually dropping over-quota logs or only measuring them. Used as the
+/// `mode` tag on the over-limit metric.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThrottleMode {
+    /// Forward over-quota logs and only emit the would-drop metric.
+    Shadow,
+    /// Drop over-quota logs.
+    Enforce,
+}
+
+impl ThrottleMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ThrottleMode::Shadow => "shadow",
+            ThrottleMode::Enforce => "enforce",
+        }
+    }
+}
 
 const fn default_sidecar_endpoint() -> &'static str {
     "http://127.0.0.1:8090/api/reportCounts"
@@ -57,10 +77,15 @@ fn default_system_field() -> String {
     ".message.kubernetes.pod_labels.system".to_string()
 }
 
+const fn default_emit_inflow_metric() -> bool {
+    true
+}
+
 /// Configuration for the `dynamic_rls_throttle` transform.
 ///
-/// This transform enforces per-`(topic, system)` online quotas by dropping logs whose
-/// `(topic, system)` combination is currently over quota. It does not decide quotas itself:
+/// This transform enforces per-`(topic, system)` online quotas: it drops logs whose
+/// `(topic, system)` is over quota when `enforce` is true, or shadow-forwards them when false (the
+/// default). It does not decide quotas itself:
 /// every `report_interval_secs` it POSTs the per-combo passed-through counts to a sidecar
 /// (a Java service in the same pod) which consults the rate-limit service (RLSv2) and returns
 /// the current over-limit set. The transform reads that set lock-free on the hot path and
@@ -71,7 +96,7 @@ fn default_system_field() -> String {
 /// through. Dropping logs we should not is worse than briefly letting over-quota logs through.
 #[configurable_component(transform(
     "dynamic_rls_throttle",
-    "Drop logs whose topic/system is over its online quota, as decided by the rate-limit service."
+    "Throttle logs whose topic/system is over its online quota (as decided by the rate-limit service); drops when `enforce` is set, otherwise shadow-forwards."
 ))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +133,19 @@ pub struct DynamicRlsThrottleConfig {
     /// `system` label (`kubernetes.pod_labels.system`).
     #[serde(default = "default_system_field")]
     pub system_field: String,
+
+    /// Drop over-quota logs (`true`), or shadow-forward them (`false`, the default). Over-quota
+    /// logs are excluded from the RLSv2 counts in both modes, so shadow predicts enforce's drops.
+    #[serde(default)]
+    pub enforce: bool,
+
+    /// Whether to emit the per-`(topic, system)` `dynamic_rls_throttle_inflow_total` metric
+    /// (default `true`). This is the highest-cardinality metric — one series per `(topic, system)`
+    /// per pod, emitted for every keyed log. Set to `false` to suppress it on a shard where the
+    /// series count is a concern; the `over_limit` metric (sparse — only over-quota combos) is
+    /// unaffected.
+    #[serde(default = "default_emit_inflow_metric")]
+    pub emit_inflow_metric: bool,
 }
 
 impl Default for DynamicRlsThrottleConfig {
@@ -119,6 +157,8 @@ impl Default for DynamicRlsThrottleConfig {
             max_staleness_secs: default_max_staleness_secs(),
             topic_field: default_topic_field(),
             system_field: default_system_field(),
+            enforce: false,
+            emit_inflow_metric: default_emit_inflow_metric(),
         }
     }
 }
@@ -284,6 +324,15 @@ impl TaskTransform<Event> for DynamicRlsThrottle {
             events_dropped,
         } = *self;
 
+        // Drop over-quota logs, or shadow (measure only)? Fixed for the stream's lifetime.
+        let mode = if config.enforce {
+            ThrottleMode::Enforce
+        } else {
+            ThrottleMode::Shadow
+        };
+        // Captured before `config` is moved into the reporter below.
+        let emit_inflow_metric = config.emit_inflow_metric;
+
         // The reporter runs concurrently so the hot path never blocks on the sidecar. It is
         // aborted when the input stream ends (the returned guard's `Drop`).
         let reporter = BackgroundReporter::spawn(config, client, Arc::clone(&shared));
@@ -295,17 +344,37 @@ impl TaskTransform<Event> for DynamicRlsThrottle {
 
             while let Some(event) = input_rx.next().await {
                 match event_key(&topic_path, &system_path, &event) {
-                    // Over quota: drop (and do not count it — only passed-through logs count).
-                    Some(key) if shared.over_limit.load().contains(&key) => {
-                        event.metadata().update_status(EventStatus::Dropped);
-                        events_dropped.emit(Count(1));
-                    }
-                    // Under quota with a usable key: count the passed-through log and forward it.
                     Some(key) => {
-                        if let Ok(mut counts) = shared.counts.lock() {
-                            *counts.entry(key).or_insert(0) += 1;
+                        // Inflow: every keyed log, pre-decision (stable across shadow/enforce).
+                        // Highest-cardinality metric, so it's suppressible via `emit_inflow_metric`.
+                        if emit_inflow_metric {
+                            emit!(DynamicRlsThrottleInflow {
+                                topic: key.0.clone(),
+                                system: key.1.clone(),
+                            });
                         }
-                        yield event;
+
+                        if shared.over_limit.load().contains(&key) {
+                            // Over quota: never counted in either mode; only the action differs.
+                            emit!(DynamicRlsThrottleOverLimit {
+                                topic: key.0,
+                                system: key.1,
+                                mode,
+                            });
+                            match mode {
+                                ThrottleMode::Enforce => {
+                                    event.metadata().update_status(EventStatus::Dropped);
+                                    events_dropped.emit(Count(1));
+                                }
+                                ThrottleMode::Shadow => yield event,
+                            }
+                        } else {
+                            // Under quota: count the passed-through log and forward it.
+                            if let Ok(mut counts) = shared.counts.lock() {
+                                *counts.entry(key).or_insert(0) += 1;
+                            }
+                            yield event;
+                        }
                     }
                     // No usable key: forward without counting.
                     None => yield event,
@@ -560,6 +629,17 @@ mod tests {
         }
     }
 
+    /// Long interval so the reporter can't drain the counts map mid-test (staleness stays
+    /// >= interval to satisfy build-time validation), with an explicit enforce/shadow mode.
+    fn hotpath_config(enforce: bool) -> DynamicRlsThrottleConfig {
+        DynamicRlsThrottleConfig {
+            report_interval_secs: 3600,
+            max_staleness_secs: 3600,
+            enforce,
+            ..test_config(default_sidecar_endpoint_string())
+        }
+    }
+
     /// Construct a transform from a config, parsing its key paths the same way `build` does.
     fn build_throttle(config: &DynamicRlsThrottleConfig) -> DynamicRlsThrottle {
         let client = HttpClient::new(None, &Default::default()).unwrap();
@@ -578,14 +658,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drops_over_limit_and_counts_passed_through() {
-        // Long report interval so the background reporter cannot drain the counts map between
-        // processing the events and asserting on the counts below. Staleness must stay >= interval.
-        let config = DynamicRlsThrottleConfig {
-            report_interval_secs: 3600,
-            max_staleness_secs: 3600,
-            ..test_config(default_sidecar_endpoint_string())
-        };
+    async fn enforce_drops_over_limit_and_counts_passed_through() {
+        // enforce = true: over-limit logs are actually dropped.
+        let config = hotpath_config(true);
         // (spark-log, telemetry) is over quota; (background-activity-log, auth-v2) is not.
         let mut over_limit = HashSet::new();
         over_limit.insert(("spark-log".to_string(), "telemetry".to_string()));
@@ -622,6 +697,131 @@ mod tests {
             Some(&2)
         );
         assert_eq!(counts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shadow_forwards_over_limit_but_still_excludes_from_counts() {
+        // enforce = false: over-limit logs are forwarded, but still excluded from the RLSv2 counts
+        // (same rule as enforce), so the shadow over-limit count predicts what enforce would drop.
+        let config = hotpath_config(false);
+        let mut over_limit = HashSet::new();
+        over_limit.insert(("spark-log".to_string(), "telemetry".to_string()));
+
+        let throttle = throttle_with_over_limit(&config, over_limit);
+        let shared = Arc::clone(&throttle.shared);
+
+        let (mut tx, rx) = futures::channel::mpsc::channel(10);
+        let mut out = Box::new(throttle).transform(Box::pin(rx));
+
+        // Over-limit event — forwarded in shadow, not dropped.
+        tx.try_send(log_with("spark-log", "telemetry")).unwrap();
+        // Under-limit events pass through and are counted.
+        tx.try_send(log_with("background-activity-log", "auth-v2"))
+            .unwrap();
+        tx.try_send(log_with("background-activity-log", "auth-v2"))
+            .unwrap();
+
+        // All THREE come out — including the over-limit one (shadow drops nothing).
+        for _ in 0..3 {
+            assert!(out.next().await.is_some());
+        }
+
+        tx.disconnect();
+        assert_eq!(out.next().await, None);
+
+        // Counting is identical to enforce: the over-limit combo is NOT counted (excluded from
+        // the RLSv2 report), only the two under-limit logs are.
+        let counts = shared.counts.lock().unwrap();
+        assert_eq!(
+            counts.get(&("background-activity-log".to_string(), "auth-v2".to_string())),
+            Some(&2)
+        );
+        assert!(
+            !counts.contains_key(&("spark-log".to_string(), "telemetry".to_string())),
+            "over-limit combo must be excluded from counts even in shadow mode"
+        );
+        assert_eq!(counts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn emits_expected_metrics_per_mode() {
+        // The recorder is a name set: `contains_name_once` checks presence/absence, not count.
+        use vector_lib::event_test_util::{clear_recorded_events, contains_name_once};
+
+        // Drive one log — either an over-limit combo or an under-limit one — through the transform
+        // in the given mode, then drain the output.
+        async fn run(enforce: bool, over_limit_log: bool) {
+            let config = hotpath_config(enforce);
+            let mut over_limit = HashSet::new();
+            over_limit.insert(("spark-log".to_string(), "telemetry".to_string()));
+            let throttle = throttle_with_over_limit(&config, over_limit);
+
+            let (mut tx, rx) = futures::channel::mpsc::channel(10);
+            let mut out = Box::new(throttle).transform(Box::pin(rx));
+
+            let log = if over_limit_log {
+                log_with("spark-log", "telemetry") // in the over-limit set
+            } else {
+                log_with("background-activity-log", "auth-v2") // under limit
+            };
+            tx.try_send(log).unwrap();
+            tx.disconnect();
+            while out.next().await.is_some() {}
+        }
+
+        // Over-limit log: inflow + over-limit counter fire in both modes. The `mode` tag value and
+        // the drop-vs-forward action are covered by enforce_drops_* / shadow_forwards_*.
+        for enforce in [false, true] {
+            clear_recorded_events();
+            run(enforce, true).await;
+            assert!(contains_name_once("DynamicRlsThrottleInflow").is_ok());
+            assert!(
+                contains_name_once("DynamicRlsThrottleOverLimit").is_ok(),
+                "over-limit log must emit the over-limit metric (enforce={enforce})"
+            );
+        }
+
+        // Under-limit log: inflow fires, over-limit counter does NOT — in both modes.
+        for enforce in [false, true] {
+            clear_recorded_events();
+            run(enforce, false).await;
+            assert!(contains_name_once("DynamicRlsThrottleInflow").is_ok());
+            assert!(
+                contains_name_once("DynamicRlsThrottleOverLimit").is_err(),
+                "under-limit log must not emit the over-limit metric (enforce={enforce})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_inflow_metric_false_suppresses_inflow_only() {
+        use vector_lib::event_test_util::{clear_recorded_events, contains_name_once};
+
+        // Over-quota log with inflow disabled: inflow is suppressed, over-limit still fires.
+        let config = DynamicRlsThrottleConfig {
+            emit_inflow_metric: false,
+            ..hotpath_config(false)
+        };
+        let mut over_limit = HashSet::new();
+        over_limit.insert(("spark-log".to_string(), "telemetry".to_string()));
+        let throttle = throttle_with_over_limit(&config, over_limit);
+
+        let (mut tx, rx) = futures::channel::mpsc::channel(10);
+        let mut out = Box::new(throttle).transform(Box::pin(rx));
+
+        clear_recorded_events();
+        tx.try_send(log_with("spark-log", "telemetry")).unwrap();
+        tx.disconnect();
+        while out.next().await.is_some() {}
+
+        assert!(
+            contains_name_once("DynamicRlsThrottleInflow").is_err(),
+            "inflow metric must be suppressed when emit_inflow_metric is false"
+        );
+        assert!(
+            contains_name_once("DynamicRlsThrottleOverLimit").is_ok(),
+            "over-limit metric is unaffected by emit_inflow_metric"
+        );
     }
 
     #[tokio::test]
