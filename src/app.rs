@@ -508,6 +508,11 @@ impl FinishedApplication {
             service_event = 4,
             internal_log_rate_limit = false,
         );
+        // Prometheus mirror of the TERMINATION_SIGNAL_RECEIVED VEL. Fires once per shutdown here (both
+        // the graceful `stop` and the `quit` paths flow through this method), so it is the
+        // denominator for the close-complete rate: `vector_shutdown_components_closed_total` (emitted
+        // when a shutdown reaches COMPONENTS_CLOSED) / `vector_shutdown_termination_signal_total`.
+        metrics::counter!("shutdown_termination_signal_total").increment(1);
 
         // At this point, we'll have the only reference to the shared topology controller and can
         // safely remove it from the wrapper to shut down the topology.
