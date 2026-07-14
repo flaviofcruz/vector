@@ -347,6 +347,23 @@ pub struct Config {
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     rotate_wait: Duration,
 
+    /// How long to retain the checkpoint of a reaped (deleted/rotated-away) file
+    /// before it becomes eligible for cleanup.
+    ///
+    /// Kept long enough to bridge the gap between a source file being reaped
+    /// (e.g. `0.log` deleted during rotation) and its compressed successor
+    /// (`*.gz`, which shares the same fingerprint) appearing on disk, so the
+    /// archive resumes from the checkpoint instead of being re-read from the
+    /// beginning. The retained checkpoint's death time is persisted, so cleanup
+    /// still occurs the configured duration after death even across a restart.
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[serde(
+        default = "default_checkpoint_dead_retention",
+        rename = "checkpoint_dead_retention_secs"
+    )]
+    checkpoint_dead_retention: Duration,
+
     /// Only read files if their last modification timestamp is later than the specified absolute unix timestamp.
     /// If not set, all files matching the include patterns will be read.
     #[serde(default, deserialize_with = "deserialize_iso8601_timestamp")]
@@ -485,6 +502,7 @@ impl Default for Config {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            checkpoint_dead_retention: default_checkpoint_dead_retention(),
             start_reading_at: None,
             source_context: None,
             multiline: None,
@@ -773,6 +791,7 @@ struct Source {
     ingestion_timestamp_field: Option<OwnedTargetPath>,
     include_file_metric_tag: bool,
     rotate_wait: Duration,
+    checkpoint_dead_retention: Duration,
     file_to_pod_map: Arc<Mutex<HashMap<PathBuf, LogFileInfo>>>,
     start_reading_at: Option<DateTime<Utc>>,
     source_context: Option<HashMap<String, String>>,
@@ -1046,6 +1065,7 @@ impl Source {
             ingestion_timestamp_field,
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
+            checkpoint_dead_retention: config.checkpoint_dead_retention,
             file_to_pod_map: Arc::new(Mutex::new(HashMap::new())),
             start_reading_at: parse_start_reading_at(config.start_reading_at.clone()),
             source_context: config.source_context.clone(),
@@ -1096,6 +1116,7 @@ impl Source {
             ingestion_timestamp_field,
             include_file_metric_tag,
             rotate_wait,
+            checkpoint_dead_retention,
             file_to_pod_map,
             start_reading_at,
             ref source_context,
@@ -1156,7 +1177,10 @@ impl Source {
 
         // TODO: maybe more of the parameters have to be configurable.
 
-        let checkpointer = Checkpointer::new(&data_dir);
+        let checkpointer = Checkpointer::new(&data_dir).with_dead_retention(
+            chrono::Duration::from_std(checkpoint_dead_retention)
+                .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX)),
+        );
         let file_to_pod_map_ref = Arc::clone(&file_to_pod_map);
         let file_server = FileServer {
             // Use our special paths provider.
@@ -1548,6 +1572,12 @@ const fn default_delay_deletion_ms() -> Duration {
 
 const fn default_rotate_wait() -> Duration {
     Duration::from_secs(u64::MAX / 2)
+}
+
+const fn default_checkpoint_dead_retention() -> Duration {
+    // 60s preserves the historical hardcoded retention (status quo). Raise via
+    // `checkpoint_dead_retention_secs` to bridge longer rotation-to-`.gz` gaps.
+    Duration::from_secs(60)
 }
 
 const fn default_drain_on_shutdown() -> bool {

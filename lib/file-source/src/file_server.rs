@@ -430,6 +430,11 @@ where
             // Archives that reached EOF this cycle — removed from fp_map after the loop.
             let mut done_archives: Vec<(FileFingerprint, PathBuf)> = Vec::new();
             for (&file_id, watcher) in &mut fp_map {
+                // Presence in fp_map means the file exists on disk; keep its
+                // checkpoint live (clear death mark, refresh `modified`) even if
+                // we don't read it this cycle.
+                checkpoints.clear_dead(file_id);
+
                 if !watcher.should_read() {
                     continue;
                 }
@@ -551,7 +556,15 @@ where
             }
 
             for (_, watcher) in &mut fp_map {
-                if !watcher.file_findable() && watcher.last_seen().elapsed() > self.rotate_wait {
+                // Reap a vanished archive immediately (terminal, no successor);
+                // give a non-archive the `rotate_wait` grace so a live watcher
+                // can hand its position to the rotated `.gz` via `update_path`.
+                let expired = if self.is_archive(&watcher.path) {
+                    !watcher.file_findable()
+                } else {
+                    !watcher.file_findable() && watcher.last_seen().elapsed() > self.rotate_wait
+                };
+                if expired {
                     watcher.set_dead();
                 }
             }
@@ -900,6 +913,10 @@ where
                 } else {
                     self.emitter.emit_file_added(&path);
                 }
+                // Creating a watcher means the file exists on disk; keep its
+                // checkpoint live even for a caught-up `.gz` that never calls
+                // `update`.
+                checkpoints.clear_dead(file_id);
                 watcher.set_file_findable(true);
                 fp_map.insert(file_id, watcher);
             }
@@ -2209,26 +2226,23 @@ mod tests {
     }
 
     /// Rotation where the original file is *fully processed* before its `.gz`
-    /// archive appears — demonstrating that a persisted checkpoint is NOT enough
-    /// on its own because the dead-fingerprint expiry purges it too soon.
+    /// archive appears. The fix keeps the live watcher across the gap so it hands
+    /// off to the `.gz`, delivering each original line exactly once.
     ///
-    ///   Stage 0: active.json (logline1 / logline1b / logline1c) — read to EOF;
-    ///            once all lines are observed delivered, the test records the
-    ///            checkpoint a fix would persist (fingerprint → EOF offset).
+    ///   Stage 0: active.json (logline1 / logline1b / logline1c) — read to EOF.
     ///   Stage 1: rename active.json → active-1.json; create NEW active.json.
-    ///            The original watcher goes unfindable and is eventually marked
-    ///            dead; its checkpoint becomes eligible for expiry 60 s later.
-    ///   Stage 2 (90 s later, still < rotate_wait = 5 min): gzip active-1.json →
-    ///            active-1.json.gz; the glob returns the .gz, which shares its
-    ///            fingerprint with the (now expired) original checkpoint.
+    ///            The original (non-archive) watcher goes unfindable but is kept
+    ///            alive for rotate_wait (5 min) rather than reaped at EOF.
+    ///   Stage 2 (30 s later, past the 10 s dead-retention but < rotate_wait):
+    ///            gzip active-1.json → active-1.json.gz; the glob returns the .gz,
+    ///            which shares the watcher's fingerprint, so update_path repoints
+    ///            the live watcher to the .gz and it resumes at its EOF position.
     ///
-    /// The periodic checkpoint writer (every glob_minimum_cooldown) runs
-    /// remove_expired, which drops the checkpoint 60 s after the watcher died —
-    /// before the .gz appears at 90 s. So the .gz opens at ReadFrom::Beginning
-    /// and each original line is delivered TWICE. Asserts the re-delivery,
-    /// documenting that the checkpoint's 60 s expiry window is the real gap.
+    /// Asserts each original line is delivered exactly once (no re-delivery),
+    /// which previously failed: the watcher was reaped at EOF and the checkpoint
+    /// expired (dead-retention) before the .gz appeared.
     #[tokio::test]
-    async fn rotation_while_original_file_still_was_done_redelivery_bug() {
+    async fn rotation_while_original_file_still_was_done_no_redelivery() {
         use async_compression::tokio::bufread::GzipEncoder;
         use std::sync::{Arc, Mutex};
         use tokio::io::AsyncReadExt;
@@ -2346,8 +2360,12 @@ mod tests {
         );
 
         // Create the checkpointer up front and grab its shared view so the stage
-        // driver can simulate the checkpoint a fix would persist.
-        let checkpointer = Checkpointer::new(data_dir.as_path());
+        // driver can simulate the checkpoint a fix would persist. Use a short
+        // 10 s dead-retention so the dead-fingerprint expiry would fire well
+        // before the .gz appears at 30 s — the fix must keep the live watcher
+        // regardless.
+        let checkpointer = Checkpointer::new(data_dir.as_path())
+            .with_dead_retention(chrono::Duration::seconds(10));
         let checkpoints_view = checkpointer.view();
 
         let stage_driver = {
@@ -2394,10 +2412,11 @@ mod tests {
                     .unwrap();
                 *paths.lock().unwrap() = vec![active_json.clone()];
 
-                // Stage 2 (90 s after rotation, still < rotate_wait = 5 min): compress
-                // active-1.json → active-1.json.gz with preserved mtime; expose the
-                // .gz to the glob.  It shares the original's first-line fingerprint.
-                tokio::time::sleep(Duration::from_secs(90)).await;
+                // Stage 2 (30 s after rotation, still < rotate_wait = 5 min, but
+                // well past the 10 s dead-retention): compress active-1.json →
+                // active-1.json.gz with preserved mtime; expose the .gz to the
+                // glob.  It shares the original's first-line fingerprint.
+                tokio::time::sleep(Duration::from_secs(30)).await;
                 let gz_content = format!("{line0}\n{line0b}\n{line0c}\n");
                 let mut enc = GzipEncoder::new(gz_content.as_bytes());
                 let mut gz_bytes = Vec::new();
@@ -2439,17 +2458,16 @@ mod tests {
         collector.await.expect("collector panicked");
         let lines = delivered.lock().unwrap().clone();
 
-        // Even though a checkpoint was recorded at the original's EOF offset, the
-        // dead-fingerprint expiry (removed 60 s after the original watcher went
-        // dead) purges it before the .gz appears at 90 s. So the .gz is opened
-        // from ReadFrom::Beginning and each original line is delivered TWICE.
+        // The live watcher survives the rotation gap (non-archive kept for
+        // rotate_wait) and follows active.json -> active-1.json -> .gz via
+        // update_path on the shared fingerprint, resuming at its EOF position.
+        // So each original line is delivered exactly ONCE — no re-delivery.
         for orig in [&line0, &line0b, &line0c] {
             let count = lines.iter().filter(|l| l.as_str() == orig.as_str()).count();
             assert_eq!(
-                count, 2,
-                "expected original line {:?} to be re-delivered (checkpoint \
-                 expired 60 s after watcher death, before the 90 s .gz); got {} \
-                 in {:?}",
+                count, 1,
+                "expected original line {:?} to be delivered exactly once \
+                 (watcher handed off to the .gz across rotation); got {} in {:?}",
                 orig, count, lines,
             );
         }

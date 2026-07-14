@@ -22,6 +22,24 @@ generated: components: sources: file: configuration: {
 			type: bool: {}
 		}
 	}
+	checkpoint_dead_retention_secs: {
+		description: """
+			How long to retain the checkpoint of a reaped (deleted/rotated-away) file
+			before it becomes eligible for cleanup.
+
+			Kept long enough to bridge the gap between a source file being reaped
+			(e.g. `active.json` deleted during rotation) and its compressed successor
+			(`*.json.gz`, which shares the same fingerprint) appearing on disk, so the
+			archive resumes from the checkpoint instead of being re-read from the
+			beginning. The retained checkpoint's death time is persisted, so cleanup
+			still occurs the configured duration after death even across a restart.
+			"""
+		required: false
+		type: uint: {
+			default: 60
+			unit:    "seconds"
+		}
+	}
 	data_dir: {
 		description: """
 			The directory used to persist file checkpoint positions.

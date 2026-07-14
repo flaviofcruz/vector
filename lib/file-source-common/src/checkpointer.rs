@@ -20,6 +20,14 @@ use super::{FilePosition, fingerprinter::FileFingerprint};
 const TMP_FILE_NAME: &str = "checkpoints.new.json";
 pub const CHECKPOINT_FILE_NAME: &str = "checkpoints.json";
 
+/// How long a checkpoint is kept after its watcher is marked dead (`set_dead`,
+/// e.g. the file went unfindable and was reaped from `fp_map`) before
+/// `remove_expired` deletes it. Note this is keyed on watcher death, not file
+/// deletion. 60s matches the historical hardcoded value; raise via
+/// `Checkpointer::with_dead_retention` to bridge the gap until a rotated `.gz`
+/// (same fingerprint) appears.
+pub const DEFAULT_DEAD_RETENTION: chrono::Duration = chrono::Duration::seconds(60);
+
 /// This enum represents the file format of checkpoints persisted to disk. Right
 /// now there is only one variant, but any incompatible changes will require and
 /// additional variant to be added here and handled anywhere that we transit
@@ -43,6 +51,10 @@ struct Checkpoint {
     is_done: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    /// Time the watcher was marked dead (`set_dead`), or `None` while watched.
+    /// Persisted so the retention clock survives a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    removed_ts: Option<DateTime<Utc>>,
 }
 
 pub struct Checkpointer {
@@ -50,6 +62,10 @@ pub struct Checkpointer {
     stable_file_path: PathBuf,
     checkpoints: Arc<CheckpointsView>,
     last: Mutex<Option<State>>,
+    /// How long a checkpoint for a reaped file is retained before cleanup.
+    /// Defaults to [`DEFAULT_DEAD_RETENTION`]; override with
+    /// [`Checkpointer::with_dead_retention`].
+    dead_retention: chrono::Duration,
 }
 
 /// A thread-safe handle for reading and writing checkpoints in-memory across
@@ -70,8 +86,16 @@ pub struct CheckpointsView {
 impl CheckpointsView {
     pub fn update(&self, fng: FileFingerprint, pos: FilePosition) {
         self.checkpoints.insert(fng, pos);
-        self.modified_times.insert(fng, Utc::now());
+        self.clear_dead(fng);
+    }
+
+    /// Marks a fingerprint's checkpoint as live: clears the death mark and
+    /// refreshes `modified`. Refreshing `modified` (not just on a read) keeps a
+    /// still-present file — e.g. a rotated log compressed to `.gz` with a bumped
+    /// mtime — from being evicted by the `ignore_before` load filter.
+    pub fn clear_dead(&self, fng: FileFingerprint) {
         self.removed_times.remove(&fng);
+        self.modified_times.insert(fng, Utc::now());
     }
 
     pub fn get(&self, fng: FileFingerprint) -> Option<FilePosition> {
@@ -130,7 +154,7 @@ impl CheckpointsView {
         }
     }
 
-    pub fn remove_expired(&self) {
+    pub fn remove_expired(&self, retention: chrono::Duration) {
         let now = Utc::now();
 
         // Collect all of the expired keys. Removing them while iterating can
@@ -142,7 +166,7 @@ impl CheckpointsView {
             .filter(|entry| {
                 let ts = entry.value();
                 let duration = now - *ts;
-                duration >= chrono::Duration::seconds(60)
+                duration >= retention
             })
             .map(|entry| *entry.key())
             .collect::<Vec<FileFingerprint>>();
@@ -163,6 +187,12 @@ impl CheckpointsView {
             .insert(checkpoint.fingerprint, checkpoint.modified);
         if checkpoint.is_done {
             self.done.insert(checkpoint.fingerprint, true);
+        }
+        // Restore the death mark so the dead-retention clock resumes from where
+        // it was rather than restarting on load. A still-present file clears
+        // this again on its first rediscovery (see `clear_dead`).
+        if let Some(removed_ts) = checkpoint.removed_ts {
+            self.removed_times.insert(checkpoint.fingerprint, removed_ts);
         }
         // Restore the archive path mapping for any checkpoint that has one,
         // regardless of is_done status. This allows skipping fingerprinting
@@ -217,6 +247,7 @@ impl CheckpointsView {
                             .map(|r| *r.value())
                             .unwrap_or(false),
                         path: fng_to_path.get(fingerprint).cloned(),
+                        removed_ts: self.removed_times.get(fingerprint).map(|r| *r.value()),
                     }
                 })
                 .collect(),
@@ -234,7 +265,15 @@ impl Checkpointer {
             stable_file_path,
             checkpoints: Arc::new(CheckpointsView::default()),
             last: Mutex::new(None),
+            dead_retention: DEFAULT_DEAD_RETENTION,
         }
+    }
+
+    /// Override how long a reaped file's checkpoint is retained before cleanup.
+    #[must_use]
+    pub fn with_dead_retention(mut self, dead_retention: chrono::Duration) -> Self {
+        self.dead_retention = dead_retention;
+        self
     }
 
     pub fn view(&self) -> Arc<CheckpointsView> {
@@ -255,11 +294,11 @@ impl Checkpointer {
     /// do so in an atomic way that allow for recovering the previous state in
     /// the event of a crash.
     pub async fn write_checkpoints(&self) -> Result<usize, io::Error> {
-        // First drop any checkpoints for files that were removed more than 60
-        // seconds ago. This keeps our working set as small as possible and
-        // makes sure we don't spend time and IO writing checkpoints that don't
-        // matter anymore.
-        self.checkpoints.remove_expired();
+        // First drop any checkpoints for files that were removed longer than the
+        // dead-retention window ago. This keeps our working set as small as
+        // possible and makes sure we don't spend time and IO writing checkpoints
+        // that don't matter anymore.
+        self.checkpoints.remove_expired(self.dead_retention);
 
         let current = self.checkpoints.get_state();
 
@@ -407,6 +446,7 @@ mod test {
                     modified: *modified,
                     is_done: false,
                     path: None,
+                    removed_ts: None,
                 });
                 assert_eq!(chkptr.get_checkpoint(*fingerprint), Some(position));
                 chkptr.write_checkpoints().await.unwrap();
@@ -506,7 +546,10 @@ mod test {
         ];
 
         let data_dir = tempdir().unwrap();
-        let mut chkptr = Checkpointer::new(data_dir.path());
+        // Pin a 60s retention so this boundary test is independent of the
+        // (much longer) production default.
+        let mut chkptr =
+            Checkpointer::new(data_dir.path()).with_dead_retention(chrono::Duration::seconds(60));
 
         for (fingerprint, position, removed) in cases.clone() {
             chkptr.update_checkpoint(fingerprint, position);
@@ -711,7 +754,7 @@ mod test {
         view.removed_times
             .insert(fng, Utc::now() - Duration::seconds(120));
 
-        view.remove_expired();
+        view.remove_expired(Duration::seconds(60));
 
         assert!(view.get(fng).is_none());
         assert!(!view.get_done(fng));
@@ -730,6 +773,7 @@ mod test {
             modified: Utc::now(),
             is_done: true,
             path: Some("/tmp/archive.gz".to_string()),
+            removed_ts: None,
         });
         assert!(view.get_done(fng));
         assert_eq!(
@@ -745,6 +789,7 @@ mod test {
             modified: Utc::now(),
             is_done: false,
             path: None,
+            removed_ts: None,
         });
         assert!(!view.get_done(fng2));
     }
@@ -785,6 +830,7 @@ mod test {
                 modified: Utc::now(),
                 is_done: true,
                 path: Some("/var/log/app.gz".to_string()),
+                removed_ts: None,
             });
             assert!(chkptr.checkpoints.get_done(fng));
             assert_eq!(
@@ -838,5 +884,128 @@ mod test {
         let fng = FileFingerprint::DevInode(7, 8);
         assert_eq!(chkptr.get_checkpoint(fng), Some(999));
         assert!(!chkptr.checkpoints.get_done(fng));
+    }
+
+    // ----- Dead-retention (L2a / L2a′ / L2b) -----
+
+    #[test]
+    fn test_remove_expired_respects_configurable_retention() {
+        let view = super::CheckpointsView::default();
+        let fng = FileFingerprint::DevInode(1, 2);
+        view.checkpoints.insert(fng, 100);
+        // Died 30 minutes ago.
+        view.removed_times
+            .insert(fng, Utc::now() - Duration::minutes(30));
+
+        // Under a 1h retention it survives...
+        view.remove_expired(Duration::hours(1));
+        assert_eq!(view.get(fng), Some(100));
+
+        // ...but under a 10m retention it is cleaned up.
+        view.remove_expired(Duration::minutes(10));
+        assert_eq!(view.get(fng), None);
+    }
+
+    #[test]
+    fn test_clear_dead_prevents_expiry() {
+        let view = super::CheckpointsView::default();
+        let fng = FileFingerprint::DevInode(3, 4);
+        view.checkpoints.insert(fng, 100);
+        view.set_dead(fng);
+
+        // Rediscovery clears the death mark (as watch_new_file does on watcher
+        // creation), so even a very short retention won't drop it — this is the
+        // caught-up-.gz case where no `update` ever fires.
+        view.clear_dead(fng);
+        view.remove_expired(Duration::zero());
+        assert_eq!(view.get(fng), Some(100));
+    }
+
+    #[test]
+    fn test_clear_dead_refreshes_modified_for_ignore_before() {
+        // BUG-7: a rotated file compressed to `.gz` hours after its last read
+        // keeps a fresh on-disk mtime but a stale checkpoint `modified` (frozen
+        // at last read). On re-watch, `clear_dead` must refresh `modified` so the
+        // `ignore_before` load filter does not evict a still-present file.
+        let view = super::CheckpointsView::default();
+        let fng = FileFingerprint::DevInode(7, 8);
+        view.checkpoints.insert(fng, 100);
+        // Simulate a stale last-read time (24h ago).
+        view.modified_times
+            .insert(fng, Utc::now() - Duration::hours(24));
+
+        // Re-watch (rediscovered on disk) refreshes modified to ~now.
+        view.clear_dead(fng);
+
+        let modified = *view.modified_times.get(&fng).unwrap().value();
+        assert!(
+            Utc::now() - modified < Duration::minutes(1),
+            "clear_dead should refresh modified to now, got {modified}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dead_timestamp_persisted_and_enforced_across_restart() {
+        let position: FilePosition = 1234;
+        let data_dir = tempdir().unwrap();
+
+        // Alive (never dead), dead-recently, dead-long-ago.
+        let alive = FileFingerprint::DevInode(1, 1);
+        let dead_recent = FileFingerprint::DevInode(2, 2);
+        let dead_old = FileFingerprint::DevInode(3, 3);
+
+        {
+            // Long retention on the writer so all three entries persist.
+            let chkptr = Checkpointer::new(data_dir.path()).with_dead_retention(Duration::hours(2));
+            for fng in [alive, dead_recent, dead_old] {
+                chkptr.checkpoints.update(fng, position);
+            }
+            // Stamp deaths directly to control the clock.
+            chkptr
+                .checkpoints
+                .removed_times
+                .insert(dead_recent, Utc::now() - Duration::minutes(5));
+            chkptr
+                .checkpoints
+                .removed_times
+                .insert(dead_old, Utc::now() - Duration::minutes(90));
+            chkptr.write_checkpoints().await.unwrap();
+        }
+
+        // Restart: all entries load (no load-time death filter). The persisted
+        // `removed` timestamp is restored so post-restart `remove_expired` still
+        // enforces retention on the write tick — dead_old (90m) is dropped under
+        // a 1h retention, dead_recent (5m) and alive survive.
+        {
+            let mut chkptr =
+                Checkpointer::new(data_dir.path()).with_dead_retention(Duration::hours(1));
+            chkptr.read_checkpoints(None).await;
+            assert_eq!(chkptr.get_checkpoint(alive), Some(position));
+            assert_eq!(chkptr.get_checkpoint(dead_recent), Some(position));
+            assert_eq!(chkptr.get_checkpoint(dead_old), Some(position));
+
+            // remove_expired (fired via the periodic write) enforces retention
+            // using the restored `removed` timestamps.
+            chkptr.write_checkpoints().await.unwrap();
+            assert_eq!(chkptr.get_checkpoint(alive), Some(position));
+            assert_eq!(chkptr.get_checkpoint(dead_recent), Some(position));
+            assert_eq!(
+                chkptr.get_checkpoint(dead_old),
+                None,
+                "dead_old past retention should be cleaned by remove_expired after restart"
+            );
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_deserialization_without_removed_defaults_none() {
+        // Old on-disk files have no `removed` field; it must default to None.
+        let json = r#"{
+            "fingerprint": { "dev_inode": [ 9, 9 ] },
+            "position": 5,
+            "modified": "2021-07-12T18:19:11.769003Z"
+        }"#;
+        let cp: Checkpoint = serde_json::from_str(json).unwrap();
+        assert!(cp.removed_ts.is_none());
     }
 }

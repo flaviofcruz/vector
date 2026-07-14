@@ -275,6 +275,23 @@ pub struct FileConfig {
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     pub rotate_wait: Duration,
 
+    /// How long to retain the checkpoint of a reaped (deleted/rotated-away) file
+    /// before it becomes eligible for cleanup.
+    ///
+    /// Kept long enough to bridge the gap between a source file being reaped
+    /// (e.g. `active.json` deleted during rotation) and its compressed successor
+    /// (`*.json.gz`, which shares the same fingerprint) appearing on disk, so the
+    /// archive resumes from the checkpoint instead of being re-read from the
+    /// beginning. The retained checkpoint's death time is persisted, so cleanup
+    /// still occurs the configured duration after death even across a restart.
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[serde(
+        default = "default_checkpoint_dead_retention",
+        rename = "checkpoint_dead_retention_secs"
+    )]
+    pub checkpoint_dead_retention: Duration,
+
     /// TTL removal configuration for file management
     /// This allows us to specify the behavior of TTL file removal by file patterns
     #[serde(default)]
@@ -330,6 +347,12 @@ fn default_line_delimiter() -> String {
 
 const fn default_rotate_wait() -> Duration {
     Duration::from_secs(u64::MAX / 2)
+}
+
+const fn default_checkpoint_dead_retention() -> Duration {
+    // 60s preserves the historical hardcoded retention (status quo). Raise via
+    // `checkpoint_dead_retention_secs` to bridge longer rotation-to-`.gz` gaps.
+    Duration::from_secs(60)
 }
 
 /// Configuration for how files should be identified.
@@ -439,6 +462,7 @@ impl Default for FileConfig {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            checkpoint_dead_retention: default_checkpoint_dead_retention(),
             ttl_removal_config: None,
             source_context: None,
             archive_extensions: default_archive_extensions(),
@@ -606,7 +630,10 @@ pub fn file_source(
         None => None,
     };
 
-    let checkpointer = Checkpointer::new(&data_dir);
+    let checkpointer = Checkpointer::new(&data_dir).with_dead_retention(
+        chrono::Duration::from_std(config.checkpoint_dead_retention)
+            .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX)),
+    );
     let strategy = config.fingerprint.clone().into();
 
     let file_server = FileServer {
