@@ -2472,4 +2472,80 @@ mod tests {
             );
         }
     }
+
+    // The FileServer read loop must never advance the persisted checkpoint on its own — the offset
+    // is advanced only by the source's downstream map-closure (on ack, or at pull time for no-acks).
+    // So a read-but-unforwarded tail stays at the last checkpointed offset and is re-read on restart
+    // (at-least-once), not skipped. Fails if a change ever checkpoints read-but-unforwarded bytes.
+    #[tokio::test]
+    async fn drain_off_shutdown_does_not_checkpoint_undelivered_tail() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let log_path = tmp.path().join("test.log");
+        // Total size comfortably exceeds max_read_bytes (2048) so a single
+        // read iteration cannot consume the whole file.
+        let content: String = (0..200)
+            .map(|i| format!("line {:04} -- padding to make this longer\n", i))
+            .collect();
+        fs::write(&log_path, &content).await.unwrap();
+        let file_size = fs::metadata(&log_path).await.unwrap().len();
+
+        let file_server = make_file_server(vec![log_path.clone()], data_dir.clone(), false);
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+
+        // Immediate shutdown: exactly one read iteration before the select fires.
+        let shutdown_data = futures::future::ready(());
+        let shutdown_checkpointer = futures::future::ready(());
+        let checkpointer = Checkpointer::new(data_dir.as_path());
+
+        let result = file_server
+            .run(tx, shutdown_data, shutdown_checkpointer, checkpointer)
+            .await;
+        assert!(result.is_ok());
+
+        // Drain whatever was already handed to the (now-closed) channel.
+        let mut received = Vec::new();
+        while let Ok(batch) = rx.try_recv() {
+            received.extend(batch);
+        }
+        // Partial read: some but not all lines were delivered.
+        assert!(
+            !received.is_empty() && received.len() < 200,
+            "expected a partial read (0 < Y < 200), got {} lines",
+            received.len()
+        );
+
+        // Reload the persisted checkpoint in a fresh Checkpointer.
+        let mut checkpointer = Checkpointer::new(data_dir.as_path());
+        checkpointer.read_checkpoints(None).await;
+        let mut fingerprinter = Fingerprinter::new(
+            FingerprintStrategy::FirstLinesChecksum {
+                ignored_header_bytes: 0,
+                lines: 1,
+            },
+            1024,
+            true,
+        );
+        let mut known_small_files = HashMap::new();
+        let fingerprint = fingerprinter
+            .fingerprint_or_emit(&log_path, &mut known_small_files, &NoErrors)
+            .await
+            .expect("should be able to fingerprint the file");
+        let position = checkpointer.view().get(fingerprint).unwrap_or(0);
+
+        // No downstream wiring advanced the offset, so the checkpoint must sit below EOF — a
+        // checkpoint at EOF would skip the undelivered tail on restart (a real drop).
+        assert!(
+            position < file_size,
+            "checkpoint ({position}) advanced to/past EOF ({file_size}) for \
+             undelivered data — the tail would be dropped on restart"
+        );
+        assert_eq!(
+            position, 0,
+            "read loop must not advance the checkpoint for un-forwarded data; \
+             expected checkpoint 0, got {position}"
+        );
+    }
 }

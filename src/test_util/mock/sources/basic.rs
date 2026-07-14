@@ -129,7 +129,44 @@ impl SourceConfig for BasicSourceConfig {
                 tokio::select! {
                     biased;
 
-                    _ = &mut shutdown1, if force_shutdown => break,
+                    // Deliver-until-checkpoint: on force-shutdown, drain already-accepted ingress
+                    // downstream before returning clean (mirrors the real `file`/`kubernetes_logs`
+                    // read-ahead drain). Never blocks on new input past the checkpoint.
+                    _ = &mut shutdown1, if force_shutdown => {
+                        loop {
+                            match recv.try_next() {
+                                Some(array) => {
+                                    if let Some(counter) = &event_counter {
+                                        counter.fetch_add(array.len(), Ordering::Relaxed);
+                                    }
+                                    if let Err(e) = out.send_event(array).await {
+                                        error!(message = "Error sending in sink..", %e);
+                                        return Err(())
+                                    }
+                                }
+                                None => {
+                                    // Queue empty: stop unless the ingress is closed, in which case
+                                    // block once for any last in-flight item (closed+empty ends it).
+                                    if !recv.is_closed() {
+                                        break;
+                                    }
+                                    match recv.next().await {
+                                        Some(array) => {
+                                            if let Some(counter) = &event_counter {
+                                                counter.fetch_add(array.len(), Ordering::Relaxed);
+                                            }
+                                            if let Err(e) = out.send_event(array).await {
+                                                error!(message = "Error sending in sink..", %e);
+                                                return Err(())
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        }
+                        break
+                    }
 
                     result = recv.next() => match result {
                         Some(array) => {
