@@ -1,0 +1,139 @@
+syntax = "proto2";
+
+package databricks.logstructuredredactionplan;
+
+// Vendored copy. Two changes from the source: the scalapb import and option block are dropped, and
+// the taxonomy import points at the local DataLabel-only stub. Wire format and generated Rust are
+// unchanged.
+//
+// TODO(vendored): copy of universe's
+// log-sync/structured-logs/common/src/redaction/proto/redaction_plan.proto. When vrl/vector is
+// vendored into universe, converge this and the universe original to a single source of truth so the
+// contract isn't maintained in two places.
+import "compliance/taxonomy.proto";
+
+option java_package = "com.databricks.log.structured.redaction.streaming.plan.jproto";
+option java_outer_classname = "RedactionPlanProto";
+option java_generate_equals_and_hash = true;
+option java_multiple_files = true;
+
+/*
+Language-neutral contract between the Java planner and the Rust executor for the streaming proto
+redactor. RedactionPlanBuilder's in-memory MessagePlan graph of pointers can't cross the JVM/Rust
+boundary, so it's lowered into this flat table of plans that reference each other by index; the Rust
+executor reconstructs the graph and redacts records. Only the planner's inputs are serialized;
+whatever MessagePlan.freeze() derives is recomputed by the Rust loader.
+
+  PRODUCER: log-sync/structured-logs/common/src/redaction/streaming/MessagePlanSerializer.java
+  CONSUMER: the Rust executor crate (databricks-eng/vector fork).
+
+1:1 with the planner (source of truth for redaction semantics):
+  MessageRedactionPlan <- MessagePlan (log-sync/structured-logs/common/src/redaction/streaming/MessagePlan.java)
+  FieldAction          <- FieldAction opcodes (log-sync/structured-logs/common/src/redaction/streaming/FieldAction.java)
+  RedactionPlanSet     <- serialization wrapper (flat table); no planner equivalent.
+*/
+
+// The flat plan table; plans reference each other by index (see Recurse) instead of inlining, which
+// represents the possibly-cyclic planner graph. plans[0] is the root log-type plan.
+message RedactionPlanSet {
+  // Plans in index order; referenced by index elsewhere.
+  repeated MessageRedactionPlan plans = 1;
+}
+
+// Redaction plan for one proto message type (1:1 with MessagePlan).
+message MessageRedactionPlan {
+  // FQ proto name of the redacted message. Debug/trace only; not unique, so never key on it.
+  optional string message_full_name = 1;
+
+  // Per-field actions; a field number absent here is dropped (allowlist default).
+  repeated FieldActionEntry actions = 2;
+
+  // Attribution field numbers for per-tenant gating; each unset if the message lacks that field.
+  optional int32 workspace_id_field_number = 3;
+  optional int32 account_id_field_number = 4;
+  optional int32 metastore_id_field_number = 5;
+
+  // (-- TODO: key-shape gate (key_shape_field_number + key_shapes), once shape enforcement lands. --)
+}
+
+// One (field number -> action) pair; a repeated list replaces map<int32, FieldAction> (awkward in Rust).
+message FieldActionEntry {
+  // Field number within the message this plan redacts.
+  optional int32 field_number = 1;
+  // How to handle the field.
+  optional FieldAction action = 2;
+}
+
+// How to handle one field (1:1 with FieldAction opcodes). Exactly one arm is set; unset/unknown
+// means fail closed.
+message FieldAction {
+  oneof action {
+    // Copy the field's bytes verbatim.
+    PassThrough pass_through = 1;
+    // Drop the field.
+    Remove remove = 2;
+    // Redact a nested message with another plan in the table.
+    Recurse recurse = 3;
+    // Keep/drop a json_map field per-entry by key centralizability.
+    MapEntry map_entry = 4;
+    // Keep the map key, strip the value.
+    MapStripValue map_strip_value = 5;
+    // Keep a tagged value only if its runtime label is centralizable.
+    RedactTag redact_tag = 6;
+    // Centralizable string (PassThrough until shape enforcement lands).
+    PassThroughString pass_through_string = 7;
+    // (-- TODO: additive arms for the deferred opcodes when implemented:
+    // RedactFrom (8), GenericAny (9), EmptyString (10), TodoRemove (11). --)
+  }
+}
+
+// Copy the field's bytes verbatim (centralizable field).
+message PassThrough {}
+
+// Drop the field.
+message Remove {}
+
+// Centralizable string; behaves like PassThrough while shape enforcement is off.
+// (-- TODO: allowed_shapes, once shape enforcement lands. --)
+message PassThroughString {}
+
+// map<K, V> with a centralizable key but non-centralizable value: keep the key, strip the value.
+message MapStripValue {}
+
+// Redact a nested message with one of the plans in the table.
+message Recurse {
+  // Index into RedactionPlanSet.plans. Must be set and < plans size; the Rust loader bounds-checks
+  // and fails closed. May reference an ancestor (how cyclic message types are expressed).
+  // (-- int32 not uint32: the proto linter disallows unsigned scalars. --)
+  optional int32 child_plan_index = 1;
+}
+
+// A databricks.json_map field, kept or dropped per entry by key centralizability. The default
+// applies to keys not in `key_decisions`; each entry overrides one key, in either direction. E.g.
+// "keep all but secret_token" = default true + {secret_token: false}; "drop all but tenant_id" is
+// the mirror.
+message MapEntry {
+  // Field number of the entry's `key` field.
+  optional int32 key_field_number = 1;
+
+  // Applied to keys not in `key_decisions`. true = keep, false = drop.
+  optional bool default_is_centralizable = 2;
+
+  // Per-key overrides; unlisted keys use the default. Keys are pre-lower-cased by the planner.
+  repeated MapKeyDecision key_decisions = 3;
+}
+
+// Overrides the map default for one key.
+message MapKeyDecision {
+  // The (lower-cased) map key this decision applies to.
+  optional string key = 1;
+  // Always set by the producer: true = keep this key, false = drop it.
+  optional bool is_centralizable = 2;
+}
+
+// A logging.Field tagged value: keep its value only if its runtime label is in this set.
+message RedactTag {
+  // Labels whose tagged values are kept; others are dropped. The Rust executor compares each
+  // DataLabel's enum number against the raw varint label on the wire.
+  repeated compliance.DataLabel keepable_labels = 1;
+}

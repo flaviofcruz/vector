@@ -1,0 +1,18 @@
+[package]
+name = "vector-redaction-executor"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+# Native (Rust) executor for the streaming proto redactor: runs a serialized RedactionPlanSet
+# against log records. Vendored copy; see src/lib.rs for the source reference.
+
+[dependencies]
+# The vector workspace pins prost with default-features off; take the workspace version but
+# re-enable `derive`, which the generated code needs (`#[derive(::prost::Message)]`) and which
+# default-features off would otherwise drop.
+prost = { workspace = true, features = ["derive"] }
+
+[build-dependencies]
+prost-build.workspace = true
