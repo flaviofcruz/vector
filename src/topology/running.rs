@@ -8,6 +8,7 @@ use std::{
 
 use futures::{Future, FutureExt, future};
 use itertools::Itertools;
+use metrics::counter;
 use snafu::Snafu;
 use stream_cancel::Trigger;
 use tokio::{
@@ -743,6 +744,11 @@ impl RunningTopology {
                     gracefully_closed = gracefully_closed,
                     internal_log_rate_limit = false,
                 );
+                // Prometheus mirror of the COMPONENTS_CLOSED VEL, so graceful-shutdown health can be
+                // alerted on in real time (the VEL only lands in Lumberjack). The `gracefully_closed`
+                // label gives the graceful-shutdown rate; the total (over both label values) divided
+                // by `vector_shutdown_termination_signal_total` gives the close-complete rate.
+                counter!("shutdown_components_closed_total", "gracefully_closed" => gracefully_closed.to_string()).increment(1);
 
                 // Suppress the shutdown reporter before wave 2. The reporter generates
                 // log events that feed into internal_logs, creating a feedback loop that
@@ -856,6 +862,9 @@ impl RunningTopology {
                     gracefully_closed = false,
                     internal_log_rate_limit = false,
                 );
+                // Prometheus mirror of the COMPONENTS_CLOSED VEL (see the two-wave branch). Single-pass
+                // shutdown is never "graceful" in the wave-1 sense, so this is always `false`.
+                counter!("shutdown_components_closed_total", "gracefully_closed" => "false").increment(1);
 
                 // See the matching comment in the two-wave branch above.
                 tokio::time::sleep(Duration::from_millis(50)).await;

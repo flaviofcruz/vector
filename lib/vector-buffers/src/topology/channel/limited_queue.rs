@@ -504,6 +504,23 @@ impl<T: Send + 'static> LimitedReceiver<T> {
         self.inner.limiter.available_permits()
     }
 
+    /// Whether the channel is closed (all senders dropped); with an empty queue, no more items
+    /// can arrive, so a shutdown drain can stop.
+    pub fn is_closed(&self) -> bool {
+        self.inner.limiter.is_closed()
+    }
+
+    /// Pops an already-queued item without waiting (`None` if momentarily empty). Lets a shutdown
+    /// "deliver-until-checkpoint" drain forward already-accepted items without blocking on sends.
+    pub fn try_next(&mut self) -> Option<T> {
+        let (permit, bytes, events, item) = self.inner.data.pop()?;
+        drop(permit);
+        self.inner.record_current_fill();
+        self.inner.release_bytes(bytes);
+        self.inner.release_events(events);
+        Some(item)
+    }
+
     pub async fn next(&mut self) -> Option<T> {
         loop {
             if let Some((permit, bytes, events, item)) = self.inner.data.pop() {

@@ -48,6 +48,8 @@ mod dnstap;
 mod docker_logs;
 #[cfg(feature = "sinks-doris")]
 mod doris;
+#[cfg(feature = "transforms-dynamic_rls_throttle")]
+mod dynamic_rls_throttle;
 mod encoding_transcode;
 #[cfg(feature = "sources-eventstoredb_metrics")]
 mod eventstoredb_metrics;
@@ -215,6 +217,8 @@ pub(crate) use self::dnstap::*;
 pub(crate) use self::docker_logs::*;
 #[cfg(feature = "sinks-doris")]
 pub(crate) use self::doris::*;
+#[cfg(feature = "transforms-dynamic_rls_throttle")]
+pub(crate) use self::dynamic_rls_throttle::*;
 #[cfg(feature = "sources-eventstoredb_metrics")]
 pub(crate) use self::eventstoredb_metrics::*;
 #[cfg(feature = "sources-exec")]

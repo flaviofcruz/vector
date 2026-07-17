@@ -78,6 +78,9 @@ where
     /// fallback when a filename doesn't match the Lumberjack convention
     /// (e.g. `kubernetes_logs` falls back to `sawmill-service-log`).
     pub source_type: &'static str,
+    /// Minimum backoff cap for the read loop (reset value after a non-empty
+    /// read). Defaults to `1`.
+    pub read_loop_min_backoff: usize,
 }
 
 /// `FileServer` as Source
@@ -427,6 +430,11 @@ where
             // Archives that reached EOF this cycle — removed from fp_map after the loop.
             let mut done_archives: Vec<(FileFingerprint, PathBuf)> = Vec::new();
             for (&file_id, watcher) in &mut fp_map {
+                // Presence in fp_map means the file exists on disk; keep its
+                // checkpoint live (clear death mark, refresh `modified`) even if
+                // we don't read it this cycle.
+                checkpoints.clear_dead(file_id);
+
                 if !watcher.should_read() {
                     continue;
                 }
@@ -548,7 +556,15 @@ where
             }
 
             for (_, watcher) in &mut fp_map {
-                if !watcher.file_findable() && watcher.last_seen().elapsed() > self.rotate_wait {
+                // Reap a vanished archive immediately (terminal, no successor);
+                // give a non-archive the `rotate_wait` grace so a live watcher
+                // can hand its position to the rotated `.gz` via `update_path`.
+                let expired = if self.is_archive(&watcher.path) {
+                    !watcher.file_findable()
+                } else {
+                    !watcher.file_findable() && watcher.last_seen().elapsed() > self.rotate_wait
+                };
+                if expired {
                     watcher.set_dead();
                 }
             }
@@ -588,7 +604,7 @@ where
             backoff_cap = if global_bytes_read == 0 {
                 cmp::min(2_048, backoff_cap.saturating_mul(2))
             } else {
-                1
+                self.read_loop_min_backoff
             };
             let backoff = backoff_cap.saturating_sub(global_bytes_read);
 
@@ -897,6 +913,10 @@ where
                 } else {
                     self.emitter.emit_file_added(&path);
                 }
+                // Creating a watcher means the file exists on disk; keep its
+                // checkpoint live even for a caught-up `.gz` that never calls
+                // `update`.
+                checkpoints.clear_dead(file_id);
                 watcher.set_file_findable(true);
                 fp_map.insert(file_id, watcher);
             }
@@ -1138,6 +1158,25 @@ mod tests {
         }
     }
 
+    // PathsProvider whose path list can be swapped from outside (simulates glob
+    // returning different results as files are renamed / compressed / deleted).
+    struct DynamicPathsProvider {
+        paths: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    }
+
+    impl PathsProvider for DynamicPathsProvider {
+        type IntoIter = Vec<(Option<crate::paths_provider::LogFileInfo>, PathBuf)>;
+
+        fn paths(&self) -> Self::IntoIter {
+            self.paths
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| (None, p.clone()))
+                .collect()
+        }
+    }
+
     fn make_file_server(
         paths: Vec<PathBuf>,
         data_dir: PathBuf,
@@ -1172,6 +1211,7 @@ mod tests {
             drain_on_shutdown,
             archive_extensions: vec!["gz".to_string()],
             source_type: "file",
+            read_loop_min_backoff: 1,
         }
     }
 
@@ -1934,6 +1974,578 @@ mod tests {
             !gz_path.exists(),
             "expected done gz archive to be deleted by remove_after on restart, \
              but it still exists"
+        );
+    }
+
+    /// Simulates a full log-rotation cycle, including the application
+    /// immediately reopening the log file after logrotate:
+    ///
+    ///   Stage 0: active.json (logline1 / logline1b / logline1c) — server opens
+    ///            and reads it.
+    ///   Stage 1: rename active.json → active-1.json; create NEW active.json
+    ///            with a Unix-timestamp first line.
+    ///   Stage 2: gzip active-1.json → active-1.json.gz (mtime preserved,
+    ///            as gzip -k does); delete active-1.json.
+    ///
+    /// Glob pattern: `active.json` and `active-*.json.gz`.
+    /// `active-1.json` never matches and is never returned by the glob.
+    ///
+    /// Glob stages:
+    ///   Stage 0: [active.json]
+    ///   Stage 1: [active.json]  ← new file, different fingerprint
+    ///   Stage 2: [active.json, active-1.json.gz]
+    ///   Stage 3: [active.json, active-1.json.gz]  (after active-1.json deleted)
+    ///
+    /// The test asserts four things:
+    ///   (a) After 2× rotate_wait no FD is held to the deleted active-1.json inode.
+    ///   (b) Lines that exist only inside active-1.json.gz are eventually delivered
+    ///       (proving the watcher reconciled to the .gz inode via update_path).
+    ///   (c) The new active.json (first line: "{unix_secs} INFO new session started")
+    ///       is picked up and its content delivered.
+    ///   (d) The extra pre-rotation lines (logline1b, logline1c) survive the
+    ///       rename+gzip and are still delivered.
+    ///
+    /// glob_minimum_cooldown = 1 s  (proportional to 1-minute production value)
+    /// rotate_wait           = 20 s  (proportional to 5-minute production value)
+    #[tokio::test]
+    async fn rotation_while_original_file_still_being_read() {
+        use async_compression::tokio::bufread::GzipEncoder;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::oneshot;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let active_json = tmp.path().join("active.json");
+        let active_1_json = tmp.path().join("active-1.json");
+        let active_1_gz = tmp.path().join("active-1.json.gz");
+
+        // Each log line starts with yyyy/mm/dd hh:mm:ss.  A 1-second sleep
+        // between writes ensures every timestamp is distinct, so each line has
+        // a unique prefix and a unique fingerprint (FirstLinesChecksum uses the
+        // first line only).
+        use chrono::Local;
+        let ts0 = Local::now().format("%Y/%m/%d %H:%M:%S").to_string();
+        // Three lines; only the first drives the fingerprint. The extras slow the
+        // read (8 bytes/2000 ms ≈ 20 s) so the watcher is still reading when the
+        // .gz appears 3 s later, exercising survive-and-reconcile rather than EOF.
+        let line0 = format!("{ts0} logline1");
+        let line0b = format!("{ts0} logline1b");
+        let line0c = format!("{ts0} logline1c");
+        fs::write(&active_json, format!("{line0}\n{line0b}\n{line0c}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let current_paths: Arc<Mutex<Vec<PathBuf>>> =
+            Arc::new(Mutex::new(vec![active_json.clone()]));
+
+        let file_server = FileServer {
+            paths_provider: DynamicPathsProvider {
+                paths: current_paths.clone(),
+            },
+            max_read_bytes: 8,
+            ignore_checkpoints: false,
+            read_from: ReadFrom::Beginning,
+            ignore_before: None,
+            start_reading_at: None,
+            max_line_bytes: 1024,
+            line_delimiter: Bytes::from("\n"),
+            data_dir: data_dir.clone(),
+            glob_minimum_cooldown: Duration::from_secs(1),
+            fingerprinter: Fingerprinter::new(
+                FingerprintStrategy::FirstLinesChecksum {
+                    ignored_header_bytes: 0,
+                    lines: 1,
+                },
+                1024,
+                true,
+            ),
+            oldest_first: false,
+            remove_after: None,
+            emitter: NoErrors,
+            rotate_wait: Duration::from_secs(20),
+            ttl_removal_config: None,
+            source_context: None,
+            file_to_pod_map: None,
+            drain_on_shutdown: false,
+            archive_extensions: vec!["gz".to_string()],
+            source_type: "file",
+            read_loop_min_backoff: 2000,
+        };
+
+        let (tx, rx) = mpsc::channel::<Vec<Line>>(32);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_data: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+            });
+
+        let collector = tokio::spawn(async move {
+            let mut rx = rx;
+            let mut lines: Vec<String> = Vec::new();
+            while let Some(batch) = rx.next().await {
+                for l in batch {
+                    lines.push(String::from_utf8_lossy(&l.text).into_owned());
+                }
+            }
+            lines
+        });
+
+        // The new active.json gets its own timestamp (≥1 s after line0 due to
+        // the stage-0 sleep), guaranteeing a different fingerprint.
+        let new_session_line = format!(
+            "{} INFO new session started",
+            Local::now().format("%Y/%m/%d %H:%M:%S")
+        );
+
+        let stage_driver = {
+            let paths = current_paths.clone();
+            let active_json = active_json.clone();
+            let active_1_json = active_1_json.clone();
+            let active_1_gz = active_1_gz.clone();
+            let new_session_line = new_session_line.clone();
+            let line0 = line0.clone();
+            let line0b = line0b.clone();
+            let line0c = line0c.clone();
+            tokio::spawn(async move {
+                // Stage 0 (2 s): server opens active.json and reads "logline1".
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                // Stage 1 (3 s): rename active.json → active-1.json (never visible to
+                // glob — doesn't match active.json or active-*.json.gz).  Immediately
+                // create a new active.json with a datetime-prefixed first line,
+                // simulating the application reopening the log file after logrotate.
+                // Glob returns [active.json] for the new file; the old watcher
+                // (logline1 fingerprint) becomes unfindable.
+                fs::rename(&active_json, &active_1_json).await.unwrap();
+                let new_content = format!("{new_session_line}\n");
+                fs::write(&active_json, new_content.as_bytes()).await.unwrap();
+                *paths.lock().unwrap() = vec![active_json.clone()];
+                tokio::time::sleep(Duration::from_secs(3)).await; // ≥2 glob cycles @ 1 s cooldown
+
+                // Stage 2 (2 s): compress active-1.json → active-1.json.gz with
+                // preserved mtime (as gzip -k does).  active-1.json is never
+                // returned by the glob.  Glob now returns [active.json, active-1.json.gz].
+                // .gz carries the three original lines plus an archive-only
+                // logline2, whose delivery proves the watcher switched inodes.
+                let ts2 = chrono::Local::now().format("%Y/%m/%d %H:%M:%S").to_string();
+                let gz_content = format!("{line0}\n{line0b}\n{line0c}\n{ts2} logline2\n");
+                let extended = gz_content.as_bytes();
+                let mut enc = GzipEncoder::new(extended);
+                let mut gz_bytes = Vec::new();
+                enc.read_to_end(&mut gz_bytes).await.unwrap();
+                fs::write(&active_1_gz, &gz_bytes).await.unwrap();
+                let raw_mtime = {
+                    use std::fs::File;
+                    File::open(&active_1_json)
+                        .unwrap()
+                        .metadata()
+                        .unwrap()
+                        .modified()
+                        .unwrap()
+                };
+                std::fs::File::options()
+                    .write(true)
+                    .open(&active_1_gz)
+                    .unwrap()
+                    .set_modified(raw_mtime)
+                    .unwrap();
+                *paths.lock().unwrap() = vec![active_json.clone(), active_1_gz.clone()];
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                // Stage 3 (41 s): delete active-1.json; glob unchanged.
+                // Wait 2× rotate_wait + 1 glob cycle for any dead watcher to be expelled.
+                fs::remove_file(&active_1_json).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(41)).await;
+
+                let snapshot = snapshot_deleted_fds(&active_1_json);
+                let _ = shutdown_tx.send(());
+                snapshot
+            })
+        };
+
+        let checkpointer = Checkpointer::new(data_dir.as_path());
+        file_server
+            .run(
+                tx,
+                shutdown_data,
+                futures::future::ready(()),
+                checkpointer,
+            )
+            .await
+            .expect("FileServer::run failed");
+
+        let fd_snapshot = stage_driver.await.expect("stage driver panicked");
+        let lines = collector.await.expect("collector panicked");
+
+        // (a) No FD should remain open to the deleted active-1.json inode after
+        //     2× rotate_wait has elapsed.
+        assert!(
+            fd_snapshot.leaked_fds.is_empty(),
+            "FileServer held open fd(s) to deleted active-1.json after \
+             2× rotate_wait: {:?}",
+            fd_snapshot.leaked_fds,
+        );
+
+        // (b) The archive-only line (yyyy/mm/dd hh:mm:ss logline2) exists only
+        //     inside active-1.json.gz.  Its delivery proves the watcher reconciled
+        //     to the .gz inode.
+        assert!(
+            lines.iter().any(|l| l.ends_with("logline2")),
+            "expected a 'logline2' line from active-1.json.gz to be delivered; \
+             received: {:?}",
+            lines,
+        );
+
+        // (c) The new active.json (first line: "yyyy/mm/dd hh:mm:ss INFO new session
+        //     started") is picked up independently of the rotation.
+        assert!(
+            lines.iter().any(|l| l == &new_session_line),
+            "expected new-session line '{}' from new active.json to be delivered; \
+             received: {:?}",
+            new_session_line,
+            lines,
+        );
+
+        // (d) logline1b / logline1c keep the read in progress across the
+        //     rename+gzip; both must still be delivered from the archive.
+        assert!(
+            lines.iter().any(|l| l.ends_with("logline1b")),
+            "expected 'logline1b' from the archived active.json content to be \
+             delivered; received: {:?}",
+            lines,
+        );
+        assert!(
+            lines.iter().any(|l| l.ends_with("logline1c")),
+            "expected 'logline1c' from the archived active.json content to be \
+             delivered; received: {:?}",
+            lines,
+        );
+    }
+
+    /// Rotation where the original file is *fully processed* before its `.gz`
+    /// archive appears. The fix keeps the live watcher across the gap so it hands
+    /// off to the `.gz`, delivering each original line exactly once.
+    ///
+    ///   Stage 0: active.json (logline1 / logline1b / logline1c) — read to EOF.
+    ///   Stage 1: rename active.json → active-1.json; create NEW active.json.
+    ///            The original (non-archive) watcher goes unfindable but is kept
+    ///            alive for rotate_wait (5 min) rather than reaped at EOF.
+    ///   Stage 2 (30 s later, past the 10 s dead-retention but < rotate_wait):
+    ///            gzip active-1.json → active-1.json.gz; the glob returns the .gz,
+    ///            which shares the watcher's fingerprint, so update_path repoints
+    ///            the live watcher to the .gz and it resumes at its EOF position.
+    ///
+    /// Asserts each original line is delivered exactly once (no re-delivery),
+    /// which previously failed: the watcher was reaped at EOF and the checkpoint
+    /// expired (dead-retention) before the .gz appeared.
+    #[tokio::test]
+    async fn rotation_while_original_file_still_was_done_no_redelivery() {
+        use async_compression::tokio::bufread::GzipEncoder;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::oneshot;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let active_json = tmp.path().join("active.json");
+        let active_1_json = tmp.path().join("active-1.json");
+        let active_1_gz = tmp.path().join("active-1.json.gz");
+
+        use chrono::Local;
+        let ts0 = Local::now().format("%Y/%m/%d %H:%M:%S").to_string();
+        let line0 = format!("{ts0} logline1");
+        let line0b = format!("{ts0} logline1b");
+        let line0c = format!("{ts0} logline1c");
+        let orig_content = format!("{line0}\n{line0b}\n{line0c}\n");
+        fs::write(&active_json, orig_content.as_bytes()).await.unwrap();
+
+        // Fingerprint + full length of the original file, used to simulate the
+        // checkpoint a fix would persist once the file is fully read.
+        let orig_position = orig_content.len() as u64;
+        let orig_fingerprint = {
+            let mut fp = Fingerprinter::new(
+                FingerprintStrategy::FirstLinesChecksum {
+                    ignored_header_bytes: 0,
+                    lines: 1,
+                },
+                1024,
+                true,
+            );
+            let mut ksf = std::collections::HashMap::new();
+            fp.fingerprint_or_emit(&active_json, &mut ksf, &NoErrors)
+                .await
+                .expect("failed to fingerprint original file")
+        };
+
+        let current_paths: Arc<Mutex<Vec<PathBuf>>> =
+            Arc::new(Mutex::new(vec![active_json.clone()]));
+
+        let file_server = FileServer {
+            paths_provider: DynamicPathsProvider {
+                paths: current_paths.clone(),
+            },
+            // Large read + minimum backoff: the original is drained to EOF within
+            // the first glob cycles, before rotation.
+            max_read_bytes: 2048,
+            ignore_checkpoints: false,
+            read_from: ReadFrom::Beginning,
+            ignore_before: None,
+            start_reading_at: None,
+            max_line_bytes: 1024,
+            line_delimiter: Bytes::from("\n"),
+            data_dir: data_dir.clone(),
+            glob_minimum_cooldown: Duration::from_secs(1),
+            fingerprinter: Fingerprinter::new(
+                FingerprintStrategy::FirstLinesChecksum {
+                    ignored_header_bytes: 0,
+                    lines: 1,
+                },
+                1024,
+                true,
+            ),
+            oldest_first: false,
+            remove_after: None,
+            emitter: NoErrors,
+            rotate_wait: Duration::from_secs(5 * 60),
+            ttl_removal_config: None,
+            source_context: None,
+            file_to_pod_map: None,
+            drain_on_shutdown: false,
+            archive_extensions: vec!["gz".to_string()],
+            source_type: "file",
+            read_loop_min_backoff: 1,
+        };
+
+        let (tx, rx) = mpsc::channel::<Vec<Line>>(32);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_data: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+            });
+
+        // A real shutdown_checkpointer signal (rather than ready(())), so the
+        // periodic checkpoint writer keeps ticking every glob_minimum_cooldown
+        // during the run instead of exiting on its first select!.
+        let (ckpt_shutdown_tx, ckpt_shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_checkpointer: std::pin::Pin<
+            Box<dyn std::future::Future<Output = ()> + Send>,
+        > = Box::pin(async move {
+            let _ = ckpt_shutdown_rx.await;
+        });
+
+        // Shared buffer so the stage driver can observe delivery in real time and
+        // stop as soon as the .gz re-delivery has landed.
+        let delivered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = {
+            let delivered = delivered.clone();
+            tokio::spawn(async move {
+                let mut rx = rx;
+                while let Some(batch) = rx.next().await {
+                    let mut buf = delivered.lock().unwrap();
+                    for l in batch {
+                        buf.push(String::from_utf8_lossy(&l.text).into_owned());
+                    }
+                }
+            })
+        };
+
+        let new_session_line = format!(
+            "{} INFO new session started",
+            Local::now().format("%Y/%m/%d %H:%M:%S")
+        );
+
+        // Create the checkpointer up front and grab its shared view so the stage
+        // driver can simulate the checkpoint a fix would persist. Use a short
+        // 10 s dead-retention so the dead-fingerprint expiry would fire well
+        // before the .gz appears at 30 s — the fix must keep the live watcher
+        // regardless.
+        let checkpointer = Checkpointer::new(data_dir.as_path())
+            .with_dead_retention(chrono::Duration::seconds(10));
+        let checkpoints_view = checkpointer.view();
+
+        let stage_driver = {
+            let paths = current_paths.clone();
+            let active_json = active_json.clone();
+            let active_1_json = active_1_json.clone();
+            let active_1_gz = active_1_gz.clone();
+            let new_session_line = new_session_line.clone();
+            let line0 = line0.clone();
+            let line0b = line0b.clone();
+            let line0c = line0c.clone();
+            let delivered = delivered.clone();
+            let checkpoints_view = checkpoints_view.clone();
+            let orig_fingerprint = orig_fingerprint;
+            let orig_position = orig_position;
+            tokio::spawn(async move {
+                // Stage 0: wait until the batch notifier (delivered buffer) shows
+                // every original line has been delivered — i.e. the file was read
+                // to EOF — then simulate the checkpoint a fix would persist at that
+                // point: record the original fingerprint at its full-content offset.
+                let deliver_deadline = Duration::from_secs(30);
+                let poll = Duration::from_millis(200);
+                let mut waited = Duration::ZERO;
+                loop {
+                    let all_delivered = {
+                        let buf = delivered.lock().unwrap();
+                        [&line0, &line0b, &line0c].iter().all(|orig| {
+                            buf.iter().any(|l| l.as_str() == orig.as_str())
+                        })
+                    };
+                    if all_delivered || waited >= deliver_deadline {
+                        break;
+                    }
+                    tokio::time::sleep(poll).await;
+                    waited += poll;
+                }
+                checkpoints_view.update(orig_fingerprint, orig_position);
+
+                // Stage 1: rename active.json → active-1.json (invisible to glob),
+                // create a new active.json (app reopens its log).
+                fs::rename(&active_json, &active_1_json).await.unwrap();
+                fs::write(&active_json, format!("{new_session_line}\n").as_bytes())
+                    .await
+                    .unwrap();
+                *paths.lock().unwrap() = vec![active_json.clone()];
+
+                // Stage 2 (30 s after rotation, still < rotate_wait = 5 min, but
+                // well past the 10 s dead-retention): compress active-1.json →
+                // active-1.json.gz with preserved mtime; expose the .gz to the
+                // glob.  It shares the original's first-line fingerprint.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let gz_content = format!("{line0}\n{line0b}\n{line0c}\n");
+                let mut enc = GzipEncoder::new(gz_content.as_bytes());
+                let mut gz_bytes = Vec::new();
+                enc.read_to_end(&mut gz_bytes).await.unwrap();
+                fs::write(&active_1_gz, &gz_bytes).await.unwrap();
+                let raw_mtime = {
+                    use std::fs::File;
+                    File::open(&active_1_json)
+                        .unwrap()
+                        .metadata()
+                        .unwrap()
+                        .modified()
+                        .unwrap()
+                };
+                std::fs::File::options()
+                    .write(true)
+                    .open(&active_1_gz)
+                    .unwrap()
+                    .set_modified(raw_mtime)
+                    .unwrap();
+                *paths.lock().unwrap() = vec![active_json.clone(), active_1_gz.clone()];
+                fs::remove_file(&active_1_json).await.unwrap();
+
+                // Give the .gz a bounded window (20 s) to be globbed and read.
+                // With the simulated checkpoint in place it should resume at EOF
+                // and deliver nothing; the assertion below verifies no re-delivery.
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                let _ = shutdown_tx.send(());
+                let _ = ckpt_shutdown_tx.send(());
+            })
+        };
+
+        file_server
+            .run(tx, shutdown_data, shutdown_checkpointer, checkpointer)
+            .await
+            .expect("FileServer::run failed");
+
+        stage_driver.await.expect("stage driver panicked");
+        collector.await.expect("collector panicked");
+        let lines = delivered.lock().unwrap().clone();
+
+        // The live watcher survives the rotation gap (non-archive kept for
+        // rotate_wait) and follows active.json -> active-1.json -> .gz via
+        // update_path on the shared fingerprint, resuming at its EOF position.
+        // So each original line is delivered exactly ONCE — no re-delivery.
+        for orig in [&line0, &line0b, &line0c] {
+            let count = lines.iter().filter(|l| l.as_str() == orig.as_str()).count();
+            assert_eq!(
+                count, 1,
+                "expected original line {:?} to be delivered exactly once \
+                 (watcher handed off to the .gz across rotation); got {} in {:?}",
+                orig, count, lines,
+            );
+        }
+    }
+
+    // The FileServer read loop must never advance the persisted checkpoint on its own — the offset
+    // is advanced only by the source's downstream map-closure (on ack, or at pull time for no-acks).
+    // So a read-but-unforwarded tail stays at the last checkpointed offset and is re-read on restart
+    // (at-least-once), not skipped. Fails if a change ever checkpoints read-but-unforwarded bytes.
+    #[tokio::test]
+    async fn drain_off_shutdown_does_not_checkpoint_undelivered_tail() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let log_path = tmp.path().join("test.log");
+        // Total size comfortably exceeds max_read_bytes (2048) so a single
+        // read iteration cannot consume the whole file.
+        let content: String = (0..200)
+            .map(|i| format!("line {:04} -- padding to make this longer\n", i))
+            .collect();
+        fs::write(&log_path, &content).await.unwrap();
+        let file_size = fs::metadata(&log_path).await.unwrap().len();
+
+        let file_server = make_file_server(vec![log_path.clone()], data_dir.clone(), false);
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+
+        // Immediate shutdown: exactly one read iteration before the select fires.
+        let shutdown_data = futures::future::ready(());
+        let shutdown_checkpointer = futures::future::ready(());
+        let checkpointer = Checkpointer::new(data_dir.as_path());
+
+        let result = file_server
+            .run(tx, shutdown_data, shutdown_checkpointer, checkpointer)
+            .await;
+        assert!(result.is_ok());
+
+        // Drain whatever was already handed to the (now-closed) channel.
+        let mut received = Vec::new();
+        while let Ok(batch) = rx.try_recv() {
+            received.extend(batch);
+        }
+        // Partial read: some but not all lines were delivered.
+        assert!(
+            !received.is_empty() && received.len() < 200,
+            "expected a partial read (0 < Y < 200), got {} lines",
+            received.len()
+        );
+
+        // Reload the persisted checkpoint in a fresh Checkpointer.
+        let mut checkpointer = Checkpointer::new(data_dir.as_path());
+        checkpointer.read_checkpoints(None).await;
+        let mut fingerprinter = Fingerprinter::new(
+            FingerprintStrategy::FirstLinesChecksum {
+                ignored_header_bytes: 0,
+                lines: 1,
+            },
+            1024,
+            true,
+        );
+        let mut known_small_files = HashMap::new();
+        let fingerprint = fingerprinter
+            .fingerprint_or_emit(&log_path, &mut known_small_files, &NoErrors)
+            .await
+            .expect("should be able to fingerprint the file");
+        let position = checkpointer.view().get(fingerprint).unwrap_or(0);
+
+        // No downstream wiring advanced the offset, so the checkpoint must sit below EOF — a
+        // checkpoint at EOF would skip the undelivered tail on restart (a real drop).
+        assert!(
+            position < file_size,
+            "checkpoint ({position}) advanced to/past EOF ({file_size}) for \
+             undelivered data — the tail would be dropped on restart"
+        );
+        assert_eq!(
+            position, 0,
+            "read loop must not advance the checkpoint for un-forwarded data; \
+             expected checkpoint 0, got {position}"
         );
     }
 }

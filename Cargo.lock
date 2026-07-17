@@ -14120,6 +14120,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vector-redaction-executor"
+version = "0.1.0"
+dependencies = [
+ "prost 0.12.6",
+ "prost-build 0.12.6",
+]
+
+[[package]]
 name = "vector-stream"
 version = "0.1.0"
 dependencies = [
@@ -14199,6 +14207,8 @@ dependencies = [
  "dnstap-parser",
  "enrichment",
  "indoc",
+ "prost 0.12.6",
+ "vector-redaction-executor",
  "vector-vrl-metrics",
  "vrl",
 ]
@@ -14359,10 +14369,19 @@ dependencies = [
  "url",
  "utf8-width",
  "uuid",
+ "vrl-redaction-executor",
  "webbrowser",
  "woothee",
  "xxhash-rust",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "vrl-redaction-executor"
+version = "0.1.0"
+dependencies = [
+ "prost 0.13.5",
+ "prost-build 0.13.5",
 ]
 
 [[package]]

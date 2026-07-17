@@ -1246,6 +1246,194 @@ async fn topology_two_wave_force_terminates_stuck_wave1_sink_at_data_sink_deadli
     );
 }
 
+// Wave-1 no-drop guarantee: `gracefully_closed == true` ⟹ no wave-1 data was dropped.
+//
+// `gracefully_closed = wave1_sources_clean && wave1_sinks_clean` is computed from task-exit timing
+// (`running.rs`), so the risk is a component reporting clean while still holding undelivered wave-1
+// data. Each test below strands data at a different wave-1 boundary via a gated sink consumer that
+// backpressures the pipeline, closes the ingress (the checkpoint), then releases the gate during
+// `stop()` and asserts a clean close implies everything produced was delivered.
+
+/// How the wave-1 sink buffers its input — selects which boundary the event is stranded at.
+enum Wave1Buffer {
+    /// Default in-memory channel: strands events in the source ingress (source-side drain).
+    None,
+    /// Disk buffer: strands events in the sink's buffer (sink drain).
+    Disk,
+    /// 1-event blocking memory buffer: parks the per-output pump mid-`fanout.send()` holding a
+    /// pulled-but-unsunk event — the no-acks pull-boundary the disk case can't reach.
+    Memory1,
+}
+
+/// Drives a gated wave-1 pipeline to strand data at the checkpoint, then releases the gate during
+/// `stop()`. Returns `(gracefully_closed, produced, delivered)` where `produced` is counted by the
+/// source (at pull time — the no-acks checkpoint analogue) and `delivered` is what reached the sink.
+/// `force_shutdown` makes the source honor the force tripwire first; `with_transform` inserts a 1:1
+/// wave-1 transform between source and sink.
+async fn run_wave1_delivery_test(
+    force_shutdown: bool,
+    buffer: Wave1Buffer,
+    with_transform: bool,
+) -> (bool, usize, usize) {
+    trace_init();
+    let tmpdir = tempfile::tempdir().expect("no tmpdir");
+
+    let (mut ext_tx, ext_source, produced_counter) = basic_source_with_event_counter(force_shutdown);
+
+    // Gated sink: nothing drains until `sink_gate` opens (after shutdown), so the pipeline backs up.
+    let (sink_out, wave1_sink) = basic_sink(1);
+    let delivered_counter = Arc::new(AtomicUsize::new(0));
+    let delivered_bg = Arc::clone(&delivered_counter);
+    let sink_gate = Arc::new(AtomicBool::new(false));
+    let sink_gate_bg = Arc::clone(&sink_gate);
+    let drain_handle = tokio::spawn(async move {
+        while !sink_gate_bg.load(Ordering::Relaxed) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let mut stream = sink_out.flat_map(into_event_stream);
+        while stream.next().await.is_some() {
+            delivered_bg.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    // A deferred internal source engages the two-wave path where `gracefully_closed` is computed.
+    let (mut internal_tx, internal_source) = deferred_source();
+    let (_internal_out, internal_sink) = basic_sink(10);
+
+    let mut config = Config::builder();
+    config.global.two_wave_shutdown = true.into();
+    config.set_data_dir(tmpdir.path());
+    // Generous deadlines: the property is data-completion, not a deadline miss.
+    config.graceful_shutdown_duration = Some(Duration::from_secs(30));
+    config.graceful_data_source_shutdown_duration = Some(Duration::from_secs(5));
+    config.graceful_data_sink_shutdown_duration = Some(Duration::from_secs(10));
+    config.graceful_internal_source_shutdown_duration = Some(Duration::from_secs(20));
+
+    config.add_source("ext_source", ext_source);
+    config.add_source("internal_logs", internal_source);
+    let sink_input = if with_transform {
+        config.add_transform("wave1_transform", &["ext_source"], basic_transform(" w1", 0.0));
+        "wave1_transform"
+    } else {
+        "ext_source"
+    };
+    let mut wave1_sink_outer = SinkOuter::new(vec![String::from(sink_input)], wave1_sink);
+    match buffer {
+        Wave1Buffer::None => {}
+        Wave1Buffer::Disk => {
+            wave1_sink_outer.buffer = BufferConfig::Single(BufferType::DiskV2 {
+                max_size: std::num::NonZeroU64::new(268435488).unwrap(),
+                when_full: WhenFull::Block,
+            });
+        }
+        Wave1Buffer::Memory1 => {
+            wave1_sink_outer.buffer = BufferConfig::Single(BufferType::Memory {
+                size: vector_lib::buffers::MemoryBufferSize::MaxEvents(
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                ),
+                when_full: WhenFull::Block,
+            });
+        }
+    }
+    config.add_sink_outer("wave1_sink", wave1_sink_outer);
+    config.add_sink("internal_sink", &["internal_logs"], internal_sink);
+
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
+
+    // Keep the deferred pipeline alive so two-wave mode stays engaged.
+    internal_tx
+        .send_event(Event::Log(LogEvent::from("internal")))
+        .await
+        .unwrap();
+
+    // Feed until the source backpressures (gated sink full). Every Ok send is an accepted event.
+    let mut accepted = 0usize;
+    loop {
+        let send = ext_tx.send_event(Event::Log(LogEvent::from(format!("wave1_{accepted}"))));
+        match tokio::time::timeout(Duration::from_millis(50), send).await {
+            Ok(Ok(())) => {
+                accepted += 1;
+                yield_now().await;
+                if accepted >= 8 {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    sleep(Duration::from_millis(50)).await;
+    drop(internal_tx);
+
+    // Checkpoint: close the ingress. Everything accepted is now in flight, gated behind the sink.
+    drop(ext_tx);
+
+    // Shut down while stranded, releasing the gate so a correct pipeline can drain before reporting.
+    let stop_fut = topology.stop();
+    sink_gate.store(true, Ordering::Relaxed);
+    let gracefully_closed = stop_fut.await;
+    _ = tokio::time::timeout(Duration::from_secs(2), drain_handle).await;
+
+    let produced = produced_counter.load(Ordering::Relaxed);
+    let delivered = delivered_counter.load(Ordering::Relaxed);
+    // Guard: the scenario must have actually stranded data, else it isn't exercising the drain path.
+    assert!(
+        accepted >= 2,
+        "scenario did not backpressure wave 1: accepted={accepted} produced={produced} delivered={delivered}"
+    );
+    (gracefully_closed, produced, delivered)
+}
+
+/// Source side: a force-broken wave-1 source must deliver its accepted-but-unforwarded ingress
+/// (deliver-until-checkpoint) before reporting clean, so `gracefully_closed` ⟹ `delivered >= produced`.
+#[tokio::test]
+async fn topology_gracefully_closed_implies_no_wave1_drop() {
+    let (gracefully_closed, produced, delivered) =
+        run_wave1_delivery_test(true, Wave1Buffer::None, false).await;
+    assert!(
+        !gracefully_closed || delivered >= produced,
+        "gracefully_closed=true but only {delivered}/{produced} wave-1 events delivered"
+    );
+}
+
+/// Sink side: a wave-1 sink task exits only on an empty buffer (its force-cut tripwire is disabled
+/// during graceful shutdown), so a clean close implies the disk buffer drained fully.
+#[tokio::test]
+async fn topology_gracefully_closed_implies_wave1_sink_buffer_drained() {
+    let (gracefully_closed, produced, delivered) =
+        run_wave1_delivery_test(false, Wave1Buffer::Disk, false).await;
+    assert!(
+        !gracefully_closed || delivered >= produced,
+        "gracefully_closed=true but only {delivered}/{produced} events drained from the sink buffer"
+    );
+}
+
+/// Transform side: a wave-1 transform is awaited in the same Phase-B set as sinks and exits only
+/// after forwarding all output, so a clean close implies it flushed everything downstream.
+#[tokio::test]
+async fn topology_gracefully_closed_implies_wave1_transform_flushed() {
+    let (gracefully_closed, produced, delivered) =
+        run_wave1_delivery_test(false, Wave1Buffer::None, true).await;
+    assert!(
+        !gracefully_closed || delivered >= produced,
+        "gracefully_closed=true but only {delivered}/{produced} events flushed through the transform"
+    );
+}
+
+/// No-acks pull boundary: `kubernetes_logs`/`file` advance their checkpoint at pull time, before any
+/// sink ack. A 1-event blocking memory buffer parks the per-output pump (a wave-1 source task)
+/// mid-`fanout.send()` holding a pulled event; that task exits clean only once the event lands, so a
+/// clean close still implies every pulled (checkpoint-advanced) event was delivered.
+#[tokio::test]
+async fn topology_gracefully_closed_implies_no_acks_pulled_event_not_dropped() {
+    let (gracefully_closed, pulled, delivered) =
+        run_wave1_delivery_test(false, Wave1Buffer::Memory1, false).await;
+    assert!(
+        !gracefully_closed || delivered >= pulled,
+        "gracefully_closed=true but only {delivered}/{pulled} pulled no-acks events delivered"
+    );
+}
+
+
 /// Shutdown must finish the instant all flushing components report drained, NOT sleep to the
 /// wave/overall deadline. Each wave wait is a `timeout_at(deadline, join_all(tasks))`, which
 /// resolves as soon as its `join_all` completes and only sleeps to the deadline when a task is

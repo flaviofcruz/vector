@@ -5,13 +5,16 @@
 //! - Standard VRL library functions (`vrl::stdlib::all`)
 //! - Vector-specific functions (`vector_vrl::secret_functions`)
 //! - Enrichment table functions (`enrichment::vrl_functions`)
+//! - Redaction functions (`redaction_functions`)
 //! - DNS tap parsing functions (optional, with `dnstap` feature)
 
 #![deny(warnings)]
 
 use vrl::{compiler::Function, path::OwnedTargetPath};
 
+pub mod apply_redaction;
 pub mod get_secret;
+pub mod redaction;
 pub mod remove_secret;
 pub mod set_secret;
 pub mod set_semantic_meaning;
@@ -35,12 +38,18 @@ pub fn secret_functions() -> Vec<Box<dyn Function>> {
     ]
 }
 
+/// Returns Vector-specific redaction functions.
+pub fn redaction_functions() -> Vec<Box<dyn Function>> {
+    vec![Box::new(apply_redaction::ApplyRedaction) as _]
+}
+
 /// Returns all VRL functions available in Vector.
 #[allow(clippy::disallowed_methods)]
 pub fn all() -> Vec<Box<dyn Function>> {
     let functions = vrl::stdlib::all()
         .into_iter()
         .chain(secret_functions())
+        .chain(redaction_functions())
         .chain(enrichment::vrl_functions());
 
     #[cfg(feature = "dnstap")]
