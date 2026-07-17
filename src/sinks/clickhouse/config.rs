@@ -179,6 +179,27 @@ pub struct ClickhouseConfig {
     /// to N (one per pod) instead of N × concurrency. Defaults to `1`.
     #[serde(default)]
     pub pool_max_idle_per_host: Option<usize>,
+
+    /// ClickHouse error codes that must not be retried.
+    ///
+    /// ClickHouse returns most deterministic data errors (e.g. `VIOLATED_CONSTRAINT`,
+    /// `CANNOT_CONVERT_TYPE`) over HTTP as status 500 with a body beginning
+    /// `Code: {n}. DB::Exception: ...`. Such rows fail identically on every retry,
+    /// so retrying only wastes the retry budget (and, in headless mode, fans the
+    /// doomed request across pods) before the request is dropped anyway. Codes
+    /// listed here are dropped immediately instead.
+    ///
+    /// Left unset, a built-in default set is used (469, 70, 69, 407, 131, 53, 117).
+    /// Set explicitly to override per shard without a Vector binary roll; an empty
+    /// list retries every 500. Transient 500s (e.g. `MEMORY_LIMIT_EXCEEDED`) and
+    /// bodies without a parseable `Code:` prefix are always retried.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "example_non_retriable_error_codes()"))]
+    pub non_retriable_error_codes: Option<Vec<u32>>,
+}
+
+fn example_non_retriable_error_codes() -> Vec<u32> {
+    vec![469, 70, 69, 407, 131]
 }
 
 /// Query settings for the `clickhouse` sink.
@@ -252,6 +273,7 @@ struct ClickhouseBuildParams {
     format: Format,
     request_builder: ClickhouseRequestBuilder,
     svc_config: EndpointServiceConfig,
+    non_retriable_error_codes: Option<Vec<u32>>,
 }
 
 impl_generate_config_from_default!(ClickhouseConfig);
@@ -312,6 +334,7 @@ impl SinkConfig for ClickhouseConfig {
             format,
             request_builder,
             svc_config,
+            non_retriable_error_codes: self.non_retriable_error_codes.clone(),
         };
 
         if self.use_headless_service {
@@ -416,7 +439,10 @@ impl ClickhouseConfig {
         S::Future: Send + 'static,
     {
         let service = ServiceBuilder::new()
-            .settings(params.request_limits, ClickhouseRetryLogic::default())
+            .settings(
+                params.request_limits,
+                ClickhouseRetryLogic::new(params.non_retriable_error_codes),
+            )
             .service(inner_service);
 
         let sink = ClickhouseSink::new(
