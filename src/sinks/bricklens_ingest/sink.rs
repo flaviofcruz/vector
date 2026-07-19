@@ -50,6 +50,10 @@ impl BricklensIngestSink {
         // Build HTTP client with TLS configuration
         let mut http_connector = hyper::client::HttpConnector::new();
         http_connector.enforce_http(false);
+        // Bound the TCP connect so a black-holed SYN (LB scaling, conntrack eviction) fails fast
+        // and is retried, rather than stalling on the OS default until the Tower request timeout
+        // consumes the whole retry budget on a single attempt.
+        http_connector.set_connect_timeout(Some(std::time::Duration::from_secs(5)));
 
         // Read TLS configuration
         let verify_cert = config
@@ -114,9 +118,26 @@ impl BricklensIngestSink {
             Ok(())
         });
 
-        // Configure client for HTTP/2 (required for gRPC)
+        // Configure client for HTTP/2 (required for gRPC).
+        //
+        // Keepalive is essential here: this client pools long-lived HTTP/2 connections to the
+        // endpoint (the s2s-proxy sidecar or the DBNS load balancer). An intermediary — NLB idle
+        // timeout, s2s-proxy/Envoy upstream idle timeout, or a conntrack/firewall eviction — can
+        // silently drop an idle connection without a TCP RST/FIN reaching Vector. Without
+        // keepalive PINGs, hyper never learns the connection is half-open and keeps dispatching
+        // new streams onto it; those streams hang until the Tower `Timeout` fires, surfacing as
+        // `request_failed` "connection timeout" even though bricklens-ingest-internal is healthy
+        // (the bytes never arrived). Retries ride the same poisoned connection and also time out,
+        // dropping the whole batch. `http2_keep_alive_while_idle` PINGs even when no stream is
+        // active, so a severed connection is detected and evicted before real traffic is sent.
+        // `pool_idle_timeout` stays under typical NLB/proxy idle windows so connections are
+        // recycled proactively rather than found dead on next use.
         let client = hyper::Client::builder()
             .http2_only(true)
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(30)))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+            .pool_idle_timeout(Some(std::time::Duration::from_secs(60)))
             .build(https_connector);
 
         let endpoint = config
