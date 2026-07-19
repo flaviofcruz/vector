@@ -121,7 +121,7 @@ impl BricklensIngestSink {
         // Configure client for HTTP/2 (required for gRPC).
         //
         // Keepalive is essential here: this client pools long-lived HTTP/2 connections to the
-        // endpoint (the s2s-proxy sidecar or the DBNS load balancer). An intermediary — NLB idle
+        // endpoint (the s2s-proxy or the DBNS load balancer). An intermediary — NLB idle
         // timeout, s2s-proxy/Envoy upstream idle timeout, or a conntrack/firewall eviction — can
         // silently drop an idle connection without a TCP RST/FIN reaching Vector. Without
         // keepalive PINGs, hyper never learns the connection is half-open and keeps dispatching
