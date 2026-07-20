@@ -801,7 +801,13 @@ impl IngestorProcess {
 
         let processing_start = Instant::now();
         let result = self
-            .process_s3_object(&msg.bucket, &msg.key, &region, self.log_namespace)
+            .process_s3_object(
+                &msg.bucket,
+                &msg.key,
+                &region,
+                msg.log_type.as_deref(),
+                self.log_namespace,
+            )
             .await;
 
         // Fire ingestion callback if configured (non-blocking).
@@ -893,10 +899,12 @@ impl IngestorProcess {
             }
         }
 
+        // S3 bucket notifications carry no log type; only direct-ingest messages do.
         self.process_s3_object(
             &s3_event.s3.bucket.name,
             &s3_event.s3.object.key,
             &s3_event.aws_region,
+            None,
             log_namespace,
         )
         .await
@@ -915,6 +923,7 @@ impl IngestorProcess {
         bucket: &str,
         key: &str,
         region: &str,
+        log_type: Option<&str>,
         log_namespace: LogNamespace,
     ) -> Result<(), ProcessingError> {
         let processing_start_time = Utc::now();
@@ -925,6 +934,7 @@ impl IngestorProcess {
         let bucket = bucket.to_owned();
         let key = key.to_owned();
         let region = region.to_owned();
+        let log_type = log_type.map(|s| s.to_owned());
 
         let object_result = self
             .state
@@ -1046,6 +1056,7 @@ impl IngestorProcess {
                             &bucket,
                             &key,
                             &region,
+                            log_type.as_deref(),
                             &metadata,
                             timestamp,
                         );
@@ -1201,6 +1212,7 @@ fn handle_single_log(
     bucket: &str,
     key: &str,
     region: &str,
+    log_type: Option<&str>,
     metadata: &Option<HashMap<String, String>>,
     timestamp: Option<DateTime<Utc>>,
 ) {
@@ -1226,6 +1238,18 @@ fn handle_single_log(
         path!("region"),
         Bytes::copy_from_slice(region.as_bytes()),
     );
+
+    // Only stamp log_type when the direct-ingest message carried it, so events
+    // from plain S3 notifications are unchanged.
+    if let Some(log_type) = log_type {
+        log_namespace.insert_source_metadata(
+            AwsS3Config::NAME,
+            log,
+            Some(LegacyKey::Overwrite(path!("log_type"))),
+            path!("log_type"),
+            Bytes::copy_from_slice(log_type.as_bytes()),
+        );
+    }
 
     if let Some(metadata) = metadata {
         for (key, value) in metadata {
@@ -1308,7 +1332,7 @@ const DIRECT_INGEST_KIND: &str = "INGEST";
 ///
 /// Example message:
 /// ```json
-/// {"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log", "file_id": "f-abc-123"}
+/// {"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log", "file_id": "f-abc-123", "log_type": "cp_logs"}
 /// ```
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1325,6 +1349,12 @@ pub struct DirectIngestMessage {
     pub key: String,
     /// Optional AWS region override. Falls back to the source's configured region.
     pub region: Option<String>,
+    /// Optional log type set by the upstream caller to demarcate the type of
+    /// log file being processed. When present, it is stamped onto every emitted
+    /// log event so downstream transforms can route on it. Optional: messages
+    /// that omit it deserialize to `None` and are not rejected.
+    #[serde(default)]
+    pub log_type: Option<String>,
 }
 
 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/how-to-enable-disable-notification-intro.html
@@ -1610,6 +1640,8 @@ fn test_direct_ingest_message() {
             assert_eq!(msg.key, "path/to/file.log");
             assert!(msg.region.is_none());
             assert_eq!(msg.file_id, "f-123");
+            // log_type is optional; a message that omits it parses to None.
+            assert!(msg.log_type.is_none());
         }
         _ => panic!("Expected DirectIngest variant"),
     }
@@ -1643,6 +1675,57 @@ fn test_direct_ingest_message() {
     }"#;
     let value: SqsEvent = serde_json::from_str(s3_notification).unwrap();
     assert!(matches!(value, SqsEvent::Event(_)));
+}
+
+#[test]
+fn test_direct_ingest_message_with_log_type() {
+    // log_type set by the upstream Log Access service is carried through so the
+    // ingestion path can segregate CP / DP-spark / DP-service logs.
+    let value: SqsEvent = serde_json::from_str(
+        r#"{"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log", "file_id": "f-123", "log_type": "cp_logs"}"#,
+    )
+    .unwrap();
+    match value {
+        SqsEvent::DirectIngest(msg) => {
+            assert_eq!(msg.log_type.as_deref(), Some("cp_logs"));
+        }
+        _ => panic!("Expected DirectIngest variant"),
+    }
+}
+
+#[test]
+fn handle_single_log_stamps_log_type_when_present() {
+    let mut log = LogEvent::default();
+    handle_single_log(
+        &mut log,
+        LogNamespace::Legacy,
+        "my-bucket",
+        "path/to/file.log",
+        "us-west-2",
+        Some("cp_logs"),
+        &None,
+        None,
+    );
+    assert_eq!(log["log_type"], "cp_logs".into());
+}
+
+#[test]
+fn handle_single_log_omits_log_type_when_absent() {
+    let mut log = LogEvent::default();
+    handle_single_log(
+        &mut log,
+        LogNamespace::Legacy,
+        "my-bucket",
+        "path/to/file.log",
+        "us-west-2",
+        None,
+        &None,
+        None,
+    );
+    assert!(
+        log.get("log_type").is_none(),
+        "log_type must be absent when the message did not carry it"
+    );
 }
 
 #[test]

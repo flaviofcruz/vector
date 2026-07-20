@@ -679,7 +679,9 @@ impl IngestorProcess {
         );
 
         let processing_start = std::time::Instant::now();
-        let result = self.process_blob_object(&msg.container, &msg.blob).await;
+        let result = self
+            .process_blob_object(&msg.container, &msg.blob, msg.log_type.as_deref())
+            .await;
 
         // Fire ingestion callback if configured (non-blocking).
         if let Some(ref cb_client) = self.state.callback_client {
@@ -756,7 +758,8 @@ impl IngestorProcess {
             });
         }
 
-        self.process_blob_object(container, blob).await
+        // Event Grid notifications carry no log type; only direct-ingest messages do.
+        self.process_blob_object(container, blob, None).await
     }
 
     /// Downloads a blob, decompresses, frames, deserializes, enriches, and sends
@@ -767,6 +770,7 @@ impl IngestorProcess {
         &mut self,
         container: &str,
         blob: &str,
+        log_type: Option<&str>,
     ) -> Result<(), ProcessingError> {
         let processing_start_time = Utc::now();
 
@@ -774,6 +778,7 @@ impl IngestorProcess {
         // and log enrichment, so we avoid repeated to_owned() calls.
         let container = container.to_owned();
         let blob = blob.to_owned();
+        let log_type = log_type.map(|s| s.to_owned());
 
         // Get blob client and download content
         let blob_client = self
@@ -913,6 +918,7 @@ impl IngestorProcess {
                             &container,
                             &blob,
                             &account_name,
+                            log_type.as_deref(),
                             &metadata_map,
                             timestamp_chrono,
                         );
@@ -1051,6 +1057,7 @@ fn handle_single_log(
     container: &str,
     blob: &str,
     account: &str,
+    log_type: Option<&str>,
     metadata: &HashMap<String, String>,
     timestamp: Option<DateTime<Utc>>,
 ) {
@@ -1080,6 +1087,18 @@ fn handle_single_log(
         path!("account"),
         Bytes::from(account.as_bytes().to_vec()),
     );
+
+    // Only stamp log_type when the direct-ingest message carried it, so events
+    // from plain Event Grid notifications are unchanged.
+    if let Some(log_type) = log_type {
+        log_namespace.insert_source_metadata(
+            AzureBlobConfig::NAME,
+            log,
+            Some(LegacyKey::Overwrite(path!("log_type"))),
+            path!("log_type"),
+            Bytes::from(log_type.as_bytes().to_vec()),
+        );
+    }
 
     // Add any additional metadata
     if !metadata.is_empty() {
@@ -1146,7 +1165,7 @@ const DIRECT_INGEST_KIND: &str = "INGEST";
 ///
 /// Example message:
 /// ```json
-/// {"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log", "file_id": "f-abc-123"}
+/// {"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log", "file_id": "f-abc-123", "log_type": "cp_logs"}
 /// ```
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1163,6 +1182,12 @@ pub(crate) struct DirectIngestMessage {
     pub blob: String,
     /// Optional storage account override. Falls back to the source's configured account.
     pub account: Option<String>,
+    /// Optional log type set by the upstream caller to demarcate the type of
+    /// log file being processed. When present, it is stamped onto every emitted
+    /// log event so downstream transforms can route on it. Optional: messages
+    /// that omit it deserialize to `None` and are not rejected.
+    #[serde(default)]
+    pub log_type: Option<String>,
 }
 
 /// Represents the possible message types that can arrive on the Azure Queue.
@@ -1426,6 +1451,8 @@ mod tests {
                 assert_eq!(msg.blob, "path/to/file.log");
                 assert!(msg.account.is_none());
                 assert_eq!(msg.file_id, "f-123");
+                // log_type is optional; a message that omits it parses to None.
+                assert!(msg.log_type.is_none());
             }
             _ => panic!("Expected DirectIngest variant"),
         }
@@ -1459,6 +1486,57 @@ mod tests {
         }"#;
         let value: QueueEvent = serde_json::from_str(event_grid_json).unwrap();
         assert!(matches!(value, QueueEvent::EventGrid(_)));
+    }
+
+    #[test]
+    fn test_direct_ingest_message_with_log_type() {
+        // log_type set by the upstream Log Access service is carried through so
+        // the ingestion path can segregate CP / DP-spark / DP-service logs.
+        let value: QueueEvent = serde_json::from_str(
+            r#"{"kind": "INGEST", "container": "my-container", "blob": "path/to/file.log", "file_id": "f-123", "log_type": "cp_logs"}"#,
+        )
+        .unwrap();
+        match value {
+            QueueEvent::DirectIngest(msg) => {
+                assert_eq!(msg.log_type.as_deref(), Some("cp_logs"));
+            }
+            _ => panic!("Expected DirectIngest variant"),
+        }
+    }
+
+    #[test]
+    fn handle_single_log_stamps_log_type_when_present() {
+        let mut log = LogEvent::default();
+        handle_single_log(
+            &mut log,
+            LogNamespace::Legacy,
+            "my-container",
+            "path/to/file.log",
+            "myaccount",
+            Some("dp_spark_logs"),
+            &HashMap::new(),
+            None,
+        );
+        assert_eq!(log["log_type"], "dp_spark_logs".into());
+    }
+
+    #[test]
+    fn handle_single_log_omits_log_type_when_absent() {
+        let mut log = LogEvent::default();
+        handle_single_log(
+            &mut log,
+            LogNamespace::Legacy,
+            "my-container",
+            "path/to/file.log",
+            "myaccount",
+            None,
+            &HashMap::new(),
+            None,
+        );
+        assert!(
+            log.get("log_type").is_none(),
+            "log_type must be absent when the message did not carry it"
+        );
     }
 
     #[test]
