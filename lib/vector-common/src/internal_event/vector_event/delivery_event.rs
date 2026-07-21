@@ -5,12 +5,17 @@ use std::collections::HashMap;
 use std::env;
 use std::ops::Add;
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, LazyLock, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tracing::Span;
+
+// Cumulative delivery counters survive config reloads but reset with the process. Keep this value
+// process-wide so remote consumers can distinguish real resets without splitting on config reload.
+static PROCESS_GENERATION_ID: LazyLock<String> =
+    LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
 // Sentinel emitted when a Lumberjack source's topic cannot be resolved from
 // either the source context or the filename. The spelling — including the
@@ -351,6 +356,7 @@ impl DeliveryEventSingleton {
             "time_parity" => time_parity.to_string(),
             "delivery_method" => delivery_method_for_source_type(source_type),
             "topic" => resolve_received_topic(ctx, &path, source_type),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
         )
         .increment(lines_read as u64);
 
@@ -572,6 +578,7 @@ fn emit_sink_delivery_counters<'a>(
             "time_parity" => time_parity_from_value_map(&value.value_map),
             "topic" => topic_from_value_map(&value.value_map),
             "delivery_method" => delivery_method_from_value_map(&value.value_map),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
         )
         .increment(value.count as u64);
     }
@@ -677,6 +684,15 @@ impl VectorSinkDeliveryEvent {
 #[cfg(test)]
 mod topic_inference_tests {
     use super::*;
+
+    #[test]
+    fn process_generation_id_is_stable_and_valid() {
+        let first = PROCESS_GENERATION_ID.as_str();
+        let second = PROCESS_GENERATION_ID.as_str();
+
+        assert_eq!(first, second);
+        assert!(uuid::Uuid::parse_str(first).is_ok());
+    }
 
     #[test]
     fn camel_to_dash_case_basic() {

@@ -13939,6 +13939,7 @@ dependencies = [
  "stream-cancel",
  "tokio",
  "tracing 0.1.44",
+ "uuid",
  "vector-common-macros",
  "vector-config",
  "vrl",
