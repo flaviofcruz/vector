@@ -35,6 +35,14 @@ use crate::enrichment_tables::indexed_data::IndexedData;
 use crate::http::HttpClient;
 use crate::tls::TlsSettings;
 
+/// Exponential-backoff bounds for the background recovery retry used when the table started
+/// empty (its initial load failed and no cache was available). The first retry fires quickly so
+/// a brief upstream blip is recovered almost immediately; the delay then doubles on each failure
+/// up to the cap, so a longer outage settles to at most one attempt per minute. Recovery stops
+/// as soon as one fetch succeeds.
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
 /// Shared state between the table handle(s) and the background refresh task.
 struct Shared {
     /// The current indexed snapshot. Read lock-free by lookups, replaced atomically by
@@ -57,7 +65,10 @@ pub struct HttpTable {
 impl HttpTable {
     /// Build the table: load an initial snapshot (from a fresh on-disk cache if available,
     /// otherwise by fetching), then spawn the background refresh task when a refresh interval
-    /// is configured.
+    /// is configured. If the initial load fails and no cache is available, the table starts
+    /// empty rather than failing the build (which would abort the whole topology at startup),
+    /// and a background retry recovers the data — see the fail-open comment inside. Set
+    /// `require_initial_load` to opt back into failing the build in that case.
     pub async fn new(
         config: HttpConfig,
         globals: &crate::config::GlobalOptions,
@@ -68,33 +79,58 @@ impl HttpTable {
         let cache_path = resolve_cache_path(&config, globals);
 
         // Prefer a fresh cache for an instant start; otherwise fetch now.
-        let (rows, from_fresh_cache) = match fresh_cache(&config, cache_path.as_ref()) {
-            Some(rows) => (rows, true),
-            None => match ctx.fetch_all_pages().await {
-                Ok(rows) => (rows, false),
-                Err(e) => {
-                    // Fetch failed on first build: fall back to a stale cache if one exists,
-                    // otherwise there is nothing to serve and we must fail the build.
-                    match any_cache(cache_path.as_ref()) {
-                        Some(stale) => {
-                            warn!(
-                                message = "Initial HTTP enrichment table fetch failed; serving stale cached snapshot.",
-                                url = %config.url,
-                                error = %e,
-                            );
-                            (stale.rows, true)
-                        }
-                        None => {
-                            return Err(format!(
-                                "failed to load HTTP enrichment table from {}: {e}",
-                                config.url
-                            )
-                            .into());
+        //
+        // `started_empty` tracks the fail-open case where neither a fresh fetch nor any cache
+        // (fresh or stale) could produce data. Building must not fail in that case: an
+        // enrichment table that returns `Err` here aborts the whole topology at startup (the
+        // builder collects it as a configuration error, and the process exits with
+        // `exitcode::CONFIG`). A transient upstream outage — a 404/503 from the endpoint, DNS
+        // failure, etc. — would then crashloop Vector rather than degrade one lookup source.
+        // Instead we start with an empty snapshot (lookups simply match nothing, exactly as an
+        // empty dataset would) and rely on the background refresh to populate it once the
+        // endpoint recovers. This mirrors the fail-open behavior of every other path in this
+        // table (stale-cache fallback, keep-last-good on refresh failure) and the config-reload
+        // path, which already logs and keeps serving rather than aborting.
+        let (rows, from_fresh_cache, started_empty) =
+            match fresh_cache(&config, cache_path.as_ref()) {
+                Some(rows) => (rows, true, false),
+                None => match ctx.fetch_all_pages().await {
+                    Ok(rows) => (rows, false, false),
+                    Err(e) => {
+                        // Fetch failed on first build: fall back to a stale cache if one exists,
+                        // otherwise start empty and let the background refresh recover.
+                        match any_cache(cache_path.as_ref()) {
+                            Some(stale) => {
+                                warn!(
+                                    message = "Initial HTTP enrichment table fetch failed; serving stale cached snapshot.",
+                                    url = %config.url,
+                                    error = %e,
+                                );
+                                (stale.rows, true, false)
+                            }
+                            None if config.require_initial_load => {
+                                // Opt-in fail-fast: the dataset is a hard dependency, so a
+                                // failed initial load with no cache aborts startup (the topology
+                                // builder turns this Err into `exitcode::CONFIG`).
+                                return Err(format!(
+                                    "failed to load HTTP enrichment table from {}: {e}",
+                                    config.url
+                                )
+                                .into());
+                            }
+                            None => {
+                                error!(
+                                    message = "Initial HTTP enrichment table load failed and no cache is available; starting empty and will retry in the background. Lookups match nothing until a refresh succeeds.",
+                                    url = %config.url,
+                                    error = %e,
+                                    internal_log_rate_limit = false,
+                                );
+                                (Vec::new(), false, true)
+                            }
                         }
                     }
-                }
-            },
-        };
+                },
+            };
 
         let indexed = decode_indexed(&rows, &config.schema, timezone);
         let shared = Arc::new(Shared {
@@ -102,18 +138,40 @@ impl HttpTable {
             index_specs: Mutex::new(Vec::new()),
         });
 
-        // Persist a freshly fetched snapshot (a cache-sourced one is already on disk).
-        if !from_fresh_cache {
+        // Persist a freshly fetched snapshot (a cache-sourced one is already on disk). Never
+        // persist the empty placeholder — that would clobber a good on-disk snapshot with
+        // nothing and defeat the instant-start cache on the next restart.
+        if !from_fresh_cache && !started_empty {
             persist(&config, cache_path.as_ref(), &rows).await;
         }
 
-        if let Some(secs) = config.refresh_interval_secs {
+        // Schedule the background refresh task. It has up to two phases:
+        //
+        // - Recovery (only when `started_empty`, i.e. the synchronous initial load failed): retry
+        //   with exponential backoff until one fetch succeeds. This fills the empty placeholder
+        //   fast after a transient outage — a brief blip recovers in ~1s — without hammering a
+        //   still-down endpoint (the delay doubles, capped at one attempt per minute). It applies
+        //   whether or not an interval is configured, so a long `refresh_interval_secs` no longer
+        //   means minutes/hours of an empty table after a failed start.
+        // - Steady state (only when `refresh_interval_secs` is set): refresh periodically forever,
+        //   as before.
+        //
+        // With no configured interval, an empty-start table stops once recovery succeeds — that
+        // is exactly the "fetch once at startup, never refresh" semantics of an unset interval
+        // (the failed initial fetch just left that one fetch undone), so it ends up in the same
+        // state as a table that had loaded cleanly. With no interval and a successful load there
+        // is nothing to do, so no task is spawned.
+        let steady_interval = config
+            .refresh_interval_secs
+            .map(|secs| Duration::from_secs(secs.max(1)));
+        if steady_interval.is_some() || started_empty {
             spawn_refresh_task(
                 Arc::downgrade(&shared),
                 ctx,
                 config.clone(),
                 cache_path,
-                Duration::from_secs(secs.max(1)),
+                steady_interval,
+                started_empty,
             );
         }
 
@@ -204,18 +262,88 @@ impl std::fmt::Debug for HttpTable {
     }
 }
 
+/// Perform one fetch and, on success, atomically swap in the new indexed snapshot (rebuilding
+/// the registered indexes) and persist it. Returns `true` on a successful fetch, `false` on a
+/// failed one (the previous snapshot is left in place). Takes the already-upgraded `Shared` so
+/// the caller controls the `Weak` lifetime check.
+async fn refresh_once(
+    shared: &Shared,
+    ctx: &FetchContext,
+    config: &HttpConfig,
+    cache_path: Option<&std::path::PathBuf>,
+) -> bool {
+    match ctx.fetch_all_pages().await {
+        Ok(rows) => {
+            let mut new = decode_indexed(&rows, &config.schema, ctx.timezone);
+            {
+                let specs = shared.index_specs.lock().expect("index_specs poisoned");
+                new.reapply_indexes(&specs);
+                shared.data.store(Arc::new(new));
+            }
+            persist(config, cache_path, &rows).await;
+            trace!(message = "Refreshed HTTP enrichment table.", url = %config.url);
+            true
+        }
+        Err(e) => {
+            warn!(
+                message = "Failed to refresh HTTP enrichment table; keeping previous data.",
+                url = %config.url,
+                error = %e,
+            );
+            false
+        }
+    }
+}
+
 /// Spawn the detached background refresh task. It exits when every table handle has been
 /// dropped (the `Weak` upgrade fails), for example on a config reload.
+///
+/// The task has up to two phases:
+/// - **Recovery** (when `recover_empty` is set, i.e. the table started empty because its initial
+///   load failed): retry with exponential backoff — [`INITIAL_RETRY_BACKOFF`], doubling, capped
+///   at [`MAX_RETRY_BACKOFF`] — until one fetch succeeds. This populates the empty placeholder
+///   quickly after a transient outage without hammering a still-down endpoint.
+/// - **Steady state** (when `steady_interval` is `Some`): refresh periodically forever.
+///
+/// If `steady_interval` is `None`, the task ends once recovery succeeds (an unset
+/// `refresh_interval_secs` is "fetch once, never refresh"). At least one of `recover_empty` /
+/// `steady_interval` is always meaningfully set by the caller.
 fn spawn_refresh_task(
     shared: std::sync::Weak<Shared>,
     ctx: FetchContext,
     config: HttpConfig,
     cache_path: Option<std::path::PathBuf>,
-    interval: Duration,
+    steady_interval: Option<Duration>,
+    recover_empty: bool,
 ) {
     tokio::spawn(async move {
+        // Recovery phase: exponential backoff until the first successful fetch.
+        if recover_empty {
+            let mut backoff = INITIAL_RETRY_BACKOFF;
+            loop {
+                tokio::time::sleep(backoff).await;
+                // Stop once the table is gone (all handles dropped, e.g. a config reload).
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
+                if refresh_once(&shared, &ctx, &config, cache_path.as_ref()).await {
+                    debug!(
+                        message = "HTTP enrichment table recovered its initial snapshot.",
+                        url = %config.url,
+                    );
+                    break;
+                }
+                backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+            }
+        }
+
+        // Steady-state phase: periodic refresh on the configured interval, if any.
+        let Some(interval) = steady_interval else {
+            return;
+        };
         let mut ticker = tokio::time::interval(interval);
-        // The first tick fires immediately; skip it since we already loaded at build time.
+        // The first tick fires immediately; skip it since we already have data at this point
+        // (either loaded at build time or just recovered above).
         ticker.tick().await;
         loop {
             ticker.tick().await;
@@ -223,25 +351,7 @@ fn spawn_refresh_task(
             let Some(shared) = shared.upgrade() else {
                 break;
             };
-            match ctx.fetch_all_pages().await {
-                Ok(rows) => {
-                    let mut new = decode_indexed(&rows, &config.schema, ctx.timezone);
-                    {
-                        let specs = shared.index_specs.lock().expect("index_specs poisoned");
-                        new.reapply_indexes(&specs);
-                        shared.data.store(Arc::new(new));
-                    }
-                    persist(&config, cache_path.as_ref(), &rows).await;
-                    trace!(message = "Refreshed HTTP enrichment table.", url = %config.url);
-                }
-                Err(e) => {
-                    warn!(
-                        message = "Failed to refresh HTTP enrichment table; keeping previous data.",
-                        url = %config.url,
-                        error = %e,
-                    );
-                }
-            }
+            refresh_once(&shared, &ctx, &config, cache_path.as_ref()).await;
         }
     });
 }
@@ -992,6 +1102,166 @@ mod tests {
         let ctx = FetchContext::new(&config, TimeZone::default(), &ProxyConfig::default()).unwrap();
         let err = ctx.fetch_page(&[]).await.unwrap_err();
         assert!(err.contains("timed out"), "unexpected error: {err}");
+    }
+
+    // Regression test for the startup crash: an initial load failure with no cache must NOT
+    // fail the build. Before the fail-open change, `HttpTable::new` returned `Err` here, which
+    // the topology builder surfaced as a configuration error and turned into a process exit
+    // (`exitcode::CONFIG`) — so a 404 (or any transient upstream error) from the enrichment
+    // endpoint crashlooped the whole Vector process. It must instead start with an empty
+    // snapshot and recover in the background.
+    #[tokio::test]
+    async fn initial_load_failure_starts_empty_instead_of_failing_build() {
+        // Reproduce the reported failure exactly: the endpoint answers, but with 404.
+        let uri = crate::test_util::http::spawn_blackhole_http_server(|_req| async {
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .body(hyper::Body::from(
+                        r#"{"error_code":"ENDPOINT_NOT_FOUND","message":"No API found"}"#,
+                    ))
+                    .unwrap(),
+            )
+        })
+        .await;
+
+        let config = HttpConfig {
+            url: uri.to_string(),
+            // No refresh interval configured: the "fetch once at startup" case. The build must
+            // still succeed despite the failed fetch.
+            refresh_interval_secs: None,
+            // Disable persistence so no data_dir / cache can mask the failure path.
+            persist: false,
+            ..Default::default()
+        };
+
+        let table = HttpTable::new(config, &crate::config::GlobalOptions::default())
+            .await
+            .expect("build must succeed (start empty) when the initial fetch fails with no cache");
+
+        // The table is empty: a `find_table_rows` returns no rows (never panics), and a
+        // `find_table_row` reports "no rows found" rather than crashing the lookup path.
+        assert_eq!(table.shared.data.load().len(), 0);
+        let rows = table
+            .find_table_rows(Case::Sensitive, &[], None, None, None)
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    // A DNS/connection failure (not just an HTTP error status) on the initial load must also be
+    // fail-open, and when a refresh interval IS configured the build still succeeds empty and
+    // the periodic refresh is left to recover the data.
+    #[tokio::test]
+    async fn initial_load_failure_with_refresh_interval_starts_empty() {
+        let config = HttpConfig {
+            // TEST-NET-1 (RFC 5737): guaranteed unroutable, so the connection attempt fails.
+            url: "http://192.0.2.1/api".to_string(),
+            request_timeout_secs: 1,
+            refresh_interval_secs: Some(3600),
+            persist: false,
+            ..Default::default()
+        };
+
+        let table = HttpTable::new(config, &crate::config::GlobalOptions::default())
+            .await
+            .expect("build must succeed (start empty) on an unreachable endpoint");
+        assert_eq!(table.shared.data.load().len(), 0);
+    }
+
+    // Opt-in fail-fast: with `require_initial_load = true`, a failed initial load and no cache
+    // must return `Err` (the topology builder turns that into a startup abort) rather than
+    // starting empty. This is the behavior a deployment selects when the dataset is a hard
+    // dependency.
+    #[tokio::test]
+    async fn require_initial_load_fails_build_when_initial_fetch_fails() {
+        let config = HttpConfig {
+            // TEST-NET-1 (RFC 5737): guaranteed unroutable, so the initial fetch fails.
+            url: "http://192.0.2.1/api".to_string(),
+            request_timeout_secs: 1,
+            require_initial_load: true,
+            persist: false,
+            ..Default::default()
+        };
+
+        let err = HttpTable::new(config, &crate::config::GlobalOptions::default())
+            .await
+            .expect_err("build must fail when require_initial_load is set and the fetch fails");
+        assert!(
+            err.to_string().contains("failed to load HTTP enrichment table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // A table that started empty because its initial load failed must recover in the background
+    // via the exponential-backoff retry: the endpoint fails the first (synchronous) fetch, then
+    // starts serving data, and the table populates without a configured refresh interval. With
+    // `INITIAL_RETRY_BACKOFF` at 1s, recovery lands within a couple of seconds.
+    #[tokio::test]
+    async fn empty_start_recovers_in_background_after_transient_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Fail the first request (the synchronous initial load), then serve one row.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let uri = {
+            let calls = Arc::clone(&calls);
+            crate::test_util::http::spawn_blackhole_http_server(move |_req| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    let resp = if n == 0 {
+                        http::Response::builder()
+                            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                            .body(hyper::Body::empty())
+                            .unwrap()
+                    } else {
+                        http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .body(hyper::Body::from(r#"[{"id": "a", "v": "1"}]"#))
+                            .unwrap()
+                    };
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            })
+            .await
+        };
+
+        let config = HttpConfig {
+            url: uri.to_string(),
+            // No refresh interval: recovery must still run and then stop after the first success.
+            refresh_interval_secs: None,
+            persist: false,
+            ..Default::default()
+        };
+
+        let table = HttpTable::new(config, &crate::config::GlobalOptions::default())
+            .await
+            .expect("build must succeed (start empty)");
+        // The synchronous load failed, so the table starts empty.
+        assert_eq!(table.shared.data.load().len(), 0);
+
+        // The background retry (first backoff ~1s) should populate the table shortly.
+        let mut recovered = false;
+        for _ in 0..40 {
+            if table.shared.data.load().len() == 1 {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(recovered, "table did not recover in the background within the deadline");
+        let row = table
+            .find_table_row(
+                Case::Sensitive,
+                &[Condition::Equals {
+                    field: "id",
+                    value: Value::from("a"),
+                }],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(row.get("v"), Some(&Value::from("1")));
     }
 
     // Build a table directly from decoded data, bypassing the network, for lookup/index tests.

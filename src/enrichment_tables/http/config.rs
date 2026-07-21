@@ -197,6 +197,19 @@ pub struct HttpConfig {
     #[serde(default = "crate::serde::default_true")]
     pub persist: bool,
 
+    /// Whether a failed initial load should abort startup.
+    ///
+    /// By default (`false`) the table fails open: if the first fetch fails at startup and no
+    /// cached snapshot is available, the table starts empty (lookups match nothing) and a
+    /// background task retries until it succeeds, so a transient upstream outage degrades a
+    /// single lookup source rather than crashing the whole Vector process. Set this to `true`
+    /// when the dataset is a hard dependency and serving no data is worse than not starting: a
+    /// failed initial load with no cache to fall back on then fails the build, aborting startup.
+    /// This only affects the no-data-at-all case — a usable (even stale) cached snapshot is
+    /// always served regardless of this setting.
+    #[serde(default)]
+    pub require_initial_load: bool,
+
     /// The maximum age, in seconds, of a persisted snapshot that will be trusted on startup.
     ///
     /// On startup, if a persisted snapshot exists and is younger than this, it is loaded
@@ -254,6 +267,7 @@ impl Default for HttpConfig {
             refresh_interval_secs: None,
             request_timeout_secs: default_request_timeout_secs(),
             persist: true,
+            require_initial_load: false,
             max_cache_age_secs: None,
             schema: HashMap::new(),
         }
