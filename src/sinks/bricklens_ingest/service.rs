@@ -4,17 +4,17 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use http::{Request, Uri};
 use hyper::Body;
-use prost_reflect::{MethodDescriptor, prost::Message};
+use prost_reflect::{prost::Message, MethodDescriptor};
 use snafu::Snafu;
 use tower::Service;
 use tracing::{debug, warn};
 
-use vector_lib::EstimatedJsonEncodedSizeOf;
 use vector_lib::config::telemetry;
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::internal_event::{ComponentEventsDropped, INTENTIONAL, UNINTENTIONAL};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
+use vector_lib::EstimatedJsonEncodedSizeOf;
 
 use crate::sinks::util::retries::RetryLogic;
 
@@ -143,7 +143,7 @@ fn grpc_status_message(headers: &http::HeaderMap) -> Option<String> {
 /// OK (status 0). Reading the trailers matters because an intermediary (e.g. the s2s-proxy/Envoy
 /// hop) can deliver a transient status there — and missing it would misreport the error and skip
 /// the retry.
-fn resolve_grpc_status(
+pub(crate) fn resolve_grpc_status(
     headers: &http::HeaderMap,
     trailers: Option<&http::HeaderMap>,
 ) -> (i32, Option<String>) {
@@ -354,11 +354,10 @@ impl BricklensIngestService {
 
         // Build gRPC HTTP/2 request
         let path = self.grpc_path();
-        let uri = build_request_uri(&self.endpoint, &path).map_err(|e| {
-            BricklensIngestError::Encode {
+        let uri =
+            build_request_uri(&self.endpoint, &path).map_err(|e| BricklensIngestError::Encode {
                 message: format!("Failed to build request URI: {}", e),
-            }
-        })?;
+            })?;
 
         // Tell the server the same deadline the client enforces via the Tower `Timeout` layer.
         // The timeout is configured in whole seconds (TowerRequestConfig::timeout_secs), so second
@@ -384,7 +383,6 @@ impl BricklensIngestService {
     fn parse_grpc_response(
         &self,
         mut body: impl bytes::Buf,
-        event_count: usize,
         events_sent: GroupedCountByteSize,
         bytes_sent: usize,
     ) -> Result<BricklensIngestResponse, BricklensIngestError> {
@@ -436,9 +434,12 @@ impl BricklensIngestService {
             // bricklens-ingest-external is an atomic (all-or-nothing) forwarder: its Export* RPCs
             // return an empty `ExportResponse` with no partial-success channel, and this code is
             // reached only on a gRPC-OK status, so a response means the destination accepted the
-            // whole batch. There is no per-record accounting to fold in (unlike
-            // `BatchCreateLogRecords`); every event is accepted.
-            "ExportResponse" => event_count,
+            // one message we sent. `build_grpc_request` encodes and sends exactly ONE event (the
+            // merged event; it warns and drops the tail if handed more than one — see the
+            // `event_values.len() > 1` guard), so the accepted count is 1. It is deliberately NOT
+            // the request's input event count: acking a never-sent tail as delivered would silently
+            // lose those events when misconfigured with `max_events > 1`.
+            "ExportResponse" => 1,
             other => {
                 // The sink is pointed at a method whose response type we don't know how to
                 // interpret. Treat as Rejected (accepted_count = 0) rather than silently acking
@@ -606,17 +607,15 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
             for event in &req.events {
                 events_sent.add_event(event, event.estimated_json_encoded_size_of());
             }
-            // Captured before `build_grpc_request` consumes `req`: the empty `ExportResponse`
-            // carries no per-record counts, so the whole-batch accept is sized from the request.
-            let event_count = req.events.len();
-
             let (http_req, bytes_sent) = service.build_grpc_request(req)?;
 
-            let response = client.request(http_req).await.map_err(|e| {
-                BricklensIngestError::Transport {
-                    message: e.to_string(),
-                }
-            })?;
+            let response =
+                client
+                    .request(http_req)
+                    .await
+                    .map_err(|e| BricklensIngestError::Transport {
+                        message: e.to_string(),
+                    })?;
 
             // The gRPC status can arrive in the initial HEADERS frame (a "Trailers-Only" response,
             // typical for fast errors) or in the HTTP/2 trailers sent after the body. Snapshot the
@@ -631,7 +630,8 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
             let mut response_body = response.into_body();
             let mut body = bytes::BytesMut::new();
             while let Some(chunk) =
-                std::future::poll_fn(|cx| std::pin::Pin::new(&mut response_body).poll_data(cx)).await
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut response_body).poll_data(cx))
+                    .await
             {
                 let chunk = chunk.map_err(|e| BricklensIngestError::Transport {
                     message: format!("Failed to read response body: {}", e),
@@ -657,8 +657,7 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
             // computed above: the grouped size of the events actually sent and the encoded payload's
             // byte size. For the atomic `ExportResponse` forwarder this is the whole batch on a
             // gRPC-OK response.
-            let response =
-                service.parse_grpc_response(body.freeze(), event_count, events_sent, bytes_sent)?;
+            let response = service.parse_grpc_response(body.freeze(), events_sent, bytes_sent)?;
 
             // Log accepted count for observability.
             debug!(
@@ -674,12 +673,12 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
 #[cfg(test)]
 mod tests {
     use prost_reflect::{
-        DynamicMessage,
         prost_types::{
-            DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto, FieldDescriptorProto,
-            FileDescriptorProto, FileDescriptorSet, MethodDescriptorProto, ServiceDescriptorProto,
-            field_descriptor_proto,
+            field_descriptor_proto, DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto,
+            FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet, MethodDescriptorProto,
+            ServiceDescriptorProto,
         },
+        DynamicMessage,
     };
     use vector_lib::event::{Event, LogEvent};
 
@@ -1089,7 +1088,7 @@ mod tests {
         msg_bytes.extend_from_slice(&fail);
         let body = bytes::Bytes::from(encode_grpc_message(msg_bytes));
         let resp = svc
-            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap();
         // Only the two success=true records are counted; the failed one is excluded so a
         // partially-failed batch isn't acked as fully delivered.
@@ -1104,10 +1103,13 @@ mod tests {
         let msg_bytes = vec![0x0A, 0x00];
         let body = bytes::Bytes::from(encode_grpc_message(msg_bytes));
         let resp = svc
-            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap();
         assert_eq!(resp.accepted_count, 0);
-        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Rejected
+        );
     }
 
     /// Hand-encodes a proto3 `Response { status, metrics_written, metrics_failed }` body.
@@ -1149,7 +1151,7 @@ mod tests {
         );
         let body = bytes::Bytes::from(encode_grpc_message(encode_write_metrics_body(1, 5, 0)));
         let resp = svc
-            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap();
         assert_eq!(resp.accepted_count, 5);
         assert_eq!(
@@ -1170,10 +1172,13 @@ mod tests {
         );
         let body = bytes::Bytes::from(encode_grpc_message(encode_write_metrics_body(1, 0, 0)));
         let resp = svc
-            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap();
         assert_eq!(resp.accepted_count, 0);
-        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Rejected
+        );
     }
 
     #[test]
@@ -1187,10 +1192,13 @@ mod tests {
         );
         let body = bytes::Bytes::from(encode_grpc_message(encode_write_metrics_body(3, 5, 0)));
         let resp = svc
-            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap();
         assert_eq!(resp.accepted_count, 0);
-        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Rejected
+        );
     }
 
     #[test]
@@ -1204,7 +1212,7 @@ mod tests {
         );
         let body = bytes::Bytes::from(encode_grpc_message(encode_write_metrics_body(2, 3, 2)));
         let resp = svc
-            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap();
         assert_eq!(resp.accepted_count, 3);
         assert_eq!(
@@ -1228,10 +1236,13 @@ mod tests {
         // Empty Response message — the proto has no fields at all.
         let body = bytes::Bytes::from(encode_grpc_message(Vec::new()));
         let resp = svc
-            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap();
         assert_eq!(resp.accepted_count, 0);
-        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Rejected
+        );
     }
 
     /// Builds a descriptor pool whose method response is the empty `ExportResponse` (the
@@ -1277,24 +1288,28 @@ mod tests {
         use vector_lib::json_size::JsonSize;
 
         // bricklens-ingest-external is an atomic (all-or-nothing) forwarder: its Export* RPCs return
-        // an empty ExportResponse, and a gRPC-OK response means the destination accepted the whole
-        // batch (there is no partial-success channel). So the batch must be reported Delivered with
-        // every event accepted -- accepted_count == the request's event count -- not Rejected, which
-        // is what the unknown-name fallback did before the ExportResponse branch existed.
+        // an empty ExportResponse, and a gRPC-OK response means the destination accepted the one
+        // message we sent (there is no partial-success channel). accepted_count is 1 -- the single
+        // merged message build_grpc_request encodes -- so event_status() reports Delivered (not the
+        // Rejected the unknown-name fallback returned before the ExportResponse branch existed).
+        // accepted_count is deliberately DECOUPLED from the request's input event count: the sink
+        // sends exactly one message, and acking a never-sent tail would silently lose data under a
+        // misconfigured max_events > 1. events_sent telemetry (below) is a separate axis and still
+        // carries the real per-event grouped size.
         let svc = make_test_service_with_pool(
             "https://example.com:443",
             make_test_pool_with_export_response_shape(),
         );
         // Empty ExportResponse message body.
         let body = bytes::Bytes::from(encode_grpc_message(Vec::new()));
-        // Pass non-trivial telemetry the way call() does so we also pin that parse_grpc_response
-        // threads the real events_sent/bytes_sent straight onto the response (no placeholder, no
-        // post-parse overwrite). On this atomic path that is the whole batch.
+        // Pass a >1 event grouped size (CountByteSize(5, ..)) the way call() does, to prove
+        // accepted_count is NOT derived from it (regression guard for the over-count fix) while
+        // events_sent/bytes_sent are still threaded straight through (no placeholder, no overwrite).
         let events_sent: GroupedCountByteSize = CountByteSize(5, JsonSize::new(321)).into();
-        let resp = svc.parse_grpc_response(body, 5, events_sent, 654).unwrap();
+        let resp = svc.parse_grpc_response(body, events_sent, 654).unwrap();
         assert_eq!(
-            resp.accepted_count, 5,
-            "atomic forwarder accepts the whole batch"
+            resp.accepted_count, 1,
+            "atomic forwarder sends exactly one merged message; accept count is 1, not the input count"
         );
         assert_eq!(
             resp.event_status(),
@@ -1317,7 +1332,7 @@ mod tests {
         let svc = make_test_service("https://example.com:443");
         let body = bytes::Bytes::from(vec![0x00, 0x00, 0x00, 0x00]); // 4 bytes, need 5
         let err = svc
-            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap_err();
         assert!(
             err.to_string().contains("too short"),
@@ -1332,7 +1347,7 @@ mod tests {
         // 5-byte gRPC frame with compression flag = 1 and empty body
         let body = bytes::Bytes::from(vec![0x01, 0x00, 0x00, 0x00, 0x00]);
         let err = svc
-            .parse_grpc_response(body, 1, GroupedCountByteSize::new_untagged(), 0)
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap_err();
         assert!(
             err.to_string().contains("Compressed"),
@@ -1354,7 +1369,10 @@ mod tests {
             events_sent: GroupedCountByteSize::new_untagged(),
             bytes_sent: 0,
         };
-        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Rejected
+        );
     }
 
     #[test]
@@ -1413,8 +1431,8 @@ mod tests {
         // the real events. The call() path must derive events_sent from req.events, so the count is
         // the true number of delivered events rather than the zeroed metadata field.
         use crate::sinks::util::RequestBuilder;
-        use vector_lib::EstimatedJsonEncodedSizeOf;
         use vector_lib::config::telemetry;
+        use vector_lib::EstimatedJsonEncodedSizeOf;
 
         let events = vec![log_event("a"), log_event("b"), log_event("c")];
 
@@ -1523,9 +1541,11 @@ mod tests {
         assert!(!logic.is_retriable_error(&BricklensIngestError::Encode {
             message: "x".to_string(),
         }));
-        assert!(!logic.is_retriable_error(&BricklensIngestError::ResponseParse {
-            message: "x".to_string(),
-        }));
+        assert!(
+            !logic.is_retriable_error(&BricklensIngestError::ResponseParse {
+                message: "x".to_string(),
+            })
+        );
     }
 
     #[test]

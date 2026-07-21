@@ -750,6 +750,7 @@ sources-vector = ["dep:prost", "dep:tonic", "protobuf-build"]
 transforms = ["transforms-logs", "transforms-metrics"]
 transforms-logs = [
   "transforms-aws_ec2_metadata",
+  "transforms-bricklens_config_enricher",
   "transforms-dedupe",
   "transforms-dynamic_rls_throttle",
   "transforms-filter",
@@ -781,6 +782,7 @@ transforms-metrics = [
 
 transforms-aggregate = []
 transforms-aws_ec2_metadata = ["dep:arc-swap"]
+transforms-bricklens_config_enricher = ["dep:prost-reflect", "dep:prost"]
 transforms-dedupe = ["transforms-impl-dedupe"]
 transforms-dynamic_rls_throttle = ["dep:arc-swap", "dep:prost-reflect", "dep:prost"]
 transforms-filter = []
