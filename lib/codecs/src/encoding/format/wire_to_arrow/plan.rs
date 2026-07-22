@@ -298,7 +298,21 @@ impl MessagePlan {
             // Maps take precedence: proto map fields have `is_map() == true` and
             // cardinality Repeated, but we dispatch differently from a bare
             // repeated-message field.
-            let slot = if proto_field.is_map() {
+            //
+            // We also treat as a map any repeated-message field whose UC/Arrow target column is a
+            // `Map` type. This covers Databricks' `(databricks.json_map) = true` convention
+            // (e.g. `dbr_log.DbrLog.context` -> `repeated SparkContext`), a hand-rolled
+            // `repeated KeyValue` that carries NO proto `map_entry` option (so `is_map()` is false)
+            // but which the legacy Spark pipeline renders as a Spark MapType. On the wire such a
+            // field is byte-identical to a native map, and the entry message exposes `key`/`value`
+            // by the same field numbers, so the existing Map sub-plan handles it unchanged. The
+            // Arrow schema (derived from the UC table) is the source of truth for the target column
+            // type: we only take this path when UC declares the column a `Map`, so a repeated
+            // key/value message that UC instead models as `List<Struct>` still lands as a list.
+            let target_is_arrow_map = matches!(arrow_field.data_type(), DataType::Map(_, _));
+            let treat_as_map = proto_field.is_map()
+                || (is_repeated && matches!(kind, Kind::Message(_)) && target_is_arrow_map);
+            let slot = if treat_as_map {
                 let entry_desc = match &kind {
                     Kind::Message(m) => m,
                     _ => {

@@ -486,6 +486,128 @@ fn repeated_scalar_empty_row_produces_empty_list() {
     assert!(!list.is_null(0), "list column itself should never be null");
 }
 
+/// A `repeated KeyValue` message where `KeyValue { string key = 1; string value = 2; }` does NOT
+/// carry the proto `map_entry` option. This models Databricks' `(databricks.json_map) = true`
+/// convention (e.g. `dbr_log.DbrLog.context` -> `repeated SparkContext`), which the legacy Spark
+/// pipeline renders as a Spark MapType even though it is not a native proto map. `is_map()` is
+/// false for this field, so wire_to_arrow must recognize the "repeated key/value message targeting
+/// an Arrow Map column" shape to build a MapArray.
+fn json_map_descriptor() -> MessageDescriptor {
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_json_map_test.proto".into()),
+        package: Some("wire_to_arrow_json_map_test".into()),
+        message_type: vec![
+            DescriptorProto {
+                name: Some("Log".into()),
+                field: vec![FieldDescriptorProto {
+                    name: Some("context".into()),
+                    number: Some(3),
+                    label: Some(Label::Repeated as i32),
+                    r#type: Some(ProtoType::Message as i32),
+                    type_name: Some(".wire_to_arrow_json_map_test.KeyValue".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            // KeyValue: key=1, value=2, NO options.map_entry (unlike a native proto map entry).
+            DescriptorProto {
+                name: Some("KeyValue".into()),
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("key".into()),
+                        number: Some(1),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::String as i32),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("value".into()),
+                        number: Some(2),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::String as i32),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes).unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_json_map_test.Log")
+        .unwrap()
+}
+
+#[test]
+fn json_map_repeated_keyvalue_roundtrips_to_map() {
+    // The json_map field is `repeated KeyValue` (no map_entry option), and the UC schema declares
+    // the column as Arrow Map<Struct(key, value)>. On the wire a repeated key/value message is
+    // byte-identical to a native proto map, so wire_to_arrow should produce a MapArray keyed by the
+    // Arrow Map column type — not fall through to List<Struct>.
+    let desc = json_map_descriptor();
+    let entry_fields = ArrowFields::from(vec![
+        Field::new("key", DataType::LargeUtf8, false),
+        Field::new("value", DataType::LargeUtf8, true),
+    ]);
+    let entry_field = Arc::new(Field::new(
+        "key_value",
+        DataType::Struct(entry_fields),
+        false,
+    ));
+    let schema = Schema::new(vec![Field::new(
+        "context",
+        DataType::Map(entry_field, false),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // Populate `context` with two KeyValue entries.
+    let kv_desc = desc
+        .get_field_by_name("context")
+        .unwrap()
+        .kind()
+        .as_message()
+        .unwrap()
+        .clone();
+    let mut kv1 = DynamicMessage::new(kv_desc.clone());
+    kv1.set_field_by_name("key", ProtoValue::String("spark.app.id".into()));
+    kv1.set_field_by_name("value", ProtoValue::String("app-123".into()));
+    let mut kv2 = DynamicMessage::new(kv_desc);
+    kv2.set_field_by_name("key", ProtoValue::String("spark.executor.id".into()));
+    kv2.set_field_by_name("value", ProtoValue::String("driver".into()));
+
+    let mut msg = DynamicMessage::new(desc.clone());
+    msg.set_field_by_name(
+        "context",
+        ProtoValue::List(vec![ProtoValue::Message(kv1), ProtoValue::Message(kv2)]),
+    );
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc.encode_batch(&[Bytes::from(buf)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let map = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::MapArray>()
+        .expect("json_map column should be MapArray");
+    assert_eq!(map.value_length(0), 2, "expected 2 json_map entries");
+    let keys = map.keys().as_string::<i64>();
+    let values = map.values().as_string::<i64>();
+    let pairs: std::collections::HashMap<String, String> = (0..2)
+        .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+        .collect();
+    assert_eq!(pairs.get("spark.app.id").map(String::as_str), Some("app-123"));
+    assert_eq!(
+        pairs.get("spark.executor.id").map(String::as_str),
+        Some("driver")
+    );
+}
+
 #[test]
 fn map_roundtrip() {
     // Proto: test_protobuf3.Person.data = map<string, PhoneType>
