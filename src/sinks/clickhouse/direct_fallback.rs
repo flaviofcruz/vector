@@ -13,10 +13,13 @@ use tokio::time::{sleep, timeout};
 use tower::Service;
 use tracing::warn;
 
+use vector_lib::emit;
+
 use super::headless::{EndpointServiceConfig, build_endpoint_service};
 use super::service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder};
 use super::sink::PartitionKey;
 use crate::http::HttpClient;
+use crate::internal_events::{ClickhouseDirectFallbackRouted, ClickhouseDirectRetry};
 use crate::sinks::util::http::{HttpRequest, HttpResponse, HttpService};
 use crate::sinks::util::retries::RetryLogic;
 
@@ -97,6 +100,7 @@ impl DirectFallbackService {
             }
 
             if attempt < self.max_attempts_per_endpoint {
+                emit!(ClickhouseDirectRetry { endpoint: label });
                 sleep(cur.min(self.max_backoff)).await;
                 let next = prev.checked_add(cur).unwrap_or(self.max_backoff).min(self.max_backoff);
                 prev = cur;
@@ -126,8 +130,7 @@ impl Service<HttpRequest<PartitionKey>> for DirectFallbackService {
                 EndpointOutcome::Success(resp) => return Ok(resp),
                 EndpointOutcome::NonRetriable(res) => return res,
                 EndpointOutcome::Exhausted(_) => {
-                    metrics::counter!("clickhouse_direct_fallback_routed_total").increment(1);
-                    warn!(message = "ClickHouse primary exhausted retries; failing over to fallback.");
+                    emit!(ClickhouseDirectFallbackRouted);
                 }
             }
             match this.run_endpoint(&mut fallback, &request, "fallback").await {
@@ -171,6 +174,19 @@ mod tests {
     }
 
     fn spawn_server(addr: std::net::SocketAddr, status: u16, body: &'static str) -> Arc<AtomicUsize> {
+        spawn_flaky_server(addr, 0, status, status, body)
+    }
+
+    /// Spawns a server that returns `fail_status` for the first `fail_times`
+    /// requests, then `ok_status` for the rest. `fail_times = 0` means always
+    /// `ok_status`. Returns the hit counter.
+    fn spawn_flaky_server(
+        addr: std::net::SocketAddr,
+        fail_times: usize,
+        fail_status: u16,
+        ok_status: u16,
+        body: &'static str,
+    ) -> Arc<AtomicUsize> {
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_srv = hits.clone();
         let make = make_service_fn(move |_| {
@@ -179,7 +195,8 @@ mod tests {
                 Ok::<_, Infallible>(service_fn(move |_req| {
                     let hits = hits.clone();
                     async move {
-                        hits.fetch_add(1, Ordering::SeqCst);
+                        let n = hits.fetch_add(1, Ordering::SeqCst);
+                        let status = if n < fail_times { fail_status } else { ok_status };
                         Ok::<_, Infallible>(HyperResponse::builder().status(status).body(Body::from(body)).unwrap())
                     }
                 }))
@@ -191,9 +208,36 @@ mod tests {
         hits
     }
 
-    /// Runs one request through the service. `Some((status, body))` spawns a live
-    /// server; `None` leaves the port unbound (connection refused). Returns
-    /// `(primary_hits, fallback_hits, result)`; 2 attempts/endpoint, 1ms backoff.
+    /// Sends one request through a service pointed at `p_addr`/`fb_addr`, with
+    /// `attempts` per endpoint and 1ms backoff. Servers must already be spawned.
+    async fn drive(
+        p_addr: std::net::SocketAddr,
+        fb_addr: std::net::SocketAddr,
+        non_retriable_codes: Option<Vec<u32>>,
+        attempts: usize,
+    ) -> SinkResult {
+        let cfg = EndpointServiceConfig {
+            auth: None,
+            skip_unknown_fields: None,
+            date_time_best_effort: false,
+            insert_random_shard: false,
+            compression: Default::default(),
+            query_settings: Default::default(),
+        };
+        let uri = |a: std::net::SocketAddr| format!("http://{}:{}/", a.ip(), a.port()).parse().unwrap();
+        let client = HttpClient::new(None, &ProxyConfig::default()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        DirectFallbackService::new(
+            &client, uri(p_addr), uri(fb_addr), &cfg, non_retriable_codes,
+            attempts, Duration::from_millis(1), Duration::from_millis(1), Duration::from_secs(2),
+        )
+        .oneshot(test_request())
+        .await
+    }
+
+    /// `run` for the common case: `Some((status, body))` spawns a live server,
+    /// `None` leaves the port unbound (connection refused). 2 attempts/endpoint.
+    /// Returns `(primary_hits, fallback_hits, result)`.
     async fn run(
         primary: Option<(u16, &'static str)>,
         fallback: Option<(u16, &'static str)>,
@@ -204,39 +248,39 @@ mod tests {
         let no_hits = || Arc::new(AtomicUsize::new(0));
         let p_hits = primary.map_or_else(no_hits, |(s, b)| spawn_server(p_addr, s, b));
         let fb_hits = fallback.map_or_else(no_hits, |(s, b)| spawn_server(fb_addr, s, b));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let client = HttpClient::new(None, &ProxyConfig::default()).unwrap();
-        let cfg = EndpointServiceConfig {
-            auth: None,
-            skip_unknown_fields: None,
-            date_time_best_effort: false,
-            insert_random_shard: false,
-            compression: Default::default(),
-            query_settings: Default::default(),
-        };
-        let uri = |a: std::net::SocketAddr| format!("http://{}:{}/", a.ip(), a.port()).parse().unwrap();
-        let svc = DirectFallbackService::new(
-            &client, uri(p_addr), uri(fb_addr), &cfg, non_retriable_codes,
-            2, Duration::from_millis(1), Duration::from_millis(1), Duration::from_secs(2),
-        );
-
-        let result = svc.oneshot(test_request()).await;
+        let result = drive(p_addr, fb_addr, non_retriable_codes, 2).await;
         (p_hits.load(Ordering::SeqCst), fb_hits.load(Ordering::SeqCst), result)
     }
 
-    #[tokio::test]
-    async fn falls_back_when_primary_connection_refused() {
-        let (p, fb, res) = run(None, Some((200, "")), None).await;
-        assert!(res.is_ok());
-        assert_eq!((p, fb), (0, 1));
-    }
+    // --- Primary succeeds (no failover) ---
 
     #[tokio::test]
     async fn uses_primary_and_skips_fallback_when_healthy() {
         let (p, fb, res) = run(Some((200, "")), None, None).await;
         assert!(res.is_ok());
         assert_eq!((p, fb), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn primary_retries_then_succeeds_without_failover() {
+        // Primary fails once (503) then succeeds on the 2nd attempt; fallback untouched.
+        let (_pg, p_addr) = next_addr();
+        let (_fg, fb_addr) = next_addr();
+        let p_hits = spawn_flaky_server(p_addr, 1, 503, 200, "");
+        let fb_hits = spawn_server(fb_addr, 200, "");
+        let res = drive(p_addr, fb_addr, None, 2).await;
+        assert!(res.is_ok());
+        assert_eq!(p_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(fb_hits.load(Ordering::SeqCst), 0);
+    }
+
+    // --- Primary fails, fallback succeeds ---
+
+    #[tokio::test]
+    async fn falls_back_when_primary_connection_refused() {
+        let (p, fb, res) = run(None, Some((200, "")), None).await;
+        assert!(res.is_ok());
+        assert_eq!((p, fb), (0, 1));
     }
 
     #[tokio::test]
@@ -247,9 +291,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fallback_retries_then_succeeds() {
+        // Primary exhausts on 503; fallback fails once then succeeds on its 2nd attempt.
+        let (_pg, p_addr) = next_addr();
+        let (_fg, fb_addr) = next_addr();
+        let p_hits = spawn_server(p_addr, 503, "overloaded");
+        let fb_hits = spawn_flaky_server(fb_addr, 1, 503, 200, "");
+        let res = drive(p_addr, fb_addr, None, 2).await;
+        assert!(res.is_ok());
+        assert_eq!(p_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(fb_hits.load(Ordering::SeqCst), 2);
+    }
+
+    // --- Non-retriable: stop, never fail over ---
+
+    #[tokio::test]
     async fn does_not_fall_back_on_non_retriable_clickhouse_error() {
         let (p, fb, res) = run(Some((500, "Code: 70. DB::Exception")), Some((200, "")), Some(vec![70])).await;
         assert_eq!(res.unwrap().http_response.status().as_u16(), 500);
         assert_eq!((p, fb), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn non_retriable_on_fallback_is_returned_as_is() {
+        // Primary exhausts on 503, fails over; fallback returns a non-retriable 500 (code 70).
+        let (p, fb, res) =
+            run(Some((503, "overloaded")), Some((500, "Code: 70. DB::Exception")), Some(vec![70])).await;
+        assert_eq!(res.unwrap().http_response.status().as_u16(), 500);
+        assert_eq!((p, fb), (2, 1));
+    }
+
+    // --- Both endpoints fail ---
+
+    #[tokio::test]
+    async fn both_endpoints_unreachable_returns_error() {
+        // Both ports unbound: primary and fallback each exhaust on connection refused.
+        let (p, fb, res) = run(None, None, None).await;
+        assert!(res.is_err());
+        assert_eq!((p, fb), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn both_endpoints_exhaust_on_transient_5xx() {
+        // Both return 503: each retried to max_attempts; the fallback's last 5xx is surfaced.
+        let (p, fb, res) = run(Some((503, "overloaded")), Some((503, "still down")), None).await;
+        assert_eq!(res.unwrap().http_response.status().as_u16(), 503);
+        assert_eq!((p, fb), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn primary_unreachable_fallback_exhausts_5xx() {
+        // Primary unreachable (connection refused), fallback keeps returning 503.
+        let (p, fb, res) = run(None, Some((503, "still down")), None).await;
+        assert_eq!(res.unwrap().http_response.status().as_u16(), 503);
+        assert_eq!((p, fb), (0, 2));
+    }
+
+    // --- Config edge: no retries still fails over ---
+
+    #[tokio::test]
+    async fn single_attempt_still_fails_over() {
+        // attempts = 1 (no retries): one primary hit, then fail over.
+        let (_pg, p_addr) = next_addr();
+        let (_fg, fb_addr) = next_addr();
+        let p_hits = spawn_server(p_addr, 503, "overloaded");
+        let fb_hits = spawn_server(fb_addr, 200, "");
+        let res = drive(p_addr, fb_addr, None, 1).await;
+        assert!(res.is_ok());
+        assert_eq!(p_hits.load(Ordering::SeqCst), 1, "no retries when attempts = 1");
+        assert_eq!(fb_hits.load(Ordering::SeqCst), 1);
     }
 }
