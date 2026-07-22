@@ -11,6 +11,7 @@
 
 mod arrow;
 pub mod config;
+mod direct_fallback;
 mod dns;
 mod headless;
 #[cfg(all(test, feature = "clickhouse-integration-tests"))]

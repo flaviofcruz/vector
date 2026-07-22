@@ -437,7 +437,7 @@ impl tower::Service<HttpRequest<PartitionKey>> for HeadlessService {
 /// Note: hyper 0.14 wraps mid-stream IO errors (like "Connection reset by peer")
 /// as `Kind::Io` which has no public checker method, so we walk the source chain
 /// to find the underlying `std::io::Error`.
-fn is_connection_error(error: &crate::Error) -> bool {
+pub(super) fn is_connection_error(error: &crate::Error) -> bool {
     error.downcast_ref::<HttpError>().is_some_and(|e| match e {
         HttpError::CallRequest { source } => {
             source.is_connect()
@@ -472,7 +472,7 @@ fn has_io_connection_error(error: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 /// Builds an `HttpService` targeting a single resolved endpoint URI.
-fn build_endpoint_service(
+pub(super) fn build_endpoint_service(
     client: &HttpClient,
     uri: Uri,
     config: &EndpointServiceConfig,
