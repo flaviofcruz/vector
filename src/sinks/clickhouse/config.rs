@@ -395,8 +395,8 @@ impl ClickhouseConfig {
         if let Some(fallback) = self.fallback_endpoint.as_ref() {
             let fallback_uri = fallback.with_default_parts().uri;
 
-            // Per-endpoint attempt budget: `retry_attempts` is retries, so total
-            // attempts is +1. Capture backoff/timeout before disabling the outer layer.
+            // `retry_attempts` is retries, so total attempts per endpoint is +1.
+            // Capture backoff/timeout before disabling the outer retry layer below.
             let max_attempts_per_endpoint = params.request_limits.retry_attempts.saturating_add(1);
             let initial_backoff = params.request_limits.retry_initial_backoff;
             let max_backoff = params.request_limits.retry_max_duration;
@@ -421,19 +421,18 @@ impl ClickhouseConfig {
                 per_call_timeout,
             );
 
-            // The service handles retries internally; disable the outer retry layer
-            // (else attempts multiply) and widen the outer timeout to cover both
-            // phases end-to-end: up to `2 * max_attempts` hops (each bounded by
-            // `per_call_timeout`) plus the backoff sleeps between them (each capped
-            // at `max_backoff`). Sum both and add margin; saturate rather than panic.
+            // The service owns its retry loop: disable the outer retry layer (else
+            // attempts multiply) and widen the outer timeout to bound both phases —
+            // up to `2 * max_attempts` hops plus the backoff sleeps between them,
+            // with margin. Saturate rather than panic.
             params.request_limits.retry_attempts = 0;
             let hops = (2 * max_attempts_per_endpoint) as u32;
-            let sleeps = hops.saturating_sub(2); // no sleep after the last attempt of each phase
+            let sleeps = hops.saturating_sub(2);
             let hop_budget = per_call_timeout.checked_mul(hops).unwrap_or(Duration::MAX);
             let sleep_budget = max_backoff.checked_mul(sleeps).unwrap_or(Duration::MAX);
             params.request_limits.timeout = hop_budget
                 .checked_add(sleep_budget)
-                .and_then(|d| d.checked_add(Duration::from_secs(5))) // margin
+                .and_then(|d| d.checked_add(Duration::from_secs(5)))
                 .unwrap_or(Duration::MAX);
 
             return self.build_sink_and_healthcheck(params, service);
