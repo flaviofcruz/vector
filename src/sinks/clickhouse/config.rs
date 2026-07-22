@@ -1,6 +1,7 @@
 //! Configuration for the `Clickhouse` sink.
 
 use std::fmt;
+use std::time::Duration;
 
 use http::{Request, StatusCode, Uri};
 use hyper::Body;
@@ -382,26 +383,59 @@ impl ClickhouseConfig {
     /// Builds the direct single-endpoint sink (no headless routing).
     ///
     /// When `fallback_endpoint` is set, wraps the primary endpoint in a
-    /// [`DirectFallbackService`] that re-dispatches a request to the fallback on a
-    /// connection-level failure (the `clickhouse-proxy` dual-write path). Without
-    /// a `fallback_endpoint`, builds a plain single-endpoint sink.
+    /// [`DirectFallbackService`] that retries the primary (proxy), then fails over
+    /// to the fallback (direct SMK) and retries that — the `clickhouse-proxy`
+    /// dual-write path. That service owns its retry loop, so the outer Tower retry
+    /// layer is disabled and the outer timeout widened to bound the two phases.
+    /// Without a `fallback_endpoint`, builds a plain single-endpoint sink.
     fn build_direct(
         &self,
-        params: ClickhouseBuildParams,
+        mut params: ClickhouseBuildParams,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         if let Some(fallback) = self.fallback_endpoint.as_ref() {
             let fallback_uri = fallback.with_default_parts().uri;
+
+            // Per-endpoint attempt budget: `retry_attempts` is retries, so total
+            // attempts is +1. Capture backoff/timeout before disabling the outer layer.
+            let max_attempts_per_endpoint = params.request_limits.retry_attempts.saturating_add(1);
+            let initial_backoff = params.request_limits.retry_initial_backoff;
+            let max_backoff = params.request_limits.retry_max_duration;
+            let per_call_timeout = params.request_limits.timeout;
+
             info!(
-                message = "ClickHouse direct sink configured with a connection-error fallback endpoint.",
+                message = "ClickHouse direct sink configured with a retrying fallback endpoint.",
                 primary_endpoint = %params.endpoint,
                 fallback_endpoint = %fallback_uri,
+                max_attempts_per_endpoint,
             );
+
             let service = DirectFallbackService::new(
                 &params.client,
                 params.endpoint.clone(),
                 fallback_uri,
                 &params.svc_config,
+                params.non_retriable_error_codes.clone(),
+                max_attempts_per_endpoint,
+                initial_backoff,
+                max_backoff,
+                per_call_timeout,
             );
+
+            // The service handles retries internally; disable the outer retry layer
+            // (else attempts multiply) and widen the outer timeout to cover both
+            // phases end-to-end: up to `2 * max_attempts` hops (each bounded by
+            // `per_call_timeout`) plus the backoff sleeps between them (each capped
+            // at `max_backoff`). Sum both and add margin; saturate rather than panic.
+            params.request_limits.retry_attempts = 0;
+            let hops = (2 * max_attempts_per_endpoint) as u32;
+            let sleeps = hops.saturating_sub(2); // no sleep after the last attempt of each phase
+            let hop_budget = per_call_timeout.checked_mul(hops).unwrap_or(Duration::MAX);
+            let sleep_budget = max_backoff.checked_mul(sleeps).unwrap_or(Duration::MAX);
+            params.request_limits.timeout = hop_budget
+                .checked_add(sleep_budget)
+                .and_then(|d| d.checked_add(Duration::from_secs(5))) // margin
+                .unwrap_or(Duration::MAX);
+
             return self.build_sink_and_healthcheck(params, service);
         }
 
