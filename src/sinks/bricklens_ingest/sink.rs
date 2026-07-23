@@ -90,9 +90,18 @@ impl BricklensIngestSink {
         // Load client certificate and key for mTLS. The s2s-proxy sidecar requires a client cert
         // to identify the pod when server_name routes to bricklens-ingest-internal.
         if let (Some(crt), Some(key)) = (crt_file, key_file) {
+            // Use set_certificate_CHAIN_file, not set_certificate_file: the former sends every cert
+            // in the PEM (leaf + intermediates), the latter sends only the leaf. The direct DP->CP
+            // mTLS path (useEnvoy=false, e.g. the BRICKINDEX vdb-pool) presents the workload-identity
+            // (UWI) cert, whose leaf chains to the Data Plane Misc Root via an intermediate UWI CA.
+            // The trusted-daemon N/S route can only build the path to its trusted root if the client
+            // SENDS that intermediate, so a leaf-only presentation is rejected at the handshake with
+            // `unknown_ca` (TLS alert 48). Verified at the wire on staging brickindex/rtud2a: the
+            // config_enricher (which already uses set_certificate_chain_file) handshakes with the same
+            // UWI cert, while this sink failed leaf-only until switched to the chain loader.
             ssl_builder
-                .set_certificate_file(&crt, openssl::ssl::SslFiletype::PEM)
-                .map_err(|e| format!("Failed to load client certificate {:?}: {}", crt, e))?;
+                .set_certificate_chain_file(&crt)
+                .map_err(|e| format!("Failed to load client certificate chain {:?}: {}", crt, e))?;
             ssl_builder
                 .set_private_key_file(&key, openssl::ssl::SslFiletype::PEM)
                 .map_err(|e| format!("Failed to load client key {:?}: {}", key, e))?;

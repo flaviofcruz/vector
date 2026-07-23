@@ -1056,17 +1056,24 @@ fn lookup_key_from_event(event: &Event) -> Option<ConfigLookupKey> {
 /// proto directly instead of matching field names by convention).
 fn apply_destination(event: &mut Event, key: &ConfigLookupKey, action: &RouteInfo) {
     let log = event.as_mut_log();
-    log.insert("destination.workspace_id", key.workspace_id);
+    // bricklens-ingest-external's `Destination` message is a `oneof destination_config`, so the UC-table
+    // fields must nest under the `unity_catalog_table` arm — writing them flat on `.destination` makes
+    // the bricklens_ingest sink encode scalars into the `unity_catalog_table` (message) field, which the
+    // server rejects with "invalid wire type: LengthDelimited (expected Varint)". Build the nested shape.
     log.insert(
-        "destination.uc_resource_target",
+        "destination.unity_catalog_table.workspace_id",
+        key.workspace_id,
+    );
+    log.insert(
+        "destination.unity_catalog_table.uc_resource_target",
         action.uc_resource_target.clone(),
     );
     log.insert(
-        "destination.service_principal_resource",
+        "destination.unity_catalog_table.service_principal_resource",
         action.service_principal_resource.clone(),
     );
     log.insert(
-        "destination.service_principal_type",
+        "destination.unity_catalog_table.service_principal_type",
         action.service_principal_type.clone(),
     );
 }
