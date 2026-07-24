@@ -103,7 +103,7 @@ const DIRECT_INGEST_KIND: &str = "INGEST";
 ///
 /// Example payload:
 /// ```json
-/// {"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log", "file_id": "f-abc-123"}
+/// {"kind": "INGEST", "bucket": "my-bucket", "key": "path/to/file.log", "file_id": "f-abc-123", "log_type": "cp_logs"}
 /// ```
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +120,12 @@ pub(crate) struct DirectIngestMessage {
     /// notify the upstream service of processing completion or failure.
     /// Messages without this field are rejected at deserialization time.
     pub file_id: String,
+    /// Optional log type set by the upstream caller to demarcate the type of
+    /// log file being processed. When present, it is stamped onto every emitted
+    /// log event so downstream transforms can route on it. Optional: messages
+    /// that omit it deserialize to `None` and are not rejected.
+    #[serde(default)]
+    pub log_type: Option<String>,
 }
 
 /// All message types recognised on the Pub/Sub subscription.
@@ -582,6 +588,7 @@ impl IngestorProcess {
             .process_object(
                 &msg.bucket,
                 &msg.key,
+                msg.log_type.as_deref(),
                 &mut self.out,
                 self.log_namespace,
                 self.acknowledgements,
@@ -785,6 +792,27 @@ mod tests {
             msg.is_err(),
             "deny_unknown_fields must prevent unrecognised fields from silently passing"
         );
+    }
+
+    /// log_type is optional: messages that omit it must still parse (backward
+    /// compatibility with producers that predate the field).
+    #[test]
+    fn message_without_log_type_parses_to_none() {
+        let json = r#"{"kind": "INGEST", "bucket": "b", "key": "k", "file_id": "f"}"#;
+        let msg: DirectIngestMessage =
+            serde_json::from_str(json).expect("missing log_type must parse — field is optional");
+        assert_eq!(msg.log_type, None, "absent log_type must deserialize to None");
+    }
+
+    /// log_type is carried through when the upstream Log Access service sets it,
+    /// so the ingestion path can segregate CP / DP-spark / DP-service logs.
+    #[test]
+    fn message_with_log_type_is_parsed() {
+        let json =
+            r#"{"kind": "INGEST", "bucket": "b", "key": "k", "file_id": "f", "log_type": "cp_logs"}"#;
+        let msg: DirectIngestMessage =
+            serde_json::from_str(json).expect("log_type must parse when present");
+        assert_eq!(msg.log_type.as_deref(), Some("cp_logs"));
     }
 
     /// QueueEvent must reject messages that match no known variant so that a

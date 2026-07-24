@@ -82,6 +82,7 @@ impl GcsDownloader {
         &self,
         bucket: &str,
         key: &str,
+        log_type: Option<&str>,
         out: &mut SourceSender,
         log_namespace: LogNamespace,
         acknowledgements: bool,
@@ -92,6 +93,7 @@ impl GcsDownloader {
         let processing_start_time = Utc::now();
         let bucket = bucket.to_owned();
         let key = key.to_owned();
+        let log_type = log_type.map(|s| s.to_owned());
 
         // Build the URL using url::Url so object key segments are percent-encoded.
         // Special characters (?, #, &, spaces etc.) would break URL parsing if left
@@ -216,7 +218,14 @@ impl GcsDownloader {
                 .map(|mut event: Event| {
                     event = event.with_batch_notifier_option(&batch);
                     if let Some(log_event) = event.maybe_as_log_mut() {
-                        enrich_log_event(log_event, log_namespace, &bucket, &key, &project);
+                        enrich_log_event(
+                            log_event,
+                            log_namespace,
+                            &bucket,
+                            &key,
+                            &project,
+                            log_type.as_deref(),
+                        );
                     }
                     events_received.emit(CountByteSize(1, event.estimated_json_encoded_size_of()));
                     event
@@ -289,6 +298,7 @@ fn enrich_log_event(
     bucket: &str,
     key: &str,
     project: &str,
+    log_type: Option<&str>,
 ) {
     log_namespace.insert_source_metadata(
         GcpGcsConfig::NAME,
@@ -313,6 +323,18 @@ fn enrich_log_event(
         path!("project"),
         Bytes::from(project.as_bytes().to_vec()),
     );
+
+    // Only stamp log_type when the direct-ingest message carried it, so events
+    // from messages without a log type are unchanged.
+    if let Some(log_type) = log_type {
+        log_namespace.insert_source_metadata(
+            GcpGcsConfig::NAME,
+            log,
+            Some(LegacyKey::Overwrite(path!("log_type"))),
+            path!("log_type"),
+            Bytes::from(log_type.as_bytes().to_vec()),
+        );
+    }
 
     log_namespace.insert_vector_metadata(
         log,
@@ -432,12 +454,15 @@ mod tests {
             "my-bucket",
             "path/file.log",
             "my-project",
+            Some("cp_logs"),
         );
         let after = chrono::Utc::now();
 
         assert_eq!(log["bucket"], "my-bucket".into());
         assert_eq!(log["object"], "path/file.log".into());
         assert_eq!(log["project"], "my-project".into());
+        // log_type is stamped when the direct-ingest message carried it.
+        assert_eq!(log["log_type"], "cp_logs".into());
 
         use vector_lib::lookup::PathPrefix;
         let key = log_schema()
@@ -465,12 +490,21 @@ mod tests {
             "my-bucket",
             "path/file.log",
             "my-project",
+            None,
         );
 
         // In Vector namespace, fields must NOT appear in the event body.
         assert!(
             log.get("bucket").is_none(),
             "bucket must not be in the event body"
+        );
+        // No log_type supplied → it must not be attached anywhere on the event.
+        assert!(
+            log.get("log_type").is_none()
+                && log
+                    .get(metadata_path!(GcpGcsConfig::NAME, "log_type"))
+                    .is_none(),
+            "log_type must be absent when the message did not carry it"
         );
         assert!(
             log.get("object").is_none(),
@@ -531,6 +565,7 @@ mod tests {
             .process_object(
                 "my-bucket",
                 "key.log",
+                Some("cp_logs"),
                 &mut tx,
                 LogNamespace::Vector,
                 false,
@@ -548,6 +583,11 @@ mod tests {
             log.get("bucket").is_none(),
             "bucket must not be in event body"
         );
+        // log_type from the direct-ingest message is stamped as source metadata.
+        let log_type = log
+            .get(metadata_path!(GcpGcsConfig::NAME, "log_type"))
+            .and_then(|v| v.as_str().map(|s| s.to_owned()));
+        assert_eq!(log_type.as_deref(), Some("cp_logs"));
         assert!(
             log.get("object").is_none(),
             "object must not be in event body"
@@ -581,6 +621,7 @@ mod tests {
             .process_object(
                 "my-bucket",
                 "my-key",
+                None,
                 &mut tx,
                 LogNamespace::Legacy,
                 false,
@@ -609,6 +650,7 @@ mod tests {
             .process_object(
                 "my-bucket",
                 "logs/app.log",
+                None,
                 &mut tx,
                 LogNamespace::Legacy,
                 false,
@@ -671,6 +713,7 @@ mod tests {
                 .process_object(
                     "my-logs-bucket",
                     key,
+                    None,
                     &mut tx,
                     LogNamespace::Legacy,
                     false,
