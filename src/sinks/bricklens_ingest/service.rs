@@ -20,8 +20,10 @@ use crate::sinks::util::retries::RetryLogic;
 
 // gRPC status codes (https://grpc.io/docs/guides/status-codes/) that represent transient
 // conditions worth retrying. Everything else is treated as a permanent failure.
+const GRPC_STATUS_UNKNOWN: i32 = 2;
 const GRPC_STATUS_DEADLINE_EXCEEDED: i32 = 4;
 const GRPC_STATUS_RESOURCE_EXHAUSTED: i32 = 8;
+const GRPC_STATUS_INTERNAL: i32 = 13;
 const GRPC_STATUS_UNAVAILABLE: i32 = 14;
 
 /// Errors returned by [`BricklensIngestService::call`].
@@ -62,8 +64,10 @@ impl BricklensIngestError {
             // Retry only the gRPC status codes that indicate a transient condition.
             Self::Grpc { status, .. } => matches!(
                 *status,
-                GRPC_STATUS_DEADLINE_EXCEEDED
+                GRPC_STATUS_UNKNOWN
+                    | GRPC_STATUS_DEADLINE_EXCEEDED
                     | GRPC_STATUS_RESOURCE_EXHAUSTED
+                    | GRPC_STATUS_INTERNAL
                     | GRPC_STATUS_UNAVAILABLE
             ),
             // Encoding and response-parse failures are deterministic; retrying cannot help.
@@ -1514,8 +1518,10 @@ mod tests {
             message: "connection reset".to_string(),
         }));
 
-        // Retriable gRPC statuses: DEADLINE_EXCEEDED(4), RESOURCE_EXHAUSTED(8), UNAVAILABLE(14).
-        for status in [4, 8, 14] {
+        // Retriable gRPC statuses: the transient codes DEADLINE_EXCEEDED(4),
+        // RESOURCE_EXHAUSTED(8), UNAVAILABLE(14) plus the ambiguous server-side codes
+        // UNKNOWN(2), INTERNAL(13) — safe to retry because WriteMetrics is idempotent.
+        for status in [2, 4, 8, 13, 14] {
             assert!(
                 logic.is_retriable_error(&BricklensIngestError::Grpc {
                     status,
@@ -1526,8 +1532,8 @@ mod tests {
         }
 
         // Permanent gRPC statuses must NOT retry: e.g. INVALID_ARGUMENT(3), NOT_FOUND(5),
-        // PERMISSION_DENIED(7), INTERNAL(13).
-        for status in [3, 5, 7, 13] {
+        // PERMISSION_DENIED(7).
+        for status in [3, 5, 7] {
             assert!(
                 !logic.is_retriable_error(&BricklensIngestError::Grpc {
                     status,
