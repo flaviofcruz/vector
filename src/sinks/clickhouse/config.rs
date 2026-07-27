@@ -1,6 +1,7 @@
 //! Configuration for the `Clickhouse` sink.
 
 use std::fmt;
+use std::time::Duration;
 
 use http::{Request, StatusCode, Uri};
 use hyper::Body;
@@ -8,6 +9,7 @@ use vector_lib::codecs::encoding::format::SchemaProvider;
 use vector_lib::codecs::encoding::{ArrowStreamSerializerConfig, BatchSerializerConfig};
 
 use super::{
+    direct_fallback::DirectFallbackService,
     headless::{EndpointServiceConfig, HeadlessService},
     request_builder::ClickhouseRequestBuilder,
     service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
@@ -154,17 +156,28 @@ pub struct ClickhouseConfig {
     #[serde(default)]
     pub dns_refresh_interval_secs: Option<u64>,
 
-    /// Fallback endpoint used when all headless pod IPs are unreachable.
+    /// Fallback endpoint used when the primary endpoint is unreachable.
     ///
-    /// Required when `use_headless_service` is true. Must point to a normal
-    /// ClusterIP Kubernetes service (not a headless service) so Kubernetes
-    /// handles routing internally. Activated when all resolved pod IPs have
-    /// been removed due to connection errors; traffic returns to P2C once
-    /// the headless DNS refresh re-discovers healthy pods.
+    /// Behaves differently depending on `use_headless_service`:
+    ///
+    /// - **Headless mode** (`use_headless_service: true`): required. Must point to
+    ///   a normal ClusterIP Kubernetes service (not a headless service). Activated
+    ///   when all resolved pod IPs have been removed due to connection errors;
+    ///   traffic returns to P2C once the headless DNS refresh re-discovers healthy
+    ///   pods.
+    ///
+    /// - **Direct mode** (`use_headless_service: false`): optional. Enables a
+    ///   per-request single-hop fallback — each request is sent to `endpoint`
+    ///   (e.g. `clickhouse-proxy`) and, if that request hits a connection-level
+    ///   error, the same request is immediately re-sent to this endpoint (e.g. the
+    ///   direct ClusterIP write service). This is the `clickhouse-proxy`
+    ///   dual-write path: keep the proxy as the primary, fall back to writing SMK
+    ///   directly when the proxy is down. Only connection failures trigger the
+    ///   fallback; a `5xx` response is left to the retry logic.
     ///
     /// Can be HTTP or HTTPS. If HTTPS, the `tls` block must also be configured
     /// with the appropriate CA certificate — the same `HttpClient` is shared
-    /// between the headless pod connections and this fallback. Without a `tls`
+    /// between the primary connections and this fallback. Without a `tls`
     /// block, HTTPS will fail for self-signed or custom-CA certificates.
     #[configurable(metadata(
         docs::examples = "http://cluster-service-write.logging-clickhouse.svc.cluster.local:8123"
@@ -367,11 +380,64 @@ impl ClickhouseConfig {
         Ok(())
     }
 
-    /// Builds the direct single-endpoint sink (default behavior, no headless routing).
+    /// Builds the direct single-endpoint sink (no headless routing).
+    ///
+    /// When `fallback_endpoint` is set, wraps the primary endpoint in a
+    /// [`DirectFallbackService`] that retries the primary (proxy), then fails over
+    /// to the fallback (direct SMK) and retries that — the `clickhouse-proxy`
+    /// dual-write path. That service owns its retry loop, so the outer Tower retry
+    /// layer is disabled and the outer timeout widened to bound the two phases.
+    /// Without a `fallback_endpoint`, builds a plain single-endpoint sink.
     fn build_direct(
         &self,
-        params: ClickhouseBuildParams,
+        mut params: ClickhouseBuildParams,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
+        if let Some(fallback) = self.fallback_endpoint.as_ref() {
+            let fallback_uri = fallback.with_default_parts().uri;
+
+            // `retry_attempts` is retries, so total attempts per endpoint is +1.
+            // Capture backoff/timeout before disabling the outer retry layer below.
+            let max_attempts_per_endpoint = params.request_limits.retry_attempts.saturating_add(1);
+            let initial_backoff = params.request_limits.retry_initial_backoff;
+            let max_backoff = params.request_limits.retry_max_duration;
+            let per_call_timeout = params.request_limits.timeout;
+
+            info!(
+                message = "ClickHouse direct sink configured with a retrying fallback endpoint.",
+                primary_endpoint = %params.endpoint,
+                fallback_endpoint = %fallback_uri,
+                max_attempts_per_endpoint,
+            );
+
+            let service = DirectFallbackService::new(
+                &params.client,
+                params.endpoint.clone(),
+                fallback_uri,
+                &params.svc_config,
+                params.non_retriable_error_codes.clone(),
+                max_attempts_per_endpoint,
+                initial_backoff,
+                max_backoff,
+                per_call_timeout,
+            );
+
+            // The service owns its retry loop: disable the outer retry layer (else
+            // attempts multiply) and widen the outer timeout to bound both phases —
+            // up to `2 * max_attempts` hops plus the backoff sleeps between them,
+            // with margin. Saturate rather than panic.
+            params.request_limits.retry_attempts = 0;
+            let hops = (2 * max_attempts_per_endpoint) as u32;
+            let sleeps = hops.saturating_sub(2);
+            let hop_budget = per_call_timeout.checked_mul(hops).unwrap_or(Duration::MAX);
+            let sleep_budget = max_backoff.checked_mul(sleeps).unwrap_or(Duration::MAX);
+            params.request_limits.timeout = hop_budget
+                .checked_add(sleep_budget)
+                .and_then(|d| d.checked_add(Duration::from_secs(5)))
+                .unwrap_or(Duration::MAX);
+
+            return self.build_sink_and_healthcheck(params, service);
+        }
+
         let service_request_builder = ClickhouseServiceRequestBuilder {
             auth: params.svc_config.auth.clone(),
             endpoint: params.endpoint.clone(),
