@@ -3,6 +3,7 @@ use std::{hash::Hash, num::NonZeroU32, pin::Pin, time::Duration};
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use governor::{Quota, clock};
+use metrics::Counter;
 use snafu::Snafu;
 use vector_common::finalization::EventStatus;
 
@@ -28,6 +29,7 @@ pub struct Throttle<C: clock::Clock<Instant = I>, I: clock::Reference> {
     pub clock: C,
     internal_metrics: ThrottleInternalMetricsConfig,
     throttled_event_status: EventStatus,
+    pub cpu_ns: Option<Counter>,
 }
 
 impl<C, I> Throttle<C, I>
@@ -76,6 +78,7 @@ where
             exclude,
             internal_metrics: config.internal_metrics.clone(),
             throttled_event_status,
+            cpu_ns: context.cpu_ns.clone(),
         })
     }
 
@@ -84,7 +87,7 @@ where
     where
         K: Hash + Eq + Clone + Send + Sync + 'static,
     {
-        RateLimiterRunner::start(self.quota, self.clock.clone(), self.flush_keys_interval)
+        RateLimiterRunner::start(self)
     }
 
     pub fn emit_event_discarded(&self, key: String) {

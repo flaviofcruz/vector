@@ -337,6 +337,12 @@ components: sources: internal_metrics: {
 			default_namespace: "vector"
 			tags:              _component_tags
 		}
+		component_cpu_usage_ns_total: {
+			description:       "The CPU time consumed by a component in nanoseconds. Available for transforms only. Emitted only on Linux and macOS."
+			type:              "counter"
+			default_namespace: "vector"
+			tags:              _component_tags
+		}
 		component_discarded_events_total: {
 			description:       "The number of events dropped by this component."
 			type:              "counter"
