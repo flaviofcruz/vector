@@ -9,7 +9,7 @@ use vector_lib::codecs::encoding::format::SchemaProvider;
 use vector_lib::codecs::encoding::{ArrowStreamSerializerConfig, BatchSerializerConfig};
 
 use super::{
-    direct_fallback::DirectFallbackService,
+    direct_fallback::{DirectFallbackService, RetrySettings},
     headless::{EndpointServiceConfig, HeadlessService},
     request_builder::ClickhouseRequestBuilder,
     service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
@@ -167,13 +167,19 @@ pub struct ClickhouseConfig {
     ///   pods.
     ///
     /// - **Direct mode** (`use_headless_service: false`): optional. Enables a
-    ///   per-request single-hop fallback — each request is sent to `endpoint`
-    ///   (e.g. `clickhouse-proxy`) and, if that request hits a connection-level
-    ///   error, the same request is immediately re-sent to this endpoint (e.g. the
-    ///   direct ClusterIP write service). This is the `clickhouse-proxy`
+    ///   per-request two-phase retry — each request is first sent to `endpoint`
+    ///   (e.g. `clickhouse-proxy`) and retried there per the `request` settings
+    ///   (attempts, Fibonacci backoff, jitter); if the primary still fails, the
+    ///   same request fails over to this endpoint (e.g. the direct ClusterIP write
+    ///   service) and is retried there the same way. This is the `clickhouse-proxy`
     ///   dual-write path: keep the proxy as the primary, fall back to writing SMK
-    ///   directly when the proxy is down. Only connection failures trigger the
-    ///   fallback; a `5xx` response is left to the retry logic.
+    ///   directly when the proxy is down. Failover fires after the primary
+    ///   exhausts *any* retriable failure — connection-level errors, per-attempt
+    ///   timeouts, and retriable HTTP responses (408/429/5xx) alike. A
+    ///   non-retriable ClickHouse error (a `5xx` whose body carries a `Code: N` in
+    ///   the non-retriable set — see `non_retriable_error_codes`) does **not** fail
+    ///   over and is returned as-is, since the same rows would fail identically on
+    ///   the fallback.
     ///
     /// Can be HTTP or HTTPS. If HTTPS, the `tls` block must also be configured
     /// with the appropriate CA certificate — the same `HttpClient` is shared
@@ -396,46 +402,65 @@ impl ClickhouseConfig {
             let fallback_uri = fallback.with_default_parts().uri;
 
             // `retry_attempts` is retries, so total attempts per endpoint is +1.
-            // Capture backoff/timeout before disabling the outer retry layer below.
-            let max_attempts_per_endpoint = params.request_limits.retry_attempts.saturating_add(1);
-            let initial_backoff = params.request_limits.retry_initial_backoff;
-            let max_backoff = params.request_limits.retry_max_duration;
-            let per_call_timeout = params.request_limits.timeout;
+            // Capture backoff/timeout/jitter before disabling the outer retry layer
+            // below — each endpoint's own standard retry policy applies them.
+            let retry_settings = RetrySettings {
+                max_attempts_per_endpoint: params.request_limits.retry_attempts.saturating_add(1),
+                initial_backoff: params.request_limits.retry_initial_backoff,
+                max_backoff: params.request_limits.retry_max_duration,
+                jitter_mode: params.request_limits.retry_jitter_mode,
+                per_call_timeout: params.request_limits.timeout,
+            };
 
             info!(
                 message = "ClickHouse direct sink configured with a retrying fallback endpoint.",
                 primary_endpoint = %params.endpoint,
                 fallback_endpoint = %fallback_uri,
-                max_attempts_per_endpoint,
+                max_attempts_per_endpoint = retry_settings.max_attempts_per_endpoint,
             );
 
             let service = DirectFallbackService::new(
                 &params.client,
                 params.endpoint.clone(),
-                fallback_uri,
+                fallback_uri.clone(),
                 &params.svc_config,
                 params.non_retriable_error_codes.clone(),
-                max_attempts_per_endpoint,
-                initial_backoff,
-                max_backoff,
-                per_call_timeout,
+                retry_settings,
             );
 
-            // The service owns its retry loop: disable the outer retry layer (else
-            // attempts multiply) and widen the outer timeout to bound both phases —
-            // up to `2 * max_attempts` hops plus the backoff sleeps between them,
-            // with margin. Saturate rather than panic.
+            // Each endpoint owns its standard retry policy (jitter + standard sink
+            // retry metrics), so disable the outer Tower retry layer — else attempts
+            // (and their metrics) multiply — and widen the outer timeout to bound
+            // both phases end-to-end: up to `2 * max_attempts` hops plus the backoff
+            // sleeps between them, with margin. Saturate rather than panic.
             params.request_limits.retry_attempts = 0;
-            let hops = (2 * max_attempts_per_endpoint) as u32;
+            let hops = (2 * retry_settings.max_attempts_per_endpoint) as u32;
             let sleeps = hops.saturating_sub(2);
-            let hop_budget = per_call_timeout.checked_mul(hops).unwrap_or(Duration::MAX);
-            let sleep_budget = max_backoff.checked_mul(sleeps).unwrap_or(Duration::MAX);
+            let hop_budget = retry_settings
+                .per_call_timeout
+                .checked_mul(hops)
+                .unwrap_or(Duration::MAX);
+            let sleep_budget = retry_settings
+                .max_backoff
+                .checked_mul(sleeps)
+                .unwrap_or(Duration::MAX);
             params.request_limits.timeout = hop_budget
                 .checked_add(sleep_budget)
                 .and_then(|d| d.checked_add(Duration::from_secs(5)))
                 .unwrap_or(Duration::MAX);
 
-            return self.build_sink_and_healthcheck(params, service);
+            // The service can write through either endpoint, so the healthcheck
+            // must pass if *either* is healthy — a down primary (proxy) with a
+            // healthy fallback (direct SMK) can still serve writes, and required
+            // healthchecks would otherwise reject startup/reload.
+            let healthcheck = Box::pin(healthcheck_either(
+                params.client.clone(),
+                params.endpoint.clone(),
+                fallback_uri.clone(),
+                params.auth.clone(),
+            )) as Healthcheck;
+
+            return self.build_sink_and_healthcheck(params, service, Some(healthcheck));
         }
 
         let service_request_builder = ClickhouseServiceRequestBuilder {
@@ -449,7 +474,7 @@ impl ClickhouseConfig {
         };
 
         let service = HttpService::new(params.client.clone(), service_request_builder);
-        self.build_sink_and_healthcheck(params, service)
+        self.build_sink_and_healthcheck(params, service, None)
     }
 
     /// Builds the headless-service sink with P2C load-balanced dispatch across
@@ -486,16 +511,22 @@ impl ClickhouseConfig {
         // Healthcheck should target the stable ClusterIP, not the headless DNS name.
         // The headless name resolves to individual pod IPs which may come and go.
         params.endpoint = fallback_uri;
-        self.build_sink_and_healthcheck(params, headless)
+        self.build_sink_and_healthcheck(params, headless, None)
     }
 
     /// Wraps an inner service with Tower middleware and constructs the
     /// sink + healthcheck pair. Shared by both single-endpoint and headless
     /// code paths.
+    ///
+    /// `healthcheck_override` lets a caller supply its own healthcheck future;
+    /// when `None`, a single-endpoint probe of `params.endpoint` is used. The
+    /// direct-fallback path passes an override that probes both endpoints so a
+    /// healthy fallback isn't blocked by a down primary.
     fn build_sink_and_healthcheck<S>(
         &self,
         params: ClickhouseBuildParams,
         inner_service: S,
+        healthcheck_override: Option<Healthcheck>,
     ) -> crate::Result<(VectorSink, Healthcheck)>
     where
         S: Service<HttpRequest<PartitionKey>, Response = HttpResponse, Error = crate::Error>
@@ -520,7 +551,9 @@ impl ClickhouseConfig {
             params.request_builder,
         );
 
-        let healthcheck = Box::pin(healthcheck(params.client, params.endpoint, params.auth));
+        let healthcheck = healthcheck_override.unwrap_or_else(|| {
+            Box::pin(healthcheck(params.client, params.endpoint, params.auth))
+        });
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }
 
@@ -688,6 +721,39 @@ async fn healthcheck(client: HttpClient, endpoint: Uri, auth: Option<Auth>) -> c
     }
 }
 
+/// Healthcheck for the direct-fallback path: succeeds if *either* the primary
+/// (proxy) or the fallback (direct SMK) endpoint is healthy.
+///
+/// The primary is probed first and short-circuits on success, so the common
+/// healthy-proxy case does no extra work. Only when the primary probe fails is
+/// the fallback probed; if both fail, both errors are surfaced so the operator
+/// can see why the sink is unhealthy.
+async fn healthcheck_either(
+    client: HttpClient,
+    primary: Uri,
+    fallback: Uri,
+    auth: Option<Auth>,
+) -> crate::Result<()> {
+    let primary_err = match healthcheck(client.clone(), primary, auth.clone()).await {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+
+    match healthcheck(client, fallback, auth).await {
+        Ok(()) => {
+            warn!(
+                message = "ClickHouse primary endpoint healthcheck failed; fallback is healthy.",
+                primary_error = %primary_err,
+            );
+            Ok(())
+        }
+        Err(fallback_err) => Err(format!(
+            "both ClickHouse endpoints failed healthcheck: primary: {primary_err}; fallback: {fallback_err}"
+        )
+        .into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -820,5 +886,107 @@ mod tests {
             Format::JsonEachRow,
             "on Arrow setup failure the sink must fall back to JSONEachRow"
         );
+    }
+
+    mod healthcheck_either {
+        use std::convert::Infallible;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Response as HyperResponse, Server};
+
+        use super::super::{Auth, HttpClient, Uri, healthcheck_either};
+        use crate::config::ProxyConfig;
+        use crate::test_util::addr::next_addr;
+
+        /// Spawns a server that answers every request with `status`, returning a
+        /// hit counter so tests can assert whether an endpoint was probed.
+        fn spawn_server(addr: SocketAddr, status: u16) -> Arc<AtomicUsize> {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_srv = hits.clone();
+            let make = make_service_fn(move |_| {
+                let hits = hits_srv.clone();
+                async move {
+                    Ok::<_, Infallible>(service_fn(move |_req| {
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, Infallible>(
+                                HyperResponse::builder()
+                                    .status(status)
+                                    .body(Body::empty())
+                                    .unwrap(),
+                            )
+                        }
+                    }))
+                }
+            });
+            tokio::spawn(async move {
+                let _ = Server::bind(&addr).serve(make).await;
+            });
+            hits
+        }
+
+        fn uri(addr: SocketAddr) -> Uri {
+            format!("http://{}:{}/", addr.ip(), addr.port())
+                .parse()
+                .unwrap()
+        }
+
+        fn client() -> HttpClient {
+            HttpClient::new(None, &ProxyConfig::default()).unwrap()
+        }
+
+        async fn run(
+            primary: Option<u16>,
+            fallback: Option<u16>,
+        ) -> (usize, usize, crate::Result<()>) {
+            let (_pg, p_addr) = next_addr();
+            let (_fg, fb_addr) = next_addr();
+            let no_hits = || Arc::new(AtomicUsize::new(0));
+            let p_hits = primary.map_or_else(no_hits, |s| spawn_server(p_addr, s));
+            let fb_hits = fallback.map_or_else(no_hits, |s| spawn_server(fb_addr, s));
+            // Give the spawned servers a moment to bind.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let res = healthcheck_either(client(), uri(p_addr), uri(fb_addr), None::<Auth>).await;
+            (
+                p_hits.load(Ordering::SeqCst),
+                fb_hits.load(Ordering::SeqCst),
+                res,
+            )
+        }
+
+        #[tokio::test]
+        async fn primary_healthy_short_circuits_and_skips_fallback() {
+            let (p, fb, res) = run(Some(200), Some(200)).await;
+            assert!(res.is_ok());
+            assert_eq!((p, fb), (1, 0), "fallback must not be probed when primary is healthy");
+        }
+
+        #[tokio::test]
+        async fn primary_down_falls_back_to_healthy_fallback() {
+            // Primary port unbound (connection refused); fallback answers 200.
+            let (p, fb, res) = run(None, Some(200)).await;
+            assert!(res.is_ok(), "a healthy fallback must satisfy the healthcheck");
+            assert_eq!((p, fb), (0, 1));
+        }
+
+        #[tokio::test]
+        async fn primary_unhealthy_status_falls_back() {
+            // Primary returns 500; fallback answers 200.
+            let (p, fb, res) = run(Some(500), Some(200)).await;
+            assert!(res.is_ok());
+            assert_eq!((p, fb), (1, 1));
+        }
+
+        #[tokio::test]
+        async fn both_endpoints_down_errors() {
+            let (p, fb, res) = run(None, None).await;
+            assert!(res.is_err(), "healthcheck must fail when neither endpoint is healthy");
+            assert_eq!((p, fb), (0, 0));
+        }
     }
 }
