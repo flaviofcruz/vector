@@ -162,6 +162,13 @@ impl ArchivedLedgerState {
         value
     }
 
+    /// Advances the reader's current data file id. Test-only: used to force edge-case ledger states
+    /// (e.g. reader ahead of writer) that are otherwise hard to reach through normal operation.
+    #[cfg(test)]
+    pub fn increment_reader_file_id_for_test(&self) -> u16 {
+        self.increment_reader_file_id()
+    }
+
     pub(super) fn get_last_reader_record_id(&self) -> u64 {
         self.reader_last_record.load(Ordering::Acquire)
     }
