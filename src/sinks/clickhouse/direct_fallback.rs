@@ -44,20 +44,24 @@ type RetryingEndpoint = Retry<FibonacciRetryPolicy<ClickhouseRetryLogic>, Timeou
 
 type SinkResult = Result<HttpResponse, crate::Error>;
 
-/// Total attempts against the primary (proxy): 1 initial try + 1 retry. The
-/// proxy fails fast so we spend the bulk of the budget on the direct-SMK
-/// fallback below.
-pub(super) const PRIMARY_MAX_ATTEMPTS: usize = 2;
+/// Default total attempts against the primary (proxy): 1 try + 1 retry. The
+/// proxy fails fast so the bulk of the budget is spent on the direct-SMK
+/// fallback. Overridable via `fallback_primary_max_attempts`.
+pub(super) const DEFAULT_PRIMARY_MAX_ATTEMPTS: usize = 2;
 
-/// Total attempts against the fallback (direct SMK): 1 initial try + 2 retries.
-/// The direct write is the safety net, so it gets more chances than the proxy.
-pub(super) const FALLBACK_MAX_ATTEMPTS: usize = 3;
+/// Default total attempts against the fallback (direct SMK): 1 try + 2 retries.
+/// The direct write is the terminal path, so it gets more chances than the
+/// proxy. Overridable via `fallback_secondary_max_attempts`.
+pub(super) const DEFAULT_SECONDARY_MAX_ATTEMPTS: usize = 3;
 
-/// Backoff/jitter/timeout shared by both endpoints' retry policies, taken from
-/// the sink's request settings. Attempt counts are not from config — they are
-/// the fixed `PRIMARY_MAX_ATTEMPTS` / `FALLBACK_MAX_ATTEMPTS`.
+/// Per-endpoint retry parameters. Attempt counts come from the sink's
+/// `fallback_primary_max_attempts` / `fallback_secondary_max_attempts` (not
+/// `request.retry_attempts`); backoff/jitter/timeout come from the request
+/// settings.
 #[derive(Clone, Copy)]
 pub(super) struct RetrySettings {
+    pub primary_max_attempts: usize,
+    pub secondary_max_attempts: usize,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
     pub jitter_mode: JitterMode,
@@ -92,7 +96,7 @@ impl DirectFallbackService {
                 svc_config,
                 &retry_logic,
                 &settings,
-                PRIMARY_MAX_ATTEMPTS,
+                settings.primary_max_attempts,
                 false,
             ),
             fallback: Self::build_endpoint(
@@ -101,7 +105,7 @@ impl DirectFallbackService {
                 svc_config,
                 &retry_logic,
                 &settings,
-                FALLBACK_MAX_ATTEMPTS,
+                settings.secondary_max_attempts,
                 true,
             ),
             retry_logic,
@@ -258,9 +262,9 @@ mod tests {
     }
 
     /// Sends one request through a service pointed at `p_addr`/`fb_addr`. Attempt
-    /// counts are the fixed `PRIMARY_MAX_ATTEMPTS` (2) / `FALLBACK_MAX_ATTEMPTS`
-    /// (3); backoff is 1ms and jitter is disabled so retry timing stays
-    /// deterministic in tests. Servers must already be spawned.
+    /// counts are the defaults (`DEFAULT_PRIMARY_MAX_ATTEMPTS` 2 /
+    /// `DEFAULT_SECONDARY_MAX_ATTEMPTS` 3); backoff is 1ms and jitter is disabled
+    /// so retry timing stays deterministic in tests. Servers must already be spawned.
     async fn drive(
         p_addr: std::net::SocketAddr,
         fb_addr: std::net::SocketAddr,
@@ -284,6 +288,8 @@ mod tests {
             &cfg,
             non_retriable_codes,
             RetrySettings {
+                primary_max_attempts: DEFAULT_PRIMARY_MAX_ATTEMPTS,
+                secondary_max_attempts: DEFAULT_SECONDARY_MAX_ATTEMPTS,
                 initial_backoff: Duration::from_millis(1),
                 max_backoff: Duration::from_millis(1),
                 jitter_mode: JitterMode::None,
@@ -408,15 +414,14 @@ mod tests {
         assert_eq!((p, fb), (0, 3));
     }
 
-    // --- Fixed per-endpoint attempt budget ---
+    // --- Default per-endpoint attempt budget ---
 
     #[tokio::test]
     async fn proxy_uses_two_attempts_fallback_uses_three() {
         // Both endpoints keep failing (503), so each is driven to its full,
-        // fixed attempt budget: proxy = PRIMARY_MAX_ATTEMPTS (2), fallback =
-        // FALLBACK_MAX_ATTEMPTS (3).
+        // default attempt budget: proxy 2, fallback 3.
         let (p, fb, _res) = run(Some((503, "overloaded")), Some((503, "still down")), None).await;
-        assert_eq!(p, PRIMARY_MAX_ATTEMPTS, "proxy should be tried exactly twice");
-        assert_eq!(fb, FALLBACK_MAX_ATTEMPTS, "direct SMK should be tried exactly three times");
+        assert_eq!(p, DEFAULT_PRIMARY_MAX_ATTEMPTS, "proxy should be tried exactly twice");
+        assert_eq!(fb, DEFAULT_SECONDARY_MAX_ATTEMPTS, "direct SMK should be tried exactly three times");
     }
 }
