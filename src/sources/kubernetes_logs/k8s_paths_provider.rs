@@ -2,7 +2,7 @@
 
 #![deny(missing_docs)]
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 /// Default container name used when container name extraction is disabled.
 /// Choosing something obvious to make debugging easier when container name is invalid
@@ -20,6 +20,7 @@ use crate::kubernetes::pod_manager_logic::extract_static_pod_config_hashsum;
 pub struct K8sPathsProvider {
     pod_state: Store<Pod>,
     namespace_state: Store<Namespace>,
+    annotation_selector: AnnotationSelector,
     pod_logs_glob_patterns: Vec<String>,
     include_paths: Vec<glob::Pattern>,
     exclude_paths: Vec<glob::Pattern>,
@@ -54,6 +55,7 @@ impl K8sPathsProvider {
     pub fn new(
         pod_state: Store<Pod>,
         namespace_state: Store<Namespace>,
+        annotation_selector: AnnotationSelector,
         pod_logs_glob_patterns: Vec<String>,
         include_paths: Vec<glob::Pattern>,
         exclude_paths: Vec<glob::Pattern>,
@@ -64,6 +66,7 @@ impl K8sPathsProvider {
         Self {
             pod_state,
             namespace_state,
+            annotation_selector,
             pod_logs_glob_patterns,
             include_paths,
             exclude_paths,
@@ -82,6 +85,7 @@ impl PathsProvider for K8sPathsProvider {
 
         state
             .into_iter()
+            .filter(|pod| self.annotation_selector.matches(pod.metadata.annotations.as_ref()))
             // filter out pods where we haven't fetched the namespace metadata yet
             // they will be picked up on a later run
             // Only check namespace metadata if insert_namespace_fields is enabled
@@ -137,6 +141,171 @@ impl PathsProvider for K8sPathsProvider {
             })
             .collect()
     }
+}
+
+/// A local selector for matching Pod annotations.
+///
+/// Kubernetes does not support server-side annotation selectors. This mirrors the useful subset of
+/// Kubernetes label selector syntax and is applied client-side while deriving log paths from watched
+/// Pods.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AnnotationSelector {
+    requirements: Vec<AnnotationSelectorRequirement>,
+}
+
+impl AnnotationSelector {
+    /// Parse a comma-separated annotation selector.
+    pub fn parse(selector: &str) -> crate::Result<Self> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Ok(Self::default());
+        }
+
+        let requirements = split_selector_requirements(selector)
+            .into_iter()
+            .map(AnnotationSelectorRequirement::parse)
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        Ok(Self { requirements })
+    }
+
+    fn matches(&self, annotations: Option<&BTreeMap<String, String>>) -> bool {
+        self.requirements
+            .iter()
+            .all(|requirement| requirement.matches(annotations))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AnnotationSelectorRequirement {
+    Exists(String),
+    DoesNotExist(String),
+    Equals(String, String),
+    NotEquals(String, String),
+    In(String, Vec<String>),
+    NotIn(String, Vec<String>),
+}
+
+impl AnnotationSelectorRequirement {
+    fn parse(requirement: &str) -> crate::Result<Self> {
+        let requirement = requirement.trim();
+        if requirement.is_empty() {
+            return Err("annotation selector contains an empty requirement".into());
+        }
+
+        if let Some((key, values)) = parse_set_requirement(requirement, " notin ")? {
+            return Ok(Self::NotIn(key, values));
+        }
+        if let Some((key, values)) = parse_set_requirement(requirement, " in ")? {
+            return Ok(Self::In(key, values));
+        }
+        if let Some((key, value)) = requirement.split_once("!=") {
+            return Ok(Self::NotEquals(
+                parse_selector_key(key)?,
+                parse_selector_value(value)?,
+            ));
+        }
+        if let Some((key, value)) = requirement.split_once("==") {
+            return Ok(Self::Equals(
+                parse_selector_key(key)?,
+                parse_selector_value(value)?,
+            ));
+        }
+        if let Some((key, value)) = requirement.split_once('=') {
+            return Ok(Self::Equals(
+                parse_selector_key(key)?,
+                parse_selector_value(value)?,
+            ));
+        }
+        if let Some(key) = requirement.strip_prefix('!') {
+            return Ok(Self::DoesNotExist(parse_selector_key(key)?));
+        }
+
+        Ok(Self::Exists(parse_selector_key(requirement)?))
+    }
+
+    fn matches(&self, annotations: Option<&BTreeMap<String, String>>) -> bool {
+        let annotation_value = |key: &str| annotations.and_then(|annotations| annotations.get(key));
+
+        match self {
+            Self::Exists(key) => annotation_value(key).is_some(),
+            Self::DoesNotExist(key) => annotation_value(key).is_none(),
+            Self::Equals(key, expected) => annotation_value(key) == Some(expected),
+            Self::NotEquals(key, expected) => annotation_value(key) != Some(expected),
+            Self::In(key, expected_values) => annotation_value(key)
+                .is_some_and(|actual| expected_values.iter().any(|expected| expected == actual)),
+            Self::NotIn(key, expected_values) => match annotation_value(key) {
+                Some(actual) => expected_values.iter().all(|expected| expected != actual),
+                None => true,
+            },
+        }
+    }
+}
+
+fn split_selector_requirements(selector: &str) -> Vec<&str> {
+    let mut requirements = Vec::new();
+    let mut start = 0;
+    let mut paren_depth = 0_usize;
+
+    for (idx, ch) in selector.char_indices() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            ',' if paren_depth == 0 => {
+                requirements.push(&selector[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    requirements.push(&selector[start..]);
+    requirements
+}
+
+fn parse_set_requirement(
+    requirement: &str,
+    operator: &'static str,
+) -> crate::Result<Option<(String, Vec<String>)>> {
+    let Some((key, values)) = requirement.split_once(operator) else {
+        return Ok(None);
+    };
+
+    let values = values.trim();
+    if !values.starts_with('(') || !values.ends_with(')') {
+        return Err(
+            format!("annotation selector set requirement must use parentheses: {requirement}")
+                .into(),
+        );
+    }
+
+    let values = values[1..values.len() - 1]
+        .split(',')
+        .map(parse_selector_value)
+        .collect::<crate::Result<Vec<_>>>()?;
+    if values.is_empty() {
+        return Err(
+            format!("annotation selector set requirement has no values: {requirement}").into(),
+        );
+    }
+
+    Ok(Some((parse_selector_key(key)?, values)))
+}
+
+fn parse_selector_key(key: &str) -> crate::Result<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("annotation selector requirement has an empty key".into());
+    }
+    Ok(key.to_string())
+}
+
+fn parse_selector_value(value: &str) -> crate::Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("annotation selector requirement has an empty value".into());
+    }
+    Ok(value.to_string())
 }
 
 /// This function takes a `Pod` resource and returns the path to where the logs
@@ -530,18 +699,75 @@ fn filter_paths<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
     use tempfile::TempDir;
 
     use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::ObjectMeta};
 
     use super::{
+        AnnotationSelector,
         DATABRICKS_HOSTPATH_CUSTOMER_LOGGING_ANNOTATION_KEY,
         DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY, build_container_exclusion_patterns,
         extract_databricks_pod_logs_directory, extract_excluded_containers_for_pod,
         extract_hostpath_logging_annotation_directory, extract_pod_logs_directory, filter_paths,
         get_databricks_pod_logs_directories, list_pod_log_paths,
     };
+
+    fn annotations(entries: Vec<(&str, &str)>) -> BTreeMap<String, String> {
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_annotation_selector_matches_required_annotation() {
+        let selector =
+            AnnotationSelector::parse("logDaemonDockerLoggingGroup=docker-common-log-group")
+                .unwrap();
+
+        assert!(selector.matches(Some(&annotations(vec![(
+            "logDaemonDockerLoggingGroup",
+            "docker-common-log-group",
+        )]))));
+        assert!(!selector.matches(Some(&annotations(vec![(
+            "logDaemonDockerLoggingGroup",
+            "other-log-group",
+        )]))));
+        assert!(!selector.matches(None));
+    }
+
+    #[test]
+    fn test_annotation_selector_supports_label_selector_operators() {
+        let selector = AnnotationSelector::parse(
+            "group in (docker-common-log-group,system),env!=dev,present,!missing",
+        )
+        .unwrap();
+
+        assert!(selector.matches(Some(&annotations(vec![
+            ("group", "docker-common-log-group"),
+            ("env", "prod"),
+            ("present", ""),
+        ]))));
+        assert!(!selector.matches(Some(&annotations(vec![
+            ("group", "debug"),
+            ("env", "prod"),
+            ("present", ""),
+        ]))));
+        assert!(!selector.matches(Some(&annotations(vec![
+            ("group", "system"),
+            ("env", "dev"),
+            ("present", ""),
+        ]))));
+    }
+
+    #[test]
+    fn test_annotation_selector_rejects_invalid_requirements() {
+        assert!(AnnotationSelector::parse("=value").is_err());
+        assert!(AnnotationSelector::parse("key=").is_err());
+        assert!(AnnotationSelector::parse("key in value").is_err());
+        assert!(AnnotationSelector::parse("key,").is_err());
+    }
 
     #[test]
     fn test_extract_pod_logs_directory() {

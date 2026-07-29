@@ -14,7 +14,7 @@ use futures::{future::FutureExt, stream::StreamExt};
 use futures_util::Stream;
 use http_1::{HeaderName, HeaderValue};
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
-use k8s_paths_provider::K8sPathsProvider;
+use k8s_paths_provider::{AnnotationSelector, K8sPathsProvider};
 use kube::{
     Client, Config as ClientConfig,
     api::Api,
@@ -124,6 +124,19 @@ pub struct Config {
         docs::examples = "my_custom_label!=my_value,my_other_custom_label=my_value"
     ))]
     extra_namespace_label_selector: String,
+
+    /// Specifies the annotation selector to filter [Pods][pods] with.
+    ///
+    /// Kubernetes does not support server-side annotation selectors, so this filter is applied
+    /// client-side after Pods have been watched by Vector. The supported syntax mirrors the
+    /// common Kubernetes label selector operators: `=` and `==` for equality, `!=`, `in`,
+    /// lowercase `notin`, key existence, and key non-existence with `!`.
+    ///
+    /// [pods]: https://kubernetes.io/docs/concepts/workloads/pods/
+    #[configurable(metadata(
+        docs::examples = "logDaemonDockerLoggingGroup=docker-common-log-group"
+    ))]
+    extra_annotation_selector: String,
 
     /// Specifies whether or not to enrich logs with namespace fields.
     ///
@@ -471,6 +484,7 @@ impl Default for Config {
         Self {
             extra_label_selector: "".to_string(),
             extra_namespace_label_selector: "".to_string(),
+            extra_annotation_selector: "".to_string(),
             insert_namespace_fields: true,
             extract_databricks_logs: false,
             hostpath_logging_annotation_key: None,
@@ -774,6 +788,7 @@ struct Source {
     node_field_spec: node_metadata_annotator::FieldsSpec,
     insert_namespace_fields: bool,
     extract_databricks_logs: bool,
+    annotation_selector: AnnotationSelector,
     hostpath_logging_annotation_key: Option<String>,
     ttl_removal_config: Option<TTLRemovalConfig>,
     self_node_name: String,
@@ -843,6 +858,8 @@ impl Source {
         let label_selector = prepare_label_selector(config.extra_label_selector.as_ref());
         let namespace_label_selector =
             prepare_label_selector(config.extra_namespace_label_selector.as_ref());
+        let annotation_selector =
+            AnnotationSelector::parse(config.extra_annotation_selector.as_ref())?;
         let node_selector = prepare_node_selector(self_node_name.as_str())?;
 
         let delay_deletion = config.delay_deletion_ms;
@@ -1041,6 +1058,7 @@ impl Source {
             node_field_spec: config.node_annotation_fields.clone(),
             insert_namespace_fields,
             extract_databricks_logs: config.extract_databricks_logs,
+            annotation_selector,
             // Always default to the dblet-logs-path annotation when no key is explicitly
             // configured. Pods without the annotation are silently skipped for hostPath
             // discovery in `get_databricks_pod_logs_directories`, so the emptyDir scrape
@@ -1099,6 +1117,7 @@ impl Source {
             node_field_spec,
             insert_namespace_fields,
             extract_databricks_logs,
+            annotation_selector,
             hostpath_logging_annotation_key,
             ttl_removal_config,
             self_node_name,
@@ -1143,6 +1162,7 @@ impl Source {
         let paths_provider = K8sPathsProvider::new(
             pod_state.clone(),
             ns_state.clone(),
+            annotation_selector,
             pod_logs_glob_patterns,
             include_paths,
             exclude_paths,
@@ -1708,6 +1728,21 @@ mod tests {
         let default_toml = "";
         let default_config: Config = toml::from_str(default_toml).unwrap();
         assert_eq!(default_config.insert_namespace_fields, true);
+    }
+
+    #[test]
+    fn test_config_serialization_extra_annotation_selector() {
+        let toml_config = r#"
+            extra_annotation_selector = "logDaemonDockerLoggingGroup=docker-common-log-group"
+        "#;
+        let config: Config = toml::from_str(toml_config).unwrap();
+        assert_eq!(
+            config.extra_annotation_selector,
+            "logDaemonDockerLoggingGroup=docker-common-log-group"
+        );
+
+        let default_config: Config = toml::from_str("").unwrap();
+        assert_eq!(default_config.extra_annotation_selector, "");
     }
 
     #[test]
