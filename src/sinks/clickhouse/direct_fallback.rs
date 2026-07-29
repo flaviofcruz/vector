@@ -83,6 +83,9 @@ impl DirectFallbackService {
     ) -> Self {
         let retry_logic = ClickhouseRetryLogic::new(non_retriable_codes);
         Self {
+            // Primary exhaustion means failover (signalled by
+            // `ClickhouseDirectFallbackRouted`), not a drop — so suppress its drop
+            // log. The fallback is terminal, so it keeps the standard drop log.
             primary: Self::build_endpoint(
                 client,
                 primary_endpoint,
@@ -90,6 +93,7 @@ impl DirectFallbackService {
                 &retry_logic,
                 &settings,
                 PRIMARY_MAX_ATTEMPTS,
+                false,
             ),
             fallback: Self::build_endpoint(
                 client,
@@ -98,6 +102,7 @@ impl DirectFallbackService {
                 &retry_logic,
                 &settings,
                 FALLBACK_MAX_ATTEMPTS,
+                true,
             ),
             retry_logic,
         }
@@ -106,7 +111,8 @@ impl DirectFallbackService {
     /// Wraps a single endpoint's `HttpService` in a per-attempt timeout and the
     /// standard Fibonacci retry policy, so retries honor `jitter_mode` and emit
     /// the standard sink retry metrics. `max_attempts` is the total attempts for
-    /// this endpoint (initial try + retries).
+    /// this endpoint (initial try + retries). `log_drop_on_exhaustion` should be
+    /// false for the non-terminal primary (exhaustion means failover, not a drop).
     fn build_endpoint(
         client: &HttpClient,
         endpoint: Uri,
@@ -114,17 +120,21 @@ impl DirectFallbackService {
         retry_logic: &ClickhouseRetryLogic,
         settings: &RetrySettings,
         max_attempts: usize,
+        log_drop_on_exhaustion: bool,
     ) -> RetryingEndpoint {
         let inner = build_endpoint_service(client, endpoint, svc_config);
         // The policy counts *retries*, so subtract the initial attempt (min 0).
         let retries = max_attempts.saturating_sub(1);
-        let policy = FibonacciRetryPolicy::new(
+        let mut policy = FibonacciRetryPolicy::new(
             retries,
             settings.initial_backoff,
             settings.max_backoff,
             retry_logic.clone(),
             settings.jitter_mode,
         );
+        if !log_drop_on_exhaustion {
+            policy = policy.without_drop_on_exhaustion_log();
+        }
         ServiceBuilder::new()
             .retry(policy)
             .timeout(settings.per_call_timeout)
