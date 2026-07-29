@@ -44,14 +44,20 @@ type RetryingEndpoint = Retry<FibonacciRetryPolicy<ClickhouseRetryLogic>, Timeou
 
 type SinkResult = Result<HttpResponse, crate::Error>;
 
-/// Backoff/jitter/attempt parameters for one endpoint's retry policy.
-///
-/// Mirrors the sink's `TowerRequestSettings`, captured in `build_direct` before
-/// the outer retry layer is disabled.
+/// Total attempts against the primary (proxy): 1 initial try + 1 retry. The
+/// proxy fails fast so we spend the bulk of the budget on the direct-SMK
+/// fallback below.
+pub(super) const PRIMARY_MAX_ATTEMPTS: usize = 2;
+
+/// Total attempts against the fallback (direct SMK): 1 initial try + 2 retries.
+/// The direct write is the safety net, so it gets more chances than the proxy.
+pub(super) const FALLBACK_MAX_ATTEMPTS: usize = 3;
+
+/// Backoff/jitter/timeout shared by both endpoints' retry policies, taken from
+/// the sink's request settings. Attempt counts are not from config — they are
+/// the fixed `PRIMARY_MAX_ATTEMPTS` / `FALLBACK_MAX_ATTEMPTS`.
 #[derive(Clone, Copy)]
 pub(super) struct RetrySettings {
-    /// Total attempts per endpoint (`retry_attempts + 1`).
-    pub max_attempts_per_endpoint: usize,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
     pub jitter_mode: JitterMode,
@@ -77,26 +83,41 @@ impl DirectFallbackService {
     ) -> Self {
         let retry_logic = ClickhouseRetryLogic::new(non_retriable_codes);
         Self {
-            primary: Self::build_endpoint(client, primary_endpoint, svc_config, &retry_logic, &settings),
-            fallback: Self::build_endpoint(client, fallback_endpoint, svc_config, &retry_logic, &settings),
+            primary: Self::build_endpoint(
+                client,
+                primary_endpoint,
+                svc_config,
+                &retry_logic,
+                &settings,
+                PRIMARY_MAX_ATTEMPTS,
+            ),
+            fallback: Self::build_endpoint(
+                client,
+                fallback_endpoint,
+                svc_config,
+                &retry_logic,
+                &settings,
+                FALLBACK_MAX_ATTEMPTS,
+            ),
             retry_logic,
         }
     }
 
     /// Wraps a single endpoint's `HttpService` in a per-attempt timeout and the
     /// standard Fibonacci retry policy, so retries honor `jitter_mode` and emit
-    /// the standard sink retry metrics.
+    /// the standard sink retry metrics. `max_attempts` is the total attempts for
+    /// this endpoint (initial try + retries).
     fn build_endpoint(
         client: &HttpClient,
         endpoint: Uri,
         svc_config: &EndpointServiceConfig,
         retry_logic: &ClickhouseRetryLogic,
         settings: &RetrySettings,
+        max_attempts: usize,
     ) -> RetryingEndpoint {
         let inner = build_endpoint_service(client, endpoint, svc_config);
-        // `retry_attempts` in the policy is the number of *retries*, so subtract
-        // the initial attempt from the total-attempts budget (min 0).
-        let retries = settings.max_attempts_per_endpoint.saturating_sub(1);
+        // The policy counts *retries*, so subtract the initial attempt (min 0).
+        let retries = max_attempts.saturating_sub(1);
         let policy = FibonacciRetryPolicy::new(
             retries,
             settings.initial_backoff,
@@ -226,14 +247,14 @@ mod tests {
         hits
     }
 
-    /// Sends one request through a service pointed at `p_addr`/`fb_addr`, with
-    /// `attempts` per endpoint and 1ms backoff. Jitter is disabled so retry
-    /// timing stays deterministic in tests. Servers must already be spawned.
+    /// Sends one request through a service pointed at `p_addr`/`fb_addr`. Attempt
+    /// counts are the fixed `PRIMARY_MAX_ATTEMPTS` (2) / `FALLBACK_MAX_ATTEMPTS`
+    /// (3); backoff is 1ms and jitter is disabled so retry timing stays
+    /// deterministic in tests. Servers must already be spawned.
     async fn drive(
         p_addr: std::net::SocketAddr,
         fb_addr: std::net::SocketAddr,
         non_retriable_codes: Option<Vec<u32>>,
-        attempts: usize,
     ) -> SinkResult {
         let cfg = EndpointServiceConfig {
             auth: None,
@@ -253,7 +274,6 @@ mod tests {
             &cfg,
             non_retriable_codes,
             RetrySettings {
-                max_attempts_per_endpoint: attempts,
                 initial_backoff: Duration::from_millis(1),
                 max_backoff: Duration::from_millis(1),
                 jitter_mode: JitterMode::None,
@@ -265,8 +285,8 @@ mod tests {
     }
 
     /// `run` for the common case: `Some((status, body))` spawns a live server,
-    /// `None` leaves the port unbound (connection refused). 2 attempts/endpoint.
-    /// Returns `(primary_hits, fallback_hits, result)`.
+    /// `None` leaves the port unbound (connection refused). Uses the fixed
+    /// per-endpoint attempt counts. Returns `(primary_hits, fallback_hits, result)`.
     async fn run(
         primary: Option<(u16, &'static str)>,
         fallback: Option<(u16, &'static str)>,
@@ -277,7 +297,7 @@ mod tests {
         let no_hits = || Arc::new(AtomicUsize::new(0));
         let p_hits = primary.map_or_else(no_hits, |(s, b)| spawn_server(p_addr, s, b));
         let fb_hits = fallback.map_or_else(no_hits, |(s, b)| spawn_server(fb_addr, s, b));
-        let result = drive(p_addr, fb_addr, non_retriable_codes, 2).await;
+        let result = drive(p_addr, fb_addr, non_retriable_codes).await;
         (p_hits.load(Ordering::SeqCst), fb_hits.load(Ordering::SeqCst), result)
     }
 
@@ -297,7 +317,7 @@ mod tests {
         let (_fg, fb_addr) = next_addr();
         let p_hits = spawn_flaky_server(p_addr, 1, 503, 200, "");
         let fb_hits = spawn_server(fb_addr, 200, "");
-        let res = drive(p_addr, fb_addr, None, 2).await;
+        let res = drive(p_addr, fb_addr, None).await;
         assert!(res.is_ok());
         assert_eq!(p_hits.load(Ordering::SeqCst), 2);
         assert_eq!(fb_hits.load(Ordering::SeqCst), 0);
@@ -326,7 +346,7 @@ mod tests {
         let (_fg, fb_addr) = next_addr();
         let p_hits = spawn_server(p_addr, 503, "overloaded");
         let fb_hits = spawn_flaky_server(fb_addr, 1, 503, 200, "");
-        let res = drive(p_addr, fb_addr, None, 2).await;
+        let res = drive(p_addr, fb_addr, None).await;
         assert!(res.is_ok());
         assert_eq!(p_hits.load(Ordering::SeqCst), 2);
         assert_eq!(fb_hits.load(Ordering::SeqCst), 2);
@@ -362,32 +382,31 @@ mod tests {
 
     #[tokio::test]
     async fn both_endpoints_exhaust_on_transient_5xx() {
-        // Both return 503: each retried to max_attempts; the fallback's last 5xx is surfaced.
+        // Both return 503: primary retried to 2 attempts, fallback to 3; the
+        // fallback's last 5xx is surfaced.
         let (p, fb, res) = run(Some((503, "overloaded")), Some((503, "still down")), None).await;
         assert_eq!(res.unwrap().http_response.status().as_u16(), 503);
-        assert_eq!((p, fb), (2, 2));
+        assert_eq!((p, fb), (2, 3));
     }
 
     #[tokio::test]
     async fn primary_unreachable_fallback_exhausts_5xx() {
-        // Primary unreachable (connection refused), fallback keeps returning 503.
+        // Primary unreachable (connection refused), fallback keeps returning 503
+        // for all 3 of its attempts.
         let (p, fb, res) = run(None, Some((503, "still down")), None).await;
         assert_eq!(res.unwrap().http_response.status().as_u16(), 503);
-        assert_eq!((p, fb), (0, 2));
+        assert_eq!((p, fb), (0, 3));
     }
 
-    // --- Config edge: no retries still fails over ---
+    // --- Fixed per-endpoint attempt budget ---
 
     #[tokio::test]
-    async fn single_attempt_still_fails_over() {
-        // attempts = 1 (no retries): one primary hit, then fail over.
-        let (_pg, p_addr) = next_addr();
-        let (_fg, fb_addr) = next_addr();
-        let p_hits = spawn_server(p_addr, 503, "overloaded");
-        let fb_hits = spawn_server(fb_addr, 200, "");
-        let res = drive(p_addr, fb_addr, None, 1).await;
-        assert!(res.is_ok());
-        assert_eq!(p_hits.load(Ordering::SeqCst), 1, "no retries when attempts = 1");
-        assert_eq!(fb_hits.load(Ordering::SeqCst), 1);
+    async fn proxy_uses_two_attempts_fallback_uses_three() {
+        // Both endpoints keep failing (503), so each is driven to its full,
+        // fixed attempt budget: proxy = PRIMARY_MAX_ATTEMPTS (2), fallback =
+        // FALLBACK_MAX_ATTEMPTS (3).
+        let (p, fb, _res) = run(Some((503, "overloaded")), Some((503, "still down")), None).await;
+        assert_eq!(p, PRIMARY_MAX_ATTEMPTS, "proxy should be tried exactly twice");
+        assert_eq!(fb, FALLBACK_MAX_ATTEMPTS, "direct SMK should be tried exactly three times");
     }
 }
