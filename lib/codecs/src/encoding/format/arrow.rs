@@ -1591,6 +1591,10 @@ fn build_map_value_array(values: &[Value], field: &Field) -> Result<ArrayRef, Ar
                         Ok(s) => builder.append_value(s),
                         Err(_) => builder.append_value(&String::from_utf8_lossy(b)),
                     },
+                    // A null (e.g. an unset proto field synthesized to Value::Null while
+                    // flattening a nested struct) must become a real Arrow null, not the literal
+                    // "<null>" that Value::to_string_lossy would emit via the catch-all below.
+                    Value::Null => handle_null_constraints!(builder, nullable, field.name()),
                     _ => builder.append_value(&v.to_string_lossy()),
                 }
             }
@@ -1604,6 +1608,10 @@ fn build_map_value_array(values: &[Value], field: &Field) -> Result<ArrayRef, Ar
                         Ok(s) => builder.append_value(s),
                         Err(_) => builder.append_value(&String::from_utf8_lossy(b)),
                     },
+                    // A null (e.g. an unset proto field synthesized to Value::Null while
+                    // flattening a nested struct) must become a real Arrow null, not the literal
+                    // "<null>" that Value::to_string_lossy would emit via the catch-all below.
+                    Value::Null => handle_null_constraints!(builder, nullable, field.name()),
                     _ => builder.append_value(&v.to_string_lossy()),
                 }
             }
@@ -3470,6 +3478,66 @@ mod tests {
             .unwrap();
         assert!(!struct_col.is_null(0), "row 0 should be non-null");
         assert!(struct_col.is_null(1), "row 1 should be null");
+    }
+
+    #[test]
+    fn test_encode_list_of_struct_null_string_child_is_arrow_null() {
+        use arrow::array::{ListArray, StringArray, StructArray};
+
+        // Regression: a null string field nested inside a struct within a list used to be
+        // stringified to the literal "<null>" by build_map_value_array's Utf8 arm (via the
+        // Value::to_string_lossy catch-all). It must become a real Arrow null instead. This path
+        // (build_list_item_array -> build_map_value_array) is only reached for fields nested inside
+        // a List; top-level string fields go through the already-correct build_string_array.
+        let mut log = LogEvent::default();
+        // One-element list: element 0 has an inner struct whose "name" is explicitly null.
+        log.insert("outer[0].inner.name", Value::Null);
+        log.insert("outer[0].inner.label", "l-1");
+        let events = vec![Event::Log(log)];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "outer",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "inner",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("name", DataType::Utf8, true),
+                        Field::new("label", DataType::Utf8, true),
+                    ])),
+                    true,
+                )])),
+                true,
+            ))),
+            true,
+        )]));
+
+        let result = build_record_batch(Arc::clone(&schema), &events);
+        assert!(result.is_ok(), "build_record_batch failed: {:?}", result);
+        let batch = result.unwrap();
+
+        let outer = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let item_structs = outer.values().as_any().downcast_ref::<StructArray>().unwrap();
+        let inner = item_structs
+            .column_by_name("inner")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let name = inner
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(
+            name.is_null(0),
+            "null nested string child must be a real Arrow null, not the literal \"<null>\""
+        );
     }
 
     #[test]
