@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Fields, TimeUnit};
-use prost_reflect::{Cardinality, Kind, MessageDescriptor};
+use prost_reflect::{Cardinality, EnumDescriptor, Kind, MessageDescriptor};
 
 use super::builders::TypedBuilder;
 use super::errors::{Result, WireToArrowError};
@@ -140,6 +140,22 @@ pub enum PlanSlot {
     /// Repeated scalar field (e.g. `repeated int32`) -> Arrow `List<primitive>`.
     /// Handles both packed and unpacked wire encodings at scan time.
     RepeatedScalar(ScalarKind),
+    /// Proto enum field paired to a STRING Arrow column: render the varint as
+    /// its enum-value *name* (e.g. `1` -> `"SUCCESS"`), matching the
+    /// arrow_stream / `proto_to_value` path. The default enum mapping is
+    /// `ScalarKind::Int32` (see [`ScalarKind::from_proto_kind`]); this variant
+    /// is only chosen when the target Arrow leaf is `LargeUtf8`. Carries the
+    /// [`EnumDescriptor`] for the number->name lookup at scan time. Kept out of
+    /// [`ScalarKind`] so that enum stays `Copy` and the primitive hot path is
+    /// untouched.
+    EnumString(EnumDescriptor),
+    /// Repeated proto enum field paired to an Arrow `List<LargeUtf8>` column:
+    /// render each enum varint as its value name (the repeated analogue of
+    /// [`PlanSlot::EnumString`]). Handles both packed and unpacked wire
+    /// encodings at scan time, like [`PlanSlot::RepeatedScalar`]. A repeated
+    /// enum paired with `List<Int32>` still falls through to
+    /// [`PlanSlot::RepeatedScalar`] and stays numeric.
+    RepeatedEnumString(EnumDescriptor),
     /// Proto `map<K, V>` -> Arrow `Map<Struct(key, value)>`. On the wire, maps
     /// are encoded as `repeated MapEntry` where `MapEntry` is a generated
     /// message with field 1 = key and field 2 = value; we scan them the same
@@ -346,6 +362,14 @@ impl MessagePlan {
                 PlanSlot::Map(Arc::new(sub))
             } else {
                 match (&kind, arrow_field.data_type(), is_repeated) {
+                    // Singular proto enum -> STRING column: render the enum
+                    // value *name* rather than its number. Enum + an integer
+                    // column falls through to the generic scalar arm below,
+                    // where `from_proto_kind` maps it to `Int32` as before, so
+                    // existing enum->int tables are unaffected.
+                    (Kind::Enum(enum_desc), DataType::LargeUtf8, false) => {
+                        PlanSlot::EnumString(enum_desc.clone())
+                    }
                     // Singular scalar.
                     (_, dt, false) if !matches!(dt, DataType::Struct(_) | DataType::List(_)) => {
                         validate_arrow_leaf_types(arrow_field.name(), dt)?;
@@ -398,6 +422,15 @@ impl MessagePlan {
                         )?;
                         PlanSlot::RepeatedMessage(Arc::new(sub))
                     }
+                    // Repeated proto enum -> Arrow List<LargeUtf8>: render each
+                    // element's value *name*. A repeated enum paired with an
+                    // integer element type falls through to the RepeatedScalar
+                    // arm below and stays numeric (Int32), as before.
+                    (Kind::Enum(enum_desc), DataType::List(item_field), true)
+                        if matches!(item_field.data_type(), DataType::LargeUtf8) =>
+                    {
+                        PlanSlot::RepeatedEnumString(enum_desc.clone())
+                    }
                     // Repeated scalar -> Arrow List<primitive>.
                     (_, DataType::List(item_field), true) => {
                         validate_arrow_leaf_types(item_field.name(), item_field.data_type())?;
@@ -440,7 +473,10 @@ impl MessagePlan {
             // check would be a false positive there.
             if !arrow_field.is_nullable() && !inside_map_entry {
                 match slot {
-                    PlanSlot::Scalar(_) | PlanSlot::Struct(_) => {
+                    // EnumString is a singular field too: absent -> null (parity
+                    // with `proto_to_value`), so a non-nullable column can't be
+                    // guaranteed and is rejected alongside Scalar/Struct.
+                    PlanSlot::Scalar(_) | PlanSlot::Struct(_) | PlanSlot::EnumString(_) => {
                         return Err(WireToArrowError::NonNullableNotGuaranteed {
                             name: arrow_field.name().to_string(),
                             reason: "proto3 singular fields are omitted at default value, \
@@ -449,6 +485,7 @@ impl MessagePlan {
                     }
                     PlanSlot::RepeatedMessage(_)
                     | PlanSlot::RepeatedScalar(_)
+                    | PlanSlot::RepeatedEnumString(_)
                     | PlanSlot::Map(_)
                     | PlanSlot::Absent => {}
                 }
