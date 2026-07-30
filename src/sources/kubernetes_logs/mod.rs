@@ -1455,6 +1455,9 @@ fn create_event(
     log_namespace: LogNamespace,
     source_context: &Option<HashMap<String, String>>,
 ) -> Event {
+    // Raw read byte count, captured before `line` is moved into the deserializer.
+    let message_bytes = line.len();
+
     let deserializer = BytesDeserializer;
     let mut log = deserializer.parse_single(line, log_namespace);
 
@@ -1508,10 +1511,11 @@ fn create_event(
 
     // Post-multiline read spot (gated on EMIT_READ_EVENT_AFTER_MULTILINE_AGG).
     // The `delivery_events_total` counter fires immediately; only the VEL
-    // `info!` log is batched through the singleton.
+    // `info!` log is batched through the singleton. Reports the raw read byte
+    // count rather than the in-memory estimated_json_encoded_size_of() estimate.
     delivery_singleton().accumulate_read(
         file.to_string(),
-        log.estimated_json_encoded_size_of().get(),
+        message_bytes,
         1,
         source_context,
         vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
@@ -1522,6 +1526,10 @@ fn create_event(
     // Carry the discovery-time bucket downstream for the woodchuck VRL wrappers to
     // copy into logMetadata.timeParity (see file.rs for the rationale).
     log.insert("time_parity", time_parity);
+
+    // Surface the raw read byte count under `source_context` so it lives with the
+    // other fields that must be preserved across transforms.
+    log.insert("source_context.bytes", message_bytes as i64);
 
     log.into()
 }

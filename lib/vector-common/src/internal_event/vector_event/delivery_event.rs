@@ -360,6 +360,17 @@ impl DeliveryEventSingleton {
         )
         .increment(lines_read as u64);
 
+        // Byte-count sibling of `delivery_events_total` with identical labels.
+        counter!(
+            "delivery_event_bytes_total",
+            "delivery_event_type" => "VECTOR_SOURCE_READ",
+            "time_parity" => time_parity.to_string(),
+            "delivery_method" => delivery_method_for_source_type(source_type),
+            "topic" => resolve_received_topic(ctx, &path, source_type),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
+        )
+        .increment(bytes_read as u64);
+
         // Inline mode (default): emit the VEL log immediately in the current
         // source span, one per read — the original pre-singleton behavior. No
         // accumulation, so the background flush task is never spawned.

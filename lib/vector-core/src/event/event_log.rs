@@ -115,6 +115,19 @@ fn get_message_count(
     }
 }
 
+// Prefer the source-stamped `bytes` (true written-log bytes, carried in the
+// metadata like the other granularity fields) when present, falling back to the
+// in-memory `size_of()` estimate for events that don't carry it.
+fn get_message_bytes(log_event: &LogEvent, log_metadata_field: &str) -> usize {
+    let path = format!("{}.bytes", log_metadata_field);
+    match log_event.parse_path_and_get_value(path) {
+        Ok(Some(value)) => value
+            .as_integer()
+            .map_or_else(|| log_event.size_of(), |bytes| bytes as usize),
+        _ => log_event.size_of(),
+    }
+}
+
 /*
 * On a list of events, iterate through them and track the counts per unique combination of
 * specified fields
@@ -136,19 +149,17 @@ pub fn generate_count_map(
         if let Event::Log(log_event) = event {
             let message_count =
                 get_message_count(event, log_metadata_field, message_count_override_field);
+            let message_bytes = get_message_bytes(log_event, log_metadata_field);
             count_map
                 .entry(build_key(log_event, log_metadata_field, granularity_fields))
                 .and_modify(|x: &mut MetadataValuesCount| {
                     x.count += message_count;
-                    // For now, using pre-defined allocated bytes measure for size of event
-                    // This may not be fully consistent with the real size of logs
-                    // But having this a placeholder as consistent size measurement is tricky
-                    x.size += log_event.size_of();
+                    x.size += message_bytes;
                 })
                 .or_insert(MetadataValuesCount {
                     value_map: build_map(log_event, log_metadata_field, granularity_fields),
                     count: message_count,
-                    size: log_event.size_of(),
+                    size: message_bytes,
                 });
         }
     }
