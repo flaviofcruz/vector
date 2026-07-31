@@ -275,6 +275,23 @@ pub struct FileConfig {
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     pub rotate_wait: Duration,
 
+    /// How long to retain the checkpoint of a reaped (deleted/rotated-away) file
+    /// before it becomes eligible for cleanup.
+    ///
+    /// Kept long enough to bridge the gap between a source file being reaped
+    /// (e.g. `active.json` deleted during rotation) and its compressed successor
+    /// (`*.json.gz`, which shares the same fingerprint) appearing on disk, so the
+    /// archive resumes from the checkpoint instead of being re-read from the
+    /// beginning. The retained checkpoint's death time is persisted, so cleanup
+    /// still occurs the configured duration after death even across a restart.
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[serde(
+        default = "default_checkpoint_dead_retention",
+        rename = "checkpoint_dead_retention_secs"
+    )]
+    pub checkpoint_dead_retention: Duration,
+
     /// TTL removal configuration for file management
     /// This allows us to specify the behavior of TTL file removal by file patterns
     #[serde(default)]
@@ -330,6 +347,12 @@ fn default_line_delimiter() -> String {
 
 const fn default_rotate_wait() -> Duration {
     Duration::from_secs(u64::MAX / 2)
+}
+
+const fn default_checkpoint_dead_retention() -> Duration {
+    // 60s preserves the historical hardcoded retention (status quo). Raise via
+    // `checkpoint_dead_retention_secs` to bridge longer rotation-to-`.gz` gaps.
+    Duration::from_secs(60)
 }
 
 /// Configuration for how files should be identified.
@@ -439,6 +462,7 @@ impl Default for FileConfig {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            checkpoint_dead_retention: default_checkpoint_dead_retention(),
             ttl_removal_config: None,
             source_context: None,
             archive_extensions: default_archive_extensions(),
@@ -485,6 +509,7 @@ impl SourceConfig for FileConfig {
             cx.out,
             acknowledgements,
             log_namespace,
+            cx.globals.async_file_server.enabled(),
         ))
     }
 
@@ -546,6 +571,11 @@ pub fn file_source(
     mut out: SourceSender,
     acknowledgements: bool,
     log_namespace: LogNamespace,
+    // When true, run the file server directly on the async runtime instead of inside
+    // tokio::task::spawn_blocking. This eliminates one pinned 2 MB blocking-pool thread per
+    // source (~214 sources × 2 MB ≈ 428 MB on a busy pod). Sourced from the
+    // `async_file_server` global flag; default OFF to preserve historical behavior.
+    run_async: bool,
 ) -> super::Source {
     // the include option must be specified but also must contain at least one entry.
     if config.include.is_empty() {
@@ -600,7 +630,10 @@ pub fn file_source(
         None => None,
     };
 
-    let checkpointer = Checkpointer::new(&data_dir);
+    let checkpointer = Checkpointer::new(&data_dir).with_dead_retention(
+        chrono::Duration::from_std(config.checkpoint_dead_retention)
+            .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX)),
+    );
     let strategy = config.fingerprint.clone().into();
 
     let file_server = FileServer {
@@ -626,6 +659,7 @@ pub fn file_source(
         drain_on_shutdown: false,
         archive_extensions: config.archive_extensions.clone(),
         source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
+        read_loop_min_backoff: 1,
     };
 
     let event_metadata = EventMetadata {
@@ -762,19 +796,49 @@ pub fn file_source(
         });
 
         let span = info_span!("file_server");
-        tokio::task::spawn_blocking(move || {
-            let _enter = span.enter();
-            let rt = tokio::runtime::Handle::current();
-            let result =
-                rt.block_on(file_server.run(tx, shutdown, shutdown_checkpointer, checkpointer));
+        if run_async {
+            // Async path: run the file server directly on the tokio runtime as a normal
+            // async task. No blocking-pool thread is held for the source's lifetime,
+            // freeing the ~2 MB stack reservation per source (~214 sources × 2 MB ≈ 428
+            // MB on a busy pod). The one synchronous call is the directory glob in
+            // `Glob::paths()`, which `FileServer::run` performs at startup and once per
+            // `glob_minimum_cooldown` (default 60 s) — a brief sync hop on a worker
+            // thread roughly once a minute rather than a dedicated blocking thread for life.
+            // Enabled via `async_file_server` global flag; default OFF.
+            let result = file_server
+                .run(tx, shutdown, shutdown_checkpointer, checkpointer)
+                .instrument(span)
+                .await;
             emit!(FileOpen { count: 0 });
-            // Panic if we encounter any error originating from the file server.
-            // We're at the `spawn_blocking` call, the panic will be caught and
-            // passed to the `JoinHandle` error, similar to the usual threads.
-            result.expect("file server exited with an error");
-        })
-        .map_err(|error| error!(message="File server unexpectedly stopped.", %error, internal_log_rate_limit = false))
-        .await
+            // Propagate a file-server failure as `Err(())` rather than swallowing it as
+            // `Ok(())`. This mirrors both the blocking path below (which surfaces the error
+            // via `spawn_blocking`'s panic -> `JoinError`) and `kubernetes_logs`'
+            // `util::run_file_server`, which `map_err`s the error back to its caller.
+            result.map(|_| ()).map_err(|error| {
+                error!(
+                    message = "File server exited with an error.",
+                    %error,
+                    internal_log_rate_limit = false
+                );
+            })
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let _enter = span.enter();
+                let rt = tokio::runtime::Handle::current();
+                let result = rt.block_on(
+                    file_server.run(tx, shutdown, shutdown_checkpointer, checkpointer),
+                );
+                emit!(FileOpen { count: 0 });
+                // Panic if we encounter any error originating from the file server.
+                // We're at the `spawn_blocking` call, the panic will be caught and
+                // passed to the `JoinHandle` error, similar to the usual threads.
+                result.expect("file server exited with an error");
+            })
+            .map_err(
+                |error| error!(message="File server unexpectedly stopped.", %error, internal_log_rate_limit = false),
+            )
+            .await
+        }
     })
 }
 
@@ -857,6 +921,9 @@ fn create_event(
     log_namespace: LogNamespace,
     include_file_metric_tag: bool,
 ) -> LogEvent {
+    // Raw read byte count, captured before `line` is moved into the deserializer.
+    let message_bytes = line.len();
+
     let deserializer = BytesDeserializer;
     let mut event = deserializer.parse_single(line, log_namespace);
 
@@ -932,9 +999,11 @@ fn create_event(
     // Post-multiline read spot (gated on EMIT_READ_EVENT_AFTER_MULTILINE_AGG).
     // The counter fires inline; only the VEL `info!` log is batched. `meta.source_context`
     // is borrowed; the singleton clones it only on first sight of this path within a window.
+    // Reports the raw read byte count rather than the in-memory
+    // estimated_json_encoded_size_of() estimate.
     delivery_singleton().accumulate_read(
         file.to_string(),
-        event.estimated_json_encoded_size_of().get(),
+        message_bytes,
         1,
         &meta.source_context,
         vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
@@ -952,8 +1021,20 @@ fn create_event(
     // Carry the discovery-time bucket downstream; the woodchuck VRL wrappers copy
     // `.time_parity` into `logMetadata.timeParity` instead of recomputing it.
     // Stamped after the byte-size measurements above so it does not inflate the
-    // reported read byte count.
-    event.insert("time_parity", time_parity);
+    // reported read byte count. Namespace-aware: Legacy keeps the top-level
+    // `time_parity` field; Vector carries it as `%file.time_parity` metadata
+    // instead of clobbering the non-object event root (the message bytes).
+    log_namespace.insert_source_metadata(
+        FileConfig::NAME,
+        &mut event,
+        Some(LegacyKey::Overwrite("time_parity")),
+        path!("time_parity"),
+        time_parity,
+    );
+
+    // Surface the raw read byte count under `source_context` so it lives with the
+    // other fields that must be preserved across transforms.
+    event.insert("source_context.bytes", message_bytes as i64);
 
     event
 }
@@ -1256,6 +1337,7 @@ mod tests {
         assert_eq!(*log.get_message().unwrap(), "hello world".into());
         assert_eq!(*log.get_source_type().unwrap(), "file".into());
         assert!(log[log_schema().timestamp_key().unwrap().to_string()].is_timestamp());
+        assert!(log["time_parity"].is_integer());
     }
 
     #[test]
@@ -1320,6 +1402,13 @@ mod tests {
                 .unwrap(),
             &value!("some_file.rs")
         );
+        assert!(
+            log.metadata()
+                .value()
+                .get(path!(FileConfig::NAME, "time_parity"))
+                .unwrap()
+                .is_integer()
+        );
     }
 
     #[test]
@@ -1366,6 +1455,64 @@ mod tests {
         let path2 = dir.path().join("file2");
 
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
+            let mut file1 = File::create(&path1).unwrap();
+            let mut file2 = File::create(&path2).unwrap();
+
+            for i in 0..n {
+                writeln!(&mut file1, "hello {i}").unwrap();
+                writeln!(&mut file2, "goodbye {i}").unwrap();
+            }
+
+            file1.flush().unwrap();
+            file2.flush().unwrap();
+
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let mut hello_i = 0;
+        let mut goodbye_i = 0;
+
+        for event in received {
+            let line =
+                event.as_log()[log_schema().message_key().unwrap().to_string()].to_string_lossy();
+            if line.starts_with("hello") {
+                assert_eq!(line, format!("hello {}", hello_i));
+                assert_eq!(
+                    event.as_log()["file"].to_string_lossy(),
+                    path1.to_str().unwrap()
+                );
+                hello_i += 1;
+            } else {
+                assert_eq!(line, format!("goodbye {}", goodbye_i));
+                assert_eq!(
+                    event.as_log()["file"].to_string_lossy(),
+                    path2.to_str().unwrap()
+                );
+                goodbye_i += 1;
+            }
+        }
+        assert_eq!(hello_i, n);
+        assert_eq!(goodbye_i, n);
+    }
+
+    // Parity check for the async (no-spawn_blocking) file-server path gated by
+    // `async_file_server`: the same happy-path workload must deliver the same
+    // events and shut down cleanly when the source runs directly on the async runtime.
+    #[tokio::test]
+    async fn file_happy_path_async() {
+        let n = 5;
+
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            ..test_default_file_config(&dir)
+        };
+
+        let path1 = dir.path().join("file1");
+        let path2 = dir.path().join("file2");
+
+        let received = run_file_source_async(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file1 = File::create(&path1).unwrap();
             let mut file2 = File::create(&path2).unwrap();
 
@@ -1749,6 +1896,7 @@ mod tests {
                 received[0].as_log().keys().unwrap().collect::<HashSet<_>>(),
                 vec![
                     "file_id".into(),
+                    "time_parity".into(),
                     default_file_key()
                         .path
                         .expect("file key to exist")
@@ -2803,6 +2951,47 @@ mod tests {
         log_namespace: LogNamespace,
         inner: impl Future<Output = ()>,
     ) -> Vec<Event> {
+        // Default to the legacy spawn_blocking path; `run_file_source_async` covers run_async.
+        run_file_source_with_mode(
+            config,
+            wait_shutdown,
+            acking_mode,
+            log_namespace,
+            false,
+            inner,
+        )
+        .await
+    }
+
+    // Same as `run_file_source` but drives the source on the async (no-spawn_blocking) path,
+    // i.e. with the `async_file_server` flag enabled, so tests can assert the
+    // run_async behavior is observably identical to the legacy path.
+    async fn run_file_source_async(
+        config: &FileConfig,
+        wait_shutdown: bool,
+        acking_mode: AckingMode,
+        log_namespace: LogNamespace,
+        inner: impl Future<Output = ()>,
+    ) -> Vec<Event> {
+        run_file_source_with_mode(
+            config,
+            wait_shutdown,
+            acking_mode,
+            log_namespace,
+            true,
+            inner,
+        )
+        .await
+    }
+
+    async fn run_file_source_with_mode(
+        config: &FileConfig,
+        wait_shutdown: bool,
+        acking_mode: AckingMode,
+        log_namespace: LogNamespace,
+        run_async: bool,
+        inner: impl Future<Output = ()>,
+    ) -> Vec<Event> {
         assert_source_compliance(&FILE_SOURCE_TAGS, async move {
             let (tx, rx) = if acking_mode == Acks {
                 let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
@@ -2823,6 +3012,7 @@ mod tests {
                 tx,
                 acks,
                 log_namespace,
+                run_async,
             ));
 
             inner.await;
@@ -3270,6 +3460,7 @@ start_reading_at: "not-a-timestamp"
                 tx,
                 true,
                 LogNamespace::Legacy,
+                false, // run_async: use legacy spawn_blocking path in tests
             ));
 
             sleep_500_millis().await;

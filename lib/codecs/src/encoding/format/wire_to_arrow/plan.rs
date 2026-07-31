@@ -298,7 +298,13 @@ impl MessagePlan {
             // Maps take precedence: proto map fields have `is_map() == true` and
             // cardinality Repeated, but we dispatch differently from a bare
             // repeated-message field.
-            let slot = if proto_field.is_map() {
+            //
+            // a field takes the Map path when it's a native proto map OR it's a repeated k-v entry
+            // whose UC column is declared Map
+            let target_is_arrow_map = matches!(arrow_field.data_type(), DataType::Map(_, _));
+            let treat_as_map = proto_field.is_map()
+                || (is_repeated && matches!(kind, Kind::Message(_)) && target_is_arrow_map);
+            let slot = if treat_as_map {
                 let entry_desc = match &kind {
                     Kind::Message(m) => m,
                     _ => {

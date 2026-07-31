@@ -1,5 +1,6 @@
 use std::io::Cursor;
 
+use super::create_standalone_ledger;
 use crate::{
     test::SizedRecord,
     variants::disk_v2::{reader::RecordReader, writer::RecordWriter},
@@ -12,6 +13,7 @@ async fn roundtrip_through_record_writer_and_record_reader() {
 
     let mut record_writer = RecordWriter::new(writer_io, 0, 16_384, u64::MAX, 2048);
     let mut record_reader = RecordReader::new(reader_io);
+    let ledger = create_standalone_ledger().await;
 
     let record = SizedRecord::new(73);
 
@@ -22,7 +24,7 @@ async fn roundtrip_through_record_writer_and_record_reader() {
     record_writer.flush().await.expect("flush should not fail");
 
     let read_token = record_reader
-        .try_next_record(false)
+        .try_next_record(true, &ledger)
         .await
         .expect("read should not fail");
     assert!(read_token.is_some());
@@ -43,8 +45,9 @@ async fn record_reader_always_returns_none_when_no_data() {
     let reader_io = Cursor::new(Vec::new());
 
     let mut record_reader = RecordReader::<_, SizedRecord>::new(reader_io);
+    let ledger = create_standalone_ledger().await;
     let read_token = record_reader
-        .try_next_record(false)
+        .try_next_record(true, &ledger)
         .await
         .expect("read should not fail");
     assert!(read_token.is_none());

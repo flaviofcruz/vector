@@ -44,13 +44,14 @@ impl ExclusiveRoute {
 }
 
 impl SyncTransform for ExclusiveRoute {
-    fn transform(&mut self, event: Event, output: &mut TransformOutputsBuf) {
+    fn transform(&mut self, mut event: Event, output: &mut TransformOutputsBuf) {
         for route in &self.routes {
-            let (result, event) = route.condition.check(event.clone());
+            let (result, returned) = route.condition.check(event);
             if result {
-                output.push(Some(&route.name), event);
+                output.push(Some(&route.name), returned);
                 return;
             }
+            event = returned;
         }
 
         output.push(Some(UNMATCHED_ROUTE), event);

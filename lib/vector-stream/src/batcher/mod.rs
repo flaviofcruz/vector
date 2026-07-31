@@ -14,6 +14,7 @@ use futures::{
 };
 use pin_project::pin_project;
 use tokio::time::Sleep;
+use vector_common::flush_signal::{self, FlushSignal};
 
 #[pin_project]
 pub struct Batcher<S, C> {
@@ -25,6 +26,11 @@ pub struct Batcher<S, C> {
 
     #[pin]
     timer: Maybe<Sleep>,
+
+    /// Optional task-local signal, set by the buffer reader during shutdown,
+    /// requesting that the open batch be flushed immediately rather than held
+    /// until the batch timeout. See `poll_next`'s `Poll::Pending` arm.
+    flush_signal: Option<FlushSignal>,
 }
 
 /// An `Option`, but with pin projection
@@ -44,6 +50,7 @@ where
             state: config,
             stream: stream.fuse(),
             timer: Maybe::None,
+            flush_signal: flush_signal::get_task_flush_signal(),
         }
     }
 }
@@ -88,6 +95,23 @@ where
                     }
                 }
                 Poll::Pending => {
+                    // Check if the buffer reader has signaled us to flush the open
+                    // batch. This happens during shutdown when the writer is done but
+                    // there are still unacknowledged records — flushing lets the sink
+                    // process them and send acks back so the buffer can drain, instead
+                    // of holding the partial batch until `batch.timeout_secs` (which can
+                    // outlast the shutdown deadline). Mirrors `PartitionedBatcher`.
+                    //
+                    // Unconditional (matching `PartitionedBatcher`): the signal only
+                    // exists for disk-buffered sinks and is only ever set at shutdown,
+                    // so this has zero steady-state effect.
+                    if let Some(signal) = this.flush_signal.as_ref() {
+                        if signal.take() && this.state.len() != 0 {
+                            this.timer.set(Maybe::None);
+                            return Poll::Ready(Some(this.state.take_batch()));
+                        }
+                    }
+
                     return {
                         if let MaybeProj::Some(timer) = this.timer.as_mut().project() {
                             ready!(timer.poll(cx));
@@ -182,5 +206,75 @@ mod test {
         tokio::time::advance(timeout).await;
         let batch = next.await;
         assert_eq!(batch, Some(vec![1, 2]));
+    }
+
+    /// The shutdown flush signal must flush the open partial batch immediately
+    /// (before the batch timeout fires), so a disk-buffered sink can drain and
+    /// ack inside the wave-1 shutdown deadline instead of waiting out the full
+    /// `batch.timeout_secs`. Mirrors `PartitionedBatcher`'s flush-signal behavior.
+    #[tokio::test]
+    async fn flush_signal_flushes_open_batch_immediately() {
+        tokio::time::pause();
+
+        // Long timeout so the batch would NOT flush on its own within the test.
+        let timeout = Duration::from_secs(60);
+        let signal = FlushSignal::new();
+
+        flush_signal::with_flush_signal(signal.clone(), async {
+            let stream = stream::iter([1, 2]).chain(stream::pending());
+            let batcher = Batcher::new(
+                stream,
+                BatcherSettings::new(
+                    timeout,
+                    NonZeroUsize::new(5).unwrap(),
+                    NonZeroUsize::new(100).unwrap(),
+                )
+                .as_item_size_config(|x: &u32| *x as usize),
+            );
+
+            tokio::pin!(batcher);
+            let mut next = batcher.next();
+            // Items are buffered but the (60s) timer has NOT expired: batch is held.
+            assert_eq!(futures::poll!(&mut next), Poll::Pending);
+
+            // Buffer reader requests a flush (shutdown).
+            signal.set();
+
+            // WITHOUT advancing time, the open batch must be emitted immediately.
+            // (Polling rather than awaiting: under paused time an await would
+            // auto-advance to the 60s timer and mask a missing flush hook.)
+            assert_eq!(futures::poll!(&mut next), Poll::Ready(Some(vec![1, 2])));
+        })
+        .await;
+    }
+
+    /// Steady-state guard: with no flush signal set, an open partial batch stays
+    /// held until the timeout (unchanged from the original behavior).
+    #[tokio::test]
+    async fn no_flush_when_signal_unset() {
+        tokio::time::pause();
+
+        let timeout = Duration::from_secs(60);
+        let signal = FlushSignal::new();
+
+        flush_signal::with_flush_signal(signal.clone(), async {
+            let stream = stream::iter([1, 2]).chain(stream::pending());
+            let batcher = Batcher::new(
+                stream,
+                BatcherSettings::new(
+                    timeout,
+                    NonZeroUsize::new(5).unwrap(),
+                    NonZeroUsize::new(100).unwrap(),
+                )
+                .as_item_size_config(|x: &u32| *x as usize),
+            );
+
+            tokio::pin!(batcher);
+            let mut next = batcher.next();
+            // Signal never set: the batch must remain held (Pending), not flushed.
+            assert_eq!(futures::poll!(&mut next), Poll::Pending);
+            assert_eq!(futures::poll!(&mut next), Poll::Pending);
+        })
+        .await;
     }
 }

@@ -10,6 +10,10 @@ use crate::config::{
 };
 
 pub mod file;
+pub mod indexed_data;
+
+#[cfg(feature = "enrichment-tables-http")]
+pub mod http;
 
 #[cfg(feature = "enrichment-tables-memory")]
 pub mod memory;
@@ -26,6 +30,7 @@ pub mod mmdb;
 /// * [CSV](https://en.wikipedia.org/wiki/Comma-separated_values) files
 /// * [MaxMind](https://www.maxmind.com/en/home) databases
 /// * In-memory storage
+/// * HTTP services
 ///
 /// For the lookup in the enrichment tables to be as performant as possible, the data is indexed according
 /// to the fields that are used in the search. Note that indices can only be created for fields for which an
@@ -47,6 +52,10 @@ pub mod mmdb;
 pub enum EnrichmentTables {
     /// Exposes data from a static file as an enrichment table.
     File(file::FileConfig),
+
+    /// Exposes data fetched from an HTTP service as an enrichment table.
+    #[cfg(feature = "enrichment-tables-http")]
+    Http(http::HttpConfig),
 
     /// Exposes data from a memory cache as an enrichment table. The cache can be written to using
     /// a sink.
@@ -85,6 +94,8 @@ impl EnrichmentTables {
     pub fn files_to_watch(&self) -> Vec<&PathBuf> {
         match self {
             EnrichmentTables::File(file_config) => vec![&file_config.file.path],
+            #[cfg(feature = "enrichment-tables-http")]
+            EnrichmentTables::Http(_) => vec![],
             #[cfg(feature = "enrichment-tables-memory")]
             EnrichmentTables::Memory(_) => vec![],
             #[cfg(feature = "enrichment-tables-geoip")]

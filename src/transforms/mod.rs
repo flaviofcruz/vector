@@ -11,6 +11,10 @@ pub mod sample;
 pub mod aggregate;
 #[cfg(feature = "transforms-aws_ec2_metadata")]
 pub mod aws_ec2_metadata;
+#[cfg(feature = "transforms-bricklens_config_enricher")]
+pub mod bricklens_config_enricher;
+#[cfg(feature = "transforms-dynamic_rls_throttle")]
+pub mod dynamic_rls_throttle;
 #[cfg(feature = "transforms-exclusive-route")]
 mod exclusive_route;
 #[cfg(feature = "transforms-filter")]

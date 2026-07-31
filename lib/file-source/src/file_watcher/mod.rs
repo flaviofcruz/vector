@@ -290,7 +290,8 @@ impl FileWatcher {
                 discarded_for_size_and_truncated,
             }) => {
                 if !self.file_findable() {
-                    self.set_dead();
+                    // Death is decided by the run-loop (reaps archives now, keeps
+                    // non-archives for `rotate_wait`), not here.
                     // File has been deleted, so return what we have in the buffer, even though it
                     // didn't end with a newline. This is not a perfect signal for when we should
                     // give up waiting for a newline, but it's decent.

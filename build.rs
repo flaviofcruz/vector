@@ -157,6 +157,11 @@ fn main() {
             .unwrap();
     }
 
+    // Note: the Login OAuth service protos used by databricks_auth::TokenManager are NOT
+    // compiled here. They are loaded as a runtime FileDescriptorSet (mounted into the
+    // agent container alongside the bricklens_ingest service descriptor) so vector does
+    // not depend on a snapshot of universe protos. See LP-1615.
+
     // We keep track of which environment variables we slurp in, and then emit stanzas at the end to
     // inform Cargo when it needs to rerun this build script.  This allows us to avoid rerunning it
     // every single time unless something _actually_ changes.

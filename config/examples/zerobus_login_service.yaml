@@ -1,0 +1,92 @@
+# End-to-end test config for the databricks_zerobus sink with login_service auth.
+#
+# Mints a JWT against the Databricks Login service via mTLS (s2s-proxy path),
+# then feeds records into Zerobus → Shinkansen → UC table. Used by the
+# bricklens-agent dblet to write OTel logs/metrics/traces into Unity Catalog.
+#
+# This config is intended to run from inside a dev nimbus pod
+# (bricklens-agent-nimbus-* on dev-aws-uw2-s1-*) where the dbts2 UWI cert is
+# mounted at /databricks-infra/dbts2/creds.combined.pem.
+#
+# Replace ${WORKSPACE_ID} with the workspace ID encoded in the pod's UWI cert
+# SAN (OID 1.3.6.1.4.1.42.113.1). For dev pod bricklens-agent-nimbus-4b4p5 on
+# dev-aws-uw2-s1-0-z0ijvk this was 3481107950761530.
+#
+# See bricklens/.claude/skills/bricklens-zerobus-auth/SKILL.md (universe) for
+# the operational background.
+
+sources:
+  demo_otel_logs:
+    type: demo_logs
+    format: shuffle
+    lines:
+      - '{"resource_attributes":{},"severity_text":"INFO","body":"hello from vector"}'
+    sequence: true
+    interval_secs: 5
+
+transforms:
+  shape_otel_log:
+    type: remap
+    inputs: [demo_otel_logs]
+    source: |
+      .observed_timestamp = now() |> to_unix_timestamp_nanos!()
+      .timestamp_nanos = .observed_timestamp
+      .severity_number = 9
+      .body_text = parse_json!(.message).body
+      .resource_attributes_json = "{}"
+      del(.message)
+
+sinks:
+  zerobus:
+    type: databricks_zerobus
+    inputs: [shape_otel_log]
+    table_name: main.default.otel_logs
+    ingestion_endpoint: "https://${WORKSPACE_ID}.zerobus.us-west-2.dev.databricks.com"
+    # unity_catalog_endpoint is required by config validation but not used in login_service mode.
+    unity_catalog_endpoint: "https://unused.dev.databricks.com"
+
+    schema:
+      type: path
+      path: /etc/vector/otel_logs.desc
+      message_type: otel.OtelLog
+
+    batch_encoding:
+      codec: proto_batch
+
+    auth:
+      strategy: login_service
+      # Per-customer identity used when minting the JWT (UserAuthInfo).
+      user:
+        workspace_id: ${WORKSPACE_ID}
+        service_principal_resource: "accounts/0829fba4-55f5-4fef-9850-00f15b1a3d73/apps"
+        # service_principal_type defaults to SYSTEM (3); override only if needed.
+        uc_permissions:
+          - privileges: [USE_CATALOG]
+            securable_type: CATALOG
+            full_name: main
+          - privileges: [USE_SCHEMA]
+            securable_type: SCHEMA
+            full_name: main.default
+          - privileges: [SELECT, MODIFY]
+            securable_type: TABLE
+            full_name: main.default.otel_logs
+          - privileges: [SELECT, MODIFY]
+            securable_type: TABLE
+            full_name: main.default.otel_metrics
+          - privileges: [SELECT, MODIFY]
+            securable_type: TABLE
+            full_name: main.default.otel_spans
+      # Login service connection parameters (LoginServiceConfig).
+      login_service:
+        login_endpoint: "https://login-service-bricklens.privileged.dev.dbns.databricks.com:443"
+        login_server_name: "login-service-bricklens.privileged.dev.dbns.databricks.com"
+        tls_crt_file: "/databricks-infra/dbts2/creds.combined.pem"
+        tls_key_file: "/databricks-infra/dbts2/creds.combined.pem"
+        # tls_ca_file: "/databricks-infra/dbts2/ca.pem"   # add once confirmed on the pod
+
+        # FileDescriptorSet covering Login's InternalOAuthTokenService. Built once from
+        # universe protos and mounted into the agent container alongside otel_logs.desc.
+        # Generate with:
+        #   protoc --descriptor_set_out=oauth_service.pb --include_imports \
+        #          common/authentication/oauth/proto/oauth.proto
+        oauth_proto_descriptor_path: "/etc/vector/oauth_service.pb"

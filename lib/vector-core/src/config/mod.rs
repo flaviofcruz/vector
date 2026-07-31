@@ -386,28 +386,31 @@ impl From<bool> for TwoWaveShutdownConfig {
     }
 }
 
-/// Controls whether the `kubernetes_logs` source runs its `FileServer` directly on the async
-/// runtime instead of inside a `spawn_blocking` + `Handle::block_on` wrapper.
+/// Controls whether the file-backed sources (`file` and `kubernetes_logs`) run their `FileServer`
+/// directly on the async runtime instead of inside a `spawn_blocking` + `Handle::block_on` wrapper.
 ///
 /// When disabled (the default), the legacy `spawn_blocking` wrapper is used — preserving the
-/// historical behavior exactly. When enabled, the file server runs as a normal async task so the
-/// source can be cancelled at an `.await` point (e.g. by the wave-1 drain-deadline force-close),
-/// rather than holding a blocking-pool thread that keeps draining past the deadline. Gated so the
-/// behavior change can be ramped gradually via config.
+/// historical behavior exactly and pinning one blocking-pool thread per source for its lifetime
+/// (at the Rust default ~2 MB stack, ~214 `file` + ~37 `kubernetes_logs` sources ≈ ~500 MB of
+/// virtual address space on a busy logging-agent pod). When enabled, the file server runs as a
+/// normal async task, so no blocking-pool thread is held (freeing the ~2 MB stack reservation per
+/// source) and the source is cancellable at an `.await` point (e.g. by the wave-1 drain-deadline
+/// force-close) rather than draining past the deadline. Gated so the change can be ramped
+/// gradually via config.
 #[configurable_component]
 #[configurable(
-    title = "Controls whether the kubernetes_logs file server runs on the async runtime."
+    title = "Controls whether the file-backed sources' file server runs on the async runtime."
 )]
 #[configurable(
-    description = "When enabled, the `kubernetes_logs` source runs its file server directly on the async runtime (no `spawn_blocking` wrapper), making the source promptly cancellable on shutdown. Disabled by default."
+    description = "When enabled, the `file` and `kubernetes_logs` sources run their file server directly on the async runtime (no `spawn_blocking` wrapper), freeing one pinned ~2 MB blocking thread per source and making each source promptly cancellable on shutdown. Disabled by default to preserve historical behavior."
 )]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AsyncKubernetesLogsFileServerConfig {
+pub struct AsyncFileServerConfig {
     /// Whether or not the async (non-`spawn_blocking`) file server is enabled.
     enabled: Option<bool>,
 }
 
-impl AsyncKubernetesLogsFileServerConfig {
+impl AsyncFileServerConfig {
     pub const DEFAULT: Self = Self { enabled: None };
 
     #[must_use]
@@ -421,13 +424,13 @@ impl AsyncKubernetesLogsFileServerConfig {
     }
 }
 
-impl From<Option<bool>> for AsyncKubernetesLogsFileServerConfig {
+impl From<Option<bool>> for AsyncFileServerConfig {
     fn from(enabled: Option<bool>) -> Self {
         Self { enabled }
     }
 }
 
-impl From<bool> for AsyncKubernetesLogsFileServerConfig {
+impl From<bool> for AsyncFileServerConfig {
     fn from(enabled: bool) -> Self {
         Some(enabled).into()
     }

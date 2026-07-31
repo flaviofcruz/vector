@@ -48,6 +48,8 @@ mod dnstap;
 mod docker_logs;
 #[cfg(feature = "sinks-doris")]
 mod doris;
+#[cfg(feature = "transforms-dynamic_rls_throttle")]
+mod dynamic_rls_throttle;
 mod encoding_transcode;
 #[cfg(feature = "sources-eventstoredb_metrics")]
 mod eventstoredb_metrics;
@@ -76,6 +78,8 @@ mod http_client_source;
 mod influxdb;
 #[cfg(feature = "sources-internal_logs")]
 mod internal_logs;
+#[cfg(feature = "tikv-jemallocator")]
+mod jemalloc_stats;
 #[cfg(all(unix, feature = "sources-journald"))]
 mod journald;
 #[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]
@@ -215,6 +219,8 @@ pub(crate) use self::dnstap::*;
 pub(crate) use self::docker_logs::*;
 #[cfg(feature = "sinks-doris")]
 pub(crate) use self::doris::*;
+#[cfg(feature = "transforms-dynamic_rls_throttle")]
+pub(crate) use self::dynamic_rls_throttle::*;
 #[cfg(feature = "sources-eventstoredb_metrics")]
 pub(crate) use self::eventstoredb_metrics::*;
 #[cfg(feature = "sources-exec")]
@@ -247,6 +253,8 @@ pub(crate) use self::http_client_source::*;
 pub(crate) use self::influxdb::*;
 #[cfg(feature = "sources-internal_logs")]
 pub(crate) use self::internal_logs::*;
+#[cfg(feature = "tikv-jemallocator")]
+pub use self::jemalloc_stats::*;
 #[cfg(all(unix, feature = "sources-journald"))]
 pub(crate) use self::journald::*;
 #[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]

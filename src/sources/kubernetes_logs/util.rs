@@ -32,7 +32,7 @@ use vector_lib::{
 ///   dedicated blocking thread. That small periodic cost is the reason this path is opt-in; the
 ///   `spawn_blocking` wrapper itself was flagged as unnecessary upstream (vectordotdev/vector#23743).
 ///
-/// Gated on the `async_kubernetes_logs_file_server` global flag so the change is a no-op by default
+/// Gated on the `async_file_server` global flag so the change is a no-op by default
 /// and rampable via config. Errors are unified to `String` for the `KubernetesLifecycleError` log
 /// line: on the legacy path a sink error still becomes a panic surfaced as a `JoinError` (historical
 /// behavior); on the async path the sink error is returned directly.

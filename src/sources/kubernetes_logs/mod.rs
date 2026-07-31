@@ -14,7 +14,7 @@ use futures::{future::FutureExt, stream::StreamExt};
 use futures_util::Stream;
 use http_1::{HeaderName, HeaderValue};
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
-use k8s_paths_provider::K8sPathsProvider;
+use k8s_paths_provider::{AnnotationSelector, K8sPathsProvider};
 use kube::{
     Client, Config as ClientConfig,
     api::Api,
@@ -125,6 +125,19 @@ pub struct Config {
     ))]
     extra_namespace_label_selector: String,
 
+    /// Specifies the annotation selector to filter [Pods][pods] with.
+    ///
+    /// Kubernetes does not support server-side annotation selectors, so this filter is applied
+    /// client-side after Pods have been watched by Vector. The supported syntax mirrors the
+    /// common Kubernetes label selector operators: `=` and `==` for equality, `!=`, `in`,
+    /// lowercase `notin`, key existence, and key non-existence with `!`.
+    ///
+    /// [pods]: https://kubernetes.io/docs/concepts/workloads/pods/
+    #[configurable(metadata(
+        docs::examples = "logDaemonDockerLoggingGroup=docker-common-log-group"
+    ))]
+    extra_annotation_selector: String,
+
     /// Specifies whether or not to enrich logs with namespace fields.
     ///
     /// Setting to `false` prevents Vector from pulling in namespaces and thus namespace label fields will not
@@ -144,20 +157,12 @@ pub struct Config {
     #[serde(default = "default_extract_databricks_logs")]
     extract_databricks_logs: bool,
 
-    /// Specifies whether or not to rely on the HostPath logging-annotation-override directory to
-    /// extract Databricks logs.
+    /// Pod annotation key to read for hostPath-based log directory discovery. The annotation
+    /// value is resolved to `/databricks/host-root/{value}/` and glob patterns are applied
+    /// there. Pods without this annotation are silently skipped for hostPath discovery; the
+    /// emptyDir kubelet log directory is always scraped regardless.
     ///
-    /// If set to `true`, we will assume the Databricks logs are located in the
-    /// HostPath logging-annotation-override directory.
-    /// If set to `false`, we will assume the Databricks logs are located in the
-    /// kubelet log directory.
-    /// Deprecated: use `hostpath_logging_annotation_key` instead.
-    #[serde(default = "default_use_hostpath_logging_annotation_override")]
-    use_hostpath_logging_annotation_override: bool,
-
-    /// When set, specifies the pod annotation key to read for hostPath-based log directory
-    /// discovery. The annotation value is resolved to `/databricks/host-root/{value}/` and
-    /// glob patterns are applied there. Overrides `use_hostpath_logging_annotation_override`.
+    /// Defaults to `logging.databricks.com/dblet-logs-path` when unset.
     /// Examples:
     ///   "logging.databricks.com/dblet-logs-path" — internal/service logs
     ///   "logging.databricks.com/dblet-customer-logs-path" — customer-sensitive logs
@@ -355,6 +360,23 @@ pub struct Config {
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     rotate_wait: Duration,
 
+    /// How long to retain the checkpoint of a reaped (deleted/rotated-away) file
+    /// before it becomes eligible for cleanup.
+    ///
+    /// Kept long enough to bridge the gap between a source file being reaped
+    /// (e.g. `0.log` deleted during rotation) and its compressed successor
+    /// (`*.gz`, which shares the same fingerprint) appearing on disk, so the
+    /// archive resumes from the checkpoint instead of being re-read from the
+    /// beginning. The retained checkpoint's death time is persisted, so cleanup
+    /// still occurs the configured duration after death even across a restart.
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[serde(
+        default = "default_checkpoint_dead_retention",
+        rename = "checkpoint_dead_retention_secs"
+    )]
+    checkpoint_dead_retention: Duration,
+
     /// Only read files if their last modification timestamp is later than the specified absolute unix timestamp.
     /// If not set, all files matching the include patterns will be read.
     #[serde(default, deserialize_with = "deserialize_iso8601_timestamp")]
@@ -462,9 +484,9 @@ impl Default for Config {
         Self {
             extra_label_selector: "".to_string(),
             extra_namespace_label_selector: "".to_string(),
+            extra_annotation_selector: "".to_string(),
             insert_namespace_fields: true,
             extract_databricks_logs: false,
-            use_hostpath_logging_annotation_override: false,
             hostpath_logging_annotation_key: None,
             ttl_removal_config: None,
             self_node_name: default_self_node_name_env_template(),
@@ -494,6 +516,7 @@ impl Default for Config {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            checkpoint_dead_retention: default_checkpoint_dead_retention(),
             start_reading_at: None,
             source_context: None,
             multiline: None,
@@ -765,6 +788,7 @@ struct Source {
     node_field_spec: node_metadata_annotator::FieldsSpec,
     insert_namespace_fields: bool,
     extract_databricks_logs: bool,
+    annotation_selector: AnnotationSelector,
     hostpath_logging_annotation_key: Option<String>,
     ttl_removal_config: Option<TTLRemovalConfig>,
     self_node_name: String,
@@ -782,6 +806,7 @@ struct Source {
     ingestion_timestamp_field: Option<OwnedTargetPath>,
     include_file_metric_tag: bool,
     rotate_wait: Duration,
+    checkpoint_dead_retention: Duration,
     file_to_pod_map: Arc<Mutex<HashMap<PathBuf, LogFileInfo>>>,
     start_reading_at: Option<DateTime<Utc>>,
     source_context: Option<HashMap<String, String>>,
@@ -793,8 +818,8 @@ struct Source {
     encoding: Option<EncodingConfig>,
     archive_extensions: Vec<String>,
     /// When true, run the file server directly on the async runtime (cancellable) instead of the
-    /// legacy `spawn_blocking` wrapper. Sourced from the `async_kubernetes_logs_file_server` global
-    /// flag; default off.
+    /// legacy `spawn_blocking` wrapper. Sourced from the `async_file_server` global flag; default
+    /// off.
     async_file_server: bool,
 }
 
@@ -833,6 +858,8 @@ impl Source {
         let label_selector = prepare_label_selector(config.extra_label_selector.as_ref());
         let namespace_label_selector =
             prepare_label_selector(config.extra_namespace_label_selector.as_ref());
+        let annotation_selector =
+            AnnotationSelector::parse(config.extra_annotation_selector.as_ref())?;
         let node_selector = prepare_node_selector(self_node_name.as_str())?;
 
         let delay_deletion = config.delay_deletion_ms;
@@ -1031,17 +1058,15 @@ impl Source {
             node_field_spec: config.node_annotation_fields.clone(),
             insert_namespace_fields,
             extract_databricks_logs: config.extract_databricks_logs,
-            // New field takes precedence; fall back to legacy boolean for backwards compat.
+            annotation_selector,
+            // Always default to the dblet-logs-path annotation when no key is explicitly
+            // configured. Pods without the annotation are silently skipped for hostPath
+            // discovery in `get_databricks_pod_logs_directories`, so the emptyDir scrape
+            // path is unchanged.
             hostpath_logging_annotation_key: config
                 .hostpath_logging_annotation_key
                 .clone()
-                .or_else(|| {
-                    if config.use_hostpath_logging_annotation_override {
-                        Some("logging.databricks.com/dblet-logs-path".to_string())
-                    } else {
-                        None
-                    }
-                }),
+                .or_else(|| Some("logging.databricks.com/dblet-logs-path".to_string())),
             ttl_removal_config: config.ttl_removal_config.clone(),
             self_node_name,
             pod_logs_glob_patterns,
@@ -1058,6 +1083,7 @@ impl Source {
             ingestion_timestamp_field,
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
+            checkpoint_dead_retention: config.checkpoint_dead_retention,
             file_to_pod_map: Arc::new(Mutex::new(HashMap::new())),
             start_reading_at: parse_start_reading_at(config.start_reading_at.clone()),
             source_context: config.source_context.clone(),
@@ -1068,7 +1094,7 @@ impl Source {
             line_delimiter: config.line_delimiter.clone(),
             encoding: config.encoding.clone(),
             archive_extensions: config.archive_extensions.clone(),
-            async_file_server: globals.async_kubernetes_logs_file_server.enabled(),
+            async_file_server: globals.async_file_server.enabled(),
         })
     }
 
@@ -1091,6 +1117,7 @@ impl Source {
             node_field_spec,
             insert_namespace_fields,
             extract_databricks_logs,
+            annotation_selector,
             hostpath_logging_annotation_key,
             ttl_removal_config,
             self_node_name,
@@ -1108,6 +1135,7 @@ impl Source {
             ingestion_timestamp_field,
             include_file_metric_tag,
             rotate_wait,
+            checkpoint_dead_retention,
             file_to_pod_map,
             start_reading_at,
             ref source_context,
@@ -1134,6 +1162,7 @@ impl Source {
         let paths_provider = K8sPathsProvider::new(
             pod_state.clone(),
             ns_state.clone(),
+            annotation_selector,
             pod_logs_glob_patterns,
             include_paths,
             exclude_paths,
@@ -1168,7 +1197,10 @@ impl Source {
 
         // TODO: maybe more of the parameters have to be configurable.
 
-        let checkpointer = Checkpointer::new(&data_dir);
+        let checkpointer = Checkpointer::new(&data_dir).with_dead_retention(
+            chrono::Duration::from_std(checkpoint_dead_retention)
+                .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX)),
+        );
         let file_to_pod_map_ref = Arc::clone(&file_to_pod_map);
         let file_server = FileServer {
             // Use our special paths provider.
@@ -1232,6 +1264,7 @@ impl Source {
             drain_on_shutdown,
             archive_extensions,
             source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
+            read_loop_min_backoff: 1,
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
@@ -1422,6 +1455,9 @@ fn create_event(
     log_namespace: LogNamespace,
     source_context: &Option<HashMap<String, String>>,
 ) -> Event {
+    // Raw read byte count, captured before `line` is moved into the deserializer.
+    let message_bytes = line.len();
+
     let deserializer = BytesDeserializer;
     let mut log = deserializer.parse_single(line, log_namespace);
 
@@ -1475,10 +1511,11 @@ fn create_event(
 
     // Post-multiline read spot (gated on EMIT_READ_EVENT_AFTER_MULTILINE_AGG).
     // The `delivery_events_total` counter fires immediately; only the VEL
-    // `info!` log is batched through the singleton.
+    // `info!` log is batched through the singleton. Reports the raw read byte
+    // count rather than the in-memory estimated_json_encoded_size_of() estimate.
     delivery_singleton().accumulate_read(
         file.to_string(),
-        log.estimated_json_encoded_size_of().get(),
+        message_bytes,
         1,
         source_context,
         vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
@@ -1489,6 +1526,10 @@ fn create_event(
     // Carry the discovery-time bucket downstream for the woodchuck VRL wrappers to
     // copy into logMetadata.timeParity (see file.rs for the rationale).
     log.insert("time_parity", time_parity);
+
+    // Surface the raw read byte count under `source_context` so it lives with the
+    // other fields that must be preserved across transforms.
+    log.insert("source_context.bytes", message_bytes as i64);
 
     log.into()
 }
@@ -1532,10 +1573,6 @@ const fn default_extract_databricks_logs() -> bool {
     false
 }
 
-const fn default_use_hostpath_logging_annotation_override() -> bool {
-    false
-}
-
 const fn default_max_line_bytes() -> usize {
     // NOTE: The below comment documents an incorrect assumption, see
     // https://github.com/vectordotdev/vector/issues/6967
@@ -1563,6 +1600,12 @@ const fn default_delay_deletion_ms() -> Duration {
 
 const fn default_rotate_wait() -> Duration {
     Duration::from_secs(u64::MAX / 2)
+}
+
+const fn default_checkpoint_dead_retention() -> Duration {
+    // 60s preserves the historical hardcoded retention (status quo). Raise via
+    // `checkpoint_dead_retention_secs` to bridge longer rotation-to-`.gz` gaps.
+    Duration::from_secs(60)
 }
 
 const fn default_drain_on_shutdown() -> bool {
@@ -1693,6 +1736,21 @@ mod tests {
         let default_toml = "";
         let default_config: Config = toml::from_str(default_toml).unwrap();
         assert_eq!(default_config.insert_namespace_fields, true);
+    }
+
+    #[test]
+    fn test_config_serialization_extra_annotation_selector() {
+        let toml_config = r#"
+            extra_annotation_selector = "logDaemonDockerLoggingGroup=docker-common-log-group"
+        "#;
+        let config: Config = toml::from_str(toml_config).unwrap();
+        assert_eq!(
+            config.extra_annotation_selector,
+            "logDaemonDockerLoggingGroup=docker-common-log-group"
+        );
+
+        let default_config: Config = toml::from_str("").unwrap();
+        assert_eq!(default_config.extra_annotation_selector, "");
     }
 
     #[test]

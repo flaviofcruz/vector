@@ -5,12 +5,17 @@ use std::collections::HashMap;
 use std::env;
 use std::ops::Add;
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, LazyLock, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tracing::Span;
+
+// Cumulative delivery counters survive config reloads but reset with the process. Keep this value
+// process-wide so remote consumers can distinguish real resets without splitting on config reload.
+static PROCESS_GENERATION_ID: LazyLock<String> =
+    LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
 // Sentinel emitted when a Lumberjack source's topic cannot be resolved from
 // either the source context or the filename. The spelling — including the
@@ -351,8 +356,20 @@ impl DeliveryEventSingleton {
             "time_parity" => time_parity.to_string(),
             "delivery_method" => delivery_method_for_source_type(source_type),
             "topic" => resolve_received_topic(ctx, &path, source_type),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
         )
         .increment(lines_read as u64);
+
+        // Byte-count sibling of `delivery_events_total` with identical labels.
+        counter!(
+            "delivery_event_bytes_total",
+            "delivery_event_type" => "VECTOR_SOURCE_READ",
+            "time_parity" => time_parity.to_string(),
+            "delivery_method" => delivery_method_for_source_type(source_type),
+            "topic" => resolve_received_topic(ctx, &path, source_type),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
+        )
+        .increment(bytes_read as u64);
 
         // Inline mode (default): emit the VEL log immediately in the current
         // source span, one per read — the original pre-singleton behavior. No
@@ -572,6 +589,7 @@ fn emit_sink_delivery_counters<'a>(
             "time_parity" => time_parity_from_value_map(&value.value_map),
             "topic" => topic_from_value_map(&value.value_map),
             "delivery_method" => delivery_method_from_value_map(&value.value_map),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
         )
         .increment(value.count as u64);
     }
@@ -653,14 +671,39 @@ pub fn combine_sink_delivery_events(
 impl Add<VectorSinkDeliveryEvent> for VectorSinkDeliveryEvent {
     type Output = VectorSinkDeliveryEvent;
 
-    fn add(self, other: VectorSinkDeliveryEvent) -> Self::Output {
-        combine_sink_delivery_events(vec![self, other])
+    fn add(mut self, other: VectorSinkDeliveryEvent) -> Self::Output {
+        self.merge(other);
+        self
+    }
+}
+
+impl VectorSinkDeliveryEvent {
+    /// Merge another event's count_map into self in-place, avoiding O(N²) cloning.
+    pub fn merge(&mut self, other: VectorSinkDeliveryEvent) {
+        for (key, value) in other.count_map {
+            self.count_map
+                .entry(key)
+                .and_modify(|existing| {
+                    existing.count += value.count;
+                    existing.size += value.size;
+                })
+                .or_insert(value);
+        }
     }
 }
 
 #[cfg(test)]
 mod topic_inference_tests {
     use super::*;
+
+    #[test]
+    fn process_generation_id_is_stable_and_valid() {
+        let first = PROCESS_GENERATION_ID.as_str();
+        let second = PROCESS_GENERATION_ID.as_str();
+
+        assert_eq!(first, second);
+        assert!(uuid::Uuid::parse_str(first).is_ok());
+    }
 
     #[test]
     fn camel_to_dash_case_basic() {

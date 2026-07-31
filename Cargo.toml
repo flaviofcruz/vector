@@ -135,6 +135,7 @@ members = [
   "lib/vector-vrl/tests",
   "lib/vector-vrl/web-playground",
   "lib/vector-vrl-metrics",
+  "lib/vector-redaction-executor",
   "vdev",
 ]
 
@@ -212,6 +213,7 @@ vector-config-macros = { path = "lib/vector-config-macros" }
 vector-common-macros = { path = "lib/vector-common-macros" }
 vector-lib = { path = "lib/vector-lib", default-features = false, features = ["vrl"] }
 vector-vrl-functions = { path = "lib/vector-vrl/functions" }
+vector-redaction-executor = { path = "lib/vector-redaction-executor" }
 vrl = { path = "../vrl", features = ["arbitrary", "cli", "test", "test_framework"] }
 mock_instant = { version = "0.6" }
 serial_test = { version = "3.2" }
@@ -244,7 +246,7 @@ vector-config-macros.workspace = true
 vector-vrl-functions = { workspace = true, features = ["vrl-metrics"] }
 vector-vrl-metrics = { path = "lib/vector-vrl-metrics" }
 loki-logproto = { path = "lib/loki-logproto", optional = true }
-databricks-zerobus-ingest-sdk = { git = "https://github.com/databricks/zerobus-sdk-rs", version = "2.0.1", optional = true }
+databricks-zerobus-ingest-sdk = { version = "2.5.0", optional = true, features = ["arrow-flight"] }
 
 # Tokio / Futures
 async-stream.workspace = true
@@ -358,8 +360,8 @@ greptimedb-ingester = { git = "https://github.com/GreptimeTeam/greptimedb-ingest
 arc-swap = { workspace = true, default-features = false, optional = true }
 async-compression = { version = "0.4.27", default-features = false, features = ["tokio", "gzip", "zstd"], optional = true }
 apache-avro = { version = "0.16.0", default-features = false, optional = true }
-arrow = { version = "58.2.0", default-features = false, features = ["ipc", "json"], optional = true }
-arrow-schema = { version = "58.2.0", default-features = false, optional = true }
+arrow = { version = "59.1.0", default-features = false, features = ["ipc", "json"], optional = true }
+arrow-schema = { version = "59.1.0", default-features = false, optional = true }
 axum = { version = "0.6.20", default-features = false }
 base64 = { workspace = true, optional = true }
 bloomy = { version = "1.2.0", default-features = false, optional = true }
@@ -404,6 +406,7 @@ itertools.workspace = true
 k8s-openapi = { version = "0.22.0", default-features = false, features = ["v1_26"], optional = true }
 kube = { version = "0.93.0", default-features = false, features = ["client", "openssl-tls", "runtime"], optional = true }
 listenfd = { version = "1.0.2", default-features = false, optional = true }
+libc.workspace = true
 lru = { version = "0.16.3", default-features = false }
 maxminddb = { version = "0.27.0", default-features = false, optional = true, features = ["simdutf8"] }
 md-5 = { version = "0.10", default-features = false, optional = true }
@@ -437,7 +440,8 @@ sqlx = { version = "0.8.6", default-features = false, features = ["derive", "pos
 stream-cancel = { version = "0.8.2", default-features = false }
 strip-ansi-escapes = { version = "0.2.1", default-features = false }
 syslog = { version = "6.1.1", default-features = false, optional = true }
-tikv-jemallocator = { version = "0.6.0", default-features = false, features = ["unprefixed_malloc_on_supported_platforms", "profiling"], optional = true }
+tikv-jemallocator = { version = "0.7.0", default-features = false, features = ["unprefixed_malloc_on_supported_platforms", "profiling", "stats", "background_threads_runtime_support"], optional = true }
+tikv-jemalloc-ctl = { version = "0.7.0", default-features = false, features = ["stats", "use_std"], optional = true }
 tokio-postgres = { version = "0.7.13", default-features = false, features = ["runtime", "with-chrono-0_4"], optional = true }
 tokio-tungstenite = { version = "0.20.1", default-features = false, features = ["connect"], optional = true }
 toml.workspace = true
@@ -549,7 +553,7 @@ target-x86_64-unknown-linux-gnu = ["api", "api-client", "rdkafka?/cmake_build", 
 target-x86_64-unknown-linux-musl = ["api", "api-client", "rdkafka?/cmake_build", "enrichment-tables", "sinks", "sources", "sources-dnstap", "transforms", "unix", "secrets"]
 
 # Enables features that work only on systems providing `cfg(unix)`
-unix = ["tikv-jemallocator", "allocation-tracing"]
+unix = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 allocation-tracing = ["vector-lib/allocation-tracing"]
 
 # Enables kubernetes dependencies and shared code. Kubernetes-related sources,
@@ -599,13 +603,14 @@ protobuf-build = ["dep:tonic-build", "dep:prost-build"]
 gcp = ["dep:base64", "dep:goauth", "dep:smpl_jwt"]
 
 # Enrichment Tables
-enrichment-tables = ["enrichment-tables-geoip", "enrichment-tables-mmdb", "enrichment-tables-memory"]
+enrichment-tables = ["enrichment-tables-geoip", "enrichment-tables-mmdb", "enrichment-tables-memory", "enrichment-tables-http"]
 enrichment-tables-geoip = ["dep:maxminddb"]
 enrichment-tables-mmdb = ["dep:maxminddb"]
 enrichment-tables-memory = ["dep:evmap", "dep:evmap-derive", "dep:thread_local"]
+enrichment-tables-http = ["dep:arc-swap"]
 
 # Codecs
-codecs-arrow = ["dep:arrow", "dep:arrow-schema", "vector-lib/arrow", "databricks-zerobus-ingest-sdk?/arrow-flight"]
+codecs-arrow = ["dep:arrow", "dep:arrow-schema", "vector-lib/arrow"]
 codecs-opentelemetry = ["vector-lib/opentelemetry"]
 codecs-syslog = ["vector-lib/syslog"]
 
@@ -746,7 +751,9 @@ sources-vector = ["dep:prost", "dep:tonic", "protobuf-build"]
 transforms = ["transforms-logs", "transforms-metrics"]
 transforms-logs = [
   "transforms-aws_ec2_metadata",
+  "transforms-bricklens_config_enricher",
   "transforms-dedupe",
+  "transforms-dynamic_rls_throttle",
   "transforms-filter",
   "transforms-window",
   "transforms-log_to_metric",
@@ -778,7 +785,9 @@ transforms-metrics = [
 
 transforms-aggregate = []
 transforms-aws_ec2_metadata = ["dep:arc-swap"]
+transforms-bricklens_config_enricher = ["dep:prost-reflect", "dep:prost"]
 transforms-dedupe = ["transforms-impl-dedupe"]
+transforms-dynamic_rls_throttle = ["dep:arc-swap", "dep:prost-reflect", "dep:prost"]
 transforms-filter = []
 transforms-incremental_to_absolute = []
 transforms-window = []
@@ -932,7 +941,7 @@ sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost"]
 sinks-websocket = ["dep:tokio-tungstenite"]
 sinks-websocket-server = ["dep:tokio-tungstenite", "sources-utils-http-auth", "sources-utils-http-error", "sources-utils-http-prelude"]
 sinks-webhdfs = ["dep:opendal"]
-sinks-databricks-zerobus = ["dep:databricks-zerobus-ingest-sdk", "codecs-arrow"]
+sinks-databricks-zerobus = ["dep:databricks-zerobus-ingest-sdk", "codecs-arrow", "arrow/ipc_compression", "dep:base64", "dep:prost", "dep:prost-reflect"]
 
 # Identifies that the build is a nightly build
 nightly = []

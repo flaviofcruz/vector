@@ -81,18 +81,18 @@ impl RequestBuilder<Vec<Event>> for BricklensIngestRequestBuilder {
             });
         let metadata_builder = RequestMetadataBuilder::from_events(&input);
 
-        // Clone events to preserve them for build_request() where they're encoded to protobuf.
-        // The RequestBuilder trait requires splitting input into metadata and events, but we
-        // need the original Event objects for dynamic protobuf encoding via prost-reflect
-        // rather than working with the pre-encoded payload.
-        let events_clone = input.clone();
-
+        // Encoding to protobuf happens in the service layer (via prost-reflect) from the events
+        // carried in metadata, NOT from the RequestBuilder payload. Move the batch into metadata
+        // and hand the builder an empty event list: the (unused) payload encoder then does no real
+        // work and we avoid cloning the entire batch on every request. `build_request` ignores the
+        // payload, and the request metadata's event count / estimated size already came from
+        // `from_events(&input)` above.
         let metadata = BricklensIngestMetadata {
             finalizers,
-            events: events_clone,
+            events: input,
         };
 
-        (metadata, metadata_builder, input)
+        (metadata, metadata_builder, Vec::new())
     }
 
     fn build_request(
@@ -108,5 +108,69 @@ impl RequestBuilder<Vec<Event>> for BricklensIngestRequestBuilder {
             metadata: request_metadata,
             finalizers: metadata.finalizers,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vector_lib::codecs::encoding::{
+        Framer, FramingConfig, JsonSerializerConfig, SerializerConfig,
+    };
+    use vector_lib::event::{Event, LogEvent};
+
+    use crate::codecs::{Encoder, Transformer};
+    use crate::sinks::util::{Compression, RequestBuilder};
+
+    use super::BricklensIngestRequestBuilder;
+
+    fn make_builder() -> BricklensIngestRequestBuilder {
+        let serializer = SerializerConfig::Json(JsonSerializerConfig::default())
+            .build()
+            .expect("serializer");
+        let framer = FramingConfig::NewlineDelimited.build();
+        let encoder = (
+            Transformer::default(),
+            Encoder::<Framer>::new(framer, serializer),
+        );
+        BricklensIngestRequestBuilder::new(Compression::None, encoder)
+    }
+
+    fn log_event(message: &str) -> Event {
+        let mut log = LogEvent::default();
+        log.insert("message", message);
+        Event::Log(log)
+    }
+
+    #[test]
+    fn split_input_skips_payload_encode_and_preserves_events() {
+        let builder = make_builder();
+        let (metadata, _meta_builder, events) =
+            builder.split_input(vec![log_event("a"), log_event("b"), log_event("c")]);
+
+        // The events handed to the (unused) RequestBuilder payload encoder must be empty so the
+        // batch is not needlessly re-encoded; the real events are carried in metadata for the
+        // service layer to protobuf-encode.
+        assert!(
+            events.is_empty(),
+            "split_input must return an empty event list for the payload encoder"
+        );
+        assert_eq!(metadata.events.len(), 3, "all events must be kept in metadata");
+    }
+
+    #[test]
+    fn build_request_carries_all_events_through_empty_payload() {
+        let builder = make_builder();
+        let (metadata, meta_builder, events) =
+            builder.split_input(vec![log_event("a"), log_event("b")]);
+
+        // Encoding the empty event list must succeed (and produce an empty payload)...
+        let payload = builder
+            .encode_events(events)
+            .expect("encoding an empty event list should succeed");
+        let request_metadata = meta_builder.build(&payload);
+
+        // ...and the built request must still carry every original event.
+        let request = builder.build_request(metadata, request_metadata, payload);
+        assert_eq!(request.events.len(), 2);
     }
 }

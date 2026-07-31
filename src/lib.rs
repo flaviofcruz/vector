@@ -77,6 +77,9 @@ pub mod aws;
 pub mod common;
 pub mod completion;
 mod convert_config;
+pub mod cpu_time;
+#[cfg(feature = "sinks-databricks-zerobus")]
+pub mod databricks_auth;
 pub mod encoding_transcode;
 pub mod enrichment_tables;
 pub mod extra_context;
@@ -85,6 +88,8 @@ pub mod gcp;
 pub(crate) mod graph;
 pub mod heartbeat;
 pub mod http;
+#[cfg(feature = "tikv-jemallocator")]
+pub mod jemalloc_stats;
 #[allow(unreachable_pub)]
 #[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]
 pub mod kafka;

@@ -238,6 +238,21 @@ fn caps_and_resets_eof_backoff() {
     assert!(!watcher.reached_eof());
 }
 
+// read_line no longer decides watcher death: reaching EOF while not findable
+// must NOT reap the watcher (the run-loop owns that decision). This keeps a
+// non-archive alive for the rotate_wait handoff to its rotated `.gz`.
+#[tokio::test]
+async fn read_line_does_not_reap_on_eof_when_not_findable() {
+    let mut watcher = watcher_for_timing();
+    watcher.set_file_findable(false);
+
+    // null_reader is already at EOF -> read_line hits the not-findable EOF branch.
+    let _ = watcher.read_line().await.unwrap();
+
+    assert!(!watcher.dead(), "read_line must not reap the watcher");
+    assert!(watcher.reached_eof());
+}
+
 #[inline]
 pub fn delay(attempts: u32) {
     let delay = match attempts {

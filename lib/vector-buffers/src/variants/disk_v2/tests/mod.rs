@@ -190,6 +190,46 @@ macro_rules! set_data_file_length {
     }};
 }
 
+/// Creates a standalone [`Ledger`] in a temp directory, for tests that drive a bare
+/// [`RecordReader`]/[`RecordWriter`] over an in-memory stream and just need a ledger to satisfy
+/// `try_next_record`'s signature (they never exercise the writer-wait path).
+pub(crate) async fn create_standalone_ledger() -> Ledger<FilesystemUnderTest> {
+    let dir = temp_dir::TempDir::with_prefix("vector-buffers").expect("cannot create temp dir");
+    let config = DiskBufferConfigBuilder::from_path(dir.path())
+        .build()
+        .expect("creating buffer config should not fail");
+    let ledger = Ledger::load_or_create(config, BufferUsageHandle::noop())
+        .await
+        .expect("should not fail to create ledger");
+    // Keep the temp dir alive for the ledger's lifetime; the OS reclaims it at process exit.
+    dir.leak();
+    ledger
+}
+
+/// Like [`create_default_buffer_v2`] but returns the `Result` instead of unwrapping it, so tests
+/// can distinguish "init errored" from "init hung" (the latter shows up as a timeout at the call
+/// site rather than a panic here).
+#[allow(clippy::type_complexity)]
+pub(crate) async fn try_create_default_buffer_v2<P, R>(
+    data_dir: P,
+) -> Result<
+    (
+        BufferWriter<R, FilesystemUnderTest>,
+        BufferReader<R, FilesystemUnderTest>,
+        Arc<Ledger<FilesystemUnderTest>>,
+    ),
+    crate::variants::disk_v2::BufferError<R>,
+>
+where
+    P: AsRef<Path>,
+    R: Bufferable,
+{
+    let config = DiskBufferConfigBuilder::from_path(data_dir)
+        .build()
+        .expect("creating buffer should not fail");
+    Buffer::from_config_inner(config, BufferUsageHandle::noop()).await
+}
+
 /// Creates a disk v2 buffer with all default values i.e. maximum buffer size, etc.
 pub(crate) async fn create_default_buffer_v2<P, R>(
     data_dir: P,

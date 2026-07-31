@@ -1,5 +1,5 @@
 use chrono::Utc;
-use futures::{FutureExt, StreamExt, stream};
+use futures::{StreamExt, stream};
 use vector_lib::{
     codecs::BytesDeserializerConfig,
     config::{LegacyKey, LogNamespace, log_schema},
@@ -17,6 +17,10 @@ use crate::{
     shutdown::ShutdownSignal,
     trace::TraceSubscription,
 };
+
+/// Idle window the shutdown drain waits for a late event before concluding it is
+/// done. Small relative to the wave-2 shutdown budget, so it does not slow shutdown.
+const DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Configuration for the `internal_logs` source.
 #[configurable_component(source(
@@ -164,15 +168,20 @@ async fn run(
     // any logs that don't break the loop, as that could cause an
     // infinite loop since it receives all such logs.
     //
-    // After `shutdown` fires, drain events already buffered in the
-    // broadcast channel before exiting. Plain `take_until(shutdown)`
-    // would drop them — that's how `VECTOR_PROCESS_COMPONENTS_CLOSED`
-    // was being lost: it's emitted microseconds before wave 2 cancels
-    // this source, with no `.await` between the `info!` and the cancel,
-    // so this loop has to pick the event up after shutdown resolves.
+    // After `shutdown` fires, drain remaining events before exiting so
+    // `VECTOR_PROCESS_COMPONENTS_CLOSED` isn't lost: it's emitted right before
+    // wave 2 cancels this source, and reaches `rx` asynchronously (`info!` ->
+    // tracing layer -> broadcast channel), so it can arrive just after the drain
+    // begins. Await late arrivals with a short idle timeout rather than a single
+    // non-blocking poll, which would exit the instant the channel is momentarily
+    // empty and drop the event.
     loop {
         let next = if draining {
-            rx.next().now_or_never().flatten()
+            match tokio::time::timeout(DRAIN_IDLE_TIMEOUT, rx.next()).await {
+                Ok(item) => item,
+                // Idle for the whole window: drain complete.
+                Err(_) => break,
+            }
         } else {
             tokio::select! {
                 item = rx.next() => item,
@@ -409,6 +418,43 @@ mod tests {
             5,
             "expected all 5 buffered events to be drained on shutdown, got {}",
             drain_events.len(),
+        );
+    }
+
+    /// The drain must catch an event that arrives *after* shutdown resolves and the
+    /// drain has begun (the `VECTOR_PROCESS_COMPONENTS_CLOSED` race), not only events
+    /// already buffered when shutdown fires. Emit the event after awaiting shutdown so
+    /// the drain loop is already polling an empty channel.
+    #[tokio::test]
+    #[serial]
+    async fn drains_event_arriving_after_shutdown_begins() {
+        trace::init(false, false, "error", 10);
+        trace::reset_early_buffer();
+
+        let (tx, rx) = SourceSender::new_test();
+        let key = ComponentKey::from("internal_logs_late_drain_test");
+        let (cx, coordinator) = SourceContext::new_shutdown(&key, tx);
+        let source = InternalLogsConfig::default().build(cx).await.unwrap();
+        tokio::spawn(source);
+        sleep(Duration::from_millis(1)).await;
+        trace::stop_early_buffering();
+
+        coordinator.shutdown_all(None).await;
+        sleep(Duration::from_millis(1)).await;
+        error!(late_drain_id = 1, "event after shutdown begins");
+
+        // Let the drain forward the late event before its idle timeout fires.
+        sleep(Duration::from_millis(50)).await;
+        let events = collect_ready(rx).await;
+        let late_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.as_log().get("late_drain_id").is_some())
+            .collect();
+        assert_eq!(
+            late_events.len(),
+            1,
+            "expected the post-shutdown event to be drained, got {}",
+            late_events.len(),
         );
     }
 

@@ -313,11 +313,19 @@ where
     ///
     /// Errors can occur during the I/O or deserialization stage.  If an error occurs during any of
     /// these stages, an appropriate error variant will be returned describing the error.
-    #[cfg_attr(test, instrument(skip(self), level = "trace"))]
-    pub async fn try_next_record(
+    #[cfg_attr(test, instrument(skip(self, ledger), level = "trace"))]
+    pub async fn try_next_record<FS: Filesystem>(
         &mut self,
-        is_finalized: bool,
+        ready_to_read: bool,
+        ledger: &Ledger<FS>,
     ) -> Result<Option<ReadToken>, ReaderError<T>> {
+        // The reader's file id does not change for the duration of a single `try_next_record` (only
+        // a roll -- which happens in the caller, between calls -- advances it), so capture it once.
+        // The writer's file id CAN advance underneath us (the writer rolls to a new file), so that
+        // is re-read below.
+        let reader_file_id = ledger.get_current_reader_file_id();
+        let is_finalized =
+            (reader_file_id != ledger.get_current_writer_file_id()) || !ready_to_read;
         let Some(record_len) = self.read_length_delimiter(is_finalized).await? else {
             return Ok(None);
         };
@@ -333,10 +341,23 @@ where
         while self.aligned_buf.len() < record_len {
             let needed = record_len - self.aligned_buf.len();
             let buf = self.reader.fill_buf().await.context(IoSnafu)?;
-            if buf.is_empty() && is_finalized {
-                // If we needed more data, but there was none available, and we're finalized: we've
-                // got ourselves a partial write situation.
-                return Err(ReaderError::PartialWrite);
+            if buf.is_empty() {
+                // We have a length delimiter but the full payload is not (yet) on disk. Re-read the
+                // WRITER's file id FRESH here -- after the empty read, so we never discard payload
+                // bytes the writer may have completed-then-rolled. If the writer has moved on
+                // (reader/writer file ids differ) or we are still initializing (`!ready_to_read`),
+                // the tail is a confirmed partial write.
+                if reader_file_id != ledger.get_current_writer_file_id() || !ready_to_read {
+                    return Err(ReaderError::PartialWrite);
+                }
+
+                // Otherwise the writer is still on this file and may be mid-write: park on the
+                // writer notification (cancellable, zero CPU) instead of busy-spinning on
+                // `fill_buf`, preserving the payload bytes already accumulated in `aligned_buf`. On
+                // wake we loop back, re-read the current file, and re-check the writer file id -- so
+                // a subsequent writer roll is observed and turned into the `PartialWrite` above.
+                ledger.wait_for_writer().await;
+                continue;
             }
 
             let available = cmp::min(buf.len(), needed);
@@ -787,8 +808,16 @@ where
                 Err(e) => match e.kind() {
                     ErrorKind::NotFound => {
                         // reader is either waiting for writer to create the file which can be current writer_file_id or next writer_file_id (if writer has marked for skip)
-                        if reader_file_id == writer_file_id
-                            || reader_file_id == self.ledger.get_next_writer_file_id()
+                        //
+                        // We only wait once we're past initialization (`ready_to_read`). During
+                        // `seek_to_next_record`, `from_config_inner` has not yet returned the writer
+                        // handle, so no write can ever arrive to create the awaited file -- waiting
+                        // here would deadlock initialization. Instead we skip the missing file
+                        // forward; the reader converges to the writer's current file, which is
+                        // always created during writer init, so seek can complete.
+                        if self.ready_to_read
+                            && (reader_file_id == writer_file_id
+                                || reader_file_id == self.ledger.get_next_writer_file_id())
                         {
                             debug!(
                                 data_file_path = data_file_path.to_string_lossy().as_ref(),
@@ -860,8 +889,12 @@ where
         //
         // Once the reader/writer file IDs are identical, we fall back to the slow path.
         while self.ledger.get_current_reader_file_id() != self.ledger.get_current_writer_file_id() {
-            let data_file_path = self.ledger.get_current_reader_data_file_path();
             self.ensure_ready_for_read().await.context(IoSnafu)?;
+            // Fetch the data file path AFTER `ensure_ready_for_read`: when a data file is missing
+            // during init it skips the reader forward to the next file id, so the path must be read
+            // post-skip to open the file the reader actually landed on (reading it before the skip
+            // would try to mmap the already-skipped, nonexistent file).
+            let data_file_path = self.ledger.get_current_reader_data_file_path();
             let data_file_mmap = self
                 .ledger
                 .filesystem()
@@ -1016,27 +1049,23 @@ where
 
             self.ensure_ready_for_read().await.context(IoSnafu)?;
 
+            let (reader_file_id, writer_file_id) = self.ledger.get_current_reader_writer_file_id();
+
+            let ready_to_read = self.ready_to_read;
+            let ledger = &self.ledger;
             let reader = self
                 .reader
                 .as_mut()
                 .expect("reader should exist after `ensure_ready_for_read`");
 
-            let (reader_file_id, writer_file_id) = self.ledger.get_current_reader_writer_file_id();
-
-            // Essentially: is the writer still writing to this data file or not, and are we
-            // actually ready to read (aka initialized)?
-            //
-            // This is a necessary invariant to understand if the record reader should actually keep
-            // waiting for data, or if a data file had a partial write/missing data and should be
-            // skipped. In particular, not only does this matter for deadlocking during shutdown due
-            // to improper writer behavior/flushing, but it also matters during initialization in
-            // case where the current data file had a partial write.
-            let is_finalized = (reader_file_id != writer_file_id) || !self.ready_to_read;
-
             // Try reading a record, which if successful, gives us a token to actually read/get a
             // reference to the record.  This is a slightly-tricky song-and-dance due to rustc not
             // yet fully understanding mutable borrows when conditional control flow is involved.
-            match reader.try_next_record(is_finalized).await {
+            //
+            // `try_next_record` recomputes the "finalized" state (reader/writer file ids vs.
+            // `ready_to_read`) internally so that if it has to wait mid-record for the rest of a
+            // payload, it can observe a subsequent writer roll rather than spinning on a stale value.
+            match reader.try_next_record(ready_to_read, ledger).await {
                 // Not even enough data to read a length delimiter, so we need to wait for the
                 // writer to signal us that there's some actual data to read.
                 Ok(None) => {}

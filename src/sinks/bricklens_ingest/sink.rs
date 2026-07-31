@@ -1,17 +1,19 @@
 use futures::{StreamExt, stream::BoxStream};
 use prost_reflect::{DescriptorPool, prost::Message};
+use tower::ServiceBuilder;
 use vector_lib::stream::BatcherSettings;
 
 use crate::{
     codecs::{Encoder, Transformer},
     config::SinkContext,
     event::Event,
-    sinks::util::{Compression, StreamSink, builder::SinkBuilderExt},
+    sinks::util::{Compression, ServiceBuilderExt, StreamSink, builder::SinkBuilderExt},
 };
 
 use super::{
-    config::BricklensIngestConfig, request_builder::BricklensIngestRequestBuilder,
-    service::BricklensIngestService,
+    config::BricklensIngestConfig,
+    request_builder::BricklensIngestRequestBuilder,
+    service::{BricklensIngestService, BricklensRetryLogic},
 };
 
 pub struct BricklensIngestSink {
@@ -48,6 +50,10 @@ impl BricklensIngestSink {
         // Build HTTP client with TLS configuration
         let mut http_connector = hyper::client::HttpConnector::new();
         http_connector.enforce_http(false);
+        // Bound the TCP connect so a black-holed SYN (LB scaling, conntrack eviction) fails fast
+        // and is retried, rather than stalling on the OS default until the Tower request timeout
+        // consumes the whole retry budget on a single attempt.
+        http_connector.set_connect_timeout(Some(std::time::Duration::from_secs(5)));
 
         // Read TLS configuration
         let verify_cert = config
@@ -84,9 +90,18 @@ impl BricklensIngestSink {
         // Load client certificate and key for mTLS. The s2s-proxy sidecar requires a client cert
         // to identify the pod when server_name routes to bricklens-ingest-internal.
         if let (Some(crt), Some(key)) = (crt_file, key_file) {
+            // Use set_certificate_CHAIN_file, not set_certificate_file: the former sends every cert
+            // in the PEM (leaf + intermediates), the latter sends only the leaf. The direct DP->CP
+            // mTLS path (useEnvoy=false, e.g. the BRICKINDEX vdb-pool) presents the workload-identity
+            // (UWI) cert, whose leaf chains to the Data Plane Misc Root via an intermediate UWI CA.
+            // The trusted-daemon N/S route can only build the path to its trusted root if the client
+            // SENDS that intermediate, so a leaf-only presentation is rejected at the handshake with
+            // `unknown_ca` (TLS alert 48). Verified at the wire on staging brickindex/rtud2a: the
+            // config_enricher (which already uses set_certificate_chain_file) handshakes with the same
+            // UWI cert, while this sink failed leaf-only until switched to the chain loader.
             ssl_builder
-                .set_certificate_file(&crt, openssl::ssl::SslFiletype::PEM)
-                .map_err(|e| format!("Failed to load client certificate {:?}: {}", crt, e))?;
+                .set_certificate_chain_file(&crt)
+                .map_err(|e| format!("Failed to load client certificate chain {:?}: {}", crt, e))?;
             ssl_builder
                 .set_private_key_file(&key, openssl::ssl::SslFiletype::PEM)
                 .map_err(|e| format!("Failed to load client key {:?}: {}", key, e))?;
@@ -112,9 +127,26 @@ impl BricklensIngestSink {
             Ok(())
         });
 
-        // Configure client for HTTP/2 (required for gRPC)
+        // Configure client for HTTP/2 (required for gRPC).
+        //
+        // Keepalive is essential here: this client pools long-lived HTTP/2 connections to the
+        // endpoint (the s2s-proxy or the DBNS load balancer). An intermediary — NLB idle
+        // timeout, s2s-proxy/Envoy upstream idle timeout, or a conntrack/firewall eviction — can
+        // silently drop an idle connection without a TCP RST/FIN reaching Vector. Without
+        // keepalive PINGs, hyper never learns the connection is half-open and keeps dispatching
+        // new streams onto it; those streams hang until the Tower `Timeout` fires, surfacing as
+        // `request_failed` "connection timeout" even though bricklens-ingest-internal is healthy
+        // (the bytes never arrived). Retries ride the same poisoned connection and also time out,
+        // dropping the whole batch. `http2_keep_alive_while_idle` PINGs even when no stream is
+        // active, so a severed connection is detected and evicted before real traffic is sent.
+        // `pool_idle_timeout` stays under typical NLB/proxy idle windows so connections are
+        // recycled proactively rather than found dead on next use.
         let client = hyper::Client::builder()
             .http2_only(true)
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(30)))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+            .pool_idle_timeout(Some(std::time::Duration::from_secs(60)))
             .build(https_connector);
 
         let endpoint = config
@@ -122,16 +154,19 @@ impl BricklensIngestSink {
             .parse()
             .map_err(|e| format!("Invalid endpoint: {}", e))?;
 
+        let request_limits = config.request.into_settings();
+
         // No field extraction or enum lookups here - the VRL transform shapes the data
         // to match the proto structure. The service just blindly encodes whatever it receives.
-        let service = BricklensIngestService::new(client, endpoint, method.clone());
+        // The per-request timeout is forwarded to the server as a grpc-timeout header so it
+        // matches the client-side Tower `Timeout` applied in run_inner().
+        let service =
+            BricklensIngestService::new(client, endpoint, method.clone(), request_limits.timeout);
 
         let batch_settings = config
             .batch
             .into_batcher_settings()
             .map_err(|e| format!("Invalid batch settings: {}", e))?;
-
-        let request_limits = config.request.into_settings();
 
         let compression = Compression::None; // gRPC doesn't use transport-level compression
 
@@ -170,13 +205,26 @@ impl BricklensIngestSink {
         let encoder_inner = Encoder::<Framer>::new(framer, serializer);
         let encoder = (Transformer::default(), encoder_inner);
 
+        let request_builder_concurrency = self
+            .request_limits
+            .concurrency
+            .and_then(|n| std::num::NonZeroUsize::new(n))
+            .unwrap_or_else(|| std::num::NonZeroUsize::new(10).unwrap());
+
+        // Wrap the gRPC service in the Tower request-middleware stack so the configured
+        // retry / timeout / rate-limit / adaptive-concurrency settings actually take effect.
+        // Transient gRPC statuses (UNAVAILABLE, RESOURCE_EXHAUSTED, DEADLINE_EXCEEDED) and
+        // transport errors are retried with Fibonacci backoff + jitter; permanent failures are
+        // dropped. Without this wrapping the `request` settings are inert and every transient
+        // failure becomes a permanent drop.
+        let service = ServiceBuilder::new()
+            .settings(self.request_limits, BricklensRetryLogic)
+            .service(self.service);
+
         input
             .batched(self.batch_settings.as_byte_size_config())
             .request_builder(
-                self.request_limits
-                    .concurrency
-                    .and_then(|n| std::num::NonZeroUsize::new(n))
-                    .unwrap_or_else(|| std::num::NonZeroUsize::new(10).unwrap()),
+                request_builder_concurrency,
                 BricklensIngestRequestBuilder::new(self.compression, encoder),
             )
             .filter_map(|request| async move {
@@ -188,7 +236,7 @@ impl BricklensIngestSink {
                     Ok(req) => Some(req),
                 }
             })
-            .into_driver(self.service)
+            .into_driver(service)
             .run()
             .await
     }

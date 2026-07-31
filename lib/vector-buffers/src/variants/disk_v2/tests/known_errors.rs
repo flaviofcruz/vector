@@ -1,8 +1,5 @@
 use bytes::{Buf, BufMut};
-use bytes::{Buf, BufMut};
 use memmap2::MmapMut;
-use memmap2::MmapMut;
-use std::ops::Add;
 use std::{
     io::{self, SeekFrom},
     path::PathBuf,
@@ -20,7 +17,10 @@ use vector_common::{
     finalization::{AddBatchNotifier, BatchNotifier},
 };
 
-use super::{create_buffer_v2_with_max_data_file_size, create_default_buffer_v2};
+use super::{
+    create_buffer_v2_with_max_data_file_size, create_default_buffer_v2,
+    try_create_default_buffer_v2,
+};
 use crate::{
     EventCount, assert_buffer_size, assert_enough_bytes_written, assert_file_does_not_exist_async,
     assert_file_exists_async, assert_reader_writer_v2_file_positions, await_timeout,
@@ -232,6 +232,487 @@ async fn reader_throws_error_when_finished_file_has_truncated_record_data() {
             let final_read = await_timeout!(reader.next(), 2).expect("read should not fail");
             assert_eq!(final_read, None);
             assert_reader_writer_v2_file_positions!(ledger, 1, 1);
+        }
+    })
+    .await;
+}
+
+// Truncated record on the writer's *current* (non-finalized) data file, where the reader must seek
+// forward through it during buffer initialization, with NO new writes coming.
+//
+// Setup: write two records, ack both and drain the acks (so the ledger's last-acked reader record
+// advances to record 2), then truncate record 2's payload on disk while leaving its length
+// delimiter, WITHOUT rolling the writer. On reopen, `seek_to_next_record` (awaited inside
+// `from_config_inner`) runs its slow path -- `while last_reader_record_id < ledger_last { next() }`
+// -- and re-reads forward through the truncated record.
+//
+// This asserts init does NOT deadlock here: during seek `ready_to_read == false`, so
+// `is_finalized = (r != w) || !ready_to_read` is TRUE regardless of file ids, and the fill loop's
+// `buf.is_empty() && is_finalized` branch returns `PartialWrite` immediately (rather than spinning
+// waiting for bytes that will never come). Verified: with `ledger_last == 2` the slow path does run
+// and traverse the truncated record, and `create_default_buffer_v2` (which awaits seek) returns.
+#[tokio::test]
+async fn init_on_truncated_record_in_non_finalized_file_no_writes() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir.clone()).await;
+
+            let first_record_size = 32;
+            let first_bytes_written = writer
+                .write_record(SizedRecord::new(first_record_size))
+                .await
+                .expect("write should not fail");
+            let second_record_size = 33;
+            let second_bytes_written = writer
+                .write_record(SizedRecord::new(second_record_size))
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+
+            let expected_first_data_file_len = first_bytes_written + second_bytes_written;
+            let first_data_file_path = ledger.get_current_writer_data_file_path();
+
+            // Read and ack BOTH records, then read once more (returns None) so the finalizer's
+            // pending acks are drained into the ledger and last-acked reader record id advances to
+            // record 2. Acks are processed at the top of `next()`, so the extra read is required.
+            // Writer stays on file 0 (no roll).
+            let r1 = reader.next().await.expect("read").expect("rec1");
+            acknowledge(r1).await;
+            let r2 = reader.next().await.expect("read").expect("rec2");
+            acknowledge(r2).await;
+            // Close the writer so the trailing `next()` returns None (writer done + drained) rather
+            // than parking, and drives ack processing.
+            writer.close();
+            let _drain = reader.next().await.expect("read");
+            ledger.flush().expect("ledger flush should not fail");
+            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
+
+            drop(writer);
+            drop(reader);
+            drop(ledger);
+
+            // Truncate mid-way through record 2: delimiter survives, payload cut short. No rollover.
+            let data_file = OpenOptions::new()
+                .write(true)
+                .open(&first_data_file_path)
+                .await
+                .expect("open should not fail");
+            let metadata = data_file.metadata().await.expect("metadata should not fail");
+            assert_eq!(expected_first_data_file_len as u64, metadata.len());
+            data_file
+                .set_len((first_bytes_written + (second_bytes_written / 2)) as u64)
+                .await
+                .expect("truncate should not fail");
+            data_file.sync_all().await.expect("sync should not fail");
+            drop(data_file);
+
+            // Reopen. `from_config_inner` awaits `seek_to_next_record`. Observe whether it returns
+            // (init completes) or hangs (init deadlock) -- with NO new write issued.
+            let reopen = tokio::time::timeout(
+                Duration::from_secs(8),
+                create_default_buffer_v2::<_, SizedRecord>(data_dir),
+            )
+            .await;
+
+            assert!(
+                reopen.is_ok(),
+                "buffer initialization deadlocked (seek never returned) on a truncated record in \
+                 a non-finalized data file with no writes coming"
+            );
+        }
+    })
+    .await;
+}
+
+// LIVE-CASE REPRO (known issue): once initialization is past, a reader that reaches a truncated
+// record on the writer's *current* (non-finalized) data file gets stuck and stops delivering --
+// including brand-new traffic written after the writer rolls past the truncated file.
+//
+// This is the non-finalized twin of `reader_throws_error_when_finished_file_has_truncated_record_data`.
+// That test truncates a record on a file the writer has *rolled past* (`reader_file_id != writer_file_id`,
+// i.e. `is_finalized == true`), and the reader correctly returns `PartialWrite`. Here the writer is
+// *still on* the truncated file (`r == w`, `is_finalized == false`), mimicking an unclean shutdown
+// that persisted `[valid record][full 8-byte length delimiter + partial payload]`.
+//
+// Init is safe (seek runs with `ready_to_read == false`, forcing `is_finalized == true`). But once
+// `ready_to_read == true` and `r == w`, `is_finalized = (r != w) || !ready_to_read` is FALSE, so the
+// fill loop's `PartialWrite` escape is skipped. The buggy behavior re-polls `fill_buf` in place
+// forever and never returns control to `BufferReader::next`, so it never re-reads the reader/writer
+// file IDs. Consequently, even once the writer *rolls* to a new data file (finalizing the truncated
+// file), the reader stays stuck on the dead file and never advances to the new record.
+//
+// This asserts recovery: after the reader is sitting on the truncated record, a new write forces the
+// writer to roll, and the reader must then skip the partial record and deliver the new one within a
+// timeout. On current (buggy) code the reader never notices the roll and the read times out -> this
+// test FAILS, documenting the open bug (left parked until the reader fix lands).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_reader_wedges_on_truncated_record_in_non_finalized_file() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            // Write two records into the same (first) data file, then flush. The second record is
+            // the one we truncate.
+            let (mut writer, _, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir.clone()).await;
+
+            let first_record_size = 32;
+            let first_bytes_written = writer
+                .write_record(SizedRecord::new(first_record_size))
+                .await
+                .expect("write should not fail");
+            let second_record_size = 33;
+            let second_bytes_written = writer
+                .write_record(SizedRecord::new(second_record_size))
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+
+            let expected_first_data_file_len = first_bytes_written + second_bytes_written;
+            let first_data_file_path = ledger.get_current_writer_data_file_path();
+
+            // Both records live in file 0 and the writer has NOT rolled.
+            assert_buffer_size!(ledger, 2, expected_first_data_file_len);
+            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
+
+            // Close the buffer so we can corrupt the data file on disk.
+            drop(writer);
+            drop(ledger);
+
+            // Truncate mid-way through the second record: its 8-byte length delimiter survives, but
+            // its payload is cut short. We do NOT force a rollover, so on reopen the writer stays on
+            // file 0 and the truncated record is on the writer's current (non-finalized) file.
+            let data_file = OpenOptions::new()
+                .write(true)
+                .open(&first_data_file_path)
+                .await
+                .expect("open should not fail");
+            let metadata = data_file.metadata().await.expect("metadata should not fail");
+            assert_eq!(expected_first_data_file_len as u64, metadata.len());
+            data_file
+                .set_len((first_bytes_written + (second_bytes_written / 2)) as u64)
+                .await
+                .expect("truncating should not fail");
+            data_file.sync_all().await.expect("sync should not fail");
+            drop(data_file);
+
+            // Reopen. `validate_last_write` flags the truncated tail and sets the deferred
+            // `skip_to_next`; the writer stays on file 0 until the next write.
+            let (mut writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
+
+            // The first record reads back fine.
+            let first_read = await_timeout!(reader.next(), 5).expect("read should not fail");
+            assert_eq!(first_read, Some(SizedRecord::new(first_record_size)));
+            acknowledge(first_read.unwrap()).await;
+
+            // Drive the reader onto the truncated second record on a background task. It cannot
+            // complete this record (the payload was truncated away), so it must wait.
+            let reader_task = tokio::spawn(async move {
+                let r = reader.next().await;
+                (reader, r)
+            });
+
+            // Let the reader reach and settle on the truncated record.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Now perform a write. This forces the writer to materialize its deferred skip: it rolls
+            // to a new data file (advancing the writer file ID, finalizing file 0) and writes a
+            // fresh record there.
+            let third_record_size = 34;
+            writer
+                .write_record(SizedRecord::new(third_record_size))
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+            assert_reader_writer_v2_file_positions!(ledger, 0, 1);
+
+            // A correct reader wakes from the roll and, seeing the writer has moved on, surfaces the
+            // truncated tail as a `PartialWrite` error (rolling itself past the partial file). A
+            // buggy reader is still spinning on file 0 and never gets here, so the join times out.
+            let joined = tokio::time::timeout(Duration::from_secs(8), reader_task).await;
+            assert!(
+                joined.is_ok(),
+                "reader wedged spinning on a truncated record in a non-finalized file and never \
+                 recovered even after the writer rolled to a new file"
+            );
+            let (mut reader, result) = joined.unwrap().expect("reader task should not panic");
+            assert!(
+                matches!(result, Err(ReaderError::PartialWrite)),
+                "woken reader should report the truncated tail as a partial write, got {result:?}"
+            );
+
+            // The subsequent read rolls past the partial file and delivers the record written after
+            // the roll.
+            let recovered = await_timeout!(reader.next(), 8).expect("read should not fail");
+            assert_eq!(
+                recovered,
+                Some(SizedRecord::new(third_record_size)),
+                "reader should skip the partial record after the roll and read the new record"
+            );
+        }
+    })
+    .await;
+}
+
+// LIVE-CASE (garbled/full-length variant): counterpart to
+// `live_reader_wedges_on_truncated_record_in_non_finalized_file`, but the last record on the
+// writer's current file is *garbled in place* (all bytes present, checksum/archive invalid) rather
+// than truncated. Because the whole record is readable, `try_next_record` completes the fill loop
+// and `validate_record_archive` fails -> `Err(bad_read)` -> the reader rolls ITSELF to the next
+// file (it does not depend on the writer's file id). This experiment checks whether the live reader
+// self-heals for the garbled class (expected), in contrast to the truncated class where it wedges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_reader_on_garbled_record_in_non_finalized_file() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, _, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir.clone()).await;
+
+            let first_record_size = 32;
+            let first_bytes_written = writer
+                .write_record(SizedRecord::new(first_record_size))
+                .await
+                .expect("write should not fail");
+            let second_record_size = 33;
+            let second_bytes_written = writer
+                .write_record(SizedRecord::new(second_record_size))
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+
+            let expected_first_data_file_len = first_bytes_written + second_bytes_written;
+            let first_data_file_path = ledger.get_current_writer_data_file_path();
+            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
+
+            drop(writer);
+            drop(ledger);
+
+            // Scramble the last 8 bytes of record 2 IN PLACE (full length preserved, archive invalid).
+            let mut data_file = OpenOptions::new()
+                .write(true)
+                .open(&first_data_file_path)
+                .await
+                .expect("open should not fail");
+            assert_eq!(
+                expected_first_data_file_len as u64,
+                data_file.metadata().await.expect("metadata").len()
+            );
+            data_file
+                .seek(SeekFrom::Start(expected_first_data_file_len as u64 - 8))
+                .await
+                .expect("seek should not fail");
+            data_file
+                .write_all(&[0xd, 0xe, 0xa, 0xd, 0xb, 0xe, 0xe, 0xf])
+                .await
+                .expect("write should not fail");
+            data_file.sync_all().await.expect("sync should not fail");
+            drop(data_file);
+
+            // Reopen; writer stays on file 0.
+            let (mut writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+            assert_reader_writer_v2_file_positions!(ledger, 0, 0);
+
+            // Record 1 reads fine.
+            let first_read = await_timeout!(reader.next(), 5).expect("read should not fail");
+            assert_eq!(first_read, Some(SizedRecord::new(first_record_size)));
+            acknowledge(first_read.unwrap()).await;
+
+            // Drive the reader onto the garbled record 2 on a background task.
+            let reader_task = tokio::spawn(async move {
+                let r = reader.next().await;
+                (reader, r)
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Writer rolls to a new file and writes a fresh record. (Note: the reader may have
+            // already rolled ITSELF to the next file id by detecting the garbled record as a bad
+            // read -- unlike the truncated case, it does not need the writer to advance.)
+            let third_record_size = 34;
+            writer
+                .write_record(SizedRecord::new(third_record_size))
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+
+            // The garbled record does NOT wedge the reader: it reads the full record, detects the
+            // bad archive, and returns `Err(bad_read)` to this caller while rolling itself to the
+            // next file. So the background read completes promptly (no timeout) with an error.
+            let joined = tokio::time::timeout(Duration::from_secs(8), reader_task).await;
+            assert!(
+                joined.is_ok(),
+                "reader wedged on a garbled record in a non-finalized file and never returned"
+            );
+            let (mut reader, result) = joined.unwrap().expect("reader task should not panic");
+            assert!(
+                result.is_err(),
+                "garbled record should surface as a bad-read error, got {result:?}"
+            );
+
+            // Having rolled past the garbled record, the subsequent read delivers the new record
+            // (record 3) that the writer wrote after rolling.
+            let recovered = await_timeout!(reader.next(), 8).expect("read should not fail");
+            assert_eq!(
+                recovered,
+                Some(SizedRecord::new(third_record_size)),
+                "after the bad-read error, reader should deliver the record written post-roll"
+            );
+        }
+    })
+    .await;
+}
+
+// LATENT HAZARD (forced ledger state; no known natural trigger): if the ledger ever comes up with
+// the reader file id AHEAD of the writer file id (reader == writer + 1) on a file that was never
+// created, seek's fast path (`while reader_file_id != writer_file_id`) opens that nonexistent file
+// via `ensure_ready_for_read` -> NotFound -> `reader == next_writer_file_id` -> the unguarded
+// `wait_for_writer` (the branch #23617 widened). Because no write can be issued until
+// `from_config_inner` returns the writer handle, and that return is blocked on this very wait,
+// buffer initialization deadlocks.
+//
+// We could NOT find a normal operation or crash sequence that produces this persisted state (the
+// writer creates+syncs each file before advancing its id, and the reader's forward roll only bumps
+// the non-persistent unacked offset, so a crash rewinds to a real acked file). This test therefore
+// FORCES the state directly via the ledger's file-id fields -- no filesystem tampering -- to
+// document the hazard. Whether it is reachable without such forcing is unknown.
+#[tokio::test]
+async fn init_deadlock_forced_reader_ahead_of_writer() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            // Write one record so file 0 exists and the ledger is initialized on disk.
+            let (mut writer, _, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir.clone()).await;
+            writer.write_record(SizedRecord::new(64)).await.expect("write");
+            writer.flush().await.expect("flush");
+            writer.close();
+
+            // Force the hazardous ledger state: reader file id = 1, writer file id = 0, so that at
+            // reopen `reader != writer` (fast path runs) and `reader == next_writer_file_id` (== 1),
+            // pointing at file 1 which was never created.
+            ledger.state().increment_reader_file_id_for_test();
+            ledger.flush().expect("ledger flush");
+            assert_reader_writer_v2_file_positions!(ledger, 1, 0);
+
+            drop(writer);
+            drop(ledger);
+
+            // Reopen via the Result-returning helper so we can distinguish "hung" (timeout),
+            // "errored" (Err), and "initialized gracefully" (Ok). The fix must give GRACEFUL
+            // initialization: init neither deadlocks in `wait_for_writer` nor bubbles up a spurious
+            // NotFound -- it skips the missing file(s) forward to the writer's current file (which
+            // always exists after writer init) and completes successfully.
+            let reopen = tokio::time::timeout(
+                Duration::from_secs(8),
+                try_create_default_buffer_v2::<_, SizedRecord>(data_dir),
+            )
+            .await;
+
+            let built = reopen.expect(
+                "init deadlocked: reader ahead of writer at reopen parked in wait_for_writer on a \
+                 never-created file with no writes coming (init never returned)",
+            );
+            assert!(
+                built.is_ok(),
+                "init did not gracefully recover: reader ahead of writer at reopen should skip the \
+                 missing file(s) and initialize, but got {:?}",
+                built.err()
+            );
+        }
+    })
+    .await;
+}
+
+// A *garbled but full-length* last record (checksum/deserialization fails, but all bytes present)
+// on the writer's current file, where the reader must seek forward through it during
+// initialization, with NO new writes coming.
+//
+// Unlike the truncated case, the reader CAN read the whole (garbled) record during seek, so
+// `try_next_record` returns `Err(bad_read)` and the seek loop calls `roll_to_next_data_file()`
+// (verified). That advances the reader's effective file id past the writer's current file -- onto a
+// next file the writer has NOT created (the boot-detected skip is deferred to the first write).
+//
+// This asserts init does NOT deadlock here: the seek slow path has an explicit guard for exactly
+// this -- after a bad read it checks `reader_file_id > writer_file_id` and BREAKS out of seek,
+// rather than looping back into `next()` (which would hit `ensure_ready_for_read`'s NotFound branch
+// and park in `wait_for_writer` for a file no write will ever create). Verified: `roll_to_next_data_file`
+// runs during seek, the NotFound wait branch is NOT reached, and `create_default_buffer_v2` returns.
+#[tokio::test]
+async fn init_on_scrambled_record_needing_skip_no_writes() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (mut writer, mut reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir.clone()).await;
+
+            let bytes_1 = writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("write should not fail");
+            let bytes_2 = writer
+                .write_record(SizedRecord::new(68))
+                .await
+                .expect("write should not fail");
+            writer.flush().await.expect("flush should not fail");
+            let data_file_len = bytes_1 + bytes_2;
+            let data_file_path = ledger.get_current_writer_data_file_path();
+
+            // Read+ack both and drain so ledger last-acked reader record id advances to record 2.
+            let r1 = reader.next().await.expect("read").expect("rec1");
+            acknowledge(r1).await;
+            let r2 = reader.next().await.expect("read").expect("rec2");
+            acknowledge(r2).await;
+            writer.close();
+            let _drain = reader.next().await.expect("read");
+            ledger.flush().expect("ledger flush should not fail");
+
+            drop(writer);
+            drop(reader);
+            drop(ledger);
+
+            // Scramble the last 8 bytes of record 2 IN PLACE (full length preserved, archive/
+            // checksum now invalid) -- the "full-length garbled" corruption class.
+            let mut data_file = OpenOptions::new()
+                .write(true)
+                .open(&data_file_path)
+                .await
+                .expect("open should not fail");
+            assert_eq!(
+                data_file_len as u64,
+                data_file.metadata().await.expect("metadata").len()
+            );
+            data_file
+                .seek(SeekFrom::Start(data_file_len as u64 - 8))
+                .await
+                .expect("seek should not fail");
+            data_file
+                .write_all(&[0xd, 0xe, 0xa, 0xd, 0xb, 0xe, 0xe, 0xf])
+                .await
+                .expect("write should not fail");
+            data_file.sync_all().await.expect("sync should not fail");
+            drop(data_file);
+
+            // Reopen with NO new writes. Observe whether init returns or deadlocks.
+            let reopen = tokio::time::timeout(
+                Duration::from_secs(8),
+                create_default_buffer_v2::<_, SizedRecord>(data_dir),
+            )
+            .await;
+
+            assert!(
+                reopen.is_ok(),
+                "buffer initialization deadlocked (seek rolled past a garbled record onto a \
+                 not-yet-created next file and parked in wait_for_writer) with no writes coming"
+            );
         }
     })
     .await;

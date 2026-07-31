@@ -57,14 +57,39 @@ pub fn combine_sink_event_metadata(
 impl Add<VectorSinkEventMetadata> for VectorSinkEventMetadata {
     type Output = VectorSinkEventMetadata;
 
-    fn add(self, other: VectorSinkEventMetadata) -> Self::Output {
-        combine_sink_event_metadata(vec![self, other])
+    fn add(mut self, other: VectorSinkEventMetadata) -> Self::Output {
+        self.merge(other);
+        self
     }
 }
 
 impl AddAssign for VectorSinkEventMetadata {
     fn add_assign(&mut self, rhs: Self) {
-        *self = std::mem::take(self).add(rhs);
+        self.merge(rhs);
+    }
+}
+
+impl VectorSinkEventMetadata {
+    /// Merge another metadata into self in-place, avoiding O(N²) cloning
+    /// that occurred when using combine_sink_event_metadata(vec![self, other]).
+    pub fn merge(&mut self, other: VectorSinkEventMetadata) {
+        self.delivery_event.merge(other.delivery_event);
+        match (&mut self.file_send_event, other.file_send_event) {
+            (Some(existing), Some(other_fse)) => {
+                for (key, value) in other_fse.count_map {
+                    existing
+                        .count_map
+                        .entry(key)
+                        .and_modify(|e| {
+                            e.count += value.count;
+                            e.size += value.size;
+                        })
+                        .or_insert(value);
+                }
+            }
+            (None, some) => self.file_send_event = some,
+            _ => {}
+        }
     }
 }
 

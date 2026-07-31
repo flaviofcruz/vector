@@ -285,6 +285,8 @@ impl Application {
 
         emit!(VectorStarted);
         handle.spawn(heartbeat::heartbeat());
+        #[cfg(feature = "tikv-jemallocator")]
+        handle.spawn(crate::jemalloc_stats::report_jemalloc_stats());
 
         let Self {
             root_opts,
@@ -506,6 +508,11 @@ impl FinishedApplication {
             service_event = 4,
             internal_log_rate_limit = false,
         );
+        // Prometheus mirror of the TERMINATION_SIGNAL_RECEIVED VEL. Fires once per shutdown here (both
+        // the graceful `stop` and the `quit` paths flow through this method), so it is the
+        // denominator for the close-complete rate: `vector_shutdown_components_closed_total` (emitted
+        // when a shutdown reaches COMPONENTS_CLOSED) / `vector_shutdown_termination_signal_total`.
+        metrics::counter!("shutdown_termination_signal_total").increment(1);
 
         // At this point, we'll have the only reference to the shared topology controller and can
         // safely remove it from the wrapper to shut down the topology.
@@ -538,7 +545,37 @@ impl FinishedApplication {
                 #[cfg(unix)]
                 exitcode::OK
             }), // Graceful shutdown finished
-            _ = signal_rx.recv() => Self::quit(),
+            // A second shutdown/quit signal still aborts immediately; reload (and other
+            // non-terminal) signals are ignored so they can't cut the shutdown short. See
+            // `wait_for_abort_signal`.
+            _ = Self::wait_for_abort_signal(&mut signal_rx) => Self::quit(),
+        }
+    }
+
+    /// Resolves only on a *terminal* signal — a second `Shutdown`/`Quit` asking to abort the
+    /// in-progress graceful shutdown (the "press Ctrl-C again to force quit" escape hatch). We keep
+    /// that arm rather than dropping it and relying purely on the deadline / kubelet SIGKILL: it
+    /// preserves the operator's ability to force-quit a stuck shutdown, and matters for local /
+    /// non-k8s `vector` runs that have no external kill backstop.
+    ///
+    /// Non-terminal signals are ignored. The one that caused the bug is `ReloadFromDisk`, which
+    /// `--watch-config` emits on any config-file change; on a terminating pod the config can change
+    /// during the shutdown window (the sidecar rewrites it). Note the reload is only *received* here
+    /// to be discarded — it is never applied, because `handle_signal` (the reconfigure path) only
+    /// runs in the pre-shutdown `main` loop, not during `stop`. So a reload can't reconfigure sinks
+    /// mid-shutdown; the old `signal_rx.recv()` arm merely mis-read it as "abort" and quit before the
+    /// wave1->wave2 `COMPONENTS_CLOSED` VEL was emitted — the dominant cause of missing
+    /// close-complete events on graceful termination.
+    ///
+    /// Once the signal channel closes this never resolves; the graceful shutdown is bounded by its
+    /// own overall deadline regardless.
+    async fn wait_for_abort_signal(signal_rx: &mut SignalRx) {
+        loop {
+            match signal_rx.recv().await {
+                Ok(SignalTo::Shutdown(_)) | Ok(SignalTo::Quit) => return,
+                Ok(_) => continue,
+                Err(_) => std::future::pending::<()>().await,
+            }
         }
     }
 
@@ -577,7 +614,30 @@ pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtim
         .filter(|&v| v > 0)
         .unwrap_or(20_000);
     rt_builder.max_blocking_threads(max_blocking_threads);
-    rt_builder.enable_all().thread_name(thread_name);
+
+    // Apply a reduced thread stack size when VECTOR_THREAD_STACK_SIZE is set.
+    // This matters because tokio's default Rust stack is 2 MB per thread, and
+    // vector pins one blocking thread per file/kubernetes_logs source for its
+    // lifetime (via spawn_blocking). With ~250 such sources in production that
+    // amounts to ~500 MB of committed stack space at startup. Setting a smaller
+    // value (e.g. 512 KB) recovers ~375 MB with no behavioral change for
+    // sources that do not recurse deeply. The setting applies to both worker
+    // threads and blocking-pool threads, so choose a value safe for both
+    // (≥256 KB is the practical minimum; anything smaller risks stack overflow
+    // in deeply recursive VRL scripts or large-config reload paths).
+    //
+    // When unset, the Rust/tokio default (2 MB) is preserved exactly — this env
+    // var is intentionally absent from the deploy config by default (G4: zero-diff
+    // default behavior).
+    if let Some(stack_size) = std::env::var("VECTOR_THREAD_STACK_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+    {
+        rt_builder.thread_stack_size(stack_size);
+    }
+
+    rt_builder.enable_all();
 
     let threads = threads.unwrap_or_else(crate::num_threads);
     if threads == 0 {
@@ -588,6 +648,25 @@ pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtim
         .compare_exchange(0, threads, Ordering::Acquire, Ordering::Relaxed)
         .unwrap_or_else(|_| panic!("double thread initialization"));
     rt_builder.worker_threads(threads);
+
+    // Name worker vs blocking-pool threads distinctly. tokio applies a single
+    // thread name to BOTH the (eagerly-spawned) worker pool and the (on-demand)
+    // blocking pool, so we differentiate by spawn order: the first `threads`
+    // threads are the workers, the rest are blocking threads. The names differ
+    // early so they remain distinguishable after the kernel truncates
+    // /proc/<pid>/comm to 15 chars (e.g. "vector-worker" vs "vector-blocking").
+    let base = thread_name.trim_end_matches("-worker").to_string();
+    let worker_name = format!("{base}-worker");
+    let blocking_name = format!("{base}-blocking-worker");
+    let worker_count = threads;
+    let spawned = std::sync::Arc::new(AtomicUsize::new(0));
+    rt_builder.thread_name_fn(move || {
+        if spawned.fetch_add(1, Ordering::SeqCst) < worker_count {
+            worker_name.clone()
+        } else {
+            blocking_name.clone()
+        }
+    });
 
     debug!(message = "Building runtime.", worker_threads = threads);
     Ok(rt_builder.build().expect("Unable to create async runtime"))
@@ -772,6 +851,38 @@ pub fn watcher_config(
 #[cfg(test)]
 mod tests {
     use super::staged_shutdown_secs;
+    use super::FinishedApplication;
+    use crate::signal::SignalTo;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+
+    #[tokio::test]
+    async fn wait_for_abort_signal_ignores_reload_but_aborts_on_shutdown() {
+        let (tx, mut rx) = broadcast::channel::<SignalTo>(8);
+        // A config-watch reload must NOT resolve the abort wait. This is the bug being fixed: a
+        // reload arriving during shutdown used to quit before COMPONENTS_CLOSED was emitted.
+        tx.send(SignalTo::ReloadFromDisk).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                FinishedApplication::wait_for_abort_signal(&mut rx),
+            )
+            .await
+            .is_err(),
+            "reload signal must be ignored, not abort the in-progress shutdown",
+        );
+        // A genuine second shutdown request must resolve it (operator asking to hurry up).
+        tx.send(SignalTo::Shutdown(None)).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                FinishedApplication::wait_for_abort_signal(&mut rx),
+            )
+            .await
+            .is_ok(),
+            "a second shutdown signal must abort the in-progress shutdown",
+        );
+    }
 
     #[test]
     fn staged_shutdown_secs_passes_through_well_ordered_inputs() {

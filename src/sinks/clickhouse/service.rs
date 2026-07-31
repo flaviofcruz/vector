@@ -1,5 +1,7 @@
 //! Service implementation for the `Clickhouse` sink.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use http::{
     Request, StatusCode, Uri,
@@ -21,9 +23,39 @@ use crate::{
     },
 };
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ClickhouseRetryLogic {
     inner: HttpRetryLogic<HttpRequest<PartitionKey>>,
+    /// ClickHouse error codes (from the `Code: {n}` prefix of a 500 body) that
+    /// must not be retried. Shared behind an `Arc` so cloning the retry logic
+    /// per request is cheap.
+    non_retriable_codes: Arc<[u32]>,
+}
+
+impl Default for ClickhouseRetryLogic {
+    fn default() -> Self {
+        Self {
+            inner: HttpRetryLogic::default(),
+            non_retriable_codes: Arc::from(DEFAULT_NON_RETRIABLE_CLICKHOUSE_ERROR_CODES),
+        }
+    }
+}
+
+impl ClickhouseRetryLogic {
+    /// Builds a retry logic with a caller-supplied set of non-retriable error
+    /// codes. Passing `None` uses the built-in default set; passing `Some(list)`
+    /// uses exactly that list (an empty list means "retry every 500", i.e. the
+    /// pre-#618 behavior). Lets the universe config generator tune the set
+    /// per-shard without a Vector binary roll.
+    pub fn new(non_retriable_codes: Option<Vec<u32>>) -> Self {
+        match non_retriable_codes {
+            Some(codes) => Self {
+                inner: HttpRetryLogic::default(),
+                non_retriable_codes: Arc::from(codes),
+            },
+            None => Self::default(),
+        }
+    }
 }
 
 impl RetryLogic for ClickhouseRetryLogic {
@@ -40,25 +72,75 @@ impl RetryLogic for ClickhouseRetryLogic {
             StatusCode::INTERNAL_SERVER_ERROR => {
                 let body = response.http_response.body();
 
-                // Currently, ClickHouse returns 500's incorrect data and type mismatch errors.
-                // This attempts to check if the body starts with `Code: {code_num}` and to not
-                // retry those errors.
+                // ClickHouse surfaces most deterministic data-value errors (bad type,
+                // constraint violation, overflow, ...) as HTTP 500 with a body that
+                // begins `Code: {code_num}. DB::Exception: ...`. Retrying these is
+                // futile — the same rows fail identically every time — and in headless
+                // mode each retry fans out to another pod, wasting capacity before the
+                // request is dropped anyway. Parse the numeric code and refuse to retry
+                // the known-deterministic ones. Any other 500 (e.g. MEMORY_LIMIT_EXCEEDED,
+                // transient replication/IO errors) stays retriable.
+                //
+                // Note: codes returned by ClickHouse as 4xx (e.g. 53 TYPE_MISMATCH,
+                // 117 INCORRECT_DATA in current versions) never reach this arm; they are
+                // handled as non-retriable by the fallback below. They are kept in the
+                // set as defense-in-depth in case a version maps them back to 500.
                 //
                 // Reference: https://github.com/vectordotdev/vector/pull/693#issuecomment-517332654
-                // Error code definitions: https://github.com/ClickHouse/ClickHouse/blob/master/dbms/src/Common/ErrorCodes.cpp
-                //
-                // Fix already merged: https://github.com/ClickHouse/ClickHouse/pull/6271
-                if body.starts_with(b"Code: 117") {
-                    RetryAction::DontRetry("incorrect data".into())
-                } else if body.starts_with(b"Code: 53") {
-                    RetryAction::DontRetry("type mismatch".into())
-                } else {
-                    RetryAction::Retry(String::from_utf8_lossy(body).to_string().into())
+                // Status mapping: src/Server/HTTP/exceptionCodeToHTTPStatus.cpp
+                match parse_clickhouse_error_code(body) {
+                    Some(code) if self.non_retriable_codes.contains(&code) => {
+                        RetryAction::DontRetry(
+                            format!("non-retriable ClickHouse error code {code}").into(),
+                        )
+                    }
+                    _ => RetryAction::Retry(String::from_utf8_lossy(body).to_string().into()),
                 }
             }
             _ => self.inner.should_retry_response(&response.http_response),
         }
     }
+}
+
+/// Default set of ClickHouse error codes that represent deterministic,
+/// non-transient failures which ClickHouse returns over HTTP as 500. Retrying
+/// them can never succeed, so the sink drops the request immediately instead of
+/// exhausting its retry budget. Codes ClickHouse already returns as 4xx are
+/// intentionally not listed here (they short-circuit before this check) except
+/// where kept as defense-in-depth against version-dependent status remapping.
+///
+/// Overridable per-shard via the `non_retriable_error_codes` sink config field
+/// (see `ClickhouseConfig`), so the set can be tuned without a Vector binary
+/// roll.
+///
+/// Codes (see ClickHouse `src/Common/ErrorCodes.cpp`):
+/// - 469 VIOLATED_CONSTRAINT       — row violates a table CHECK constraint
+/// - 70  CANNOT_CONVERT_TYPE       — value not convertible to the column type
+/// - 69  ARGUMENT_OUT_OF_BOUND     — value outside the type's allowed range
+/// - 407 DECIMAL_OVERFLOW          — decimal value overflows its precision/scale
+/// - 131 TOO_LARGE_STRING_SIZE     — string exceeds the column's fixed size
+/// - 53  TYPE_MISMATCH             — 4xx today; kept as defense-in-depth
+/// - 117 INCORRECT_DATA            — 4xx today; kept as defense-in-depth
+pub(super) const DEFAULT_NON_RETRIABLE_CLICKHOUSE_ERROR_CODES: &[u32] =
+    &[469, 70, 69, 407, 131, 53, 117];
+
+/// Parses the leading numeric error code from a ClickHouse HTTP error body.
+///
+/// ClickHouse error bodies begin with `Code: {n}. DB::Exception: ...`. Returns
+/// `None` if the body does not start with that exact prefix or the code is not a
+/// parseable integer. Parsing the full integer (rather than prefix-matching the
+/// bytes) avoids matching unintended codes — e.g. `b"Code: 53"` as a prefix also
+/// matches `Code: 530`..`539`.
+fn parse_clickhouse_error_code(body: &[u8]) -> Option<u32> {
+    let rest = body.strip_prefix(b"Code: ")?;
+    let digits_end = rest
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits_end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&rest[..digits_end]).ok()?.parse().ok()
 }
 
 #[derive(Debug, Clone)]
@@ -208,8 +290,147 @@ fn set_uri_query(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::super::config::AsyncInsertSettingsConfig;
     use super::*;
+    use crate::sinks::util::retries::RetryLogic;
+
+    fn http_response(status: u16, body: &str) -> HttpResponse {
+        HttpResponse {
+            http_response: http::Response::builder()
+                .status(status)
+                .body(Bytes::from(body.to_owned()))
+                .unwrap(),
+            events_byte_size: Default::default(),
+            raw_byte_size: 0,
+        }
+    }
+
+    fn ch_500(code: u32) -> HttpResponse {
+        http_response(
+            500,
+            &format!("Code: {code}. DB::Exception: something happened. ({code})"),
+        )
+    }
+
+    #[test]
+    fn parses_leading_error_code() {
+        assert_eq!(
+            parse_clickhouse_error_code(b"Code: 469. DB::Exception: ..."),
+            Some(469)
+        );
+        assert_eq!(parse_clickhouse_error_code(b"Code: 53. foo"), Some(53));
+    }
+
+    #[test]
+    fn parse_rejects_non_matching_bodies() {
+        assert_eq!(parse_clickhouse_error_code(b"no code here"), None);
+        assert_eq!(parse_clickhouse_error_code(b"Code: abc"), None);
+        assert_eq!(parse_clickhouse_error_code(b"Code: "), None);
+    }
+
+    #[test]
+    fn parse_handles_code_with_no_trailing_text() {
+        // Body that is exactly the code with nothing after it.
+        assert_eq!(parse_clickhouse_error_code(b"Code: 469"), Some(469));
+    }
+
+    #[test]
+    fn parse_does_not_confuse_53_with_530() {
+        // The old prefix match on `b"Code: 53"` would have matched 530..539.
+        assert_eq!(parse_clickhouse_error_code(b"Code: 530. foo"), Some(530));
+        assert!(!DEFAULT_NON_RETRIABLE_CLICKHOUSE_ERROR_CODES.contains(&530));
+    }
+
+    #[test]
+    fn does_not_retry_deterministic_500_error_codes() {
+        let logic = ClickhouseRetryLogic::default();
+        // 469 is the observed VIOLATED_CONSTRAINT case; the rest are the other
+        // deterministic data-value errors ClickHouse returns as 500.
+        for code in [469, 70, 69, 407, 131, 53, 117] {
+            assert!(
+                logic
+                    .should_retry_response(&ch_500(code))
+                    .is_not_retryable(),
+                "expected code {code} to be non-retriable"
+            );
+        }
+    }
+
+    #[test]
+    fn retries_unknown_500_error_codes() {
+        let logic = ClickhouseRetryLogic::default();
+        // e.g. 241 MEMORY_LIMIT_EXCEEDED — transient, must keep retrying.
+        assert!(logic.should_retry_response(&ch_500(241)).is_retryable());
+        // A 500 without a parseable code body is also retried (fail open).
+        assert!(
+            logic
+                .should_retry_response(&http_response(500, "opaque error"))
+                .is_retryable()
+        );
+    }
+
+    #[test]
+    fn retries_500_with_code_prefixed_substring_of_blacklisted() {
+        let logic = ClickhouseRetryLogic::default();
+        // 4690 must not be treated as 469.
+        assert!(logic.should_retry_response(&ch_500(4690)).is_retryable());
+    }
+
+    #[test]
+    fn does_not_retry_4xx() {
+        let logic = ClickhouseRetryLogic::default();
+        // Client errors (e.g. 400 for TYPE_MISMATCH in current CH) fall through
+        // to the inner logic, which does not retry them.
+        assert!(
+            logic
+                .should_retry_response(&http_response(400, "Code: 53. type mismatch"))
+                .is_not_retryable()
+        );
+    }
+
+    #[test]
+    fn retries_generic_5xx() {
+        let logic = ClickhouseRetryLogic::default();
+        // 503 is transient and not the special-cased 500 path.
+        assert!(
+            logic
+                .should_retry_response(&http_response(503, "unavailable"))
+                .is_retryable()
+        );
+    }
+
+    #[test]
+    fn new_with_none_uses_default_set() {
+        let logic = ClickhouseRetryLogic::new(None);
+        // Same behavior as ::default() — the built-in set applies.
+        assert!(logic.should_retry_response(&ch_500(469)).is_not_retryable());
+        assert!(logic.should_retry_response(&ch_500(241)).is_retryable());
+    }
+
+    #[test]
+    fn config_override_replaces_default_set() {
+        // A shard that only wants to block 469 (not the rest of the default set).
+        let logic = ClickhouseRetryLogic::new(Some(vec![469]));
+        assert!(logic.should_retry_response(&ch_500(469)).is_not_retryable());
+        // 70 is in the default set but NOT in this override — so it retries now.
+        assert!(logic.should_retry_response(&ch_500(70)).is_retryable());
+    }
+
+    #[test]
+    fn config_override_empty_retries_all_500s() {
+        // Empty list == pre-#618 behavior: every 500 is retried.
+        let logic = ClickhouseRetryLogic::new(Some(vec![]));
+        assert!(logic.should_retry_response(&ch_500(469)).is_retryable());
+    }
+
+    #[test]
+    fn config_override_can_add_new_codes() {
+        // A code not in the default set can be blocked per-shard.
+        let logic = ClickhouseRetryLogic::new(Some(vec![241]));
+        assert!(logic.should_retry_response(&ch_500(241)).is_not_retryable());
+    }
 
     #[test]
     fn encode_valid() {

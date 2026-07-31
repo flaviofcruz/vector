@@ -661,6 +661,19 @@ mod test_utils {
     }
 }
 
+#[cfg(any(test, feature = "test"))]
+impl LogEvent {
+    /// Whether this event's estimated JSON-encoded size has already been computed and cached.
+    ///
+    /// Sinks that re-read the size after building a request (e.g. to populate `events_sent` in
+    /// the service layer) depend on `RequestMetadataBuilder::from_events` having warmed this
+    /// cache during request construction, so the re-read is an atomic load rather than a second
+    /// structural walk of the event. This lets such sinks assert that invariant in a test.
+    pub fn estimated_json_encoded_size_is_cached(&self) -> bool {
+        self.inner.json_encoded_size_cache.load().is_some()
+    }
+}
+
 impl From<Value> for LogEvent {
     fn from(value: Value) -> Self {
         Self::from_parts(value, EventMetadata::default())

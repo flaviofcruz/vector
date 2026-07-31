@@ -1,6 +1,7 @@
 //! Configuration for the `Clickhouse` sink.
 
 use std::fmt;
+use std::time::Duration;
 
 use http::{Request, StatusCode, Uri};
 use hyper::Body;
@@ -8,6 +9,7 @@ use vector_lib::codecs::encoding::format::SchemaProvider;
 use vector_lib::codecs::encoding::{ArrowStreamSerializerConfig, BatchSerializerConfig};
 
 use super::{
+    direct_fallback::DirectFallbackService,
     headless::{EndpointServiceConfig, HeadlessService},
     request_builder::ClickhouseRequestBuilder,
     service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
@@ -154,17 +156,28 @@ pub struct ClickhouseConfig {
     #[serde(default)]
     pub dns_refresh_interval_secs: Option<u64>,
 
-    /// Fallback endpoint used when all headless pod IPs are unreachable.
+    /// Fallback endpoint used when the primary endpoint is unreachable.
     ///
-    /// Required when `use_headless_service` is true. Must point to a normal
-    /// ClusterIP Kubernetes service (not a headless service) so Kubernetes
-    /// handles routing internally. Activated when all resolved pod IPs have
-    /// been removed due to connection errors; traffic returns to P2C once
-    /// the headless DNS refresh re-discovers healthy pods.
+    /// Behaves differently depending on `use_headless_service`:
+    ///
+    /// - **Headless mode** (`use_headless_service: true`): required. Must point to
+    ///   a normal ClusterIP Kubernetes service (not a headless service). Activated
+    ///   when all resolved pod IPs have been removed due to connection errors;
+    ///   traffic returns to P2C once the headless DNS refresh re-discovers healthy
+    ///   pods.
+    ///
+    /// - **Direct mode** (`use_headless_service: false`): optional. Enables a
+    ///   per-request single-hop fallback — each request is sent to `endpoint`
+    ///   (e.g. `clickhouse-proxy`) and, if that request hits a connection-level
+    ///   error, the same request is immediately re-sent to this endpoint (e.g. the
+    ///   direct ClusterIP write service). This is the `clickhouse-proxy`
+    ///   dual-write path: keep the proxy as the primary, fall back to writing SMK
+    ///   directly when the proxy is down. Only connection failures trigger the
+    ///   fallback; a `5xx` response is left to the retry logic.
     ///
     /// Can be HTTP or HTTPS. If HTTPS, the `tls` block must also be configured
     /// with the appropriate CA certificate — the same `HttpClient` is shared
-    /// between the headless pod connections and this fallback. Without a `tls`
+    /// between the primary connections and this fallback. Without a `tls`
     /// block, HTTPS will fail for self-signed or custom-CA certificates.
     #[configurable(metadata(
         docs::examples = "http://cluster-service-write.logging-clickhouse.svc.cluster.local:8123"
@@ -179,6 +192,27 @@ pub struct ClickhouseConfig {
     /// to N (one per pod) instead of N × concurrency. Defaults to `1`.
     #[serde(default)]
     pub pool_max_idle_per_host: Option<usize>,
+
+    /// ClickHouse error codes that must not be retried.
+    ///
+    /// ClickHouse returns most deterministic data errors (e.g. `VIOLATED_CONSTRAINT`,
+    /// `CANNOT_CONVERT_TYPE`) over HTTP as status 500 with a body beginning
+    /// `Code: {n}. DB::Exception: ...`. Such rows fail identically on every retry,
+    /// so retrying only wastes the retry budget (and, in headless mode, fans the
+    /// doomed request across pods) before the request is dropped anyway. Codes
+    /// listed here are dropped immediately instead.
+    ///
+    /// Left unset, a built-in default set is used (469, 70, 69, 407, 131, 53, 117).
+    /// Set explicitly to override per shard without a Vector binary roll; an empty
+    /// list retries every 500. Transient 500s (e.g. `MEMORY_LIMIT_EXCEEDED`) and
+    /// bodies without a parseable `Code:` prefix are always retried.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "example_non_retriable_error_codes()"))]
+    pub non_retriable_error_codes: Option<Vec<u32>>,
+}
+
+fn example_non_retriable_error_codes() -> Vec<u32> {
+    vec![469, 70, 69, 407, 131]
 }
 
 /// Query settings for the `clickhouse` sink.
@@ -252,6 +286,7 @@ struct ClickhouseBuildParams {
     format: Format,
     request_builder: ClickhouseRequestBuilder,
     svc_config: EndpointServiceConfig,
+    non_retriable_error_codes: Option<Vec<u32>>,
 }
 
 impl_generate_config_from_default!(ClickhouseConfig);
@@ -312,6 +347,7 @@ impl SinkConfig for ClickhouseConfig {
             format,
             request_builder,
             svc_config,
+            non_retriable_error_codes: self.non_retriable_error_codes.clone(),
         };
 
         if self.use_headless_service {
@@ -344,11 +380,64 @@ impl ClickhouseConfig {
         Ok(())
     }
 
-    /// Builds the direct single-endpoint sink (default behavior, no headless routing).
+    /// Builds the direct single-endpoint sink (no headless routing).
+    ///
+    /// When `fallback_endpoint` is set, wraps the primary endpoint in a
+    /// [`DirectFallbackService`] that retries the primary (proxy), then fails over
+    /// to the fallback (direct SMK) and retries that — the `clickhouse-proxy`
+    /// dual-write path. That service owns its retry loop, so the outer Tower retry
+    /// layer is disabled and the outer timeout widened to bound the two phases.
+    /// Without a `fallback_endpoint`, builds a plain single-endpoint sink.
     fn build_direct(
         &self,
-        params: ClickhouseBuildParams,
+        mut params: ClickhouseBuildParams,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
+        if let Some(fallback) = self.fallback_endpoint.as_ref() {
+            let fallback_uri = fallback.with_default_parts().uri;
+
+            // `retry_attempts` is retries, so total attempts per endpoint is +1.
+            // Capture backoff/timeout before disabling the outer retry layer below.
+            let max_attempts_per_endpoint = params.request_limits.retry_attempts.saturating_add(1);
+            let initial_backoff = params.request_limits.retry_initial_backoff;
+            let max_backoff = params.request_limits.retry_max_duration;
+            let per_call_timeout = params.request_limits.timeout;
+
+            info!(
+                message = "ClickHouse direct sink configured with a retrying fallback endpoint.",
+                primary_endpoint = %params.endpoint,
+                fallback_endpoint = %fallback_uri,
+                max_attempts_per_endpoint,
+            );
+
+            let service = DirectFallbackService::new(
+                &params.client,
+                params.endpoint.clone(),
+                fallback_uri,
+                &params.svc_config,
+                params.non_retriable_error_codes.clone(),
+                max_attempts_per_endpoint,
+                initial_backoff,
+                max_backoff,
+                per_call_timeout,
+            );
+
+            // The service owns its retry loop: disable the outer retry layer (else
+            // attempts multiply) and widen the outer timeout to bound both phases —
+            // up to `2 * max_attempts` hops plus the backoff sleeps between them,
+            // with margin. Saturate rather than panic.
+            params.request_limits.retry_attempts = 0;
+            let hops = (2 * max_attempts_per_endpoint) as u32;
+            let sleeps = hops.saturating_sub(2);
+            let hop_budget = per_call_timeout.checked_mul(hops).unwrap_or(Duration::MAX);
+            let sleep_budget = max_backoff.checked_mul(sleeps).unwrap_or(Duration::MAX);
+            params.request_limits.timeout = hop_budget
+                .checked_add(sleep_budget)
+                .and_then(|d| d.checked_add(Duration::from_secs(5)))
+                .unwrap_or(Duration::MAX);
+
+            return self.build_sink_and_healthcheck(params, service);
+        }
+
         let service_request_builder = ClickhouseServiceRequestBuilder {
             auth: params.svc_config.auth.clone(),
             endpoint: params.endpoint.clone(),
@@ -416,7 +505,10 @@ impl ClickhouseConfig {
         S::Future: Send + 'static,
     {
         let service = ServiceBuilder::new()
-            .settings(params.request_limits, ClickhouseRetryLogic::default())
+            .settings(
+                params.request_limits,
+                ClickhouseRetryLogic::new(params.non_retriable_error_codes),
+            )
             .service(inner_service);
 
         let sink = ClickhouseSink::new(
@@ -469,20 +561,39 @@ impl ClickhouseConfig {
             };
             let mut arrow_config = arrow_config.clone();
 
-            self.resolve_arrow_schema(
-                client,
-                endpoint.to_string(),
-                database,
-                auth,
-                &mut arrow_config,
-            )
-            .await?;
+            let arrow_encoder = match self
+                .resolve_arrow_schema(
+                    client,
+                    endpoint.to_string(),
+                    database,
+                    auth,
+                    &mut arrow_config,
+                )
+                .await
+            {
+                Ok(()) => BatchSerializerConfig::ArrowStream(arrow_config)
+                    .build()
+                    .map(|s| EncoderKind::Batch(BatchEncoder::new(s))),
+                Err(e) => Err(e),
+            };
 
-            let resolved_batch_config = BatchSerializerConfig::ArrowStream(arrow_config);
-            let batch_serializer = resolved_batch_config.build()?;
-            let encoder = EncoderKind::Batch(BatchEncoder::new(batch_serializer));
-
-            return Ok((Format::ArrowStream, encoder));
+            match arrow_encoder {
+                Ok(encoder) => return Ok((Format::ArrowStream, encoder)),
+                // Arrow setup failed: fall back to JSONEachRow. Return JsonEachRow, not self.format
+                // (ArrowStream here), so the FORMAT clause matches the JSON encoder.
+                Err(error) => {
+                    metrics::counter!("clickhouse_arrow_setup_failed_fallback_json").increment(1);
+                    warn!(
+                        message = "ClickHouse Arrow setup failed; falling back to JSONEachRow.",
+                        %error,
+                    );
+                    let encoder = EncoderKind::Framed(Box::new(Encoder::<Framer>::new(
+                        NewlineDelimitedEncoderConfig.build().into(),
+                        JsonSerializerConfig::default().build().into(),
+                    )));
+                    return Ok((Format::JsonEachRow, encoder));
+                }
+            }
         }
 
         let encoder = EncoderKind::Framed(Box::new(Encoder::<Framer>::new(
@@ -534,6 +645,10 @@ impl ClickhouseConfig {
         })?;
 
         config.schema = Some(schema);
+
+        // Enable coercion: without it, a missing/null or string-typed value would fail the batch
+        // on a non-nullable column.
+        config.coerce_missing_to_default = true;
 
         debug!(
             "Successfully fetched Arrow schema with {} fields.",
@@ -675,5 +790,35 @@ mod tests {
                 "format should match configured value"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_arrow_schema_failure_falls_back_to_json() {
+        use crate::http::HttpClient;
+        use crate::tls::TlsSettings;
+
+        let tls = TlsSettings::default();
+        let client = HttpClient::new(tls, &Default::default()).unwrap();
+        // Unroutable port so the schema fetch fails.
+        let endpoint: http::Uri = "http://127.0.0.1:1".parse().unwrap();
+        let database: Template = "test_db".try_into().unwrap();
+
+        let config = create_test_config(
+            Format::ArrowStream,
+            Some(BatchSerializerConfig::ArrowStream(
+                ArrowStreamSerializerConfig::default(),
+            )),
+        );
+
+        let (format, _encoder) = config
+            .resolve_strategy(&client, &endpoint, &database, None)
+            .await
+            .expect("Arrow setup failure should fall back, not error");
+
+        assert_eq!(
+            format,
+            Format::JsonEachRow,
+            "on Arrow setup failure the sink must fall back to JSONEachRow"
+        );
     }
 }

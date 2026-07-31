@@ -155,6 +155,40 @@ impl InternalEvent for ClickhouseHeadlessDnsRefreshed {
     }
 }
 
+/// Emitted when the direct-sink primary endpoint (the `clickhouse-proxy`)
+/// exhausts its retries and the request is failed over to the fallback endpoint
+/// (the direct write service).
+///
+/// `clickhouse_direct_fallback_routed_total` rising means the proxy is degraded
+/// and writes are being served directly — alert on it so proxy issues are
+/// visible rather than silently absorbed.
+#[derive(Debug, NamedInternalEvent)]
+pub struct ClickhouseDirectFallbackRouted;
+
+impl InternalEvent for ClickhouseDirectFallbackRouted {
+    fn emit(self) {
+        warn!(message = "ClickHouse primary exhausted retries; failing over to fallback.");
+        counter!("clickhouse_direct_fallback_routed_total").increment(1);
+    }
+}
+
+/// Emitted on each retry of a direct-sink endpoint (after a retriable failure,
+/// before the next attempt).
+///
+/// `clickhouse_direct_fallback_retry_total{endpoint}` counts retries per endpoint
+/// (`primary` = proxy, `fallback` = direct write) — a rising `primary` rate shows
+/// proxy instability short of a full failover.
+#[derive(Debug, NamedInternalEvent)]
+pub struct ClickhouseDirectRetry {
+    pub endpoint: &'static str,
+}
+
+impl InternalEvent for ClickhouseDirectRetry {
+    fn emit(self) {
+        counter!("clickhouse_direct_fallback_retry_total", "endpoint" => self.endpoint).increment(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -251,5 +285,36 @@ mod tests {
             interval.value(),
             MetricValue::AggregatedHistogram { .. }
         ));
+    }
+
+    #[test]
+    fn direct_fallback_routed_emits_counter() {
+        trace_init();
+
+        emit!(ClickhouseDirectFallbackRouted);
+
+        let metrics = Controller::get().unwrap().capture_metrics();
+        let counter = metrics
+            .iter()
+            .find(|m| m.name() == "clickhouse_direct_fallback_routed_total")
+            .expect("clickhouse_direct_fallback_routed_total not found");
+        assert!(matches!(counter.value(), MetricValue::Counter { value } if *value >= 1.0));
+    }
+
+    #[test]
+    fn direct_retry_emits_counter_tagged_by_endpoint() {
+        trace_init();
+
+        emit!(ClickhouseDirectRetry { endpoint: "primary" });
+
+        let metrics = Controller::get().unwrap().capture_metrics();
+        let counter = metrics
+            .iter()
+            .find(|m| {
+                m.name() == "clickhouse_direct_fallback_retry_total"
+                    && m.tags().and_then(|t| t.get("endpoint")) == Some("primary")
+            })
+            .expect("clickhouse_direct_fallback_retry_total{endpoint=primary} not found");
+        assert!(matches!(counter.value(), MetricValue::Counter { value } if *value >= 1.0));
     }
 }
