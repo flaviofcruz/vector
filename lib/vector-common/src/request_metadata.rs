@@ -323,10 +323,12 @@ impl RequestMetadata {
         events_len: usize,
         blob: String,
         container: String,
+        bucket: Option<String>,
     ) {
         let mut event_log_metadata = self.event_log_metadata.clone();
-        event_log_metadata
-            .update_file_metadata(FileEventMetadata::new(bytes, events_len, blob, container));
+        event_log_metadata.update_file_metadata(FileEventMetadata::new(
+            bytes, events_len, blob, container, bucket,
+        ));
         self.event_log_metadata = event_log_metadata;
     }
 
