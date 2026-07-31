@@ -15,6 +15,7 @@ use hyper::{Body, client::HttpConnector};
 use prost_reflect::{
     DescriptorPool, DeserializeOptions, DynamicMessage, MethodDescriptor, Value, prost::Message,
 };
+use tracing::Instrument;
 use vector_lib::{
     config::clone_input_definitions,
     configurable::configurable_component,
@@ -25,7 +26,11 @@ use vrl::path::{OwnedTargetPath, parse_target_path};
 use crate::{
     config::{DataType, Input, OutputId, TransformConfig, TransformContext, TransformOutput},
     event::{Event, EventStatus},
-    internal_events::{DynamicRlsThrottleInflow, DynamicRlsThrottleOverLimit},
+    internal_events::{
+        DynamicRlsThrottleFailOpen, DynamicRlsThrottleInflow, DynamicRlsThrottleOperational,
+        DynamicRlsThrottleOverLimit, DynamicRlsThrottleReportError,
+        DynamicRlsThrottleReportFreshness, ReportErrorReason,
+    },
     schema,
     transforms::{TaskTransform, Transform},
 };
@@ -275,7 +280,10 @@ impl TransformConfig for DynamicRlsThrottleConfig {
         // failure here (bad descriptor OR unparseable endpoint) disables throttling rather than
         // erroring the build, which would crashloop the VA config. The timing/field-path checks
         // above still fail loud — only the transport build fails open.
-        let transport = match build_transport(&self.sidecar_endpoint, self.sidecar_proto_descriptor_path.as_path()) {
+        let transport = match build_transport(
+            &self.sidecar_endpoint,
+            self.sidecar_proto_descriptor_path.as_path(),
+        ) {
             Ok(transport) => Some(transport),
             Err(error) => {
                 warn!(
@@ -336,24 +344,31 @@ fn load_report_counts_method(path: &std::path::Path) -> crate::Result<MethodDesc
         .map_err(|e| format!("decode sidecar FileDescriptorSet {}: {e}", path.display()))?;
     let pool = DescriptorPool::from_file_descriptor_set(fds)
         .map_err(|e| format!("build sidecar DescriptorPool {}: {e}", path.display()))?;
-    let service = pool.get_service_by_name(REPORT_COUNTS_SERVICE).ok_or_else(|| {
-        format!(
-            "service `{REPORT_COUNTS_SERVICE}` not found in descriptor {}",
-            path.display()
-        )
-    })?;
+    let service = pool
+        .get_service_by_name(REPORT_COUNTS_SERVICE)
+        .ok_or_else(|| {
+            format!(
+                "service `{REPORT_COUNTS_SERVICE}` not found in descriptor {}",
+                path.display()
+            )
+        })?;
     service
         .methods()
         .find(|m| m.name() == REPORT_COUNTS_METHOD)
         .ok_or_else(|| {
-            format!("method `{REPORT_COUNTS_METHOD}` not found in service `{REPORT_COUNTS_SERVICE}`")
-                .into()
+            format!(
+                "method `{REPORT_COUNTS_METHOD}` not found in service `{REPORT_COUNTS_SERVICE}`"
+            )
+            .into()
         })
 }
 
 /// Build the h2c client, parse the endpoint, and load the descriptor. Failures return to `build`
 /// (which fails open).
-fn build_transport(endpoint: &str, descriptor_path: &std::path::Path) -> crate::Result<GrpcTransport> {
+fn build_transport(
+    endpoint: &str,
+    descriptor_path: &std::path::Path,
+) -> crate::Result<GrpcTransport> {
     let method = load_report_counts_method(descriptor_path)?;
     let endpoint: Uri = endpoint
         .parse()
@@ -371,11 +386,7 @@ fn build_transport(endpoint: &str, descriptor_path: &std::path::Path) -> crate::
 
 /// The `POST /<fully-qualified-service>/<method>` URI for a unary gRPC call.
 fn grpc_uri(endpoint: &Uri, method: &MethodDescriptor) -> crate::Result<Uri> {
-    let path = format!(
-        "/{}/{}",
-        method.parent_service().full_name(),
-        method.name()
-    );
+    let path = format!("/{}/{}", method.parent_service().full_name(), method.name());
     let base = endpoint.to_string();
     let base = base.trim_end_matches('/');
     format!("{base}{path}")
@@ -402,7 +413,9 @@ fn decode_grpc_frame(mut body: Bytes) -> crate::Result<Bytes> {
     }
     let compression_flag = body.get_u8();
     if compression_flag != 0 {
-        return Err(format!("compressed gRPC responses not supported (flag {compression_flag})").into());
+        return Err(
+            format!("compressed gRPC responses not supported (flag {compression_flag})").into(),
+        );
     }
     let message_len = body.get_u32() as usize;
     if body.remaining() < message_len {
@@ -428,7 +441,9 @@ fn resolve_grpc_status(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
     };
-    let status = code(headers).or_else(|| trailers.and_then(code)).unwrap_or(0);
+    let status = code(headers)
+        .or_else(|| trailers.and_then(code))
+        .unwrap_or(0);
     let message = msg(headers).or_else(|| trailers.and_then(msg));
     (status, message)
 }
@@ -519,8 +534,11 @@ impl TaskTransform<Event> for DynamicRlsThrottle {
         // Fail-open: with no transport (descriptor load failed at build), throttling is disabled.
         // Pass every event straight through — no reporter, no counting, nothing ever dropped.
         let Some(transport) = transport else {
+            emit!(DynamicRlsThrottleOperational { operational: false });
             return input_rx;
         };
+
+        emit!(DynamicRlsThrottleOperational { operational: true });
 
         // Enforcement is decided per event (`effective_mode`, below) so one pod can drop some
         // systems while shadowing the rest (half-shadow). Captured into locals before `config` is
@@ -621,7 +639,9 @@ impl BackgroundReporter {
         transport: GrpcTransport,
         shared: Arc<SharedThrottleState>,
     ) -> Self {
-        let handle = tokio::spawn(run_reporter(config, transport, shared));
+        // `tokio::spawn` detaches the current span; re-attach it so the reporter's metrics keep the
+        // component's `component_id` (else the neon per-system/group instances are indistinguishable).
+        let handle = tokio::spawn(run_reporter(config, transport, shared).in_current_span());
         Self { handle }
     }
 }
@@ -661,27 +681,43 @@ async fn run_reporter(
                 last_ok = Instant::now();
             }
             Err(error) => {
+                // Fires (and logs) on every failed round-trip, regardless of the staleness budget.
+                emit!(DynamicRlsThrottleReportError {
+                    reason: error.reason,
+                    error: error.source.to_string(),
+                });
                 let staleness = last_ok.elapsed();
                 if staleness > Duration::from_secs(config.max_staleness_secs) {
                     // Fail open: the decision is too old to trust, so stop dropping.
                     if !shared.over_limit.load().is_empty() {
                         shared.over_limit.store(Arc::new(HashSet::new()));
+                        // Count only a real clear; an already-empty set going stale changes nothing.
+                        emit!(DynamicRlsThrottleFailOpen);
                     }
-                    warn!(
-                        message = "Failed to refresh over-limit set; failing open.",
-                        %error,
-                        staleness_secs = staleness.as_secs(),
-                        internal_log_rate_limit = true,
-                    );
-                } else {
-                    // Keep the current set; a transient failure inside the staleness budget.
-                    debug!(
-                        message = "Failed to refresh over-limit set; keeping current set.",
-                        %error,
-                        internal_log_rate_limit = true,
-                    );
                 }
             }
+        }
+
+        // Every cycle (0.0 after a success), so a healthy pod reads a real 0 rather than "no data".
+        emit!(DynamicRlsThrottleReportFreshness {
+            seconds_since_last_success: last_ok.elapsed().as_secs_f64(),
+        });
+    }
+}
+
+/// A failed `ReportCounts` round-trip. `reason` selects the metric's `error_type`; `source` is the
+/// underlying error for the log.
+struct ReportError {
+    reason: ReportErrorReason,
+    source: crate::Error,
+}
+
+impl ReportError {
+    /// Any non-timeout failure.
+    fn request_failed(source: impl Into<crate::Error>) -> Self {
+        Self {
+            reason: ReportErrorReason::RequestFailed,
+            source: source.into(),
         }
     }
 }
@@ -691,7 +727,7 @@ async fn report(
     config: &DynamicRlsThrottleConfig,
     transport: &GrpcTransport,
     snapshot: HashMap<Key, u64>,
-) -> crate::Result<HashSet<Key>> {
+) -> Result<HashSet<Key>, ReportError> {
     let request_desc = transport.method.input();
 
     // Build the request as proto3-JSON, then deserialize into a DynamicMessage against the
@@ -706,58 +742,66 @@ async fn report(
     let request_json = serde_json::json!({ "counts": counts });
     let opts = DeserializeOptions::new().deny_unknown_fields(true);
     let request_msg = DynamicMessage::deserialize_with_options(request_desc, &request_json, &opts)
-        .map_err(|e| format!("build ReportCounts request message: {e}"))?;
+        .map_err(|e| {
+            ReportError::request_failed(format!("build ReportCounts request message: {e}"))
+        })?;
 
-    let uri = grpc_uri(&transport.endpoint, &transport.method)?;
+    let uri =
+        grpc_uri(&transport.endpoint, &transport.method).map_err(ReportError::request_failed)?;
     let http_req: Request<Body> = Request::builder()
         .uri(uri)
         .method("POST")
         .header("content-type", "application/grpc+proto")
         .header("te", "trailers")
         .header("grpc-encoding", "identity")
-        .body(Body::from(encode_grpc_message(request_msg.encode_to_vec())))?;
+        .body(Body::from(encode_grpc_message(request_msg.encode_to_vec())))
+        .map_err(ReportError::request_failed)?;
 
     // Bound the whole call — request plus draining body + trailers — with the timeout. The client
     // resolves at response headers, so a stall mid-body would otherwise wedge the reporter loop and
     // the staleness fail-open could never run.
     let output_desc = transport.method.output();
-    let over_limit = tokio::time::timeout(
-        Duration::from_secs(config.report_timeout_secs),
-        async {
-            let response = transport.client.request(http_req).await?;
-            let response_headers = response.headers().clone();
+    let call = async {
+        let response = transport.client.request(http_req).await?;
+        let response_headers = response.headers().clone();
 
-            // gRPC status is in the initial HEADERS (Trailers-Only error) or the HTTP/2 trailers —
-            // drain data frames then read trailers explicitly (hyper 0.14 `to_bytes` drops them).
-            use hyper::body::HttpBody as _;
-            let mut body_stream = response.into_body();
-            let mut body = BytesMut::new();
-            while let Some(chunk) =
-                std::future::poll_fn(|cx| std::pin::Pin::new(&mut body_stream).poll_data(cx)).await
-            {
-                body.extend_from_slice(&chunk?);
-            }
-            let trailers =
-                std::future::poll_fn(|cx| std::pin::Pin::new(&mut body_stream).poll_trailers(cx))
-                    .await?;
+        // gRPC status is in the initial HEADERS (Trailers-Only error) or the HTTP/2 trailers —
+        // drain data frames then read trailers explicitly (hyper 0.14 `to_bytes` drops them).
+        use hyper::body::HttpBody as _;
+        let mut body_stream = response.into_body();
+        let mut body = BytesMut::new();
+        while let Some(chunk) =
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body_stream).poll_data(cx)).await
+        {
+            body.extend_from_slice(&chunk?);
+        }
+        let trailers =
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body_stream).poll_trailers(cx))
+                .await?;
 
-            let (status, message) = resolve_grpc_status(&response_headers, trailers.as_ref());
-            if status != 0 {
-                return Err(crate::Error::from(format!(
-                    "sidecar ReportCounts returned gRPC status {status}: {}",
-                    message.unwrap_or_else(|| "unknown error".to_string())
-                )));
-            }
+        let (status, message) = resolve_grpc_status(&response_headers, trailers.as_ref());
+        if status != 0 {
+            return Err(crate::Error::from(format!(
+                "sidecar ReportCounts returned gRPC status {status}: {}",
+                message.unwrap_or_else(|| "unknown error".to_string())
+            )));
+        }
 
-            let message_bytes = decode_grpc_frame(body.freeze())?;
-            let response_msg = DynamicMessage::decode(output_desc, &message_bytes[..])
-                .map_err(|e| format!("decode ReportCounts response: {e}"))?;
-            crate::Result::Ok(parse_over_limit(&response_msg))
-        },
-    )
-    .await??;
+        let message_bytes = decode_grpc_frame(body.freeze())?;
+        let response_msg = DynamicMessage::decode(output_desc, &message_bytes[..])
+            .map_err(|e| format!("decode ReportCounts response: {e}"))?;
+        crate::Result::Ok(parse_over_limit(&response_msg))
+    };
 
-    Ok(over_limit)
+    // Elapsed timeout vs an inner error classifies the failure for the metric's `error_type`.
+    match tokio::time::timeout(Duration::from_secs(config.report_timeout_secs), call).await {
+        Ok(Ok(over_limit)) => Ok(over_limit),
+        Ok(Err(source)) => Err(ReportError::request_failed(source)),
+        Err(elapsed) => Err(ReportError {
+            reason: ReportErrorReason::TimedOut,
+            source: elapsed.into(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -790,7 +834,11 @@ mod tests {
     // tests carry no snapshot of the universe proto and need no mounted `.pb`. Loading the real
     // `--include_imports` protoset in `prost_reflect` was validated separately.
 
-    fn optional_field(name: &str, number: i32, ty: field_descriptor_proto::Type) -> FieldDescriptorProto {
+    fn optional_field(
+        name: &str,
+        number: i32,
+        ty: field_descriptor_proto::Type,
+    ) -> FieldDescriptorProto {
         FieldDescriptorProto {
             name: Some(name.into()),
             number: Some(number),
@@ -800,7 +848,12 @@ mod tests {
         }
     }
 
-    fn message_field(name: &str, number: i32, type_name: &str, repeated: bool) -> FieldDescriptorProto {
+    fn message_field(
+        name: &str,
+        number: i32,
+        type_name: &str,
+        repeated: bool,
+    ) -> FieldDescriptorProto {
         let label = if repeated {
             field_descriptor_proto::Label::Repeated
         } else {
@@ -889,10 +942,9 @@ mod tests {
     }
 
     fn report_counts_method() -> MethodDescriptor {
-        let fds = prost_reflect::prost_types::FileDescriptorSet::decode(
-            &report_counts_fds_bytes()[..],
-        )
-        .expect("decode fixture FDS");
+        let fds =
+            prost_reflect::prost_types::FileDescriptorSet::decode(&report_counts_fds_bytes()[..])
+                .expect("decode fixture FDS");
         let pool = DescriptorPool::from_file_descriptor_set(fds).expect("fixture pool");
         pool.get_service_by_name(REPORT_COUNTS_SERVICE)
             .expect("fixture service")
@@ -958,11 +1010,12 @@ mod tests {
                             .unwrap()
                             .to_bytes();
                         let msg_bytes = decode_grpc_frame(body).expect("frame");
-                        let request_msg =
-                            DynamicMessage::decode(method.input(), &msg_bytes[..]).expect("decode req");
+                        let request_msg = DynamicMessage::decode(method.input(), &msg_bytes[..])
+                            .expect("decode req");
                         let mut rows = Vec::new();
-                        if let Some(Value::List(counts)) =
-                            request_msg.get_field_by_name("counts").map(|v| v.into_owned())
+                        if let Some(Value::List(counts)) = request_msg
+                            .get_field_by_name("counts")
+                            .map(|v| v.into_owned())
                         {
                             for c in counts {
                                 if let Value::Message(m) = c {
@@ -1001,8 +1054,7 @@ mod tests {
                         tokio::spawn(async move {
                             let _ = sender.send_data(Bytes::from(framed)).await;
                             let mut trailers = http::HeaderMap::new();
-                            trailers
-                                .insert("grpc-status", http::HeaderValue::from_static("0"));
+                            trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
                             let _ = sender.send_trailers(trailers).await;
                         });
                         Ok::<_, Infallible>(
@@ -1117,6 +1169,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_fails_open_when_descriptor_missing() {
+        use vector_lib::event_test_util::{clear_recorded_events, contains_name_once};
+
         // A missing descriptor must NOT error the build — it must produce a disabled transform that
         // forwards everything, even a combo that is "over limit". Fail open, never closed or crash.
         let config = DynamicRlsThrottleConfig {
@@ -1124,20 +1178,27 @@ mod tests {
             ..Default::default()
         };
         let transform = config.build(&TransformContext::default()).await;
-        assert!(transform.is_ok(), "descriptor load failure must fail open, not error the build");
+        assert!(
+            transform.is_ok(),
+            "descriptor load failure must fail open, not error the build"
+        );
 
         // Disabled transform (no transport); seed an over-limit combo and confirm it's forwarded.
         let throttle = build_throttle_no_transport(&config);
-        throttle
-            .shared
-            .over_limit
-            .store(Arc::new(HashSet::from([(
-                "spark-log".to_string(),
-                "telemetry".to_string(),
-            )])));
+        throttle.shared.over_limit.store(Arc::new(HashSet::from([(
+            "spark-log".to_string(),
+            "telemetry".to_string(),
+        )])));
 
+        clear_recorded_events();
         let (mut tx, rx) = futures::channel::mpsc::channel(10);
         let mut out = Box::new(throttle).transform(Box::pin(rx));
+        // The non-operational transform must publish operational=0 so the silent break is visible.
+        assert!(
+            contains_name_once("DynamicRlsThrottleOperational").is_ok(),
+            "non-operational transform must emit the operational gauge"
+        );
+
         tx.try_send(log_with("spark-log", "telemetry")).unwrap();
         // Disabled: the "over-limit" log is forwarded, not dropped.
         assert!(out.next().await.is_some());
@@ -1395,7 +1456,11 @@ mod tests {
             "auth-v2",
             "only the non-enforced system's log should be forwarded"
         );
-        assert_eq!(out.next().await, None, "the reyden log must have been dropped");
+        assert_eq!(
+            out.next().await,
+            None,
+            "the reyden log must have been dropped"
+        );
     }
 
     #[tokio::test]
@@ -1445,7 +1510,10 @@ mod tests {
         tx.try_send(log_with("spark-log", "telemetry")).unwrap();
         tx.disconnect();
 
-        assert!(out.next().await.is_some(), "with no enforce scope, nothing is dropped");
+        assert!(
+            out.next().await.is_some(),
+            "with no enforce scope, nothing is dropped"
+        );
         assert_eq!(out.next().await, None);
     }
 
@@ -1609,14 +1677,11 @@ mod tests {
         let requests = log.lock().unwrap();
         assert!(!requests.requests.is_empty(), "sidecar received no request");
         assert!(
-            requests
-                .requests
-                .iter()
-                .any(|rows| rows.contains(&(
-                    "background-activity-log".to_string(),
-                    "auth-v2".to_string(),
-                    7
-                ))),
+            requests.requests.iter().any(|rows| rows.contains(&(
+                "background-activity-log".to_string(),
+                "auth-v2".to_string(),
+                7
+            ))),
             "sidecar did not receive the seeded count over gRPC"
         );
 
@@ -1648,7 +1713,10 @@ mod tests {
                 break;
             }
         }
-        assert!(called, "reporter did not call the sidecar for an empty window");
+        assert!(
+            called,
+            "reporter did not call the sidecar for an empty window"
+        );
         // The empty window is reported as an empty counts list, not a skipped call.
         assert_eq!(log.lock().unwrap().requests[0].len(), 0);
 
@@ -1688,7 +1756,10 @@ mod tests {
                 break;
             }
         }
-        assert!(failed_open, "over-limit set was not cleared after staleness");
+        assert!(
+            failed_open,
+            "over-limit set was not cleared after staleness"
+        );
 
         drop(tx);
     }
@@ -1707,8 +1778,7 @@ mod tests {
         };
 
         let over_limit_key = ("spark-log".to_string(), "telemetry".to_string());
-        let throttle =
-            throttle_with_over_limit(&config, HashSet::from([over_limit_key.clone()]));
+        let throttle = throttle_with_over_limit(&config, HashSet::from([over_limit_key.clone()]));
         let shared = Arc::clone(&throttle.shared);
 
         let (tx, rx) = futures::channel::mpsc::channel::<Event>(1);
@@ -1724,6 +1794,144 @@ mod tests {
                 "set was cleared despite being within the staleness budget"
             );
         }
+
+        drop(tx);
+    }
+
+    // --- Reporter health metrics (LP-1832) -------------------------------------------------------
+    //
+    // The recorder is a thread-local name set; `#[tokio::test]` runs on a current-thread runtime, so
+    // the spawned reporter shares the test thread and its emissions are observable here.
+
+    #[tokio::test]
+    async fn healthy_report_emits_freshness_not_error_or_fail_open() {
+        use vector_lib::event_test_util::{clear_recorded_events, contains_name_once};
+
+        // A reachable sidecar: every cycle succeeds, so freshness is published but neither the error
+        // counter nor the fail-open counter should ever fire.
+        let (_guard, addr) = next_addr();
+        let log = Arc::new(StdMutex::new(SidecarLog::default()));
+        spawn_fake_sidecar(addr, vec![], Arc::clone(&log)).await;
+
+        let config = test_config(format!("http://{addr}"));
+        let throttle = build_throttle(&config);
+
+        clear_recorded_events();
+        let (tx, rx) = futures::channel::mpsc::channel::<Event>(1);
+        let mut out = Box::new(throttle).transform(Box::pin(rx));
+        assert_eq!(Poll::Pending, futures::poll!(out.next()));
+
+        // Wait on the emitted gauge, not the sidecar's request log: the fake sidecar records the
+        // request before responding, but freshness is emitted only after the round-trip returns.
+        let mut published = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = futures::poll!(out.next());
+            if contains_name_once("DynamicRlsThrottleReportFreshness").is_ok() {
+                published = true;
+                break;
+            }
+        }
+        assert!(
+            published,
+            "freshness gauge must be published after a successful report"
+        );
+        assert!(
+            contains_name_once("DynamicRlsThrottleOperational").is_ok(),
+            "an operational transform must publish the operational gauge"
+        );
+        assert!(
+            contains_name_once("DynamicRlsThrottleReportError").is_err(),
+            "a successful report must not emit the error counter"
+        );
+        assert!(
+            contains_name_once("DynamicRlsThrottleFailOpen").is_err(),
+            "a successful report must not emit the fail-open counter"
+        );
+
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn unreachable_sidecar_emits_report_error() {
+        use vector_lib::event_test_util::{clear_recorded_events, contains_name_once};
+
+        // Nothing is listening, so every report fails: the error counter must fire. A generous
+        // staleness budget keeps fail-open out of it, isolating the call-error signal.
+        let (_guard, addr) = next_addr();
+        let config = DynamicRlsThrottleConfig {
+            report_interval_secs: 1,
+            report_timeout_secs: 1,
+            max_staleness_secs: 3600,
+            ..test_config(format!("http://{addr}"))
+        };
+        let throttle = build_throttle(&config);
+
+        clear_recorded_events();
+        let (tx, rx) = futures::channel::mpsc::channel::<Event>(1);
+        let mut out = Box::new(throttle).transform(Box::pin(rx));
+        assert_eq!(Poll::Pending, futures::poll!(out.next()));
+
+        let mut errored = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = futures::poll!(out.next());
+            if contains_name_once("DynamicRlsThrottleReportError").is_ok() {
+                errored = true;
+                break;
+            }
+        }
+        assert!(errored, "a failed report must emit the error counter");
+        // Within the staleness budget, fail-open must NOT have fired.
+        assert!(
+            contains_name_once("DynamicRlsThrottleFailOpen").is_err(),
+            "fail-open must not fire while inside the staleness budget"
+        );
+
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn fail_open_transition_emits_fail_open_metric() {
+        use vector_lib::event_test_util::{clear_recorded_events, contains_name_once};
+
+        // Unreachable sidecar + tiny staleness budget: the seeded set is cleared once stale, which is
+        // the fail-open transition the counter records.
+        let (_guard, addr) = next_addr();
+        let config = DynamicRlsThrottleConfig {
+            report_interval_secs: 1,
+            report_timeout_secs: 1,
+            max_staleness_secs: 1,
+            ..test_config(format!("http://{addr}"))
+        };
+        let throttle = throttle_with_over_limit(
+            &config,
+            HashSet::from([("spark-log".to_string(), "telemetry".to_string())]),
+        );
+        let shared = Arc::clone(&throttle.shared);
+
+        clear_recorded_events();
+        let (tx, rx) = futures::channel::mpsc::channel::<Event>(1);
+        let mut out = Box::new(throttle).transform(Box::pin(rx));
+        assert_eq!(Poll::Pending, futures::poll!(out.next()));
+
+        let mut failed_open = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = futures::poll!(out.next());
+            if shared.over_limit.load().is_empty() {
+                failed_open = true;
+                break;
+            }
+        }
+        assert!(
+            failed_open,
+            "over-limit set was not cleared after staleness"
+        );
+        assert!(
+            contains_name_once("DynamicRlsThrottleFailOpen").is_ok(),
+            "clearing a non-empty set on staleness must emit the fail-open counter"
+        );
 
         drop(tx);
     }
