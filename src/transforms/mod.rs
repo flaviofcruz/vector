@@ -27,6 +27,8 @@ pub mod log_to_metric;
 pub mod lua;
 #[cfg(feature = "transforms-metric_to_log")]
 pub mod metric_to_log;
+#[cfg(feature = "transforms-metric_to_log_hydra")]
+pub mod metric_to_log_hydra;
 #[cfg(feature = "transforms-redact")]
 pub mod redact;
 #[cfg(feature = "transforms-remap")]

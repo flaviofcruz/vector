@@ -96,6 +96,8 @@ mod loki;
 mod lua;
 #[cfg(feature = "transforms-metric_to_log")]
 mod metric_to_log;
+#[cfg(feature = "transforms-metric_to_log_hydra")]
+mod metric_to_log_hydra;
 #[cfg(feature = "sources-mongodb_metrics")]
 mod mongodb_metrics;
 #[cfg(feature = "sinks-mqtt")]
@@ -269,6 +271,8 @@ pub(crate) use self::loki::*;
 pub(crate) use self::lua::*;
 #[cfg(feature = "transforms-metric_to_log")]
 pub(crate) use self::metric_to_log::*;
+#[cfg(feature = "transforms-metric_to_log_hydra")]
+pub(crate) use self::metric_to_log_hydra::*;
 #[cfg(feature = "sinks-mqtt")]
 pub(crate) use self::mqtt::*;
 #[cfg(feature = "sources-nginx_metrics")]
