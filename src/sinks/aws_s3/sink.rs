@@ -160,6 +160,7 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
             s3metadata.count,
             s3metadata.s3_key.clone(),
             self.bucket.clone(),
+            Some(self.bucket.clone()),
         );
         s3metadata.event_log_metadata.bytes = body.len();
         s3metadata.event_log_metadata.blob = s3metadata.s3_key.clone();

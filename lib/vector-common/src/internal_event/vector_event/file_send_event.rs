@@ -21,15 +21,23 @@ pub struct FileEventMetadata {
     pub events_len: usize,
     pub blob: String,
     pub container: String,
+    pub bucket: Option<String>,
 }
 
 impl FileEventMetadata {
-    pub fn new(bytes: usize, events_len: usize, blob: String, container: String) -> Self {
+    pub fn new(
+        bytes: usize,
+        events_len: usize,
+        blob: String,
+        container: String,
+        bucket: Option<String>,
+    ) -> Self {
         Self {
             bytes,
             events_len,
             blob,
             container,
+            bucket,
         }
     }
 
@@ -39,6 +47,7 @@ impl FileEventMetadata {
             events_len: 0,
             blob: "".to_string(),
             container: "".to_string(),
+            bucket: None,
         }
     }
 }
@@ -99,6 +108,7 @@ impl VectorFileSendEvent {
                 events_len = self.file_metadata.events_len,
                 blob = self.file_metadata.blob,
                 container = self.file_metadata.container,
+                bucket = self.file_metadata.bucket.as_deref().unwrap_or(""),
                 vector_event_type = "VECTOR_FILE_SEND_EVENT",
                 file_send_event_type = "VECTOR_FILE_SEND_WARN",
                 // Structured error reason so credential-expiry failures (e.g.
@@ -128,6 +138,7 @@ impl VectorFileSendEvent {
                 events_len = value.count,
                 blob = self.file_metadata.blob,
                 container = self.file_metadata.container,
+                bucket = self.file_metadata.bucket.as_deref().unwrap_or(""),
                 vector_event_type = vector_event_type,
                 file_send_event_type = file_send_event_type,
                 internal_log_rate_limit = false,
@@ -136,7 +147,7 @@ impl VectorFileSendEvent {
     }
 }
 
-// NOTE: This adds up the count map but will only keep the first filename/blob/container etc.
+// NOTE: This adds up the count map but will only keep the first filename/blob/container/bucket etc.
 pub fn combine_file_send_events(events: Vec<VectorFileSendEvent>) -> VectorFileSendEvent {
     let mut combined = VectorFileSendEvent::new();
     let mut combined_map: HashMap<String, MetadataValuesCount> = HashMap::new();
@@ -158,4 +169,26 @@ pub fn combine_file_send_events(events: Vec<VectorFileSendEvent>) -> VectorFileS
     }
     combined.count_map = combined_map;
     combined
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_event_metadata_keeps_bucket_separate_from_container() {
+        let metadata = FileEventMetadata::new(
+            12,
+            3,
+            "path/to/blob".to_string(),
+            "azure-container".to_string(),
+            Some("azure-storage-account".to_string()),
+        );
+
+        assert_eq!(metadata.bytes, 12);
+        assert_eq!(metadata.events_len, 3);
+        assert_eq!(metadata.blob, "path/to/blob");
+        assert_eq!(metadata.container, "azure-container");
+        assert_eq!(metadata.bucket.as_deref(), Some("azure-storage-account"));
+    }
 }

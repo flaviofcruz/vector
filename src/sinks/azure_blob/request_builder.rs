@@ -126,6 +126,7 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
             azure_metadata.count,
             azure_metadata.partition_key.clone(),
             self.container_name.clone(),
+            self.storage_account.clone(),
         );
         azure_metadata.event_log_metadata.bytes = blob_data.len();
         azure_metadata.event_log_metadata.blob = azure_metadata.partition_key.clone();
