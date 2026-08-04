@@ -759,6 +759,7 @@ transforms-logs = [
   "transforms-log_to_metric",
   "transforms-lua",
   "transforms-metric_to_log",
+  "transforms-metric_batch",
   "transforms-metric_to_log_hydra",
   "transforms-redact",
   "transforms-reduce",
@@ -794,6 +795,7 @@ transforms-window = []
 transforms-log_to_metric = []
 transforms-lua = ["dep:mlua", "vector-lib/lua"]
 transforms-metric_to_log = []
+transforms-metric_batch = []
 transforms-metric_to_log_hydra = ["dep:md-5"]
 transforms-redact = ["dep:md-5", "dep:regex-automata"]
 transforms-reduce = ["transforms-impl-reduce"]

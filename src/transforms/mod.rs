@@ -25,6 +25,8 @@ pub mod incremental_to_absolute;
 pub mod log_to_metric;
 #[cfg(feature = "transforms-lua")]
 pub mod lua;
+#[cfg(feature = "transforms-metric_batch")]
+pub mod metric_batch;
 #[cfg(feature = "transforms-metric_to_log")]
 pub mod metric_to_log;
 #[cfg(feature = "transforms-metric_to_log_hydra")]

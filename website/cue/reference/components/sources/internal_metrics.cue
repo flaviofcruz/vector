@@ -734,6 +734,17 @@ components: sources: internal_metrics: {
 			default_namespace: "vector"
 			tags:              _component_tags
 		}
+		metric_batch_groups: {
+			description:       "The number of live groups currently held by a `metric_batch` shard worker."
+			type:              "gauge"
+			default_namespace: "vector"
+			tags: _component_tags & {
+				worker: {
+					description: "The shard worker index."
+					required:    true
+				}
+			}
+		}
 		open_connections: {
 			description:       "The number of current open connections to Vector."
 			type:              "gauge"
