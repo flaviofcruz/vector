@@ -9,7 +9,10 @@ use vector_lib::codecs::encoding::format::SchemaProvider;
 use vector_lib::codecs::encoding::{ArrowStreamSerializerConfig, BatchSerializerConfig};
 
 use super::{
-    direct_fallback::DirectFallbackService,
+    direct_fallback::{
+        DEFAULT_PRIMARY_MAX_ATTEMPTS, DEFAULT_SECONDARY_MAX_ATTEMPTS, DirectFallbackService,
+        RetrySettings,
+    },
     headless::{EndpointServiceConfig, HeadlessService},
     request_builder::ClickhouseRequestBuilder,
     service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder},
@@ -21,6 +24,7 @@ use crate::{
         prelude::*,
         util::{
             RealtimeSizeBasedDefaultBatchSettings, TowerRequestSettings, UriSerde,
+            adaptive_concurrency::AdaptiveConcurrencyLimitLayer,
             http::{HttpRequest, HttpResponse, HttpService},
         },
     },
@@ -167,13 +171,22 @@ pub struct ClickhouseConfig {
     ///   pods.
     ///
     /// - **Direct mode** (`use_headless_service: false`): optional. Enables a
-    ///   per-request single-hop fallback — each request is sent to `endpoint`
-    ///   (e.g. `clickhouse-proxy`) and, if that request hits a connection-level
-    ///   error, the same request is immediately re-sent to this endpoint (e.g. the
-    ///   direct ClusterIP write service). This is the `clickhouse-proxy`
-    ///   dual-write path: keep the proxy as the primary, fall back to writing SMK
-    ///   directly when the proxy is down. Only connection failures trigger the
-    ///   fallback; a `5xx` response is left to the retry logic.
+    ///   per-request two-phase retry — each request is first sent to `endpoint`
+    ///   (e.g. `clickhouse-proxy`) and retried there, then, if the primary still
+    ///   fails, the same request fails over to this endpoint (e.g. the direct
+    ///   ClusterIP write service) and is retried there. This is the
+    ///   `clickhouse-proxy` dual-write path: keep the proxy as the primary, fall
+    ///   back to writing SMK directly when the proxy is down. The number of
+    ///   attempts per endpoint comes from `fallback_primary_max_attempts` and
+    ///   `fallback_secondary_max_attempts` (not `request.retry_attempts`), so the
+    ///   proxy can fail fast while the direct write gets more chances; the
+    ///   Fibonacci backoff, jitter, and per-attempt timeout still come from the
+    ///   `request` settings. Failover fires after the primary exhausts *any*
+    ///   retriable failure — connection-level errors, per-attempt timeouts, and
+    ///   retriable HTTP responses (408/429/5xx) alike. A non-retriable ClickHouse
+    ///   error (a `5xx` whose body carries a `Code: N` in the non-retriable set —
+    ///   see `non_retriable_error_codes`) does **not** fail over and is returned
+    ///   as-is, since the same rows would fail identically on the fallback.
     ///
     /// Can be HTTP or HTTPS. If HTTPS, the `tls` block must also be configured
     /// with the appropriate CA certificate — the same `HttpClient` is shared
@@ -184,6 +197,28 @@ pub struct ClickhouseConfig {
     ))]
     #[serde(default)]
     pub fallback_endpoint: Option<UriSerde>,
+
+    /// Total attempts against the primary (proxy) endpoint in direct-fallback
+    /// mode, before failing over to `fallback_endpoint` (initial try + retries).
+    ///
+    /// Only applies when `fallback_endpoint` is set and `use_headless_service` is
+    /// false. Defaults to `2` (1 try + 1 retry) so the proxy fails fast; the
+    /// remaining budget is spent on the direct write via
+    /// `fallback_secondary_max_attempts`. Must be at least 1; `0` is rejected at
+    /// startup rather than treated as "skip this endpoint".
+    #[serde(default)]
+    pub fallback_primary_max_attempts: Option<usize>,
+
+    /// Total attempts against the `fallback_endpoint` (direct SMK) endpoint in
+    /// direct-fallback mode, once the primary has failed over (initial try +
+    /// retries).
+    ///
+    /// Only applies when `fallback_endpoint` is set and `use_headless_service` is
+    /// false. Defaults to `3` (1 try + 2 retries) — the direct write is the
+    /// terminal path, so it gets more chances than the proxy. Must be at least 1;
+    /// `0` is rejected at startup.
+    #[serde(default)]
+    pub fallback_secondary_max_attempts: Option<usize>,
 
     /// Maximum number of idle connections to keep per ClickHouse pod IP.
     ///
@@ -313,10 +348,13 @@ impl SinkConfig for ClickhouseConfig {
 
         if self.use_headless_service {
             self.validate_headless_config(&endpoint)?;
-        } else if self.dns_refresh_interval_secs.is_some() {
-            warn!(
-                message = "'dns_refresh_interval_secs' is set but 'use_headless_service' is false; this setting will be ignored.",
-            );
+        } else {
+            self.validate_fallback_attempts()?;
+            if self.dns_refresh_interval_secs.is_some() {
+                warn!(
+                    message = "'dns_refresh_interval_secs' is set but 'use_headless_service' is false; this setting will be ignored.",
+                );
+            }
         }
 
         let (format, encoder_kind) = self
@@ -380,6 +418,20 @@ impl ClickhouseConfig {
         Ok(())
     }
 
+    /// Validates the per-endpoint attempt budgets for the direct-fallback path.
+    ///
+    /// `0` is rejected rather than coerced to `1`, so a typo fails at startup and
+    /// `0` isn't mistaken for "skip this endpoint".
+    fn validate_fallback_attempts(&self) -> crate::Result<()> {
+        if self.fallback_primary_max_attempts == Some(0) {
+            return Err("'fallback_primary_max_attempts' must be greater than 0".into());
+        }
+        if self.fallback_secondary_max_attempts == Some(0) {
+            return Err("'fallback_secondary_max_attempts' must be greater than 0".into());
+        }
+        Ok(())
+    }
+
     /// Builds the direct single-endpoint sink (no headless routing).
     ///
     /// When `fallback_endpoint` is set, wraps the primary endpoint in a
@@ -390,52 +442,94 @@ impl ClickhouseConfig {
     /// Without a `fallback_endpoint`, builds a plain single-endpoint sink.
     fn build_direct(
         &self,
-        mut params: ClickhouseBuildParams,
+        params: ClickhouseBuildParams,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         if let Some(fallback) = self.fallback_endpoint.as_ref() {
             let fallback_uri = fallback.with_default_parts().uri;
 
-            // `retry_attempts` is retries, so total attempts per endpoint is +1.
-            // Capture backoff/timeout before disabling the outer retry layer below.
-            let max_attempts_per_endpoint = params.request_limits.retry_attempts.saturating_add(1);
-            let initial_backoff = params.request_limits.retry_initial_backoff;
-            let max_backoff = params.request_limits.retry_max_duration;
-            let per_call_timeout = params.request_limits.timeout;
+            // Per-endpoint attempt counts come from config (defaulting to the
+            // proxy-fails-fast 2 / direct-SMK 3 split); backoff/jitter/timeout come
+            // from the request settings.
+            let primary_max_attempts = self
+                .fallback_primary_max_attempts
+                .unwrap_or(DEFAULT_PRIMARY_MAX_ATTEMPTS);
+            let secondary_max_attempts = self
+                .fallback_secondary_max_attempts
+                .unwrap_or(DEFAULT_SECONDARY_MAX_ATTEMPTS);
+            let retry_settings = RetrySettings {
+                primary_max_attempts,
+                secondary_max_attempts,
+                initial_backoff: params.request_limits.retry_initial_backoff,
+                max_backoff: params.request_limits.retry_max_duration,
+                jitter_mode: params.request_limits.retry_jitter_mode,
+                per_call_timeout: params.request_limits.timeout,
+            };
 
             info!(
                 message = "ClickHouse direct sink configured with a retrying fallback endpoint.",
                 primary_endpoint = %params.endpoint,
                 fallback_endpoint = %fallback_uri,
-                max_attempts_per_endpoint,
+                primary_max_attempts,
+                secondary_max_attempts,
             );
 
             let service = DirectFallbackService::new(
                 &params.client,
                 params.endpoint.clone(),
-                fallback_uri,
+                fallback_uri.clone(),
                 &params.svc_config,
                 params.non_retriable_error_codes.clone(),
-                max_attempts_per_endpoint,
-                initial_backoff,
-                max_backoff,
-                per_call_timeout,
+                retry_settings,
             );
 
-            // The service owns its retry loop: disable the outer retry layer (else
-            // attempts multiply) and widen the outer timeout to bound both phases —
-            // up to `2 * max_attempts` hops plus the backoff sleeps between them,
-            // with margin. Saturate rather than panic.
-            params.request_limits.retry_attempts = 0;
-            let hops = (2 * max_attempts_per_endpoint) as u32;
+            // Outer timeout bounds both phases: `hops` HTTP calls plus a backoff
+            // sleep between the attempts of each endpoint (`hops - 2`), with margin.
+            // Saturating throughout so an extreme config can't wrap to a tiny value.
+            let hops = u32::try_from(primary_max_attempts.saturating_add(secondary_max_attempts))
+                .unwrap_or(u32::MAX);
             let sleeps = hops.saturating_sub(2);
-            let hop_budget = per_call_timeout.checked_mul(hops).unwrap_or(Duration::MAX);
-            let sleep_budget = max_backoff.checked_mul(sleeps).unwrap_or(Duration::MAX);
-            params.request_limits.timeout = hop_budget
+            let hop_budget = retry_settings
+                .per_call_timeout
+                .checked_mul(hops)
+                .unwrap_or(Duration::MAX);
+            let sleep_budget = retry_settings
+                .max_backoff
+                .checked_mul(sleeps)
+                .unwrap_or(Duration::MAX);
+            let outer_timeout = hop_budget
                 .checked_add(sleep_budget)
                 .and_then(|d| d.checked_add(Duration::from_secs(5)))
                 .unwrap_or(Duration::MAX);
 
-            return self.build_sink_and_healthcheck(params, service);
+            // Each endpoint owns its retry policy already, so the outer stack omits
+            // the retry layer — a second policy would double-count the standard
+            // sink retry metrics and log spurious drops on primary exhaustion. The
+            // rest of the standard stack (rate limit, adaptive concurrency, outer
+            // timeout) is kept.
+            let service = ServiceBuilder::new()
+                .rate_limit(
+                    params.request_limits.rate_limit_num,
+                    params.request_limits.rate_limit_duration,
+                )
+                .layer(AdaptiveConcurrencyLimitLayer::new(
+                    params.request_limits.concurrency,
+                    params.request_limits.adaptive_concurrency,
+                    ClickhouseRetryLogic::new(params.non_retriable_error_codes.clone()),
+                ))
+                .timeout(outer_timeout)
+                .service(service);
+
+            // Probe both endpoints, mirroring the runtime failover rule (see
+            // `healthcheck_either`).
+            let healthcheck = Box::pin(healthcheck_either(
+                params.client.clone(),
+                params.endpoint.clone(),
+                fallback_uri.clone(),
+                params.non_retriable_error_codes.clone(),
+                params.auth.clone(),
+            )) as Healthcheck;
+
+            return self.build_sink_and_healthcheck(params, service, Some(healthcheck));
         }
 
         let service_request_builder = ClickhouseServiceRequestBuilder {
@@ -448,8 +542,13 @@ impl ClickhouseConfig {
             query_settings: params.svc_config.query_settings,
         };
 
-        let service = HttpService::new(params.client.clone(), service_request_builder);
-        self.build_sink_and_healthcheck(params, service)
+        let inner = HttpService::new(params.client.clone(), service_request_builder);
+        let service = Self::wrap_standard_service(
+            params.request_limits.clone(),
+            params.non_retriable_error_codes.clone(),
+            inner,
+        );
+        self.build_sink_and_healthcheck(params, service, None)
     }
 
     /// Builds the headless-service sink with P2C load-balanced dispatch across
@@ -486,31 +585,38 @@ impl ClickhouseConfig {
         // Healthcheck should target the stable ClusterIP, not the headless DNS name.
         // The headless name resolves to individual pod IPs which may come and go.
         params.endpoint = fallback_uri;
-        self.build_sink_and_healthcheck(params, headless)
+        let service = Self::wrap_standard_service(
+            params.request_limits.clone(),
+            params.non_retriable_error_codes.clone(),
+            headless,
+        );
+        self.build_sink_and_healthcheck(params, service, None)
     }
 
-    /// Wraps an inner service with Tower middleware and constructs the
-    /// sink + healthcheck pair. Shared by both single-endpoint and headless
-    /// code paths.
+    /// Constructs the sink + healthcheck pair from an already-wrapped `service`
+    /// (the caller applies the outer Tower middleware). Shared by the
+    /// single-endpoint, headless, and direct-fallback code paths.
+    ///
+    /// Callers wrap the service themselves because the direct-fallback path uses
+    /// a different outer stack (no retry layer — each endpoint owns its retry
+    /// policy) than the standard `.settings()` stack used by the other paths.
+    ///
+    /// `healthcheck_override` lets a caller supply its own healthcheck future;
+    /// when `None`, a single-endpoint probe of `params.endpoint` is used. The
+    /// direct-fallback path passes an override that probes both endpoints so a
+    /// healthy fallback isn't blocked by a down primary.
     fn build_sink_and_healthcheck<S>(
         &self,
         params: ClickhouseBuildParams,
-        inner_service: S,
+        service: S,
+        healthcheck_override: Option<Healthcheck>,
     ) -> crate::Result<(VectorSink, Healthcheck)>
     where
-        S: Service<HttpRequest<PartitionKey>, Response = HttpResponse, Error = crate::Error>
-            + Send
-            + Clone
-            + 'static,
+        S: Service<HttpRequest<PartitionKey>> + Send + 'static,
         S::Future: Send + 'static,
+        S::Response: DriverResponse + Send + 'static,
+        S::Error: std::fmt::Debug + Into<crate::Error> + Send,
     {
-        let service = ServiceBuilder::new()
-            .settings(
-                params.request_limits,
-                ClickhouseRetryLogic::new(params.non_retriable_error_codes),
-            )
-            .service(inner_service);
-
         let sink = ClickhouseSink::new(
             params.batch_settings,
             service,
@@ -520,8 +626,33 @@ impl ClickhouseConfig {
             params.request_builder,
         );
 
-        let healthcheck = Box::pin(healthcheck(params.client, params.endpoint, params.auth));
+        let healthcheck = healthcheck_override.unwrap_or_else(|| {
+            Box::pin(healthcheck(params.client, params.endpoint, params.auth))
+        });
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
+    }
+
+    /// Wraps an inner service in the standard Tower request stack (rate limit,
+    /// adaptive concurrency, Fibonacci retry, per-request timeout) built from the
+    /// sink's request settings. Used by the single-endpoint and headless paths;
+    /// the direct-fallback path builds its own retry-less stack instead.
+    fn wrap_standard_service<S>(
+        request_limits: TowerRequestSettings,
+        non_retriable_error_codes: Option<Vec<u32>>,
+        inner_service: S,
+    ) -> Svc<S, ClickhouseRetryLogic>
+    where
+        S: Service<HttpRequest<PartitionKey>, Response = HttpResponse, Error = crate::Error>
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        ServiceBuilder::new()
+            .settings(
+                request_limits,
+                ClickhouseRetryLogic::new(non_retriable_error_codes),
+            )
+            .service(inner_service)
     }
 
     /// Resolves the encoding strategy (format + encoder) based on configuration.
@@ -688,6 +819,155 @@ async fn healthcheck(client: HttpClient, endpoint: Uri, auth: Option<Auth>) -> c
     }
 }
 
+/// Outcome of probing a single endpoint for the direct-fallback healthcheck,
+/// classified with the same `ClickhouseRetryLogic` the runtime uses.
+enum ProbeOutcome {
+    /// Endpoint answered `200` — healthy.
+    Healthy,
+    /// Endpoint failed in a way the runtime would retry / fail over on
+    /// (connection error, timeout, retriable status). A healthy fallback can
+    /// legitimately cover this.
+    Retriable(crate::Error),
+    /// Endpoint answered with a non-retriable status (e.g. 401/404/501). The
+    /// runtime returns this without failing over, so a healthy fallback must
+    /// NOT mask it.
+    NonRetriable(crate::Error),
+}
+
+/// Probes one endpoint (`GET /?query=SELECT 1`) and classifies the result with
+/// `retry_logic`, mirroring the runtime failover decision in
+/// `DirectFallbackService`.
+async fn probe_endpoint(
+    client: &HttpClient,
+    endpoint: Uri,
+    auth: Option<Auth>,
+    retry_logic: &ClickhouseRetryLogic,
+) -> ProbeOutcome {
+    let uri = get_healthcheck_uri(&endpoint);
+    let mut request = Request::get(uri).body(Body::empty()).unwrap();
+    if let Some(auth) = auth {
+        auth.apply(&mut request);
+    }
+
+    // A transport-level error (connection refused/reset) is retriable at runtime.
+    let response = match client.send(request).await {
+        Ok(response) => response,
+        Err(err) => return ProbeOutcome::Retriable(err.into()),
+    };
+
+    let status = response.status();
+    if status == StatusCode::OK {
+        return ProbeOutcome::Healthy;
+    }
+
+    // Read the body so `ClickhouseRetryLogic` can inspect any `Code: N` payload,
+    // then classify the response exactly as the runtime would. (Drain via the
+    // `HttpBody` trait — `hyper::body::to_bytes` is deprecated under this fork's
+    // `#[deny(warnings)]`; the probe response carries no trailers we need.)
+    let (parts, body) = response.into_parts();
+    let body = http_body::Body::collect(body)
+        .await
+        .map(|collected| collected.to_bytes())
+        .unwrap_or_default();
+    let http_response = http::Response::from_parts(parts, body);
+    let probe = HttpResponse {
+        http_response,
+        events_byte_size: Default::default(),
+        raw_byte_size: 0,
+    };
+
+    let err: crate::Error = HealthcheckError::UnexpectedStatus { status }.into();
+    if retry_logic.should_retry_response(&probe).is_retryable() {
+        ProbeOutcome::Retriable(err)
+    } else {
+        ProbeOutcome::NonRetriable(err)
+    }
+}
+
+/// Healthcheck for the direct-fallback path. Mirrors the runtime failover
+/// semantics of `DirectFallbackService`, so a green healthcheck means writes can
+/// actually succeed:
+///
+/// - Both endpoints are probed **concurrently**, so a hanging primary can't
+///   consume the whole healthcheck deadline before the fallback is checked.
+/// - A **healthy primary passes immediately**, without waiting on the fallback
+///   probe.
+/// - A healthy fallback rescues the healthcheck **only** when the primary's
+///   failure is retriable (connection error, timeout, retriable status) — the
+///   cases where the runtime would actually fail over. A non-retriable primary
+///   failure (e.g. 401/404/501) fails the healthcheck even with a healthy
+///   fallback, since the runtime returns it without touching the fallback.
+async fn healthcheck_either(
+    client: HttpClient,
+    primary: Uri,
+    fallback: Uri,
+    non_retriable_error_codes: Option<Vec<u32>>,
+    auth: Option<Auth>,
+) -> crate::Result<()> {
+    // Per-probe cap (under the 10s default outer deadline) so one hanging endpoint
+    // can't consume the whole budget. A timed-out probe is treated as retriable,
+    // so a healthy fallback still rescues the healthcheck.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let retry_logic = ClickhouseRetryLogic::new(non_retriable_error_codes);
+
+    // Start the fallback probe concurrently (so a hanging primary can't delay it)
+    // but as a separate task, so a Healthy primary can return without awaiting it.
+    // Dropping the handle would not cancel the task, so the paths that don't need
+    // the probe abort it explicitly rather than leaving it running.
+    let fallback_probe = tokio::spawn(tokio::time::timeout(
+        PROBE_TIMEOUT,
+        healthcheck(client.clone(), fallback, auth.clone()),
+    ));
+
+    let primary_outcome = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        probe_endpoint(&client, primary, auth, &retry_logic),
+    )
+    .await
+    // A timed-out primary probe is a retriable failure.
+    .unwrap_or_else(|_elapsed| ProbeOutcome::Retriable("primary healthcheck probe timed out".into()));
+
+    match primary_outcome {
+        // Primary healthy: the runtime writes through it, so pass immediately.
+        ProbeOutcome::Healthy => {
+            fallback_probe.abort();
+            Ok(())
+        }
+        ProbeOutcome::NonRetriable(primary_err) => {
+            fallback_probe.abort();
+            Err(format!(
+                "ClickHouse primary endpoint healthcheck failed with a non-retriable error; \
+                 the fallback is not used for this failure at runtime: {primary_err}"
+            )
+            .into())
+        }
+        // Primary retriably failing: the runtime would fail over, so a healthy
+        // fallback rescues the healthcheck. Now await the fallback probe.
+        ProbeOutcome::Retriable(primary_err) => {
+            // Layers: JoinError (task) → Elapsed (timeout) → healthcheck result.
+            let fallback_result: crate::Result<()> = match fallback_probe.await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_elapsed)) => Err("fallback healthcheck probe timed out".into()),
+                Err(_join_err) => Err("fallback healthcheck probe task failed".into()),
+            };
+            match fallback_result {
+                Ok(()) => {
+                    warn!(
+                        message = "ClickHouse primary endpoint healthcheck failed; fallback is healthy.",
+                        primary_error = %primary_err,
+                    );
+                    Ok(())
+                }
+                Err(fallback_err) => Err(format!(
+                    "both ClickHouse endpoints failed healthcheck: primary: {primary_err}; fallback: {fallback_err}"
+                )
+                .into()),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,6 +992,26 @@ mod tests {
             get_healthcheck_uri(&"http://localhost:8123/path/".parse().unwrap()),
             "http://localhost:8123/path/?query=SELECT%201"
         );
+    }
+
+    #[test]
+    fn zero_fallback_attempts_is_rejected() {
+        // `0` must fail loudly rather than be coerced to 1, so a typo (or an
+        // attempt to "skip" an endpoint) doesn't silently do something else.
+        let validate = |primary, secondary| {
+            ClickhouseConfig {
+                fallback_primary_max_attempts: primary,
+                fallback_secondary_max_attempts: secondary,
+                ..Default::default()
+            }
+            .validate_fallback_attempts()
+        };
+
+        assert!(validate(Some(0), None).is_err());
+        assert!(validate(None, Some(0)).is_err());
+        // Unset (defaults) and explicit positive values are both fine.
+        assert!(validate(None, None).is_ok());
+        assert!(validate(Some(1), Some(6)).is_ok());
     }
 
     /// Helper to create a minimal ClickhouseConfig for testing
@@ -820,5 +1120,256 @@ mod tests {
             Format::JsonEachRow,
             "on Arrow setup failure the sink must fall back to JSONEachRow"
         );
+    }
+
+    mod healthcheck_either {
+        use std::convert::Infallible;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Response as HyperResponse, Server};
+
+        use super::super::{Auth, HttpClient, Uri, healthcheck_either};
+        use crate::config::ProxyConfig;
+        use crate::test_util::addr::next_addr;
+
+        /// Counters for a spawned test server: requests received, and requests
+        /// still being handled. A hanging request stays in flight until its probe
+        /// is cancelled, so `in_flight` shows whether a probe was aborted.
+        #[derive(Default)]
+        struct ServerCounters {
+            hits: Arc<AtomicUsize>,
+            in_flight: Arc<AtomicUsize>,
+        }
+
+        /// Decrements `in_flight` when the handler future is dropped.
+        struct InFlightGuard(Arc<AtomicUsize>);
+
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        /// Spawns a server that answers every request with `status` and `body`,
+        /// returning counters so tests can assert whether an endpoint was probed.
+        /// If `hang` is true, the handler never responds — used to model a
+        /// blackholing endpoint.
+        fn spawn_server(
+            addr: SocketAddr,
+            status: u16,
+            body: &'static str,
+            hang: bool,
+        ) -> ServerCounters {
+            let counters = ServerCounters::default();
+            let hits_srv = counters.hits.clone();
+            let in_flight_srv = counters.in_flight.clone();
+            let make = make_service_fn(move |_| {
+                let hits = hits_srv.clone();
+                let in_flight = in_flight_srv.clone();
+                async move {
+                    Ok::<_, Infallible>(service_fn(move |_req| {
+                        let hits = hits.clone();
+                        let in_flight = in_flight.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            in_flight.fetch_add(1, Ordering::SeqCst);
+                            let _guard = InFlightGuard(in_flight);
+                            if hang {
+                                // Never respond: model a proxy that accepts the
+                                // connection but blackholes the request.
+                                std::future::pending::<()>().await;
+                            }
+                            Ok::<_, Infallible>(
+                                HyperResponse::builder()
+                                    .status(status)
+                                    .body(Body::from(body))
+                                    .unwrap(),
+                            )
+                        }
+                    }))
+                }
+            });
+            tokio::spawn(async move {
+                let _ = Server::bind(&addr).serve(make).await;
+            });
+            counters
+        }
+
+        fn uri(addr: SocketAddr) -> Uri {
+            format!("http://{}:{}/", addr.ip(), addr.port())
+                .parse()
+                .unwrap()
+        }
+
+        fn client() -> HttpClient {
+            HttpClient::new(None, &ProxyConfig::default()).unwrap()
+        }
+
+        /// Endpoint spec for a probe: status, body, and whether it hangs.
+        /// `None` leaves the port unbound (connection refused).
+        type Endpoint = Option<(u16, &'static str, bool)>;
+
+        /// Runs a healthcheck against two spawned endpoints, returning their hit
+        /// counts, the result, and the fallback's still-in-flight count.
+        async fn run_ext(
+            primary: Endpoint,
+            fallback: Endpoint,
+            non_retriable_codes: Option<Vec<u32>>,
+        ) -> (usize, usize, crate::Result<()>, Arc<AtomicUsize>) {
+            let (_pg, p_addr) = next_addr();
+            let (_fg, fb_addr) = next_addr();
+            let default = ServerCounters::default;
+            let p = primary.map_or_else(default, |(s, b, h)| spawn_server(p_addr, s, b, h));
+            let fb = fallback.map_or_else(default, |(s, b, h)| spawn_server(fb_addr, s, b, h));
+            // Give the spawned servers a moment to bind.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let res = healthcheck_either(
+                client(),
+                uri(p_addr),
+                uri(fb_addr),
+                non_retriable_codes,
+                None::<Auth>,
+            )
+            .await;
+            (
+                p.hits.load(Ordering::SeqCst),
+                fb.hits.load(Ordering::SeqCst),
+                res,
+                fb.in_flight,
+            )
+        }
+
+        /// Convenience: healthy-vs-status endpoints, no hang, no custom codes.
+        async fn run(primary: Option<u16>, fallback: Option<u16>) -> (usize, usize, crate::Result<()>) {
+            let (p, fb, res, _) = run_ext(
+                primary.map(|s| (s, "", false)),
+                fallback.map(|s| (s, "", false)),
+                None,
+            )
+            .await;
+            (p, fb, res)
+        }
+
+        #[tokio::test]
+        async fn primary_healthy_passes() {
+            let (_p, _fb, res) = run(Some(200), Some(200)).await;
+            assert!(res.is_ok());
+        }
+
+        #[tokio::test]
+        async fn primary_down_falls_back_to_healthy_fallback() {
+            // Primary port unbound (connection refused, retriable); fallback answers 200.
+            let (p, fb, res) = run(None, Some(200)).await;
+            assert!(res.is_ok(), "a healthy fallback must satisfy the healthcheck");
+            assert_eq!((p, fb), (0, 1));
+        }
+
+        #[tokio::test]
+        async fn retriable_primary_status_falls_back() {
+            // Primary returns 503 (retriable); fallback answers 200 → green.
+            let (_p, _fb, res) = run(Some(503), Some(200)).await;
+            assert!(res.is_ok());
+        }
+
+        #[tokio::test]
+        async fn non_retriable_primary_fails_even_with_healthy_fallback() {
+            // Primary returns 401 (non-retriable): at runtime every write returns
+            // this without touching the fallback, so a healthy fallback must NOT
+            // make the healthcheck green.
+            let (_p, _fb, res, _) =
+                run_ext(Some((401, "", false)), Some((200, "", false)), None).await;
+            assert!(
+                res.is_err(),
+                "a non-retriable primary must fail the healthcheck even with a healthy fallback"
+            );
+        }
+
+        #[tokio::test]
+        async fn non_retriable_clickhouse_code_fails_even_with_healthy_fallback() {
+            // Primary returns 500 with a non-retriable ClickHouse Code: 70 body;
+            // runtime does not fail over, so the healthcheck must be red.
+            let (_p, _fb, res, _) = run_ext(
+                Some((500, "Code: 70. DB::Exception", false)),
+                Some((200, "", false)),
+                Some(vec![70]),
+            )
+            .await;
+            assert!(res.is_err());
+        }
+
+        #[tokio::test]
+        async fn hanging_primary_still_probes_fallback_within_deadline() {
+            // Primary accepts the connection but never responds. Because both
+            // endpoints are probed concurrently with a per-probe timeout, the
+            // hanging primary surfaces as a (retriable) timeout while the healthy
+            // fallback satisfies the healthcheck — rather than the hang consuming
+            // the whole budget. Resolves by the ~5s per-probe cap, well under the
+            // real 10s outer deadline.
+            let res = tokio::time::timeout(
+                Duration::from_secs(8),
+                run_ext(Some((200, "", true)), Some((200, "", false)), None),
+            )
+            .await
+            .expect("healthcheck must resolve within the outer deadline despite a hanging primary");
+            assert!(res.2.is_ok(), "healthy fallback should satisfy the healthcheck");
+        }
+
+        #[tokio::test]
+        async fn healthy_primary_does_not_wait_on_hanging_fallback() {
+            // Primary is healthy (200); fallback accepts but blackholes. A healthy
+            // primary must short-circuit and return immediately, NOT wait out the
+            // fallback's per-probe timeout — assert it resolves well under that cap.
+            let res = tokio::time::timeout(
+                Duration::from_secs(2),
+                run_ext(Some((200, "", false)), Some((200, "", true)), None),
+            )
+            .await
+            .expect("healthy primary must return without waiting on the hanging fallback");
+            assert!(res.2.is_ok());
+        }
+
+        #[tokio::test]
+        async fn both_endpoints_down_errors() {
+            let (p, fb, res) = run(None, None).await;
+            assert!(res.is_err(), "healthcheck must fail when neither endpoint is healthy");
+            assert_eq!((p, fb), (0, 0));
+        }
+
+        /// Asserts the fallback probe was cancelled, not merely un-awaited: dropping
+        /// a `JoinHandle` leaves the task running, so a hanging probe would stay in
+        /// flight for the whole `PROBE_TIMEOUT` and repeated healthchecks would
+        /// accumulate probes. `primary_status` picks the short-circuit path.
+        async fn assert_fallback_probe_aborted(primary_status: u16) {
+            let (_p, fb_hits, _res, fb_in_flight) = run_ext(
+                Some((primary_status, "", false)),
+                Some((200, "", true)),
+                None,
+            )
+            .await;
+            // Well under PROBE_TIMEOUT, so a surviving probe is still in flight.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(fb_hits, 1, "the fallback probe must have reached the server");
+            assert_eq!(
+                fb_in_flight.load(Ordering::SeqCst),
+                0,
+                "the fallback probe must be aborted, not left running in the background"
+            );
+        }
+
+        #[tokio::test]
+        async fn healthy_primary_aborts_the_fallback_probe() {
+            assert_fallback_probe_aborted(200).await;
+        }
+
+        #[tokio::test]
+        async fn non_retriable_primary_aborts_the_fallback_probe() {
+            // The fallback is never consulted on this path either, so its probe
+            // must not outlive the healthcheck.
+            assert_fallback_probe_aborted(401).await;
+        }
     }
 }

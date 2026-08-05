@@ -172,23 +172,6 @@ impl InternalEvent for ClickhouseDirectFallbackRouted {
     }
 }
 
-/// Emitted on each retry of a direct-sink endpoint (after a retriable failure,
-/// before the next attempt).
-///
-/// `clickhouse_direct_fallback_retry_total{endpoint}` counts retries per endpoint
-/// (`primary` = proxy, `fallback` = direct write) — a rising `primary` rate shows
-/// proxy instability short of a full failover.
-#[derive(Debug, NamedInternalEvent)]
-pub struct ClickhouseDirectRetry {
-    pub endpoint: &'static str,
-}
-
-impl InternalEvent for ClickhouseDirectRetry {
-    fn emit(self) {
-        counter!("clickhouse_direct_fallback_retry_total", "endpoint" => self.endpoint).increment(1);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -298,23 +281,6 @@ mod tests {
             .iter()
             .find(|m| m.name() == "clickhouse_direct_fallback_routed_total")
             .expect("clickhouse_direct_fallback_routed_total not found");
-        assert!(matches!(counter.value(), MetricValue::Counter { value } if *value >= 1.0));
-    }
-
-    #[test]
-    fn direct_retry_emits_counter_tagged_by_endpoint() {
-        trace_init();
-
-        emit!(ClickhouseDirectRetry { endpoint: "primary" });
-
-        let metrics = Controller::get().unwrap().capture_metrics();
-        let counter = metrics
-            .iter()
-            .find(|m| {
-                m.name() == "clickhouse_direct_fallback_retry_total"
-                    && m.tags().and_then(|t| t.get("endpoint")) == Some("primary")
-            })
-            .expect("clickhouse_direct_fallback_retry_total{endpoint=primary} not found");
         assert!(matches!(counter.value(), MetricValue::Counter { value } if *value >= 1.0));
     }
 }
