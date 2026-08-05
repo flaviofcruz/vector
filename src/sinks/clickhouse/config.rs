@@ -204,7 +204,8 @@ pub struct ClickhouseConfig {
     /// Only applies when `fallback_endpoint` is set and `use_headless_service` is
     /// false. Defaults to `2` (1 try + 1 retry) so the proxy fails fast; the
     /// remaining budget is spent on the direct write via
-    /// `fallback_secondary_max_attempts`. Must be at least 1.
+    /// `fallback_secondary_max_attempts`. Must be at least 1; `0` is rejected at
+    /// startup rather than treated as "skip this endpoint".
     #[serde(default)]
     pub fallback_primary_max_attempts: Option<usize>,
 
@@ -214,7 +215,8 @@ pub struct ClickhouseConfig {
     ///
     /// Only applies when `fallback_endpoint` is set and `use_headless_service` is
     /// false. Defaults to `3` (1 try + 2 retries) — the direct write is the
-    /// terminal path, so it gets more chances than the proxy. Must be at least 1.
+    /// terminal path, so it gets more chances than the proxy. Must be at least 1;
+    /// `0` is rejected at startup.
     #[serde(default)]
     pub fallback_secondary_max_attempts: Option<usize>,
 
@@ -346,10 +348,13 @@ impl SinkConfig for ClickhouseConfig {
 
         if self.use_headless_service {
             self.validate_headless_config(&endpoint)?;
-        } else if self.dns_refresh_interval_secs.is_some() {
-            warn!(
-                message = "'dns_refresh_interval_secs' is set but 'use_headless_service' is false; this setting will be ignored.",
-            );
+        } else {
+            self.validate_fallback_attempts()?;
+            if self.dns_refresh_interval_secs.is_some() {
+                warn!(
+                    message = "'dns_refresh_interval_secs' is set but 'use_headless_service' is false; this setting will be ignored.",
+                );
+            }
         }
 
         let (format, encoder_kind) = self
@@ -413,6 +418,20 @@ impl ClickhouseConfig {
         Ok(())
     }
 
+    /// Validates the per-endpoint attempt budgets for the direct-fallback path.
+    ///
+    /// `0` is rejected rather than coerced to `1`, so a typo fails at startup and
+    /// `0` isn't mistaken for "skip this endpoint".
+    fn validate_fallback_attempts(&self) -> crate::Result<()> {
+        if self.fallback_primary_max_attempts == Some(0) {
+            return Err("'fallback_primary_max_attempts' must be greater than 0".into());
+        }
+        if self.fallback_secondary_max_attempts == Some(0) {
+            return Err("'fallback_secondary_max_attempts' must be greater than 0".into());
+        }
+        Ok(())
+    }
+
     /// Builds the direct single-endpoint sink (no headless routing).
     ///
     /// When `fallback_endpoint` is set, wraps the primary endpoint in a
@@ -429,16 +448,14 @@ impl ClickhouseConfig {
             let fallback_uri = fallback.with_default_parts().uri;
 
             // Per-endpoint attempt counts come from config (defaulting to the
-            // proxy-fails-fast 2 / direct-SMK 3 split), clamped to at least 1;
-            // backoff/jitter/timeout come from the request settings.
+            // proxy-fails-fast 2 / direct-SMK 3 split); backoff/jitter/timeout come
+            // from the request settings.
             let primary_max_attempts = self
                 .fallback_primary_max_attempts
-                .unwrap_or(DEFAULT_PRIMARY_MAX_ATTEMPTS)
-                .max(1);
+                .unwrap_or(DEFAULT_PRIMARY_MAX_ATTEMPTS);
             let secondary_max_attempts = self
                 .fallback_secondary_max_attempts
-                .unwrap_or(DEFAULT_SECONDARY_MAX_ATTEMPTS)
-                .max(1);
+                .unwrap_or(DEFAULT_SECONDARY_MAX_ATTEMPTS);
             let retry_settings = RetrySettings {
                 primary_max_attempts,
                 secondary_max_attempts,
@@ -896,6 +913,8 @@ async fn healthcheck_either(
 
     // Start the fallback probe concurrently (so a hanging primary can't delay it)
     // but as a separate task, so a Healthy primary can return without awaiting it.
+    // Dropping the handle would not cancel the task, so the paths that don't need
+    // the probe abort it explicitly rather than leaving it running.
     let fallback_probe = tokio::spawn(tokio::time::timeout(
         PROBE_TIMEOUT,
         healthcheck(client.clone(), fallback, auth.clone()),
@@ -910,14 +929,19 @@ async fn healthcheck_either(
     .unwrap_or_else(|_elapsed| ProbeOutcome::Retriable("primary healthcheck probe timed out".into()));
 
     match primary_outcome {
-        // Primary healthy: the runtime writes through it, so pass immediately
-        // without waiting on the fallback probe (the task is dropped/aborted).
-        ProbeOutcome::Healthy => Ok(()),
-        ProbeOutcome::NonRetriable(primary_err) => Err(format!(
-            "ClickHouse primary endpoint healthcheck failed with a non-retriable error; \
-             the fallback is not used for this failure at runtime: {primary_err}"
-        )
-        .into()),
+        // Primary healthy: the runtime writes through it, so pass immediately.
+        ProbeOutcome::Healthy => {
+            fallback_probe.abort();
+            Ok(())
+        }
+        ProbeOutcome::NonRetriable(primary_err) => {
+            fallback_probe.abort();
+            Err(format!(
+                "ClickHouse primary endpoint healthcheck failed with a non-retriable error; \
+                 the fallback is not used for this failure at runtime: {primary_err}"
+            )
+            .into())
+        }
         // Primary retriably failing: the runtime would fail over, so a healthy
         // fallback rescues the healthcheck. Now await the fallback probe.
         ProbeOutcome::Retriable(primary_err) => {
@@ -968,6 +992,26 @@ mod tests {
             get_healthcheck_uri(&"http://localhost:8123/path/".parse().unwrap()),
             "http://localhost:8123/path/?query=SELECT%201"
         );
+    }
+
+    #[test]
+    fn zero_fallback_attempts_is_rejected() {
+        // `0` must fail loudly rather than be coerced to 1, so a typo (or an
+        // attempt to "skip" an endpoint) doesn't silently do something else.
+        let validate = |primary, secondary| {
+            ClickhouseConfig {
+                fallback_primary_max_attempts: primary,
+                fallback_secondary_max_attempts: secondary,
+                ..Default::default()
+            }
+            .validate_fallback_attempts()
+        };
+
+        assert!(validate(Some(0), None).is_err());
+        assert!(validate(None, Some(0)).is_err());
+        // Unset (defaults) and explicit positive values are both fine.
+        assert!(validate(None, None).is_ok());
+        assert!(validate(Some(1), Some(6)).is_ok());
     }
 
     /// Helper to create a minimal ClickhouseConfig for testing
@@ -1092,25 +1136,48 @@ mod tests {
         use crate::config::ProxyConfig;
         use crate::test_util::addr::next_addr;
 
+        /// Counters for a spawned test server: requests received, and requests
+        /// still being handled. A hanging request stays in flight until its probe
+        /// is cancelled, so `in_flight` shows whether a probe was aborted.
+        #[derive(Default)]
+        struct ServerCounters {
+            hits: Arc<AtomicUsize>,
+            in_flight: Arc<AtomicUsize>,
+        }
+
+        /// Decrements `in_flight` when the handler future is dropped.
+        struct InFlightGuard(Arc<AtomicUsize>);
+
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
         /// Spawns a server that answers every request with `status` and `body`,
-        /// returning a hit counter so tests can assert whether an endpoint was
-        /// probed. If `hang` is true, the handler never responds — used to model
-        /// a blackholing endpoint.
+        /// returning counters so tests can assert whether an endpoint was probed.
+        /// If `hang` is true, the handler never responds — used to model a
+        /// blackholing endpoint.
         fn spawn_server(
             addr: SocketAddr,
             status: u16,
             body: &'static str,
             hang: bool,
-        ) -> Arc<AtomicUsize> {
-            let hits = Arc::new(AtomicUsize::new(0));
-            let hits_srv = hits.clone();
+        ) -> ServerCounters {
+            let counters = ServerCounters::default();
+            let hits_srv = counters.hits.clone();
+            let in_flight_srv = counters.in_flight.clone();
             let make = make_service_fn(move |_| {
                 let hits = hits_srv.clone();
+                let in_flight = in_flight_srv.clone();
                 async move {
                     Ok::<_, Infallible>(service_fn(move |_req| {
                         let hits = hits.clone();
+                        let in_flight = in_flight.clone();
                         async move {
                             hits.fetch_add(1, Ordering::SeqCst);
+                            in_flight.fetch_add(1, Ordering::SeqCst);
+                            let _guard = InFlightGuard(in_flight);
                             if hang {
                                 // Never respond: model a proxy that accepts the
                                 // connection but blackholes the request.
@@ -1129,7 +1196,7 @@ mod tests {
             tokio::spawn(async move {
                 let _ = Server::bind(&addr).serve(make).await;
             });
-            hits
+            counters
         }
 
         fn uri(addr: SocketAddr) -> Uri {
@@ -1146,16 +1213,18 @@ mod tests {
         /// `None` leaves the port unbound (connection refused).
         type Endpoint = Option<(u16, &'static str, bool)>;
 
+        /// Runs a healthcheck against two spawned endpoints, returning their hit
+        /// counts, the result, and the fallback's still-in-flight count.
         async fn run_ext(
             primary: Endpoint,
             fallback: Endpoint,
             non_retriable_codes: Option<Vec<u32>>,
-        ) -> (usize, usize, crate::Result<()>) {
+        ) -> (usize, usize, crate::Result<()>, Arc<AtomicUsize>) {
             let (_pg, p_addr) = next_addr();
             let (_fg, fb_addr) = next_addr();
-            let no_hits = || Arc::new(AtomicUsize::new(0));
-            let p_hits = primary.map_or_else(no_hits, |(s, b, h)| spawn_server(p_addr, s, b, h));
-            let fb_hits = fallback.map_or_else(no_hits, |(s, b, h)| spawn_server(fb_addr, s, b, h));
+            let default = ServerCounters::default;
+            let p = primary.map_or_else(default, |(s, b, h)| spawn_server(p_addr, s, b, h));
+            let fb = fallback.map_or_else(default, |(s, b, h)| spawn_server(fb_addr, s, b, h));
             // Give the spawned servers a moment to bind.
             tokio::time::sleep(Duration::from_millis(50)).await;
             let res = healthcheck_either(
@@ -1167,20 +1236,22 @@ mod tests {
             )
             .await;
             (
-                p_hits.load(Ordering::SeqCst),
-                fb_hits.load(Ordering::SeqCst),
+                p.hits.load(Ordering::SeqCst),
+                fb.hits.load(Ordering::SeqCst),
                 res,
+                fb.in_flight,
             )
         }
 
         /// Convenience: healthy-vs-status endpoints, no hang, no custom codes.
         async fn run(primary: Option<u16>, fallback: Option<u16>) -> (usize, usize, crate::Result<()>) {
-            run_ext(
+            let (p, fb, res, _) = run_ext(
                 primary.map(|s| (s, "", false)),
                 fallback.map(|s| (s, "", false)),
                 None,
             )
-            .await
+            .await;
+            (p, fb, res)
         }
 
         #[tokio::test]
@@ -1209,7 +1280,7 @@ mod tests {
             // Primary returns 401 (non-retriable): at runtime every write returns
             // this without touching the fallback, so a healthy fallback must NOT
             // make the healthcheck green.
-            let (_p, _fb, res) =
+            let (_p, _fb, res, _) =
                 run_ext(Some((401, "", false)), Some((200, "", false)), None).await;
             assert!(
                 res.is_err(),
@@ -1221,7 +1292,7 @@ mod tests {
         async fn non_retriable_clickhouse_code_fails_even_with_healthy_fallback() {
             // Primary returns 500 with a non-retriable ClickHouse Code: 70 body;
             // runtime does not fail over, so the healthcheck must be red.
-            let (_p, _fb, res) = run_ext(
+            let (_p, _fb, res, _) = run_ext(
                 Some((500, "Code: 70. DB::Exception", false)),
                 Some((200, "", false)),
                 Some(vec![70]),
@@ -1266,6 +1337,39 @@ mod tests {
             let (p, fb, res) = run(None, None).await;
             assert!(res.is_err(), "healthcheck must fail when neither endpoint is healthy");
             assert_eq!((p, fb), (0, 0));
+        }
+
+        /// Asserts the fallback probe was cancelled, not merely un-awaited: dropping
+        /// a `JoinHandle` leaves the task running, so a hanging probe would stay in
+        /// flight for the whole `PROBE_TIMEOUT` and repeated healthchecks would
+        /// accumulate probes. `primary_status` picks the short-circuit path.
+        async fn assert_fallback_probe_aborted(primary_status: u16) {
+            let (_p, fb_hits, _res, fb_in_flight) = run_ext(
+                Some((primary_status, "", false)),
+                Some((200, "", true)),
+                None,
+            )
+            .await;
+            // Well under PROBE_TIMEOUT, so a surviving probe is still in flight.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(fb_hits, 1, "the fallback probe must have reached the server");
+            assert_eq!(
+                fb_in_flight.load(Ordering::SeqCst),
+                0,
+                "the fallback probe must be aborted, not left running in the background"
+            );
+        }
+
+        #[tokio::test]
+        async fn healthy_primary_aborts_the_fallback_probe() {
+            assert_fallback_probe_aborted(200).await;
+        }
+
+        #[tokio::test]
+        async fn non_retriable_primary_aborts_the_fallback_probe() {
+            // The fallback is never consulted on this path either, so its probe
+            // must not outlive the healthcheck.
+            assert_fallback_probe_aborted(401).await;
         }
     }
 }
