@@ -4,7 +4,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use http::{Request, Uri};
 use hyper::Body;
-use prost_reflect::{prost::Message, MethodDescriptor};
+use prost_reflect::{prost::Message, MethodDescriptor, ReflectMessage};
 use snafu::Snafu;
 use tower::Service;
 use tracing::{debug, warn};
@@ -110,6 +110,60 @@ fn build_request_uri(endpoint: &Uri, path: &str) -> crate::Result<Uri> {
     format!("{}{}", endpoint_base, path)
         .parse::<Uri>()
         .map_err(|e| format!("Invalid URI: {}", e).into())
+}
+
+/// Resolves an enum field's wire number to its declared value name, using the message's own
+/// descriptor. Returns `None` when the field is not an enum or the number is not a declared value,
+/// so a caller can fall back to printing the number rather than losing the value entirely.
+fn enum_value_name(
+    message: &prost_reflect::DynamicMessage,
+    field: &str,
+    number: i32,
+) -> Option<String> {
+    match message.descriptor().get_field_by_name(field)?.kind() {
+        prost_reflect::Kind::Enum(desc) => desc.get_value(number).map(|v| v.name().to_string()),
+        _ => None,
+    }
+}
+
+/// Renders one `RecordError` as a diagnostic line for the rejection-sample log.
+///
+/// Presence is checked with `has_field_by_name` before each read, because `get_field_by_name`
+/// returns the field's *default* when unset: a defaulted `error_code` would assert `OK` for a record
+/// that just failed, and a defaulted `record_index` would read as a legitimate "record 0". The
+/// fields are `optional` in a proto2 file, so the distinction is real on the wire and is carried
+/// into the log as `?`. `error_code` is a `google.rpc.Code`, so its value name is resolved off the
+/// descriptor — `error_code=3` means nothing to an on-call reader, `INVALID_ARGUMENT` does.
+fn format_record_error(record: &prost_reflect::DynamicMessage) -> String {
+    let record_index = record
+        .has_field_by_name("record_index")
+        .then(|| {
+            record
+                .get_field_by_name("record_index")
+                .and_then(|v| v.as_i32())
+        })
+        .flatten()
+        .map_or_else(|| "?".to_string(), |i| i.to_string());
+    let error_code = record
+        .has_field_by_name("error_code")
+        .then(|| {
+            record
+                .get_field_by_name("error_code")
+                .and_then(|v| v.as_enum_number())
+        })
+        .flatten()
+        .map_or_else(
+            || "?".to_string(),
+            |number| {
+                enum_value_name(record, "error_code", number)
+                    .unwrap_or_else(|| number.to_string())
+            },
+        );
+    let error_message = record
+        .get_field_by_name("error_message")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    format!("record_index={record_index} error_code={error_code}: {error_message}")
 }
 
 /// Wraps a serialized protobuf message with the 5-byte gRPC framing prefix
@@ -607,42 +661,30 @@ impl BricklensIngestService {
         // there, absence signals a stale descriptor, whereas here it is the success path, and
         // rejecting on it would retry every successful batch forever.
         let errors = response.get_field_by_name("record_errors");
-        let error_list = errors.as_ref().and_then(|f| f.as_list());
-        let rejected_count = error_list.map_or(0, |list| list.len());
+        let Some(error_list) = errors.as_ref().and_then(|f| f.as_list()) else {
+            return 1;
+        };
+        let rejected_count = error_list.len();
 
         if rejected_count == 0 {
             return 1;
         }
 
-        // Keep only a small sample of per-record reasons for logging: a fully-rejected batch would
-        // otherwise build and emit one string per record on a single line. `rejected_count` carries
-        // the true total.
+        // `rejected_count` is the list length, taken before this loop, so an entry that is not a
+        // message still counts against the rejection while contributing no diagnostic. That differs
+        // from `count_log_record_results`, where a skipped item is simply not tallied; the direction
+        // here is the safe one (a malformed entry rejects the batch rather than acking it).
         const MAX_REASON_SAMPLE: usize = 3;
         let mut reason_sample: Vec<String> = Vec::new();
-        for item in error_list.into_iter().flatten().take(MAX_REASON_SAMPLE) {
+        for item in error_list.iter().take(MAX_REASON_SAMPLE) {
             let Some(record) = item.as_message() else {
                 continue;
             };
-            let record_index = record
-                .get_field_by_name("record_index")
-                .and_then(|v| v.as_i32())
-                .unwrap_or_default();
-            let error_code = record
-                .get_field_by_name("error_code")
-                .and_then(|v| v.as_enum_number())
-                .unwrap_or_default();
-            let error_message = record
-                .get_field_by_name("error_message")
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_default();
-            reason_sample.push(format!(
-                "record_index={record_index} error_code={error_code}: {error_message}"
-            ));
+            reason_sample.push(format_record_error(record));
         }
 
         // Rate-limited to once a minute: a systematic validation failure would otherwise log on
-        // every batch. The dropped records are already counted via event_status ->
-        // component_discarded_events_total, so this log is for diagnosis only.
+        // every batch, and the loss is already counted via event_status.
         warn!(
             rejected_count,
             reason_sample = ?reason_sample,
@@ -963,18 +1005,24 @@ mod tests {
     }
 
     /// Builds a descriptor pool mirroring the clickhouse-proxy log-ingestion shape:
-    ///   test.RecordError        { int32 record_index = 1; RecordErrorCode error_code = 2;
-    ///                            string error_message = 3; }
+    ///   test.RecordError        { optional int32 record_index = 1;
+    ///                             optional RecordErrorCode error_code = 2;
+    ///                             optional string error_message = 3; }
     ///   test.IngestLogsRequest  { }
     ///   test.IngestLogsResponse { repeated RecordError record_errors = 1; }
     /// Field numbers match the production proto so the hand-encoded wire bytes in the tests below
     /// are valid against this descriptor. Response message name matches production so
     /// `parse_grpc_response`'s name-based dispatch routes to `count_ingest_logs_results`.
+    ///
+    /// Declared `proto2` to match the production file, which matters here rather than being
+    /// incidental: proto2 `optional` scalars carry explicit presence, so an omitted `error_code` is
+    /// distinguishable from one set to 0. Under proto3 both collapse to "absent" and the diagnostic
+    /// could not tell a failed record from one reporting `OK`.
     fn make_test_pool_with_ingest_logs_shape() -> prost_reflect::DescriptorPool {
         let file = FileDescriptorProto {
             name: Some("test.proto".to_string()),
             package: Some("test".to_string()),
-            syntax: Some("proto3".to_string()),
+            syntax: Some("proto2".to_string()),
             enum_type: vec![EnumDescriptorProto {
                 name: Some("RecordErrorCode".to_string()),
                 value: vec![
@@ -1417,6 +1465,69 @@ mod tests {
             buf.extend_from_slice(&inner);
         }
         buf
+    }
+
+    /// Decodes an `IngestLogsResponse` body against the ingest-logs pool and returns its first
+    /// `record_errors` entry, so the per-record diagnostic rendering can be asserted directly.
+    fn first_record_error(body: &[u8]) -> prost_reflect::DynamicMessage {
+        let pool = make_test_pool_with_ingest_logs_shape();
+        let desc = pool
+            .get_message_by_name("test.IngestLogsResponse")
+            .expect("IngestLogsResponse in pool");
+        let decoded = prost_reflect::DynamicMessage::decode(desc, body).expect("body decodes");
+        let field = decoded
+            .get_field_by_name("record_errors")
+            .expect("record_errors present");
+        let list = field.as_list().expect("record_errors is a list").to_vec();
+        list.into_iter()
+            .next()
+            .expect("at least one record error")
+            .as_message()
+            .expect("entry is a message")
+            .clone()
+    }
+
+    #[test]
+    fn test_format_record_error_renders_enum_name_not_number() {
+        // `error_code` is a `google.rpc.Code` in the contract, so the rendered diagnostic must carry
+        // the value name: `error_code=2` tells an on-call reader nothing, the name does. Asserting
+        // the formatted string (not the resolver in isolation) is what pins the log's own output.
+        // Encodes RecordError { record_index: 7, error_code: 2, error_message: "bad ts" }.
+        let mut inner: Vec<u8> = vec![0x08, 7, 0x10, 2, 0x1A, 6];
+        inner.extend_from_slice(b"bad ts");
+        let mut body = vec![0x0A, inner.len() as u8];
+        body.extend_from_slice(&inner);
+
+        assert_eq!(
+            format_record_error(&first_record_error(&body)),
+            "record_index=7 error_code=RECORD_ERROR_CODE_INVALID_VALUE: bad ts"
+        );
+    }
+
+    #[test]
+    fn test_format_record_error_renders_absent_fields_as_unknown() {
+        // `RecordError` fields are `optional` in a proto2 file, so explicit presence applies: an
+        // omitted `error_code` must stay distinguishable from one set to 0, which is `OK` in
+        // `google.rpc.Code` and would otherwise be logged for a record that just failed. Likewise an
+        // omitted `record_index` must not render as a legitimate "record 0". Encodes an empty
+        // RecordError {} — every field absent.
+        let record = first_record_error(&[0x0A, 0x00]);
+
+        // Pin why the implementation cannot use `unwrap_or_default()`: reading an unset field yields
+        // its default, so only `has_field_by_name` distinguishes absent from a real 0.
+        assert!(!record.has_field_by_name("error_code"));
+        assert_eq!(
+            record
+                .get_field_by_name("error_code")
+                .and_then(|v| v.as_enum_number()),
+            Some(0),
+            "reading an unset error_code yields 0, which is OK in google.rpc.Code"
+        );
+
+        assert_eq!(
+            format_record_error(&record),
+            "record_index=? error_code=?: "
+        );
     }
 
     #[test]
