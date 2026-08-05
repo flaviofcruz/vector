@@ -435,6 +435,7 @@ impl BricklensIngestService {
         let accepted_count = match self.method.output().name() {
             "BatchCreateLogRecordsResponse" => self.count_log_record_results(&dynamic_response),
             "WriteMetricsResponse" => self.count_write_metrics_result(&dynamic_response),
+            "IngestLogsResponse" => self.count_ingest_logs_results(&dynamic_response),
             // bricklens-ingest-external is an atomic (all-or-nothing) forwarder: its Export* RPCs
             // return an empty `ExportResponse` with no partial-success channel, and this code is
             // reached only on a gRPC-OK status, so a response means the destination accepted the
@@ -452,8 +453,9 @@ impl BricklensIngestService {
                     response_type = other,
                     internal_log_rate_secs = 60,
                     "bricklens_ingest: response proto type is not supported (expected \
-                     BatchCreateLogRecordsResponse, WriteMetricsResponse, or ExportResponse); \
-                     treating batch as Rejected so events are not silently lost"
+                     BatchCreateLogRecordsResponse, WriteMetricsResponse, IngestLogsResponse, \
+                     or ExportResponse); treating batch as Rejected so events are not silently \
+                     lost"
                 );
                 0
             }
@@ -577,6 +579,78 @@ impl BricklensIngestService {
         }
 
         accepted_count
+    }
+
+    /// Returns 1 when the consumer accepted the whole batch, 0 when it rejected any record.
+    ///
+    /// The unit is deliberately the *request*, not the record, mirroring `ExportResponse => 1`:
+    /// `build_grpc_request` encodes and sends exactly ONE message per call (the merged event; it
+    /// warns and drops the tail if handed more than one), so `accepted_count` is a count of sent
+    /// messages the consumer took, and `event_status()` only distinguishes zero from non-zero.
+    /// Returning a record count here would inflate `accepted_count` above the number of events the
+    /// driver is acking.
+    ///
+    /// Inverted relative to `count_log_record_results`: `BatchCreateLogRecordsResponse` enumerates
+    /// every record with a `success` flag, whereas `IngestLogsResponse` carries only the records the
+    /// consumer rejected. A partial rejection therefore cannot be expressed as a fraction of one
+    /// message, so it is reported as Rejected: the batch is a single unit of acknowledgement, and
+    /// acking it as Delivered would silently drop the rejected records from the delivery accounting.
+    ///
+    /// Reaching here means the gRPC status was OK, which the consumer returns only once its write is
+    /// durable — a write failure is a non-OK status handled by the retry layer before this runs. So
+    /// an OK response listing no record errors means the whole batch landed.
+    fn count_ingest_logs_results(&self, response: &prost_reflect::DynamicMessage) -> usize {
+        // Protobuf omits empty repeated fields on the wire, so a fully-successful batch arrives with
+        // no `record_errors` bytes; `prost_reflect` surfaces that as an empty list rather than a
+        // missing field, and an empty list here means "every record accepted". Deliberately NOT the
+        // `else { return 0 }` guard `count_log_record_results` applies to a missing `results` field:
+        // there, absence signals a stale descriptor, whereas here it is the success path, and
+        // rejecting on it would retry every successful batch forever.
+        let errors = response.get_field_by_name("record_errors");
+        let error_list = errors.as_ref().and_then(|f| f.as_list());
+        let rejected_count = error_list.map_or(0, |list| list.len());
+
+        if rejected_count == 0 {
+            return 1;
+        }
+
+        // Keep only a small sample of per-record reasons for logging: a fully-rejected batch would
+        // otherwise build and emit one string per record on a single line. `rejected_count` carries
+        // the true total.
+        const MAX_REASON_SAMPLE: usize = 3;
+        let mut reason_sample: Vec<String> = Vec::new();
+        for item in error_list.into_iter().flatten().take(MAX_REASON_SAMPLE) {
+            let Some(record) = item.as_message() else {
+                continue;
+            };
+            let record_index = record
+                .get_field_by_name("record_index")
+                .and_then(|v| v.as_i32())
+                .unwrap_or_default();
+            let error_code = record
+                .get_field_by_name("error_code")
+                .and_then(|v| v.as_enum_number())
+                .unwrap_or_default();
+            let error_message = record
+                .get_field_by_name("error_message")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            reason_sample.push(format!(
+                "record_index={record_index} error_code={error_code}: {error_message}"
+            ));
+        }
+
+        // Rate-limited to once a minute: a systematic validation failure would otherwise log on
+        // every batch. The dropped records are already counted via event_status ->
+        // component_discarded_events_total, so this log is for diagnosis only.
+        warn!(
+            rejected_count,
+            reason_sample = ?reason_sample,
+            internal_log_rate_secs = 60,
+            "bricklens_ingest: consumer rejected one or more records in the batch"
+        );
+
+        0
     }
 }
 
@@ -886,6 +960,108 @@ mod tests {
             file: vec![file],
         })
         .expect("test descriptor pool with unrecognized response name")
+    }
+
+    /// Builds a descriptor pool mirroring the clickhouse-proxy log-ingestion shape:
+    ///   test.RecordError        { int32 record_index = 1; RecordErrorCode error_code = 2;
+    ///                            string error_message = 3; }
+    ///   test.IngestLogsRequest  { }
+    ///   test.IngestLogsResponse { repeated RecordError record_errors = 1; }
+    /// Field numbers match the production proto so the hand-encoded wire bytes in the tests below
+    /// are valid against this descriptor. Response message name matches production so
+    /// `parse_grpc_response`'s name-based dispatch routes to `count_ingest_logs_results`.
+    fn make_test_pool_with_ingest_logs_shape() -> prost_reflect::DescriptorPool {
+        let file = FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            enum_type: vec![EnumDescriptorProto {
+                name: Some("RecordErrorCode".to_string()),
+                value: vec![
+                    EnumValueDescriptorProto {
+                        name: Some("RECORD_ERROR_CODE_UNSPECIFIED".to_string()),
+                        number: Some(0),
+                        ..Default::default()
+                    },
+                    EnumValueDescriptorProto {
+                        name: Some("RECORD_ERROR_CODE_MISSING_REQUIRED_FIELD".to_string()),
+                        number: Some(1),
+                        ..Default::default()
+                    },
+                    EnumValueDescriptorProto {
+                        name: Some("RECORD_ERROR_CODE_INVALID_VALUE".to_string()),
+                        number: Some(2),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("RecordError".to_string()),
+                    field: vec![
+                        FieldDescriptorProto {
+                            name: Some("record_index".to_string()),
+                            number: Some(1),
+                            label: Some(field_descriptor_proto::Label::Optional as i32),
+                            r#type: Some(field_descriptor_proto::Type::Int32 as i32),
+                            json_name: Some("recordIndex".to_string()),
+                            ..Default::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("error_code".to_string()),
+                            number: Some(2),
+                            label: Some(field_descriptor_proto::Label::Optional as i32),
+                            r#type: Some(field_descriptor_proto::Type::Enum as i32),
+                            type_name: Some(".test.RecordErrorCode".to_string()),
+                            json_name: Some("errorCode".to_string()),
+                            ..Default::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("error_message".to_string()),
+                            number: Some(3),
+                            label: Some(field_descriptor_proto::Label::Optional as i32),
+                            r#type: Some(field_descriptor_proto::Type::String as i32),
+                            json_name: Some("errorMessage".to_string()),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("IngestLogsRequest".to_string()),
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("IngestLogsResponse".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("record_errors".to_string()),
+                        number: Some(1),
+                        label: Some(field_descriptor_proto::Label::Repeated as i32),
+                        r#type: Some(field_descriptor_proto::Type::Message as i32),
+                        type_name: Some(".test.RecordError".to_string()),
+                        json_name: Some("recordErrors".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            service: vec![ServiceDescriptorProto {
+                name: Some("TestService".to_string()),
+                method: vec![MethodDescriptorProto {
+                    name: Some("IngestLogs".to_string()),
+                    input_type: Some(".test.IngestLogsRequest".to_string()),
+                    output_type: Some(".test.IngestLogsResponse".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        prost_reflect::DescriptorPool::from_file_descriptor_set(FileDescriptorSet {
+            file: vec![file],
+        })
+        .expect("test descriptor pool with ingest-logs shape")
     }
 
     /// Builds a descriptor pool that mirrors the real `WriteMetricsResponse` shape:
@@ -1223,6 +1399,116 @@ mod tests {
             resp.event_status(),
             vector_lib::event::EventStatus::Delivered
         );
+    }
+
+    /// Hand-encodes a proto3 `IngestLogsResponse { repeated RecordError record_errors = 1 }` body
+    /// with `count` entries. Each entry is field 1, wire type 2 (tag 0x0A) + length, and carries
+    /// `record_index` (field 1, varint) so the message is non-empty and the sample formatting is
+    /// exercised. Index 0 is skipped for the first entry under proto3 implicit presence, which is
+    /// fine: the count is what matters, and an empty submessage still counts as one list item.
+    fn encode_ingest_logs_body(count: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for index in 0..count {
+            // RecordError { record_index: index } — field 1, varint. Keep indices < 128 so the
+            // varint is a single byte and the submessage length is a constant 2.
+            let inner: Vec<u8> = vec![0x08, index as u8];
+            buf.push(0x0A); // record_errors, wire type 2
+            buf.push(inner.len() as u8);
+            buf.extend_from_slice(&inner);
+        }
+        buf
+    }
+
+    #[test]
+    fn test_parse_grpc_response_ingest_logs_no_errors_yields_delivered() {
+        // An OK status with an empty `record_errors` list is the full-success case: the one message
+        // sent was accepted whole, so accepted_count is 1 (the sent-message unit, matching
+        // `ExportResponse => 1`).
+        let svc = make_test_service_with_pool(
+            "https://example.com:443",
+            make_test_pool_with_ingest_logs_shape(),
+        );
+        let body = bytes::Bytes::from(encode_grpc_message(encode_ingest_logs_body(0)));
+        let resp = svc
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
+        assert_eq!(resp.accepted_count, 1);
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Delivered
+        );
+    }
+
+    #[test]
+    fn test_parse_grpc_response_ingest_logs_absent_field_yields_delivered() {
+        // Guards the inversion against `count_log_record_results`: protobuf omits empty repeated
+        // fields entirely, so a fully-successful batch arrives as a zero-length message with no
+        // `record_errors` bytes on the wire. That must still mean "accepted" — applying the
+        // stale-descriptor `return 0` guard that a missing `results` field warrants would retry
+        // every successful batch forever.
+        let svc = make_test_service_with_pool(
+            "https://example.com:443",
+            make_test_pool_with_ingest_logs_shape(),
+        );
+        let body = bytes::Bytes::from(encode_grpc_message(Vec::new()));
+
+        // Pin the `prost_reflect` behavior the implementation relies on: an absent repeated field
+        // decodes to an empty list, never a missing field. If a future version returned `None`
+        // instead, `as_list()` would yield `None`, `map_or(0, ..)` would still count 0 errors, and
+        // this test would keep passing — so assert the shape directly rather than inferring it from
+        // the accepted count alone.
+        let decoded = prost_reflect::DynamicMessage::decode(
+            svc.method.output(),
+            &encode_grpc_message(Vec::new())[5..],
+        )
+        .expect("empty IngestLogsResponse decodes");
+        let field = decoded.get_field_by_name("record_errors");
+        assert!(
+            field.as_ref().and_then(|f| f.as_list()).is_some(),
+            "an absent repeated field must decode to an empty list, not a missing field"
+        );
+
+        let resp = svc
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
+        assert_eq!(resp.accepted_count, 1);
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Delivered
+        );
+    }
+
+    #[test]
+    fn test_parse_grpc_response_ingest_logs_partial_rejection_yields_rejected() {
+        // A partial rejection cannot be expressed as a fraction of the single message sent, so the
+        // batch is Rejected rather than acked as Delivered — acking would drop the rejected records
+        // from the delivery accounting entirely.
+        let svc = make_test_service_with_pool(
+            "https://example.com:443",
+            make_test_pool_with_ingest_logs_shape(),
+        );
+        let body = bytes::Bytes::from(encode_grpc_message(encode_ingest_logs_body(3)));
+        let resp = svc
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
+        assert_eq!(resp.accepted_count, 0);
+        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
+    }
+
+    #[test]
+    fn test_parse_grpc_response_ingest_logs_single_rejection_yields_rejected() {
+        // One rejected record is enough to reject the batch: the response carries only failures, so
+        // any entry at all means the message was not accepted whole.
+        let svc = make_test_service_with_pool(
+            "https://example.com:443",
+            make_test_pool_with_ingest_logs_shape(),
+        );
+        let body = bytes::Bytes::from(encode_grpc_message(encode_ingest_logs_body(1)));
+        let resp = svc
+            .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
+            .unwrap();
+        assert_eq!(resp.accepted_count, 0);
+        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
     }
 
     #[test]
