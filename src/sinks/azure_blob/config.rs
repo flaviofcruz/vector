@@ -10,6 +10,7 @@ use vector_lib::{
 };
 
 use super::request_builder::AzureBlobRequestOptions;
+use crate::internal_events::vector_event::emit_blob_file_upload_attempt;
 use crate::sinks::util::vector_event_log::EventLoggingService;
 use crate::{
     Result,
@@ -231,6 +232,9 @@ impl AzureBlobSinkConfig {
                 if let Ok(ref response) = result {
                     response.event_log_metadata.emit_upload_event();
                 }
+                // One settled PutBlockBlob is one upload attempt. The Azure SDK surfaces
+                // non-2xx as `Err`, so `Ok`/`Err` is already the success/failure split.
+                emit_blob_file_upload_attempt(result.is_ok());
                 result
             })
             .service(AzureBlobService::new(client));
