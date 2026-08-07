@@ -182,6 +182,35 @@ pub(super) fn append_scalar_from_wire(
     })
 }
 
+/// Render a proto enum varint into a `LargeUtf8` builder as its enum-value
+/// *name* (e.g. `1` -> `"SUCCESS"`), matching the classic Lumberjack ETL
+/// (`ScalaPbValueFormatter`). Parity rules:
+///   - out-of-range value -> `UNKNOWN_ENUM_VALUE_<enum>_<n>` placeholder, never
+///     a row drop (matches ScalaPB's `generate_unrecognized_enum_value` codegen);
+///   - a wrong wire type (enum must be a varint) -> `WireTypeMismatch`.
+/// The absent/proto3-default case (elided zero value -> null) is handled by the
+/// builder-tree's `finalize_row`, not here.
+#[inline]
+pub(super) fn append_enum_string_from_wire(
+    desc: &prost_reflect::EnumDescriptor,
+    wv: &WireValue,
+    tb: &mut TypedBuilder,
+) -> Result<()> {
+    let raw = match wv {
+        WireValue::Varint(v) => *v,
+        other => {
+            return Err(WireToArrowError::WireTypeMismatch {
+                expected: WT_VARINT,
+                actual: wire_type_byte(other),
+            });
+        }
+    };
+    // Enum values are int32 on the wire; proto sign-extends negatives to a
+    // 64-bit varint, so `append_enum_name` narrows via `as i32` before the
+    // descriptor lookup.
+    append_enum_name(desc, raw, tb)
+}
+
 /// Append the proto3 default for `kind` to `tb`. Used at `finalize_row` time
 /// for absent scalar slots inside Map entry sub-plans, where the Arrow Map
 /// type declares the key non-nullable but proto3 elides the key tag whenever
@@ -400,6 +429,27 @@ pub(super) fn validate_scalar_from_wire(kind: ScalarKind, wv: &WireValue) -> Res
     }
 }
 
+/// Mirror of [`append_enum_string_from_wire`] that runs the wire-type check
+/// without touching a builder. Used by the pre-validate pass. Must stay in
+/// lock-step with [`append_enum_string_from_wire`]: every (desc, wv)
+/// combination that succeeds here must also succeed there. An unrecognized
+/// enum value is not a failure — it renders a placeholder on append.
+pub(super) fn validate_enum_string_from_wire(
+    desc: &prost_reflect::EnumDescriptor,
+    wv: &WireValue,
+) -> Result<()> {
+    let raw = match wv {
+        WireValue::Varint(v) => *v,
+        other => {
+            return Err(WireToArrowError::WireTypeMismatch {
+                expected: WT_VARINT,
+                actual: wire_type_byte(other),
+            });
+        }
+    };
+    validate_enum_number(desc, raw)
+}
+
 /// Mirror of [`append_repeated_scalar`] that walks the value (or packed
 /// blob) without appending. Used by the pre-validate pass — the packed-blob
 /// inner loop in [`append_repeated_scalar`] is the one site in the encoder
@@ -445,6 +495,129 @@ pub(super) fn validate_repeated_scalar(kind: ScalarKind, wv: &WireValue) -> Resu
             });
         }
     }
+    Ok(())
+}
+
+/// Repeated analogue of [`append_enum_string_from_wire`]: render each enum
+/// element's value *name* into a `LargeUtf8` list-values builder. Enums are
+/// varints, so this accepts both wire forms — a single unpacked varint or a
+/// packed blob of varints — mirroring [`append_repeated_scalar`]. `current_offset`
+/// is bumped once per element for the parent `List<LargeUtf8>` offsets buffer.
+pub(super) fn append_repeated_enum_string(
+    desc: &prost_reflect::EnumDescriptor,
+    wv: &WireValue,
+    values: &mut TypedBuilder,
+    current_offset: &mut i32,
+) -> Result<()> {
+    // Unpacked form: a single varint occurrence.
+    if let WireValue::Varint(raw) = wv {
+        append_enum_name(desc, *raw, values)?;
+        *current_offset =
+            current_offset
+                .checked_add(1)
+                .ok_or(WireToArrowError::OffsetOverflow {
+                    site: "append_repeated_enum_string:unpacked",
+                })?;
+        return Ok(());
+    }
+
+    // Packed form: a `Len` blob holding a run of raw varints.
+    let WireValue::Len(inner) = wv else {
+        return Err(WireToArrowError::WireTypeMismatch {
+            expected: WT_VARINT,
+            actual: wire_type_byte(wv),
+        });
+    };
+    let mut remaining: &[u8] = inner;
+    while !remaining.is_empty() {
+        let (v, rest) = try_read_varint(remaining)?;
+        remaining = rest;
+        append_enum_name(desc, v, values)?;
+        *current_offset =
+            current_offset
+                .checked_add(1)
+                .ok_or(WireToArrowError::OffsetOverflow {
+                    site: "append_repeated_enum_string:packed",
+                })?;
+    }
+    Ok(())
+}
+
+/// Look up `raw`'s enum-value name and append it to a `LargeUtf8` builder.
+/// A value with no matching descriptor entry renders the same synthetic
+/// placeholder ScalaPB emits (see [`unknown_enum_placeholder`]), so a proto
+/// enum value added upstream after this binary was built lands as a string
+/// instead of dropping the row — matching the classic Lumberjack ETL, whose
+/// log protos are compiled with `generate_unrecognized_enum_value = true`.
+/// Shared by the singular and repeated enum-string paths.
+#[inline]
+fn append_enum_name(
+    desc: &prost_reflect::EnumDescriptor,
+    raw: u64,
+    tb: &mut TypedBuilder,
+) -> Result<()> {
+    let value = raw as i32;
+    let TypedBuilder::LargeUtf8(b) = tb else {
+        return Err(WireToArrowError::PlanBuilderMismatch {
+            site: "append_enum_name",
+        });
+    };
+    match desc.get_value(value) {
+        Some(v) => b.append_value(v.name()),
+        None => b.append_value(unknown_enum_placeholder(desc, value)),
+    }
+    Ok(())
+}
+
+/// The placeholder string ScalaPB's `findValueByNumberCreatingIfUnknown`
+/// produces for an unrecognized enum value: `UNKNOWN_ENUM_VALUE_<enum>_<n>`,
+/// where `<enum>` is the enum's simple (unqualified) name. `desc.name()` from
+/// prost-reflect is that same simple name, so the two paths are byte-identical.
+#[inline]
+fn unknown_enum_placeholder(desc: &prost_reflect::EnumDescriptor, value: i32) -> String {
+    format!("UNKNOWN_ENUM_VALUE_{}_{}", desc.name(), value)
+}
+
+/// Mirror of [`append_repeated_enum_string`] that walks the value (or packed
+/// blob) without appending — used by the pre-validate pass. Runs the same
+/// wire-type check (and the packed-blob element-count guard) so a malformed
+/// row is dropped before any builder is mutated. An unrecognized enum value is
+/// not a failure — it renders a placeholder on append.
+pub(super) fn validate_repeated_enum_string(
+    desc: &prost_reflect::EnumDescriptor,
+    wv: &WireValue,
+) -> Result<()> {
+    match wv {
+        WireValue::Varint(raw) => validate_enum_number(desc, *raw),
+        WireValue::Len(inner) => {
+            let mut remaining: &[u8] = inner;
+            let mut count: u64 = 0;
+            while !remaining.is_empty() {
+                let (v, rest) = try_read_varint(remaining)?;
+                remaining = rest;
+                validate_enum_number(desc, v)?;
+                count += 1;
+                if count > i32::MAX as u64 {
+                    return Err(WireToArrowError::OffsetOverflow {
+                        site: "validate_repeated_enum_string:packed_row_exceeds_i32",
+                    });
+                }
+            }
+            Ok(())
+        }
+        other => Err(WireToArrowError::WireTypeMismatch {
+            expected: WT_VARINT,
+            actual: wire_type_byte(other),
+        }),
+    }
+}
+
+#[inline]
+fn validate_enum_number(_desc: &prost_reflect::EnumDescriptor, _raw: u64) -> Result<()> {
+    // An unrecognized enum value is no longer a row-drop condition: the append
+    // path renders it as a placeholder string (see [`append_enum_name`]), so
+    // every varint is valid here. Kept as a named no-op so the validate pass
+    // stays in lock-step with the append path structurally.
     Ok(())
 }
 

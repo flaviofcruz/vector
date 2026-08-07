@@ -150,6 +150,22 @@ pub enum BuilderNode {
         kind: ScalarKind,
         builder: TypedBuilder,
     },
+    /// Proto enum field rendered into a STRING column by name (parity with the
+    /// arrow_stream path). `builder` is always a `TypedBuilder::LargeUtf8`;
+    /// `desc` supplies the number->name lookup at scan time.
+    EnumString {
+        desc: prost_reflect::EnumDescriptor,
+        builder: TypedBuilder,
+    },
+    /// Repeated proto enum rendered into an Arrow `List<LargeUtf8>` by name.
+    /// Same offset+current_offset bookkeeping as `RepeatedScalar`; `values` is
+    /// always a `TypedBuilder::LargeUtf8` and `desc` supplies the lookup.
+    RepeatedEnumString {
+        desc: prost_reflect::EnumDescriptor,
+        values: TypedBuilder,
+        offsets: Vec<i32>,
+        current_offset: i32,
+    },
     /// Singular nested message. `validity[i]` tells whether row `i` had this
     /// field present (true) or absent (false — child values are null-filled).
     Struct {
@@ -209,6 +225,10 @@ impl BuilderNodeList {
                     kind: *kind,
                     builder: TypedBuilder::new(field.data_type(), capacity),
                 },
+                PlanSlot::EnumString(desc) => BuilderNode::EnumString {
+                    desc: desc.clone(),
+                    builder: TypedBuilder::new(field.data_type(), capacity),
+                },
                 PlanSlot::Struct(sub_plan) => BuilderNode::Struct {
                     sub_plan: Arc::clone(sub_plan),
                     children: BuilderNodeList::with_capacity(sub_plan, capacity)?,
@@ -238,6 +258,24 @@ impl BuilderNodeList {
                     offsets.push(0);
                     BuilderNode::RepeatedScalar {
                         kind: *kind,
+                        values: TypedBuilder::new(element_type, capacity * 2),
+                        offsets,
+                        current_offset: 0,
+                    }
+                }
+                PlanSlot::RepeatedEnumString(desc) => {
+                    let element_type = match field.data_type() {
+                        DataType::List(element_field) => element_field.data_type(),
+                        _ => {
+                            return Err(WireToArrowError::PlanBuilderMismatch {
+                                site: "with_capacity:repeated_enum_string_non_list",
+                            });
+                        }
+                    };
+                    let mut offsets = Vec::with_capacity(capacity + 1);
+                    offsets.push(0);
+                    BuilderNode::RepeatedEnumString {
+                        desc: desc.clone(),
                         values: TypedBuilder::new(element_type, capacity * 2),
                         offsets,
                         current_offset: 0,
@@ -313,6 +351,16 @@ impl BuilderNodeList {
                         }
                     }
                 }
+                // An absent enum field is elided by proto3 at its zero value;
+                // `proto_to_value` only walks present fields, so it yields null
+                // (not the name of value 0). Match that: always null on absent.
+                // Enum fields never appear inside a map entry, so there is no
+                // proto3-default branch here.
+                BuilderNode::EnumString { builder, .. } => {
+                    if !was_present {
+                        builder.append_null();
+                    }
+                }
                 BuilderNode::Struct {
                     children, validity, ..
                 } => {
@@ -334,6 +382,11 @@ impl BuilderNodeList {
                     current_offset,
                     ..
                 }
+                | BuilderNode::RepeatedEnumString {
+                    offsets,
+                    current_offset,
+                    ..
+                }
                 | BuilderNode::Map {
                     offsets,
                     current_offset,
@@ -350,7 +403,8 @@ impl BuilderNodeList {
     pub fn fill_null_row(&mut self) {
         for node in self.nodes.iter_mut() {
             match node {
-                BuilderNode::Scalar { builder, .. } => builder.append_null(),
+                BuilderNode::Scalar { builder, .. }
+                | BuilderNode::EnumString { builder, .. } => builder.append_null(),
                 BuilderNode::Struct {
                     children, validity, ..
                 } => {
@@ -363,6 +417,11 @@ impl BuilderNodeList {
                     ..
                 }
                 | BuilderNode::RepeatedScalar {
+                    offsets,
+                    current_offset,
+                    ..
+                }
+                | BuilderNode::RepeatedEnumString {
                     offsets,
                     current_offset,
                     ..
@@ -386,7 +445,8 @@ impl BuilderNodeList {
         for (idx, node) in self.nodes.iter_mut().enumerate() {
             let arrow_field = &plan.arrow_fields[idx];
             let arr: ArrayRef = match node {
-                BuilderNode::Scalar { builder, .. } => builder.finish(),
+                BuilderNode::Scalar { builder, .. }
+                | BuilderNode::EnumString { builder, .. } => builder.finish(),
                 BuilderNode::Struct {
                     sub_plan,
                     children,
@@ -460,6 +520,29 @@ impl BuilderNodeList {
                         ListArray::try_new(element_field, offset_buffer, values_array, None)
                             .map_err(|e| WireToArrowError::ArrayAssembly {
                                 kind: "list (scalar)",
+                                source: e,
+                            })?,
+                    )
+                }
+                BuilderNode::RepeatedEnumString { values, offsets, .. } => {
+                    let values_array = values.finish();
+                    let offset_buffer =
+                        OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
+                    let element_field = match arrow_field.data_type() {
+                        DataType::List(f) => Arc::clone(f),
+                        other => {
+                            return Err(WireToArrowError::UnsupportedCombination {
+                                name: arrow_field.name().to_string(),
+                                kind: "RepeatedEnumString".to_string(),
+                                arrow_type: format!("{other:?}"),
+                                repeated: true,
+                            });
+                        }
+                    };
+                    Arc::new(
+                        ListArray::try_new(element_field, offset_buffer, values_array, None)
+                            .map_err(|e| WireToArrowError::ArrayAssembly {
+                                kind: "list (enum string)",
                                 source: e,
                             })?,
                     )

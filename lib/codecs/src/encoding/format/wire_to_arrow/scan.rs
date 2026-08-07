@@ -10,7 +10,9 @@
 use zeroparser::wire::try_parse_field;
 
 use super::append::{
-    append_repeated_scalar, append_scalar_from_wire, expect_len, validate_repeated_scalar,
+    append_enum_string_from_wire, append_repeated_enum_string, append_repeated_scalar,
+    append_scalar_from_wire, expect_len, validate_enum_string_from_wire,
+    validate_repeated_enum_string, validate_repeated_scalar,
     validate_scalar_from_wire,
 };
 use super::builders::{self, BuilderNodeList};
@@ -50,6 +52,10 @@ pub(super) fn scan_message(
         match &mut nodes[slot_idx] {
             builders::BuilderNode::Scalar { kind, builder } => {
                 append_scalar_from_wire(*kind, &field.value, builder)?;
+                present[slot_idx] = true;
+            }
+            builders::BuilderNode::EnumString { desc, builder } => {
+                append_enum_string_from_wire(desc, &field.value, builder)?;
                 present[slot_idx] = true;
             }
             builders::BuilderNode::Struct {
@@ -97,6 +103,15 @@ pub(super) fn scan_message(
                 ..
             } => {
                 append_repeated_scalar(*kind, &field.value, values, current_offset)?;
+                present[slot_idx] = true;
+            }
+            builders::BuilderNode::RepeatedEnumString {
+                desc,
+                values,
+                current_offset,
+                ..
+            } => {
+                append_repeated_enum_string(desc, &field.value, values, current_offset)?;
                 present[slot_idx] = true;
             }
         }
@@ -176,6 +191,17 @@ pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<(
                 validate_message(sub_plan, sub_bytes)?;
             }
             PlanSlot::RepeatedScalar(sk) => validate_repeated_scalar(*sk, &field.value)?,
+            PlanSlot::RepeatedEnumString(desc) => {
+                validate_repeated_enum_string(desc, &field.value)?
+            }
+            PlanSlot::EnumString(desc) => {
+                if seen_singular.test_and_set(slot_idx) {
+                    return Err(WireToArrowError::DuplicateSingularField {
+                        field_number: field.field_num as u32,
+                    });
+                }
+                validate_enum_string_from_wire(desc, &field.value)?;
+            }
             // No proto field number ever points at an Absent slot (Absent
             // slots are Arrow columns the proto descriptor lacks), so this
             // arm is unreachable in practice. Mirror `scan_message`'s
