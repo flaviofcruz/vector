@@ -32,6 +32,8 @@ mod batch;
 mod clickhouse;
 mod common;
 mod conditions;
+#[cfg(feature = "sinks-databricks-zerobus")]
+mod databricks_zerobus;
 #[cfg(feature = "sources-datadog_agent")]
 mod datadog_agent;
 #[cfg(feature = "sinks-datadog_metrics")]
@@ -203,6 +205,8 @@ pub(crate) use self::aws_kinesis_firehose::*;
 pub(crate) use self::aws_sqs::*;
 #[cfg(feature = "sinks-clickhouse")]
 pub(crate) use self::clickhouse::*;
+#[cfg(feature = "sinks-databricks-zerobus")]
+pub(crate) use self::databricks_zerobus::*;
 #[cfg(feature = "sources-datadog_agent")]
 pub(crate) use self::datadog_agent::*;
 #[cfg(feature = "sinks-datadog_metrics")]
