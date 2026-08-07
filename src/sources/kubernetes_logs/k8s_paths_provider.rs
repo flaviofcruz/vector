@@ -533,6 +533,9 @@ fn build_container_exclusion_patterns<'a>(
     })
 }
 
+/// The emptyDir volume names a pod may write logs to. Scan roots are built by joining these
+/// onto the pod's emptyDir base rather than by enumerating the base, so a volume the pod does
+/// not mount simply has no scan root.
 const VALID_LOG_VOLUME_NAMES: &[&str] = &["logs", "data", "container-build", "event-logs"];
 fn get_databricks_pod_logs_directories(
     pod: &Pod,
@@ -541,36 +544,16 @@ fn get_databricks_pod_logs_directories(
 ) -> Vec<PathBuf> {
     let mut log_dirs = Vec::new();
     if let Some(empty_dir_pod_logs_directory) = empty_dir_pod_logs_directory {
-        // First, include the original pod logs directory (with no subdirectories) in the list of paths.
-        log_dirs.push(empty_dir_pod_logs_directory.clone());
-        // Then, include the direct subdirectories in the list of paths.
-        let subdirectories = std::fs::read_dir(&empty_dir_pod_logs_directory);
-        if let Ok(subdirectories) = subdirectories {
-            log_dirs.extend(subdirectories.filter_map(|entry| {
-                entry
-                    .ok()
-                    .and_then(|entry| {
-                        VALID_LOG_VOLUME_NAMES
-                            .contains(
-                                &entry
-                                    .path()
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_str()
-                                    .unwrap_or_default(),
-                            )
-                            .then_some(entry.path())
-                    })
-                    .and_then(|entry| entry.is_dir().then_some(entry))
-            }));
-        } else {
-            trace!(
-                message = "Failed to read subdirectories of emptyDir pod logs directory.",
-                pod = ?pod.metadata.name,
-                log_directory = ?empty_dir_pod_logs_directory.to_str(),
-                error = subdirectories.err().map(|e| e.to_string()),
-            );
-        }
+        // Only the named volume directories are scan roots; the emptyDir base itself is not.
+        // Configured glob patterns are volume-relative (e.g. `*/access.log*` for the file
+        // `logs/<dir>/access.log`), so globbing the base too would resolve each pattern one
+        // segment short of its intended volume and match unintended files.
+        log_dirs.extend(
+            VALID_LOG_VOLUME_NAMES
+                .iter()
+                .map(|volume| empty_dir_pod_logs_directory.join(volume))
+                .filter(|dir| dir.is_dir()),
+        );
     }
     // If a hostpath annotation key is configured, resolve the annotation and include its directory.
     if let Some(annotation_key) = hostpath_logging_annotation_key {
@@ -1233,6 +1216,8 @@ mod tests {
         std::fs::create_dir_all(&temp_data_volume_path).unwrap();
         let temp_invalid_volume_path = temp_dir_path.join("invalid_test_volume");
         std::fs::create_dir_all(&temp_invalid_volume_path).unwrap();
+        // `container-build` and `event-logs` are deliberately not created: a whitelisted volume the
+        // pod does not mount must not become a scan root.
         // Confirm that the function returns the correct directories for a pod with or without a hostpath logging annotation override.
         let cases = vec![
             (
@@ -1258,7 +1243,6 @@ mod tests {
                 )],
                 vec![
                     PathBuf::from("/databricks/host-root/local_disk0/sandbox0-custom-logs-path"),
-                    PathBuf::from(temp_dir_path),
                     temp_data_volume_path.clone(),
                     temp_logs_volume_path.clone(),
                 ],
@@ -1274,11 +1258,7 @@ mod tests {
                     ..Pod::default()
                 },
                 vec![],
-                vec![
-                    PathBuf::from(temp_dir_path),
-                    temp_data_volume_path.clone(),
-                    temp_logs_volume_path.clone(),
-                ],
+                vec![temp_data_volume_path.clone(), temp_logs_volume_path.clone()],
             ),
         ];
 
@@ -1339,24 +1319,10 @@ mod tests {
                     },
                     ..Pod::default()
                 },
-                // Calls to the glob mock.
+                // Calls to the glob mock. The pod's emptyDir volume directories do not exist on
+                // this test host, so no emptyDir scan root is produced and the only globs issued
+                // are for the hostPath annotation directory.
                 vec![
-                    // The first calls are to the base emptyDir directory.
-                    (
-                        // The pattern to expect at the mock.
-                        "/var/lib/kubelet/pods/sandbox0-uid/volumes/kubernetes.io~empty-dir/*/*.log*",
-                        // The paths to return from the mock. No paths returned as this test case
-                        // simulates an unused emptyDir directory.
-                        vec![],
-                    ),
-                    (
-                        "/var/lib/kubelet/pods/sandbox0-uid/volumes/kubernetes.io~empty-dir/*/*.json*",
-                        vec![],
-                    ),
-                    (
-                        "/var/lib/kubelet/pods/sandbox0-uid/volumes/kubernetes.io~empty-dir/*/*.pb.base64*",
-                        vec![],
-                    ),
                     (
                         // The pattern to expect at the mock.
                         "/databricks/host-root/local_disk0/sandbox0-custom-logs-path/*/*.log*",
