@@ -1594,6 +1594,218 @@ fn map_preserves_user_entry_field_name_and_metadata() {
 }
 
 // -------------------------------------------------------------------------
+// Enum -> STRING column (PlanSlot::EnumString): render the proto enum varint
+// as its value name, matching the arrow_stream / `proto_to_value` path.
+// -------------------------------------------------------------------------
+
+/// Build `message Msg { Outcome outcome = 1; }` with
+/// `enum Outcome { UNSPECIFIED = 0; SUCCESS = 1; FAILURE = 2; }`.
+fn singular_enum_descriptor() -> MessageDescriptor {
+    use prost_reflect::prost_types::{EnumDescriptorProto, EnumValueDescriptorProto};
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_enum_test.proto".into()),
+        package: Some("wire_to_arrow_enum_test".into()),
+        syntax: Some("proto3".into()),
+        enum_type: vec![EnumDescriptorProto {
+            name: Some("Outcome".into()),
+            value: vec![
+                EnumValueDescriptorProto {
+                    name: Some("UNSPECIFIED".into()),
+                    number: Some(0),
+                    ..Default::default()
+                },
+                EnumValueDescriptorProto {
+                    name: Some("SUCCESS".into()),
+                    number: Some(1),
+                    ..Default::default()
+                },
+                EnumValueDescriptorProto {
+                    name: Some("FAILURE".into()),
+                    number: Some(2),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        message_type: vec![DescriptorProto {
+            name: Some("Msg".into()),
+            field: vec![
+                FieldDescriptorProto {
+                    name: Some("outcome".into()),
+                    number: Some(1),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ProtoType::Enum as i32),
+                    type_name: Some(".wire_to_arrow_enum_test.Outcome".into()),
+                    ..Default::default()
+                },
+                FieldDescriptorProto {
+                    name: Some("outcomes".into()),
+                    number: Some(2),
+                    label: Some(Label::Repeated as i32),
+                    r#type: Some(ProtoType::Enum as i32),
+                    type_name: Some(".wire_to_arrow_enum_test.Outcome".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes).unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_enum_test.Msg")
+        .unwrap()
+}
+
+#[test]
+fn enum_to_string_renders_value_name() {
+    let desc = singular_enum_descriptor();
+    let schema = Schema::new(vec![Field::new("outcome", DataType::LargeUtf8, true)]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut msg = DynamicMessage::new(desc.clone());
+    msg.set_field_by_name("outcome", ProtoValue::EnumNumber(1)); // SUCCESS
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc.encode_batch(&[Bytes::from(buf)]).unwrap();
+    assert_eq!(batch.column(0).as_string::<i64>().value(0), "SUCCESS");
+}
+
+#[test]
+fn enum_to_string_absent_is_null() {
+    // proto3 elides an enum at its zero value; `proto_to_value` only walks
+    // present fields, so an absent enum -> null (NOT the name of value 0).
+    let desc = singular_enum_descriptor();
+    let schema = Schema::new(vec![Field::new("outcome", DataType::LargeUtf8, true)]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // Empty message: `outcome` absent.
+    let batch = enc.encode_batch(&[Bytes::new()]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(batch.column(0).is_null(0), "absent enum must be null");
+}
+
+#[test]
+fn enum_to_string_unknown_value_renders_placeholder() {
+    // An out-of-range enum number (e.g. a value added upstream after this
+    // binary was built) has no descriptor entry. The classic Lumberjack ETL
+    // renders ScalaPB's `UNKNOWN_ENUM_VALUE_<enum>_<n>` placeholder rather than
+    // dropping the row, so we match it byte-for-byte and keep the row.
+    let desc = singular_enum_descriptor();
+    let schema = Schema::new(vec![Field::new("outcome", DataType::LargeUtf8, true)]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut good = DynamicMessage::new(desc.clone());
+    good.set_field_by_name("outcome", ProtoValue::EnumNumber(2)); // FAILURE
+    let mut good_buf = Vec::new();
+    good.encode(&mut good_buf).unwrap();
+
+    let mut unknown = DynamicMessage::new(desc.clone());
+    unknown.set_field_by_name("outcome", ProtoValue::EnumNumber(99)); // undefined
+    let mut unknown_buf = Vec::new();
+    unknown.encode(&mut unknown_buf).unwrap();
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(good_buf), Bytes::from(unknown_buf)])
+        .expect("unknown-enum row must not fail the batch");
+    assert_eq!(batch.num_rows(), 2, "the unknown-enum row must be kept");
+    let col = batch.column(0).as_string::<i64>();
+    assert_eq!(col.value(0), "FAILURE");
+    assert_eq!(col.value(1), "UNKNOWN_ENUM_VALUE_Outcome_99");
+}
+
+#[test]
+fn repeated_enum_to_string_renders_value_names() {
+    // `repeated Outcome` -> List<LargeUtf8>: each element rendered by name.
+    let desc = singular_enum_descriptor();
+    let outcomes = Field::new("item", DataType::LargeUtf8, true);
+    let schema = Schema::new(vec![Field::new(
+        "outcomes",
+        DataType::List(Arc::new(outcomes)),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut msg = DynamicMessage::new(desc.clone());
+    msg.set_field_by_name(
+        "outcomes",
+        ProtoValue::List(vec![
+            ProtoValue::EnumNumber(1), // SUCCESS
+            ProtoValue::EnumNumber(2), // FAILURE
+            ProtoValue::EnumNumber(0), // UNSPECIFIED
+        ]),
+    );
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc.encode_batch(&[Bytes::from(buf)]).unwrap();
+    let list = batch.column(0).as_list::<i32>();
+    let vals = list.value(0);
+    let strs = vals.as_string::<i64>();
+    assert_eq!(strs.len(), 3);
+    assert_eq!(strs.value(0), "SUCCESS");
+    assert_eq!(strs.value(1), "FAILURE");
+    assert_eq!(strs.value(2), "UNSPECIFIED");
+}
+
+#[test]
+fn repeated_enum_to_string_empty_when_absent() {
+    // An absent repeated field is an empty list (never null), like every
+    // other repeated slot.
+    let desc = singular_enum_descriptor();
+    let outcomes = Field::new("item", DataType::LargeUtf8, true);
+    let schema = Schema::new(vec![Field::new(
+        "outcomes",
+        DataType::List(Arc::new(outcomes)),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let batch = enc.encode_batch(&[Bytes::new()]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let list = batch.column(0).as_list::<i32>();
+    assert!(!list.is_null(0), "absent repeated enum must be empty list, not null");
+    assert_eq!(list.value(0).len(), 0);
+}
+
+#[test]
+fn repeated_enum_to_string_unknown_value_renders_placeholder() {
+    // An out-of-range element renders its placeholder in place (parity with the
+    // singular case); the row is kept and known elements are unaffected.
+    let desc = singular_enum_descriptor();
+    let outcomes = Field::new("item", DataType::LargeUtf8, true);
+    let schema = Schema::new(vec![Field::new(
+        "outcomes",
+        DataType::List(Arc::new(outcomes)),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut msg = DynamicMessage::new(desc.clone());
+    msg.set_field_by_name(
+        "outcomes",
+        ProtoValue::List(vec![ProtoValue::EnumNumber(1), ProtoValue::EnumNumber(99)]),
+    );
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(buf)])
+        .expect("unknown-enum element must not fail the batch");
+    assert_eq!(batch.num_rows(), 1, "the row with an unknown element must be kept");
+    let list = batch.column(0).as_list::<i32>();
+    let strs = list.value(0);
+    let strs = strs.as_string::<i64>();
+    assert_eq!(strs.len(), 2);
+    assert_eq!(strs.value(0), "SUCCESS");
+    assert_eq!(strs.value(1), "UNKNOWN_ENUM_VALUE_Outcome_99");
+}
+
+// -------------------------------------------------------------------------
 // Fuzz: random wire bytes through `encode_batch` must not panic. Any
 // `Result` outcome is acceptable — we only care that bad input is reported
 // as a normal error and that the scan-time recursion (which the depth cap

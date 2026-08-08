@@ -1,17 +1,30 @@
 //! Direct-sink ClickHouse fallback: retry the primary (proxy), then fail over to
 //! the fallback (direct SMK) and retry that — the `clickhouse-proxy` dual-write
-//! path (`fallback_endpoint` set, `use_headless_service = false`). Retriability
-//! reuses `ClickhouseRetryLogic`. Finalizers are taken by the driver before
-//! `call`, so cloning the request per attempt does not affect acknowledgements.
+//! path (`fallback_endpoint` set, `use_headless_service = false`).
+//!
+//! Each endpoint is wrapped in Vector's standard retry stack
+//! (`Retry<FibonacciRetryPolicy<ClickhouseRetryLogic>, Timeout<HttpService>>`),
+//! so per-endpoint retries inherit the configured jitter (`retry_jitter_mode`,
+//! full jitter by default) and emit the standard `sink_requests_completed_total`
+//! / `sink_attempts_per_request` metrics — identical to every other Vector sink.
+//! `DirectFallbackService` itself only sequences the two endpoints: run the
+//! primary, and if its final result is a retriable-but-exhausted failure, fail
+//! over to the fallback. A non-retriable ClickHouse error (bad schema / type
+//! mismatch / constraint violation) is returned as-is without failing over,
+//! since the same rows would fail identically on the fallback.
+//!
+//! Retriability reuses `ClickhouseRetryLogic`. Finalizers are taken by the
+//! driver before `call`, so cloning the request per attempt does not affect
+//! acknowledgements.
 
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use http::Uri;
-use tokio::time::{sleep, timeout};
-use tower::Service;
-use tracing::warn;
+use tower::retry::Retry;
+use tower::timeout::Timeout;
+use tower::{Service, ServiceBuilder, ServiceExt};
 
 use vector_lib::emit;
 
@@ -19,96 +32,137 @@ use super::headless::{EndpointServiceConfig, build_endpoint_service};
 use super::service::{ClickhouseRetryLogic, ClickhouseServiceRequestBuilder};
 use super::sink::PartitionKey;
 use crate::http::HttpClient;
-use crate::internal_events::{ClickhouseDirectFallbackRouted, ClickhouseDirectRetry};
+use crate::internal_events::ClickhouseDirectFallbackRouted;
 use crate::sinks::util::http::{HttpRequest, HttpResponse, HttpService};
-use crate::sinks::util::retries::RetryLogic;
+use crate::sinks::util::retries::{FibonacciRetryPolicy, JitterMode, RetryLogic};
 
 type Inner = HttpService<ClickhouseServiceRequestBuilder, PartitionKey>;
+
+/// One endpoint's full request path: the standard Fibonacci retry policy (with
+/// jitter and standard metrics) wrapping a per-attempt-timed `HttpService`.
+type RetryingEndpoint = Retry<FibonacciRetryPolicy<ClickhouseRetryLogic>, Timeout<Inner>>;
+
 type SinkResult = Result<HttpResponse, crate::Error>;
 
-enum EndpointOutcome {
-    Success(HttpResponse),
-    /// Non-retriable — return as-is; failover would fail identically.
-    NonRetriable(SinkResult),
-    /// All attempts failed with retriable errors; carries the last result.
-    Exhausted(SinkResult),
+/// Default total attempts against the primary (proxy): 1 try + 1 retry. The
+/// proxy fails fast so the bulk of the budget is spent on the direct-SMK
+/// fallback. Overridable via `fallback_primary_max_attempts`.
+pub(super) const DEFAULT_PRIMARY_MAX_ATTEMPTS: usize = 2;
+
+/// Default total attempts against the fallback (direct SMK): 1 try + 2 retries.
+/// The direct write is the terminal path, so it gets more chances than the
+/// proxy. Overridable via `fallback_secondary_max_attempts`.
+pub(super) const DEFAULT_SECONDARY_MAX_ATTEMPTS: usize = 3;
+
+/// Per-endpoint retry parameters. Attempt counts come from the sink's
+/// `fallback_primary_max_attempts` / `fallback_secondary_max_attempts` (not
+/// `request.retry_attempts`); backoff/jitter/timeout come from the request
+/// settings.
+#[derive(Clone, Copy)]
+pub(super) struct RetrySettings {
+    pub primary_max_attempts: usize,
+    pub secondary_max_attempts: usize,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+    pub jitter_mode: JitterMode,
+    pub per_call_timeout: Duration,
 }
 
 #[derive(Clone)]
 pub(super) struct DirectFallbackService {
-    primary: Inner,
-    fallback: Inner,
+    primary: RetryingEndpoint,
+    fallback: RetryingEndpoint,
+    /// Classifies the final per-endpoint result to decide whether to fail over.
     retry_logic: ClickhouseRetryLogic,
-    max_attempts_per_endpoint: usize,
-    initial_backoff: Duration,
-    max_backoff: Duration,
-    per_call_timeout: Duration,
 }
 
 impl DirectFallbackService {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         client: &HttpClient,
         primary_endpoint: Uri,
         fallback_endpoint: Uri,
         svc_config: &EndpointServiceConfig,
         non_retriable_codes: Option<Vec<u32>>,
-        max_attempts_per_endpoint: usize,
-        initial_backoff: Duration,
-        max_backoff: Duration,
-        per_call_timeout: Duration,
+        settings: RetrySettings,
     ) -> Self {
+        let retry_logic = ClickhouseRetryLogic::new(non_retriable_codes);
         Self {
-            primary: build_endpoint_service(client, primary_endpoint, svc_config),
-            fallback: build_endpoint_service(client, fallback_endpoint, svc_config),
-            retry_logic: ClickhouseRetryLogic::new(non_retriable_codes),
-            max_attempts_per_endpoint: max_attempts_per_endpoint.max(1),
-            initial_backoff,
-            max_backoff,
-            per_call_timeout,
+            // Primary exhaustion means failover (signalled by
+            // `ClickhouseDirectFallbackRouted`), not a drop — so suppress its drop
+            // log. The fallback is terminal, so it keeps the standard drop log.
+            primary: Self::build_endpoint(
+                client,
+                primary_endpoint,
+                svc_config,
+                &retry_logic,
+                &settings,
+                settings.primary_max_attempts,
+                false,
+            ),
+            fallback: Self::build_endpoint(
+                client,
+                fallback_endpoint,
+                svc_config,
+                &retry_logic,
+                &settings,
+                settings.secondary_max_attempts,
+                true,
+            ),
+            retry_logic,
         }
     }
 
-    /// Retries one endpoint up to `max_attempts` times with Fibonacci backoff;
-    /// each hop is bounded by `per_call_timeout`.
-    async fn run_endpoint(
-        &self,
-        svc: &mut Inner,
-        request: &HttpRequest<PartitionKey>,
-        label: &'static str,
-    ) -> EndpointOutcome {
-        let mut last: SinkResult = Err(format!("{label}: not attempted").into());
-        let (mut prev, mut cur) = (Duration::ZERO, self.initial_backoff);
-
-        for attempt in 1..=self.max_attempts_per_endpoint {
-            match timeout(self.per_call_timeout, svc.call(request.clone())).await {
-                Err(_elapsed) => {
-                    warn!(message = "ClickHouse endpoint attempt timed out.", endpoint = label);
-                    last = Err(format!("{label}: timed out").into());
-                }
-                Ok(Ok(resp)) => {
-                    let action = self.retry_logic.should_retry_response(&resp);
-                    if action.is_successful() {
-                        return EndpointOutcome::Success(resp);
-                    }
-                    if action.is_not_retryable() {
-                        return EndpointOutcome::NonRetriable(Ok(resp));
-                    }
-                    last = Ok(resp);
-                }
-                Ok(Err(e)) => last = Err(e),
-            }
-
-            if attempt < self.max_attempts_per_endpoint {
-                emit!(ClickhouseDirectRetry { endpoint: label });
-                sleep(cur.min(self.max_backoff)).await;
-                let next = prev.checked_add(cur).unwrap_or(self.max_backoff).min(self.max_backoff);
-                prev = cur;
-                cur = next;
-            }
+    /// Wraps a single endpoint's `HttpService` in a per-attempt timeout and the
+    /// standard Fibonacci retry policy, so retries honor `jitter_mode` and emit
+    /// the standard sink retry metrics. `max_attempts` is the total attempts for
+    /// this endpoint (initial try + retries). `log_drop_on_exhaustion` should be
+    /// false for the non-terminal primary (exhaustion means failover, not a drop).
+    fn build_endpoint(
+        client: &HttpClient,
+        endpoint: Uri,
+        svc_config: &EndpointServiceConfig,
+        retry_logic: &ClickhouseRetryLogic,
+        settings: &RetrySettings,
+        max_attempts: usize,
+        log_drop_on_exhaustion: bool,
+    ) -> RetryingEndpoint {
+        let inner = build_endpoint_service(client, endpoint, svc_config);
+        // The policy counts *retries*, so subtract the initial attempt (min 0).
+        let retries = max_attempts.saturating_sub(1);
+        let mut policy = FibonacciRetryPolicy::new(
+            retries,
+            settings.initial_backoff,
+            settings.max_backoff,
+            retry_logic.clone(),
+            settings.jitter_mode,
+        );
+        if !log_drop_on_exhaustion {
+            policy = policy.without_drop_on_exhaustion_log();
         }
+        ServiceBuilder::new()
+            .retry(policy)
+            .timeout(settings.per_call_timeout)
+            .service(inner)
+    }
 
-        EndpointOutcome::Exhausted(last)
+    /// Drives one endpoint's retry stack to completion and returns its final
+    /// result. `should_fail_over` decides what that result means for the caller.
+    async fn run_endpoint(svc: &mut RetryingEndpoint, request: &HttpRequest<PartitionKey>) -> SinkResult {
+        svc.ready().await?.call(request.clone()).await
+    }
+
+    /// A final per-endpoint result is worth failing over only when it is a
+    /// retriable failure the endpoint's own retries could not clear. A success or
+    /// a non-retriable error (e.g. a deterministic ClickHouse data error) is not.
+    fn should_fail_over(&self, result: &SinkResult) -> bool {
+        match result {
+            Ok(resp) => self.retry_logic.should_retry_response(resp).is_retryable(),
+            // The endpoint's retry policy only surfaces an error after exhausting
+            // retriable ones (or on a non-retriable transport error). Failing over
+            // on any error is safe: the fallback gets a chance, and a fallback that
+            // fails identically returns its own error anyway.
+            Err(_) => true,
+        }
     }
 }
 
@@ -117,8 +171,11 @@ impl Service<HttpRequest<PartitionKey>> for DirectFallbackService {
     type Error = crate::Error;
     type Future = BoxFuture<'static, SinkResult>;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.primary.poll_ready(cx)
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Readiness is driven per-call via `ready()` inside `run_endpoint`, so the
+        // driver's poll_ready is always satisfied here (matching how the outer
+        // Tower stack polls a cloned service per request).
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, request: HttpRequest<PartitionKey>) -> Self::Future {
@@ -126,17 +183,13 @@ impl Service<HttpRequest<PartitionKey>> for DirectFallbackService {
         let (mut primary, mut fallback) = (this.primary.clone(), this.fallback.clone());
 
         Box::pin(async move {
-            match this.run_endpoint(&mut primary, &request, "primary").await {
-                EndpointOutcome::Success(resp) => return Ok(resp),
-                EndpointOutcome::NonRetriable(res) => return res,
-                EndpointOutcome::Exhausted(_) => {
-                    emit!(ClickhouseDirectFallbackRouted);
-                }
+            let primary_result = Self::run_endpoint(&mut primary, &request).await;
+            if !this.should_fail_over(&primary_result) {
+                return primary_result;
             }
-            match this.run_endpoint(&mut fallback, &request, "fallback").await {
-                EndpointOutcome::Success(resp) => Ok(resp),
-                EndpointOutcome::NonRetriable(res) | EndpointOutcome::Exhausted(res) => res,
-            }
+
+            emit!(ClickhouseDirectFallbackRouted);
+            Self::run_endpoint(&mut fallback, &request).await
         })
     }
 }
@@ -208,13 +261,14 @@ mod tests {
         hits
     }
 
-    /// Sends one request through a service pointed at `p_addr`/`fb_addr`, with
-    /// `attempts` per endpoint and 1ms backoff. Servers must already be spawned.
+    /// Sends one request through a service pointed at `p_addr`/`fb_addr`. Attempt
+    /// counts are the defaults (`DEFAULT_PRIMARY_MAX_ATTEMPTS` 2 /
+    /// `DEFAULT_SECONDARY_MAX_ATTEMPTS` 3); backoff is 1ms and jitter is disabled
+    /// so retry timing stays deterministic in tests. Servers must already be spawned.
     async fn drive(
         p_addr: std::net::SocketAddr,
         fb_addr: std::net::SocketAddr,
         non_retriable_codes: Option<Vec<u32>>,
-        attempts: usize,
     ) -> SinkResult {
         let cfg = EndpointServiceConfig {
             auth: None,
@@ -228,16 +282,27 @@ mod tests {
         let client = HttpClient::new(None, &ProxyConfig::default()).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         DirectFallbackService::new(
-            &client, uri(p_addr), uri(fb_addr), &cfg, non_retriable_codes,
-            attempts, Duration::from_millis(1), Duration::from_millis(1), Duration::from_secs(2),
+            &client,
+            uri(p_addr),
+            uri(fb_addr),
+            &cfg,
+            non_retriable_codes,
+            RetrySettings {
+                primary_max_attempts: DEFAULT_PRIMARY_MAX_ATTEMPTS,
+                secondary_max_attempts: DEFAULT_SECONDARY_MAX_ATTEMPTS,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+                jitter_mode: JitterMode::None,
+                per_call_timeout: Duration::from_secs(2),
+            },
         )
         .oneshot(test_request())
         .await
     }
 
     /// `run` for the common case: `Some((status, body))` spawns a live server,
-    /// `None` leaves the port unbound (connection refused). 2 attempts/endpoint.
-    /// Returns `(primary_hits, fallback_hits, result)`.
+    /// `None` leaves the port unbound (connection refused). Uses the fixed
+    /// per-endpoint attempt counts. Returns `(primary_hits, fallback_hits, result)`.
     async fn run(
         primary: Option<(u16, &'static str)>,
         fallback: Option<(u16, &'static str)>,
@@ -248,7 +313,7 @@ mod tests {
         let no_hits = || Arc::new(AtomicUsize::new(0));
         let p_hits = primary.map_or_else(no_hits, |(s, b)| spawn_server(p_addr, s, b));
         let fb_hits = fallback.map_or_else(no_hits, |(s, b)| spawn_server(fb_addr, s, b));
-        let result = drive(p_addr, fb_addr, non_retriable_codes, 2).await;
+        let result = drive(p_addr, fb_addr, non_retriable_codes).await;
         (p_hits.load(Ordering::SeqCst), fb_hits.load(Ordering::SeqCst), result)
     }
 
@@ -268,7 +333,7 @@ mod tests {
         let (_fg, fb_addr) = next_addr();
         let p_hits = spawn_flaky_server(p_addr, 1, 503, 200, "");
         let fb_hits = spawn_server(fb_addr, 200, "");
-        let res = drive(p_addr, fb_addr, None, 2).await;
+        let res = drive(p_addr, fb_addr, None).await;
         assert!(res.is_ok());
         assert_eq!(p_hits.load(Ordering::SeqCst), 2);
         assert_eq!(fb_hits.load(Ordering::SeqCst), 0);
@@ -297,7 +362,7 @@ mod tests {
         let (_fg, fb_addr) = next_addr();
         let p_hits = spawn_server(p_addr, 503, "overloaded");
         let fb_hits = spawn_flaky_server(fb_addr, 1, 503, 200, "");
-        let res = drive(p_addr, fb_addr, None, 2).await;
+        let res = drive(p_addr, fb_addr, None).await;
         assert!(res.is_ok());
         assert_eq!(p_hits.load(Ordering::SeqCst), 2);
         assert_eq!(fb_hits.load(Ordering::SeqCst), 2);
@@ -333,32 +398,30 @@ mod tests {
 
     #[tokio::test]
     async fn both_endpoints_exhaust_on_transient_5xx() {
-        // Both return 503: each retried to max_attempts; the fallback's last 5xx is surfaced.
+        // Both return 503: primary retried to 2 attempts, fallback to 3; the
+        // fallback's last 5xx is surfaced.
         let (p, fb, res) = run(Some((503, "overloaded")), Some((503, "still down")), None).await;
         assert_eq!(res.unwrap().http_response.status().as_u16(), 503);
-        assert_eq!((p, fb), (2, 2));
+        assert_eq!((p, fb), (2, 3));
     }
 
     #[tokio::test]
     async fn primary_unreachable_fallback_exhausts_5xx() {
-        // Primary unreachable (connection refused), fallback keeps returning 503.
+        // Primary unreachable (connection refused), fallback keeps returning 503
+        // for all 3 of its attempts.
         let (p, fb, res) = run(None, Some((503, "still down")), None).await;
         assert_eq!(res.unwrap().http_response.status().as_u16(), 503);
-        assert_eq!((p, fb), (0, 2));
+        assert_eq!((p, fb), (0, 3));
     }
 
-    // --- Config edge: no retries still fails over ---
+    // --- Default per-endpoint attempt budget ---
 
     #[tokio::test]
-    async fn single_attempt_still_fails_over() {
-        // attempts = 1 (no retries): one primary hit, then fail over.
-        let (_pg, p_addr) = next_addr();
-        let (_fg, fb_addr) = next_addr();
-        let p_hits = spawn_server(p_addr, 503, "overloaded");
-        let fb_hits = spawn_server(fb_addr, 200, "");
-        let res = drive(p_addr, fb_addr, None, 1).await;
-        assert!(res.is_ok());
-        assert_eq!(p_hits.load(Ordering::SeqCst), 1, "no retries when attempts = 1");
-        assert_eq!(fb_hits.load(Ordering::SeqCst), 1);
+    async fn proxy_uses_two_attempts_fallback_uses_three() {
+        // Both endpoints keep failing (503), so each is driven to its full,
+        // default attempt budget: proxy 2, fallback 3.
+        let (p, fb, _res) = run(Some((503, "overloaded")), Some((503, "still down")), None).await;
+        assert_eq!(p, DEFAULT_PRIMARY_MAX_ATTEMPTS, "proxy should be tried exactly twice");
+        assert_eq!(fb, DEFAULT_SECONDARY_MAX_ATTEMPTS, "direct SMK should be tried exactly three times");
     }
 }

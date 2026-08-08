@@ -79,6 +79,10 @@ pub struct FibonacciRetryPolicy<L> {
     current_jitter_duration: Duration,
     max_duration: Duration,
     logic: L,
+    /// When false, suppress the "dropping the request" error log on exhaustion.
+    /// Set for a non-terminal stage (e.g. a fallback sink's primary endpoint)
+    /// where exhaustion means "hand off", not "drop". Metrics are unaffected.
+    log_drop_on_exhaustion: bool,
 }
 
 pub struct RetryPolicyFuture {
@@ -102,7 +106,15 @@ impl<L: RetryLogic> FibonacciRetryPolicy<L> {
             current_jitter_duration: Self::add_full_jitter(initial_backoff),
             max_duration,
             logic,
+            log_drop_on_exhaustion: true,
         }
+    }
+
+    /// Suppress the "dropping the request" error log on exhaustion — for a
+    /// non-terminal stage where that means a handoff, not a drop.
+    pub const fn without_drop_on_exhaustion_log(mut self) -> Self {
+        self.log_drop_on_exhaustion = false;
+        self
     }
 
     fn add_full_jitter(d: Duration) -> Duration {
@@ -174,10 +186,12 @@ where
             Ok(response) => match self.logic.should_retry_response(response) {
                 RetryAction::Retry(reason) => {
                     if self.remaining_attempts == 0 {
-                        error!(
-                            message = "OK/retry response but retries exhausted; dropping the request.",
-                            reason = ?reason,
-                        );
+                        if self.log_drop_on_exhaustion {
+                            error!(
+                                message = "OK/retry response but retries exhausted; dropping the request.",
+                                reason = ?reason,
+                            );
+                        }
                         self.emit_attempts_histogram();
                         return None;
                     }
@@ -187,10 +201,12 @@ where
                 }
                 RetryAction::RetryPartial(modify_request) => {
                     if self.remaining_attempts == 0 {
-                        error!(
-                            message =
-                                "OK/retry response but retries exhausted; dropping the request.",
-                        );
+                        if self.log_drop_on_exhaustion {
+                            error!(
+                                message =
+                                    "OK/retry response but retries exhausted; dropping the request.",
+                            );
+                        }
                         self.emit_attempts_histogram();
                         return None;
                     }
@@ -207,7 +223,9 @@ where
             },
             Err(error) => {
                 if self.remaining_attempts == 0 {
-                    error!(message = "Retries exhausted; dropping the request.", %error);
+                    if self.log_drop_on_exhaustion {
+                        error!(message = "Retries exhausted; dropping the request.", %error);
+                    }
                     self.emit_attempts_histogram();
                     return None;
                 }
@@ -351,6 +369,30 @@ mod tests {
 
         let mut fut = task::spawn(svc.call("hello"));
         assert_request_eq!(handle, "hello").send_error(Error(false));
+        assert_ready_err!(fut.poll());
+    }
+
+    #[tokio::test]
+    async fn suppressing_drop_log_does_not_change_exhaustion_behavior() {
+        trace_init();
+
+        // With the drop-on-exhaustion log suppressed, a policy with no retries
+        // left must still surface a retriable error (drop) exactly as it would
+        // with the log enabled — only the log line differs.
+        let policy = FibonacciRetryPolicy::new(
+            0,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            SvcRetryLogic,
+            JitterMode::None,
+        )
+        .without_drop_on_exhaustion_log();
+
+        let (mut svc, mut handle) = mock::spawn_layer(RetryLayer::new(policy));
+        assert_ready_ok!(svc.poll_ready());
+
+        let mut fut = task::spawn(svc.call("hello"));
+        assert_request_eq!(handle, "hello").send_error(Error(true));
         assert_ready_err!(fut.poll());
     }
 

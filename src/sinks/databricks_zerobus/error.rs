@@ -39,9 +39,42 @@ pub enum ZerobusSinkError {
     /// permanent ones (404, 401, 403, ...).
     #[snafu(display("Schema resolution failed: {}", message))]
     SchemaError { message: String, retryable: bool },
+
+    /// The server rejected the sink's schema as stale, and the sink has since
+    /// re-resolved the table and dropped the rejected stream. Retryable: the
+    /// next attempt re-encodes against the refreshed schema on a fresh stream.
+    ///
+    /// Distinct from the underlying `InvalidSchema`, which the SDK reports as
+    /// non-retryable because *its* schema is fixed. Here the schema has actually
+    /// changed between attempts, so a retry is not a repeat of the same request.
+    #[snafu(display("Zerobus schema reloaded after rejection ({}); retrying", message))]
+    SchemaReloaded { message: String },
 }
 
 impl ZerobusSinkError {
+    /// Whether the server rejected the sink's Arrow schema, making a refetch
+    /// from Unity Catalog worth attempting.
+    ///
+    /// Every `InvalidSchema` qualifies, whatever the server's `causes` say: the
+    /// only way to learn whether a rejection is fixable is to ask Unity Catalog
+    /// and compare, which `ZerobusService::reload_schema_after_rejection` does.
+    /// Judging a rejection unfixable from its cause skips that path entirely and
+    /// drops the batch silently, and causes can look permanent without being so
+    /// (`ALTER COLUMN TYPE` arrives as `TYPE_INCOMPATIBLE`).
+    ///
+    /// The SDK surfaces `InvalidSchema` from both stream setup (`build_arrow` →
+    /// `StreamInitError`) and mid-stream recovery (`wait_for_offset`/`flush` →
+    /// `IngestionError`), so both variants are inspected.
+    pub fn is_schema_rejection(&self) -> bool {
+        let (Self::ZerobusError { source }
+        | Self::StreamInitError { source }
+        | Self::IngestionError { source }) = self
+        else {
+            return false;
+        };
+        matches!(source, ZerobusError::InvalidSchema { .. })
+    }
+
     /// Whether this error should be retried.
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -50,6 +83,7 @@ impl ZerobusSinkError {
             | Self::IngestionError { source } => source.is_retryable(),
             Self::StreamClosed => true,
             Self::SchemaError { retryable, .. } => *retryable,
+            Self::SchemaReloaded { .. } => true,
             Self::ConfigError { .. } | Self::EncodingError { .. } => false,
         }
     }
@@ -179,6 +213,50 @@ mod tests {
             message: "bad".to_string(),
         };
         assert!(!logic.is_retriable_error(&error));
+    }
+
+    // NOTE: no positive test for `is_schema_rejection` — `InvalidSchema` is
+    // `#[non_exhaustive]` with a crate-private constructor, so only a live server
+    // rejection reaches the true branch. The testable half is the one that
+    // matters for safety: nothing else may enter the refetch path.
+
+    #[test]
+    fn non_schema_errors_are_not_schema_rejections() {
+        // A retryable SDK error keeps its own recovery (drop the stream, retry).
+        assert!(
+            !ZerobusSinkError::IngestionError {
+                source: retryable_error()
+            }
+            .is_schema_rejection()
+        );
+        // Notably the client-side `InvalidArgument` from a generation-skewed
+        // batch.
+        assert!(
+            !ZerobusSinkError::IngestionError {
+                source: non_retryable_error()
+            }
+            .is_schema_rejection()
+        );
+        assert!(
+            !ZerobusSinkError::StreamInitError {
+                source: retryable_error()
+            }
+            .is_schema_rejection()
+        );
+        assert!(
+            !ZerobusSinkError::EncodingError {
+                message: "bad".to_string()
+            }
+            .is_schema_rejection()
+        );
+        // Variants that carry no `ZerobusError` at all take the early return.
+        assert!(!ZerobusSinkError::StreamClosed.is_schema_rejection());
+        assert!(
+            !ZerobusSinkError::SchemaReloaded {
+                message: "stale".to_string()
+            }
+            .is_schema_rejection()
+        );
     }
 
     #[test]

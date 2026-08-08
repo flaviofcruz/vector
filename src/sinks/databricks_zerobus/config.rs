@@ -213,6 +213,16 @@ pub struct ZerobusSinkConfig {
     #[serde(default)]
     pub request: TowerRequestConfig,
 
+    /// Reload the schema from Unity Catalog and retry when the ingestion server
+    /// rejects the sink's Arrow schema as stale, instead of dropping the batch
+    /// until the pod is restarted.
+    ///
+    /// Off by default: when disabled, a schema rejection stays a non-retryable
+    /// drop, exactly as before. Enable it to let a running sink pick up a table
+    /// whose schema was widened underneath it.
+    #[serde(default)]
+    pub recover_from_schema_rejection: bool,
+
     #[configurable(derived)]
     #[serde(
         default,
@@ -238,6 +248,7 @@ impl GenerateConfig for ZerobusSinkConfig {
             batch_encoding: default_batch_encoding(),
             batch: BatchConfig::default(),
             request: TowerRequestConfig::default(),
+            recover_from_schema_rejection: false,
             acknowledgements: AcknowledgementsConfig::default(),
         })
         .unwrap()
@@ -398,6 +409,7 @@ mod tests {
             batch_encoding: default_batch_encoding(),
             batch: Default::default(),
             request: Default::default(),
+            recover_from_schema_rejection: false,
             acknowledgements: Default::default(),
         }
     }
@@ -406,6 +418,24 @@ mod tests {
     fn test_config_validation_success() {
         let config = create_test_config();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn recover_from_schema_rejection_defaults_off() {
+        // Omitting the field must leave schema recovery disabled, so an existing
+        // deployment's behavior is unchanged until the flag is explicitly set.
+        let config: ZerobusSinkConfig = toml::from_str(
+            r#"
+            ingestion_endpoint = "https://test.databricks.com"
+            table_name = "test.default.logs"
+            unity_catalog_endpoint = "https://test-workspace.databricks.com"
+            auth.strategy = "oauth"
+            auth.client_id = "id"
+            auth.client_secret = "secret"
+            "#,
+        )
+        .unwrap();
+        assert!(!config.recover_from_schema_rejection);
     }
 
     #[test]

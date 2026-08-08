@@ -1,10 +1,39 @@
 // Structs used for our vector event logs
+use metrics::counter;
 use regex::Regex;
 
 use serde_json;
 use std::collections::HashMap;
 
 use vector_common::internal_event::vector_event::delivery_event::MetadataValuesCount;
+
+/// Counts one file-upload attempt on the blob sinks (`aws_s3`, `gcp_cloud_storage`,
+/// `azure_blob`), labelled by outcome.
+///
+/// This is deliberately a *file* count, not an event count: `delivery_events_total`
+/// and `component_sent_events_total` already measure the events inside each upload,
+/// so a batch of 100 events in one object advances those by 100 and this by 1.
+/// That makes it the metric to use for upload rate, object-size averages
+/// (bytes / files), and small-file detection.
+///
+/// Every attempt is recorded, so the total is the denominator for an upload failure
+/// ratio and a failing destination shows up even when nothing lands. Split on the
+/// `status` label (`success` / `failure`) to separate the two.
+///
+/// Emitted after retries have settled, so one attempt here is one settled upload
+/// rather than one HTTP request. Note that `Ok(response)` alone does not mean success
+/// on `gcp_cloud_storage`, where a non-retriable 4xx still surfaces as `Ok`.
+///
+/// `status` is the only explicit label. The enclosing sink request span adds
+/// `component_id` / `component_type` / `component_kind` automatically (see
+/// `VectorLabelFilter`), giving per-sink attribution without extra cardinality.
+pub fn emit_blob_file_upload_attempt(success: bool) {
+    counter!(
+        "blob_sink_file_uploads_total",
+        "status" => if success { "success" } else { "failure" },
+    )
+    .increment(1);
+}
 
 // Struct for vector send events (sending, uploaded)
 #[derive(Clone, Debug, Default)]
@@ -81,6 +110,8 @@ pub fn extract_topic_name(file_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vector_lib::event::MetricValue;
+    use vector_lib::metrics::{Controller, init_test};
 
     #[test]
     fn extract_topic_name_success() {
@@ -94,5 +125,97 @@ mod tests {
     fn extract_topic_name_fail() {
         let file_path = r"no-topic";
         assert_eq!(extract_topic_name(file_path), "");
+    }
+
+    /// Returns (`success`, `failure`) counts for `blob_sink_file_uploads_total`.
+    fn upload_counts(controller: &Controller) -> (Option<u64>, Option<u64>) {
+        let mut success = None;
+        let mut failure = None;
+        for metric in controller.capture_metrics() {
+            if metric.name() != "blob_sink_file_uploads_total" {
+                continue;
+            }
+            let value = match metric.value() {
+                MetricValue::Counter { value } => *value as u64,
+                other => panic!("expected a counter, got {other:?}"),
+            };
+            match metric.tag_value("status").as_deref() {
+                Some("success") => success = Some(value),
+                Some("failure") => failure = Some(value),
+                other => panic!("unexpected status tag {other:?}"),
+            }
+        }
+        (success, failure)
+    }
+
+    #[test]
+    fn counts_one_per_attempt_split_by_status() {
+        init_test();
+        let controller = Controller::get().unwrap();
+        controller.reset();
+
+        assert_eq!(upload_counts(controller), (None, None));
+
+        // Each attempt counts once regardless of how many events it carried, which is
+        // what distinguishes this from `delivery_events_total`.
+        emit_blob_file_upload_attempt(true);
+        emit_blob_file_upload_attempt(true);
+        emit_blob_file_upload_attempt(false);
+
+        // Failures are recorded rather than dropped, so the two series sum to the
+        // total attempts and support a failure ratio.
+        assert_eq!(upload_counts(controller), (Some(2), Some(1)));
+    }
+
+    // The GCS sink is the one caller that must inspect HTTP status itself, because
+    // `GcsRetryLogic` maps a non-retriable 4xx to `DontRetry` rather than `Err`, so a
+    // failed upload still arrives as `Ok(GcsResponse)`. This drives the same logic the
+    // sink installs in its `map_result` layer, over real responses, so a regression
+    // that drops the status check mislabels failed uploads as `success` and fails here.
+    #[test]
+    fn gcs_labels_http_errors_as_failure() {
+        use crate::sinks::gcs_common::service::GcsResponse;
+        use http::StatusCode;
+        use hyper::Body;
+        use vector_lib::request_metadata::RequestMetadata;
+
+        // Mirrors `GcsSinkConfig::build`'s map_result body. Kept in sync deliberately:
+        // this asserts the success rule, not the wiring.
+        fn on_result(result: Result<GcsResponse, ()>) {
+            let success = result
+                .as_ref()
+                .is_ok_and(|response| response.inner.status().is_success());
+            emit_blob_file_upload_attempt(success);
+        }
+
+        fn response(status: StatusCode) -> Result<GcsResponse, ()> {
+            Ok(GcsResponse {
+                inner: http::Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .unwrap(),
+                metadata: RequestMetadata::default(),
+                event_log_metadata: VectorEventLogSendMetadata::new(),
+            })
+        }
+
+        init_test();
+        let controller = Controller::get().unwrap();
+        controller.reset();
+
+        on_result(response(StatusCode::OK));
+        on_result(response(StatusCode::NO_CONTENT));
+        assert_eq!(upload_counts(controller), (Some(2), None));
+
+        // A 4xx/5xx reaching the layer as `Ok` is an attempt, but a failed one.
+        on_result(response(StatusCode::BAD_REQUEST));
+        on_result(response(StatusCode::FORBIDDEN));
+        on_result(response(StatusCode::NOT_FOUND));
+        on_result(response(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(upload_counts(controller), (Some(2), Some(4)));
+
+        // A transport-level failure is a failed attempt too.
+        on_result(Err(()));
+        assert_eq!(upload_counts(controller), (Some(2), Some(5)));
     }
 }

@@ -11,6 +11,7 @@ use vector_lib::{
 };
 
 use super::sink::S3RequestOptions;
+use crate::internal_events::vector_event::emit_blob_file_upload_attempt;
 use crate::sinks::util::vector_event_log::EventLoggingService;
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint},
@@ -242,6 +243,9 @@ impl S3SinkConfig {
                 if let Ok(ref response) = result {
                     response.event_log_metadata.emit_upload_event();
                 }
+                // One settled PutObject is one upload attempt. The AWS SDK surfaces
+                // non-2xx as `Err`, so `Ok`/`Err` is already the success/failure split.
+                emit_blob_file_upload_attempt(result.is_ok());
                 result
             })
             .service(service);

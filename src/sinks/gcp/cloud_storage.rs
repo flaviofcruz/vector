@@ -23,7 +23,7 @@ use crate::{
     event::Event,
     gcp::{GcpAuthConfig, GcpAuthenticator, Scope},
     http::{HttpClient, get_http_scheme_from_uri},
-    internal_events::vector_event::VectorEventLogSendMetadata,
+    internal_events::vector_event::{VectorEventLogSendMetadata, emit_blob_file_upload_attempt},
     serde::json::to_string,
     sinks::{
         Healthcheck, VectorSink,
@@ -320,6 +320,14 @@ impl GcsSinkConfig {
                 if let Ok(ref response) = result {
                     response.event_log_metadata.emit_upload_event();
                 }
+                // Unlike the S3/Azure SDKs, a GCS HTTP error still arrives as an `Ok`
+                // response here — `GcsRetryLogic` maps a non-retriable 4xx to
+                // `DontRetry`, not `Err` — so the status has to be inspected, otherwise
+                // failed uploads would be labelled `success`.
+                let success = result
+                    .as_ref()
+                    .is_ok_and(|response| response.inner.status().is_success());
+                emit_blob_file_upload_attempt(success);
                 result
             })
             .service(GcsService::new(client, base_url, auth));
