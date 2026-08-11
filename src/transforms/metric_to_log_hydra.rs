@@ -3,7 +3,7 @@ use md5::{Digest, Md5};
 use serde_json::Value as JsonValue;
 use vector_lib::{
     configurable::configurable_component,
-    internal_event::{Count, InternalEventHandle as _, Registered},
+    internal_event::{InternalEventHandle as _, Registered},
     lookup::event_path,
 };
 use vrl::value::{KeyString, Value};
@@ -14,7 +14,7 @@ use crate::{
         TransformOutput,
     },
     event::{Event, LogEvent, Metric, MetricValue},
-    internal_events::MetricToLogHydraEventsDropped,
+    internal_events::{MetricToLogHydraDrop, MetricToLogHydraEventsDropped},
     schema::Definition,
     transforms::{FunctionTransform, OutputBuffer, Transform},
 };
@@ -33,8 +33,12 @@ use crate::{
 /// - Timestamp window (−10 min / +5 min) matches the VRL `abort` condition.
 /// - Optional tag fields (`workspace_id`, `cluster_id`, etc.) produce JSON `null`
 ///   when absent, matching VRL's `?? null` fallback.
-/// - Metrics dropped for timestamp violations increment
-///   `component_events_dropped_total{intentional="true"}`.
+/// - Every drop is reported as a [`DropReason`] and recorded on the per-reason breakdown metric
+///   `metric_to_log_hydra_dropped_total{reason="..."}`. Reasons that count as loss
+///   ([`DropReason::counts_as_loss`]) — an invalid counter value, or a timestamp outside the
+///   window — also increment `component_discarded_events_total{intentional="true"}`. An invalid
+///   (NaN/±Inf) *gauge* value is a legitimate staleness marker, not loss: it is recorded on the
+///   breakdown metric but is kept off the discard/completeness metric.
 ///
 /// **Do not use for new pipelines** — this encodes Hydra-specific field semantics.
 /// Use `metric_to_log` + VRL remap for a different output shape.
@@ -82,6 +86,48 @@ impl TransformConfig for MetricToLogHydraConfig {
     }
 }
 
+/// Accepted timestamp window relative to now: +5 min into the future, −10 min into the past.
+const TS_WINDOW_FUTURE_MS: i64 = 300_000;
+const TS_WINDOW_PAST_MS: i64 = 600_000;
+
+/// Why `transform_one` dropped a metric instead of producing a log event.
+///
+/// Extensible: add a variant here plus its arm in [`DropReason::as_str`] to introduce a new
+/// reason. Every drop path in `transform_one` names one of these, so a drop can never be
+/// unclassified. Each reason carries its loss policy ([`DropReason::counts_as_loss`]): every drop
+/// is recorded on the per-reason breakdown metric, but only "loss" reasons also increment the
+/// standard discard metric that the completeness/SLO dashboards consume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropReason {
+    /// Gauge value is non-finite (NaN or ±Inf) — a legitimate Prometheus staleness marker
+    /// (absent scrape, recording-rule gap), not data loss.
+    InvalidGaugeValue,
+    /// Counter value is non-finite (NaN or ±Inf) — invalid for a monotonic counter.
+    InvalidCounterValue,
+    /// Metric timestamp is outside the accepted window (−10 min / +5 min from now).
+    TimestampOutOfWindow,
+}
+
+impl DropReason {
+    /// Stable, low-cardinality value for the `reason` metric label and the log line.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DropReason::InvalidGaugeValue => "invalid_gauge_value",
+            DropReason::InvalidCounterValue => "invalid_counter_value",
+            DropReason::TimestampOutOfWindow => "timestamp_out_of_window",
+        }
+    }
+
+    /// Whether a drop for this reason counts as data loss — i.e. whether it increments the
+    /// standard `component_discarded_events_total{intentional="true"}` metric the completeness/SLO
+    /// dashboards consume. An invalid gauge value is a legitimate Prometheus staleness marker, not
+    /// loss, so it does NOT (but it is still recorded on the per-reason breakdown metric so it
+    /// stays observable). Every other reason counts as loss.
+    pub const fn counts_as_loss(self) -> bool {
+        !matches!(self, DropReason::InvalidGaugeValue)
+    }
+}
+
 /// Known prometheus metric-name suffixes and their canonical type strings.
 const SUFFIXES: &[(&str, &str)] = &[
     ("_bucket", "bucket"),
@@ -126,9 +172,11 @@ impl MetricToLogHydra {
             % 100) as i64
     }
 
-    /// Consume a `Metric` and produce a `LogEvent`, or `None` if the timestamp
-    /// is outside the accepted window (−10 min / +5 min from now).
-    pub fn transform_one(metric: Metric) -> Option<LogEvent> {
+    /// Consume a `Metric` and produce a `LogEvent`, or the [`DropReason`] it was dropped for.
+    ///
+    /// `transform_one` never decides how a drop is accounted — it always reports the reason and
+    /// leaves the loss policy to the caller (via [`DropReason::counts_as_loss`]).
+    pub fn transform_one(metric: Metric) -> Result<LogEvent, DropReason> {
         let now_ms = Utc::now().timestamp_millis();
 
         let timestamp_ms: i64 = metric
@@ -136,27 +184,43 @@ impl MetricToLogHydra {
             .map(|ts| ts.timestamp_millis())
             .unwrap_or(now_ms);
 
-        if timestamp_ms > now_ms + 300_000 || timestamp_ms < now_ms - 600_000 {
-            return None;
+        // Timestamp window is checked before the value: an out-of-window drop is reported as
+        // TimestampOutOfWindow regardless of the value (so a stale gauge is never mistaken for a
+        // InvalidGaugeValue drop).
+        if timestamp_ms > now_ms + TS_WINDOW_FUTURE_MS || timestamp_ms < now_ms - TS_WINDOW_PAST_MS
+        {
+            return Err(DropReason::TimestampOutOfWindow);
         }
 
         let timestamp_hour_ms = timestamp_ms - (timestamp_ms % 3_600_000);
 
-        // Values array [{ts, v}] — only Gauge and Counter carry a scalar value.
-        let values: Value = match metric.value() {
-            MetricValue::Gauge { value } | MetricValue::Counter { value } => {
+        // Values array [{ts, v}] — only Gauge and Counter carry a scalar value. Both families are
+        // handled identically: pair the value with the reason to report if it is non-finite, then
+        // one shared finite-check + build. A non-finite value (NaN or ±Inf) is invalid — `NotNan`
+        // (which `Value::Float` wraps) can represent ±Inf but not NaN, so `is_finite()` is checked
+        // explicitly to reject both uniformly. Other metric types carry no scalar → empty array.
+        let scalar = match metric.value() {
+            MetricValue::Gauge { value } => Some((*value, DropReason::InvalidGaugeValue)),
+            MetricValue::Counter { value } => Some((*value, DropReason::InvalidCounterValue)),
+            _ => None,
+        };
+        let values: Value = match scalar {
+            Some((value, invalid_reason)) => {
+                if !value.is_finite() {
+                    return Err(invalid_reason);
+                }
+                let v = value
+                    .try_into()
+                    .expect("value checked finite above, NotNan cannot fail");
                 Value::Array(vec![Value::Object(
                     [
                         (KeyString::from("ts"), Value::Integer(timestamp_ms)),
-                        (
-                            KeyString::from("v"),
-                            Value::Float((*value).try_into().ok()?),
-                        ),
+                        (KeyString::from("v"), Value::Float(v)),
                     ]
                     .into(),
                 )])
             }
-            _ => Value::Array(vec![]),
+            None => Value::Array(vec![]),
         };
 
         let original_name: String = metric.name().to_owned();
@@ -271,16 +335,22 @@ impl MetricToLogHydra {
         log.insert(event_path!("system_uri"), system_uri);
         log.insert(event_path!("topic"), Value::Bytes("metric-to-log".into()));
 
-        Some(log)
+        Ok(log)
     }
 }
 
 impl FunctionTransform for MetricToLogHydra {
     fn transform(&mut self, output: &mut OutputBuffer, event: Event) {
-        let metric = event.into_metric();
-        match Self::transform_one(metric) {
-            Some(log) => output.push(log.into()),
-            None => self.events_dropped.emit(Count(1)),
+        match Self::transform_one(event.into_metric()) {
+            Ok(log) => output.push(log.into()),
+            // Every drop is recorded on the per-reason breakdown; whether it also counts as loss
+            // (the standard discard metric) is decided by the reason. FunctionTransform handles one
+            // event per call, so a drop here is a single event.
+            Err(reason) => self.events_dropped.emit(MetricToLogHydraDrop {
+                count: 1,
+                reason: reason.as_str(),
+                counts_as_loss: reason.counts_as_loss(),
+            }),
         }
     }
 }
@@ -319,6 +389,14 @@ mod tests {
         .with_timestamp(Some(ts))
     }
 
+    // Test helpers over the Result<LogEvent, DropReason> return.
+    fn logof(m: Metric) -> LogEvent {
+        MetricToLogHydra::transform_one(m).expect("expected a log event, got a drop")
+    }
+    fn drop_reason(m: Metric) -> DropReason {
+        MetricToLogHydra::transform_one(m).expect_err("expected a drop, got a log event")
+    }
+
     fn get_str(log: &LogEvent, key: &str) -> String {
         log.get(event_path!(key))
             .and_then(|v| v.as_str())
@@ -351,7 +429,7 @@ mod tests {
             ],
             now_ms,
         );
-        let log = MetricToLogHydra::transform_one(metric).expect("should produce log");
+        let log = logof(metric);
 
         assert_eq!(get_str(&log, "name"), "jvm_heap_used_bytes");
         assert_eq!(get_str(&log, "metric_name"), "jvm_heap_used_bytes");
@@ -379,7 +457,7 @@ mod tests {
             ("plain", "plain", "gauge"),
         ] {
             let metric = make_gauge(name, 1.0, &[], now_ms);
-            let log = MetricToLogHydra::transform_one(metric).unwrap();
+            let log = logof(metric);
             assert_eq!(
                 &get_str(&log, "metric_name"),
                 exp_base,
@@ -397,7 +475,7 @@ mod tests {
     fn counter_values_array() {
         let now_ms = Utc::now().timestamp_millis();
         let metric = make_counter("http_requests_total", 42.0, &[], now_ms);
-        let log = MetricToLogHydra::transform_one(metric).unwrap();
+        let log = logof(metric);
         let values = log.get(event_path!("values")).unwrap();
         let arr = values.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -407,14 +485,79 @@ mod tests {
         );
     }
 
+    // Returns values[0].v as f64, asserting exactly one sample is present.
+    fn single_value(log: &LogEvent) -> f64 {
+        let arr = log
+            .get(event_path!("values"))
+            .and_then(|v| v.as_array())
+            .expect("values array");
+        assert_eq!(arr.len(), 1, "expected exactly one sample");
+        arr[0].get("v").unwrap().as_float().unwrap().into_inner()
+    }
+
+    #[test]
+    fn invalid_gauge_value_is_dropped_but_not_loss() {
+        // A gauge with a non-finite value (NaN or ±Inf) is a Prometheus staleness marker: reported
+        // as InvalidGaugeValue and dropped, but it does NOT count as loss (recorded only on the
+        // per-reason breakdown metric, not the discard/completeness metric).
+        let now_ms = Utc::now().timestamp_millis();
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let reason = drop_reason(make_gauge("g", value, &[], now_ms));
+            assert_eq!(reason, DropReason::InvalidGaugeValue, "value {value}");
+            assert!(
+                !reason.counts_as_loss(),
+                "invalid gauge must not count as loss"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_counter_value_is_dropped_and_counts_as_loss() {
+        // Counter is handled symmetrically with gauge: any non-finite value (NaN or ±Inf) is
+        // invalid → dropped as InvalidCounterValue, which counts as loss.
+        let now_ms = Utc::now().timestamp_millis();
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let reason = drop_reason(make_counter("c", value, &[], now_ms));
+            assert_eq!(reason, DropReason::InvalidCounterValue, "value {value}");
+            assert!(
+                reason.counts_as_loss(),
+                "invalid counter must count as loss"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_reason_labels_are_stable() {
+        // The metric `reason` label values must stay stable (dashboards/alerts key on them).
+        assert_eq!(
+            DropReason::InvalidGaugeValue.as_str(),
+            "invalid_gauge_value"
+        );
+        assert_eq!(
+            DropReason::InvalidCounterValue.as_str(),
+            "invalid_counter_value"
+        );
+        assert_eq!(
+            DropReason::TimestampOutOfWindow.as_str(),
+            "timestamp_out_of_window"
+        );
+    }
+
+    #[test]
+    fn finite_gauge_value_is_preserved() {
+        let now_ms = Utc::now().timestamp_millis();
+        let log = logof(make_gauge("g", 123.4, &[], now_ms));
+        assert!((single_value(&log) - 123.4).abs() < f64::EPSILON);
+    }
+
     #[test]
     fn metric_part_range_and_determinism() {
         let now_ms = Utc::now().timestamp_millis();
         let metric = make_gauge("kube_pod_cpu_seconds_total", 1.0, &[], now_ms);
-        let log = MetricToLogHydra::transform_one(metric.clone()).unwrap();
+        let log = logof(metric.clone());
         let part = get_i64(&log, "metric_part");
         assert!((0..100).contains(&part), "metric_part out of range: {part}");
-        let log2 = MetricToLogHydra::transform_one(metric).unwrap();
+        let log2 = logof(metric);
         assert_eq!(get_i64(&log2, "metric_part"), part);
     }
 
@@ -427,7 +570,7 @@ mod tests {
             &[("system", "sys1"), ("shardName", "shard42")],
             now_ms,
         );
-        let log = MetricToLogHydra::transform_one(metric).unwrap();
+        let log = logof(metric);
         assert_eq!(
             get_str(&log, "hydra_cluster_column"),
             "foo_total|sys1|shard42"
@@ -447,42 +590,44 @@ mod tests {
             ],
             now_ms,
         );
-        assert_eq!(
-            get_str(
-                &MetricToLogHydra::transform_one(m).unwrap(),
-                "tenant_cluster_column"
-            ),
-            "c1"
-        );
+        assert_eq!(get_str(&logof(m), "tenant_cluster_column"), "c1");
 
         let m2 = make_gauge("m", 1.0, &[("workspace_id", "w1")], now_ms);
-        assert_eq!(
-            get_str(
-                &MetricToLogHydra::transform_one(m2).unwrap(),
-                "tenant_cluster_column"
-            ),
-            "w1"
-        );
+        assert_eq!(get_str(&logof(m2), "tenant_cluster_column"), "w1");
 
         let m3 = make_gauge("m", 1.0, &[], now_ms);
-        assert!(is_null(
-            &MetricToLogHydra::transform_one(m3).unwrap(),
-            "tenant_cluster_column"
-        ));
+        assert!(is_null(&logof(m3), "tenant_cluster_column"));
     }
 
     #[test]
     fn rejects_future_timestamp() {
         let future_ms = Utc::now().timestamp_millis() + 400_000;
-        let metric = make_gauge("foo", 1.0, &[], future_ms);
-        assert!(MetricToLogHydra::transform_one(metric).is_none());
+        // Out-of-window even for a gauge (checked before the value); counts as loss.
+        let reason = drop_reason(make_gauge("foo", 1.0, &[], future_ms));
+        assert_eq!(reason, DropReason::TimestampOutOfWindow);
+        assert!(reason.counts_as_loss());
     }
 
     #[test]
     fn rejects_old_timestamp() {
         let old_ms = Utc::now().timestamp_millis() - 700_000;
-        let metric = make_gauge("foo", 1.0, &[], old_ms);
-        assert!(MetricToLogHydra::transform_one(metric).is_none());
+        assert_eq!(
+            drop_reason(make_gauge("foo", 1.0, &[], old_ms)),
+            DropReason::TimestampOutOfWindow
+        );
+    }
+
+    #[test]
+    fn stale_invalid_gauge_reports_timestamp_and_counts_as_loss() {
+        // A gauge that is BOTH stale and non-finite must report TimestampOutOfWindow (which counts
+        // as loss), not InvalidGaugeValue — guards against deciding the reason from the value alone.
+        let old_ms = Utc::now().timestamp_millis() - 700_000;
+        let reason = drop_reason(make_gauge("foo", f64::NAN, &[], old_ms));
+        assert_eq!(reason, DropReason::TimestampOutOfWindow);
+        assert!(
+            reason.counts_as_loss(),
+            "stale drop counts as loss, unlike a well-timed invalid gauge"
+        );
     }
 
     #[test]
@@ -502,6 +647,17 @@ mod tests {
         let stale = make_gauge("stale_metric", 1.0, &[], now_ms - 700_000);
         t.transform(&mut buf, stale.into());
         assert_eq!(buf.len(), 0, "stale metric should be dropped");
+
+        // Non-finite gauge and counter (NaN or ±Inf) → dropped, buffer stays empty.
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            t.transform(&mut buf, make_gauge("nf_gauge", value, &[], now_ms).into());
+            assert_eq!(buf.len(), 0, "non-finite gauge {value} should be dropped");
+            t.transform(
+                &mut buf,
+                make_counter("nf_counter", value, &[], now_ms).into(),
+            );
+            assert_eq!(buf.len(), 0, "non-finite counter {value} should be dropped");
+        }
     }
 
     #[test]
@@ -519,7 +675,7 @@ mod tests {
             ],
             now_ms,
         );
-        let log = MetricToLogHydra::transform_one(metric).unwrap();
+        let log = logof(metric);
 
         // Reproduce what VRL does: encode_json of sorted BTreeMap
         let expected_json = r#"{"shardName":"s1","system":"obs","workspace_id":"w1"}"#;
@@ -531,7 +687,7 @@ mod tests {
     fn md5_labels_empty_tags() {
         let now_ms = Utc::now().timestamp_millis();
         let metric = make_gauge("foo", 1.0, &[], now_ms);
-        let log = MetricToLogHydra::transform_one(metric).unwrap();
+        let log = logof(metric);
         let expected_md5 = format!("{:x}", Md5::digest("{}".as_bytes()));
         assert_eq!(get_str(&log, "md5_labels"), expected_md5);
     }
@@ -540,7 +696,7 @@ mod tests {
     fn no_tags_produces_null_optional_fields() {
         let now_ms = Utc::now().timestamp_millis();
         let metric = make_gauge("some_metric", 1.0, &[], now_ms);
-        let log = MetricToLogHydra::transform_one(metric).unwrap();
+        let log = logof(metric);
         assert!(is_null(&log, "workspace_id"));
         assert!(is_null(&log, "cluster_id"));
         assert!(is_null(&log, "region_uri"));
@@ -550,5 +706,4 @@ mod tests {
         assert_eq!(get_str(&log, "shard_name"), "");
         assert_eq!(get_str(&log, "hydra_cluster_column"), "some_metric||");
     }
-
 }
