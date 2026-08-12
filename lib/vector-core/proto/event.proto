@@ -94,6 +94,7 @@ message Metadata {
   OutputId upstream_id = 5;
   Secrets secrets = 6;
   bytes source_event_id = 7;
+  optional uint64 delivery_event_count = 8;
 }
 
 message Metric {

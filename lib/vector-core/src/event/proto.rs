@@ -627,6 +627,7 @@ impl From<EventMetadata> for Metadata {
             upstream_id,
             datadog_origin_metadata,
             source_event_id,
+            delivery_event_count,
             ..
         } = value.into_owned();
 
@@ -640,6 +641,7 @@ impl From<EventMetadata> for Metadata {
             upstream_id: upstream_id.map(|id| id.as_ref().clone()).map(Into::into),
             secrets,
             source_event_id: source_event_id.map_or(vec![], std::convert::Into::into),
+            delivery_event_count: delivery_event_count.map(|count| count as u64),
         }
     }
 }
@@ -654,6 +656,7 @@ impl From<Metadata> for EventMetadata {
             secrets,
             datadog_origin_metadata,
             source_event_id,
+            delivery_event_count,
         } = value;
 
         let metadata_value = metadata_value.and_then(decode_value);
@@ -676,6 +679,7 @@ impl From<Metadata> for EventMetadata {
                 }
             }
         };
+        let delivery_event_count = delivery_event_count.and_then(|count| count.try_into().ok());
 
         EventMetadata(Arc::new(Inner {
             value: metadata_value.unwrap_or_else(|| vrl::value::Value::Object(ObjectMap::new())),
@@ -688,6 +692,7 @@ impl From<Metadata> for EventMetadata {
             dropped_fields: ObjectMap::new(),
             datadog_origin_metadata,
             source_event_id,
+            delivery_event_count,
         }))
     }
 }

@@ -100,6 +100,7 @@ fn get_message_count(
     event: &Event,
     log_metadata_field: &str,
     message_count_override_field: &str,
+    for_delivery_events: bool,
 ) -> usize {
     let path = format!("{}.{}", log_metadata_field, message_count_override_field);
     match event.as_log().parse_path_and_get_value(path) {
@@ -111,6 +112,7 @@ fn get_message_count(
                 1
             }
         }
+        _ if for_delivery_events => event.as_log().metadata().delivery_event_count(),
         _ => 1,
     }
 }
@@ -147,8 +149,12 @@ pub fn generate_count_map(
     for event in events {
         // Check if it's a log event (see enum defined in lib/vector-core/src/event/mod.rs)
         if let Event::Log(log_event) = event {
-            let message_count =
-                get_message_count(event, log_metadata_field, message_count_override_field);
+            let message_count = get_message_count(
+                event,
+                log_metadata_field,
+                message_count_override_field,
+                for_delivery_events,
+            );
             let message_bytes = get_message_bytes(log_event, log_metadata_field);
             count_map
                 .entry(build_key(log_event, log_metadata_field, granularity_fields))
@@ -229,5 +235,41 @@ impl EventWithEventLog for Event {
         file_metadata: FileEventMetadata,
     ) -> VectorSinkEventMetadata {
         compute_event_log_with_file_event(self.clone(), file_metadata)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_with_delivery_count(count: usize) -> Event {
+        let mut event = LogEvent::from("message");
+        event.metadata_mut().set_delivery_event_count(count);
+        event.into()
+    }
+
+    #[test]
+    fn delivery_count_uses_reduced_event_lineage() {
+        let event = event_with_delivery_count(4);
+
+        assert_eq!(get_message_count(&event, "metadata", "count", true), 4);
+    }
+
+    #[test]
+    fn non_delivery_count_ignores_reduced_event_lineage() {
+        let event = event_with_delivery_count(4);
+
+        assert_eq!(get_message_count(&event, "metadata", "count", false), 1);
+    }
+
+    #[test]
+    fn explicit_message_count_overrides_reduced_event_lineage() {
+        let mut event = event_with_delivery_count(4);
+        event.as_mut_log().insert("log_metadata.message_count", 9);
+
+        assert_eq!(
+            get_message_count(&event, "log_metadata", "message_count", true),
+            9
+        );
     }
 }

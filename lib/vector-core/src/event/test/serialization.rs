@@ -61,6 +61,28 @@ fn back_and_forth_through_bytes() {
 }
 
 #[test]
+fn delivery_event_count_round_trips_through_bytes() {
+    let mut event = LogEvent::from("reduced log line");
+    event.metadata_mut().set_delivery_event_count(7);
+    let events = EventArray::from(Event::from(event));
+
+    let mut buffer = BytesMut::with_capacity(64);
+    encode_value(events, &mut buffer);
+
+    let decoded = decode_value::<EventArray, _>(buffer);
+    assert_eq!(
+        decoded
+            .into_events()
+            .next()
+            .unwrap()
+            .as_log()
+            .metadata()
+            .delivery_event_count(),
+        7
+    );
+}
+
+#[test]
 fn serialization() {
     let mut event = LogEvent::from("raw log line");
     event.insert("foo", "bar");

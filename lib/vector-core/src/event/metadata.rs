@@ -78,6 +78,9 @@ pub(super) struct Inner {
     /// An internal vector id that can be used to identify this event across all components.
     #[derivative(PartialEq = "ignore")]
     pub(crate) source_event_id: Option<Uuid>,
+
+    /// Number of source events represented by this event after cardinality-reducing transforms.
+    pub(crate) delivery_event_count: Option<usize>,
 }
 
 /// Metric Origin metadata for submission to Datadog.
@@ -239,6 +242,19 @@ impl EventMetadata {
     pub fn source_event_id(&self) -> Option<Uuid> {
         self.0.source_event_id
     }
+
+    /// Returns the number of source events represented by this event.
+    ///
+    /// Events that have not passed through a cardinality-reducing transform represent themselves.
+    #[must_use]
+    pub fn delivery_event_count(&self) -> usize {
+        self.0.delivery_event_count.unwrap_or(1)
+    }
+
+    /// Sets the number of source events represented by this event.
+    pub fn set_delivery_event_count(&mut self, count: usize) {
+        self.get_mut().delivery_event_count = Some(count);
+    }
 }
 
 impl Default for Inner {
@@ -254,6 +270,7 @@ impl Default for Inner {
             dropped_fields: ObjectMap::new(),
             datadog_origin_metadata: None,
             source_event_id: Some(Uuid::new_v4()),
+            delivery_event_count: None,
         }
     }
 }
@@ -567,5 +584,14 @@ mod test {
             merged.merge(m1.clone());
             assert_eq!(merged.source_event_id(), m2.source_event_id());
         }
+    }
+
+    #[test]
+    fn delivery_event_count_defaults_to_one() {
+        let mut metadata = EventMetadata::default();
+        assert_eq!(metadata.delivery_event_count(), 1);
+
+        metadata.set_delivery_event_count(7);
+        assert_eq!(metadata.delivery_event_count(), 7);
     }
 }

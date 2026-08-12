@@ -29,6 +29,7 @@ use crate::{
 #[derive(Clone, Debug)]
 struct ReduceState {
     events: usize,
+    delivery_event_count: usize,
     fields: HashMap<OwnedTargetPath, Box<dyn ReduceValueMerger>>,
     stale_since: Instant,
     creation: Instant,
@@ -53,6 +54,7 @@ impl ReduceState {
     fn new() -> Self {
         Self {
             events: 0,
+            delivery_event_count: 0,
             stale_since: Instant::now(),
             creation: Instant::now(),
             fields: HashMap::new(),
@@ -61,6 +63,9 @@ impl ReduceState {
     }
 
     fn add_event(&mut self, e: LogEvent, strategies: &IndexMap<OwnedTargetPath, MergeStrategy>) {
+        self.delivery_event_count = self
+            .delivery_event_count
+            .saturating_add(e.metadata().delivery_event_count());
         self.metadata.merge(e.metadata().clone());
 
         for (path, strategy) in strategies {
@@ -128,6 +133,8 @@ impl ReduceState {
     }
 
     fn flush(mut self) -> LogEvent {
+        self.metadata
+            .set_delivery_event_count(self.delivery_event_count);
         let mut event = LogEvent::new_with_metadata(self.metadata);
         for (path, v) in self.fields.drain() {
             if let Err(error) = v.insert_into(&path, &mut event) {
@@ -135,6 +142,7 @@ impl ReduceState {
             }
         }
         self.events = 0;
+        self.delivery_event_count = 0;
         event
     }
 }
@@ -372,6 +380,36 @@ mod test {
         transforms::test::create_topology,
     };
 
+    fn reduce_delivery_event_count(input_counts: &[usize]) -> usize {
+        let mut state = ReduceState::new();
+        for count in input_counts {
+            let mut event = LogEvent::from("message");
+            event.metadata_mut().set_delivery_event_count(*count);
+            state.add_event(event, &IndexMap::new());
+        }
+        state.flush().metadata().delivery_event_count()
+    }
+
+    #[test]
+    fn reduce_counts_each_ordinary_input_event() {
+        let mut state = ReduceState::new();
+        for _ in 0..3 {
+            state.add_event(LogEvent::from("message"), &IndexMap::new());
+        }
+
+        assert_eq!(state.flush().metadata().delivery_event_count(), 3);
+    }
+
+    #[test]
+    fn reduce_sums_input_delivery_event_counts() {
+        assert_eq!(reduce_delivery_event_count(&[2, 3, 5]), 10);
+    }
+
+    #[test]
+    fn reduce_preserves_single_event_cardinality() {
+        assert_eq!(reduce_delivery_event_count(&[1]), 1);
+    }
+
     #[tokio::test]
     async fn reduce_from_condition() {
         let reduce_config = toml::from_str::<ReduceConfig>(
@@ -425,6 +463,7 @@ group_by = [ "request_id" ]
             let mut metadata_1 = e_1.metadata().clone();
             metadata_1.set_upstream_id(Arc::new(OutputId::from("transform")));
             metadata_1.set_schema_definition(&Arc::new(new_schema_definition.clone()));
+            metadata_1.set_delivery_event_count(3);
 
             let mut e_2 = LogEvent::from("test message 2");
             e_2.insert("counter", 2);
@@ -432,6 +471,7 @@ group_by = [ "request_id" ]
             let mut metadata_2 = e_2.metadata().clone();
             metadata_2.set_upstream_id(Arc::new(OutputId::from("transform")));
             metadata_2.set_schema_definition(&Arc::new(new_schema_definition.clone()));
+            metadata_2.set_delivery_event_count(2);
 
             let mut e_3 = LogEvent::from("test message 3");
             e_3.insert("counter", 3);
@@ -516,6 +556,7 @@ merge_strategies.baz = "max"
             let mut metadata = e_1.metadata().clone();
             metadata.set_upstream_id(Arc::new(OutputId::from("transform")));
             metadata.set_schema_definition(&Arc::new(new_schema_definition.clone()));
+            metadata.set_delivery_event_count(3);
             tx.send(e_1.into()).await.unwrap();
 
             let mut e_2 = LogEvent::from("test message 2");
@@ -583,6 +624,7 @@ group_by = [ "request_id" ]
             let mut metadata_1 = e_1.metadata().clone();
             metadata_1.set_upstream_id(Arc::new(OutputId::from("transform")));
             metadata_1.set_schema_definition(&Arc::new(new_schema_definition.clone()));
+            metadata_1.set_delivery_event_count(3);
             tx.send(e_1.into()).await.unwrap();
 
             let mut e_2 = LogEvent::from("test message 2");
@@ -590,6 +632,7 @@ group_by = [ "request_id" ]
             let mut metadata_2 = e_2.metadata().clone();
             metadata_2.set_upstream_id(Arc::new(OutputId::from("transform")));
             metadata_2.set_schema_definition(&Arc::new(new_schema_definition));
+            metadata_2.set_delivery_event_count(2);
             tx.send(e_2.into()).await.unwrap();
 
             let mut e_3 = LogEvent::from("test message 3");
@@ -792,6 +835,7 @@ merge_strategies.bar = "concat"
             let mut metadata_1 = e_1.metadata().clone();
             metadata_1.set_upstream_id(Arc::new(OutputId::from("transform")));
             metadata_1.set_schema_definition(&Arc::new(new_schema_definition.clone()));
+            metadata_1.set_delivery_event_count(3);
 
             tx.send(e_1.into()).await.unwrap();
 
@@ -802,6 +846,7 @@ merge_strategies.bar = "concat"
             let mut metadata_2 = e_2.metadata().clone();
             metadata_2.set_upstream_id(Arc::new(OutputId::from("transform")));
             metadata_2.set_schema_definition(&Arc::new(new_schema_definition));
+            metadata_2.set_delivery_event_count(3);
             tx.send(e_2.into()).await.unwrap();
 
             let mut e_3 = LogEvent::from("test message 3");
