@@ -6,7 +6,7 @@ use std::{
     time::{self, Duration},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use file_source_common::{
     FileFingerprint, FileSourceInternalEvents, Fingerprinter, ReadFrom,
@@ -25,7 +25,12 @@ use tokio::{
 };
 
 use tracing::{debug, error, info, trace, warn};
-use vector_common::internal_event::delivery_singleton;
+use vector_common::internal_event::{
+    delivery_singleton,
+    vector_event::delivery_event::{
+        REJECTION_REASON_LINE_TOO_LONG, current_hour_time_parity_ms_value,
+    },
+};
 
 use crate::{
     FileTTLAction, FileTTLRemovalConfig,
@@ -101,6 +106,39 @@ where
     PP: PathsProvider,
     E: FileSourceInternalEvents,
 {
+    fn emit_line_too_long_events(&self, path: &Path, discarded: &[BytesMut]) {
+        for buf in discarded {
+            self.emitter
+                .emit_file_line_too_long(buf, self.max_line_bytes, buf.len());
+        }
+
+        let service_system = self
+            .source_context
+            .as_ref()
+            .and_then(|context| context.get("system"))
+            .filter(|system| !system.is_empty())
+            .cloned()
+            .or_else(|| {
+                self.file_to_pod_map.as_ref().and_then(|file_to_pod_map| {
+                    file_to_pod_map
+                        .lock()
+                        .expect("file-to-pod map lock poisoned")
+                        .get(path)
+                        .and_then(|file_info| file_info.service_system.clone())
+                })
+            });
+
+        delivery_singleton().emit_rejected(
+            path.to_str().expect("not a valid path"),
+            discarded.len(),
+            &self.source_context,
+            service_system.as_deref(),
+            self.source_type,
+            current_hour_time_parity_ms_value(),
+            REJECTION_REASON_LINE_TOO_LONG,
+        );
+    }
+
     /// Returns `true` if the path has an extension that matches one of the
     /// configured archive extensions (immutable files that never change).
     fn is_archive(&self, path: &Path) -> bool {
@@ -452,13 +490,10 @@ where
                         discarded_for_size_and_truncated,
                     }) = watcher.read_line().await
                 {
-                    discarded_for_size_and_truncated.iter().for_each(|buf| {
-                        self.emitter.emit_file_line_too_long(
-                            &buf.clone(),
-                            self.max_line_bytes,
-                            buf.len(),
-                        )
-                    });
+                    self.emit_line_too_long_events(
+                        &watcher.path,
+                        &discarded_for_size_and_truncated,
+                    );
 
                     let sz = line.bytes.len();
                     trace!(
@@ -682,13 +717,10 @@ where
                                             raw_line: Some(line),
                                             discarded_for_size_and_truncated,
                                         }) => {
-                                            for buf in &discarded_for_size_and_truncated {
-                                                self.emitter.emit_file_line_too_long(
-                                                    &buf.clone(),
-                                                    self.max_line_bytes,
-                                                    buf.len(),
-                                                );
-                                            }
+                                            self.emit_line_too_long_events(
+                                                &watcher.path,
+                                                &discarded_for_size_and_truncated,
+                                            );
                                             bytes_read += line.bytes.len();
                                             lines.push(Line {
                                                 text: line.bytes,
@@ -1221,6 +1253,7 @@ mod tests {
             pod_name: "driver-pod".to_string(),
             pod_uid: "pod-uid".to_string(),
             container_name: "DEFAULT_CONTAINER_NAME".to_string(),
+            service_system: Some("spark-driver".to_string()),
         }
     }
 

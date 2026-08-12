@@ -50,6 +50,25 @@ fn extract_container_name_from_path(
     }
 }
 
+fn service_system_from_pod(pod: &Pod) -> Option<String> {
+    if let Some(system) = pod
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("system"))
+    {
+        return (!system.is_empty()).then(|| system.clone());
+    }
+
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("databricks/system_uri"))
+        .and_then(|system_uri| system_uri.strip_prefix("system:"))
+        .filter(|system| !system.is_empty())
+        .map(str::to_string)
+}
+
 impl K8sPathsProvider {
     /// Create a new [`K8sPathsProvider`].
     pub fn new(
@@ -133,6 +152,7 @@ impl PathsProvider for K8sPathsProvider {
                             pod_name: pod.metadata.name.clone().unwrap_or_default().to_string(),
                             pod_uid: pod.metadata.uid.clone().unwrap_or_default().to_string(),
                             container_name,
+                            service_system: service_system_from_pod(&pod),
                         }),
                         path,
                     )
@@ -693,7 +713,7 @@ mod tests {
         DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY, build_container_exclusion_patterns,
         extract_databricks_pod_logs_directory, extract_excluded_containers_for_pod,
         extract_hostpath_logging_annotation_directory, extract_pod_logs_directory, filter_paths,
-        get_databricks_pod_logs_directories, list_pod_log_paths,
+        get_databricks_pod_logs_directories, list_pod_log_paths, service_system_from_pod,
     };
 
     fn annotations(entries: Vec<(&str, &str)>) -> BTreeMap<String, String> {
@@ -701,6 +721,45 @@ mod tests {
             .into_iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn service_system_prefers_pod_label() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                labels: Some(annotations(vec![("system", "label-system")])),
+                annotations: Some(annotations(vec![(
+                    "databricks/system_uri",
+                    "system:annotation-system",
+                )])),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        };
+
+        assert_eq!(
+            service_system_from_pod(&pod).as_deref(),
+            Some("label-system")
+        );
+    }
+
+    #[test]
+    fn service_system_falls_back_to_system_uri_annotation() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                annotations: Some(annotations(vec![(
+                    "databricks/system_uri",
+                    "system:annotation-system",
+                )])),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        };
+
+        assert_eq!(
+            service_system_from_pod(&pod).as_deref(),
+            Some("annotation-system")
+        );
     }
 
     #[test]

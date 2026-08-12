@@ -32,6 +32,10 @@ const KUBERNETES_LOGS_FALLBACK_TOPIC: &str = "sawmill-service-log";
 pub const SOURCE_TYPE_FILE: &str = "file";
 pub const SOURCE_TYPE_KUBERNETES_LOGS: &str = "kubernetes_logs";
 
+/// Bounded reason label for records rejected by a file-backed source before
+/// they can enter the event pipeline.
+pub const REJECTION_REASON_LINE_TOO_LONG: &str = "line_too_long";
+
 /// Canonical `deliveryMethod` values written by the woodchuck VRL into
 /// `logMetadata.deliveryMethod`. Used both on the read side (where the VRL
 /// hasn't run yet, so we infer the value from `source_type`) and to keep the
@@ -381,6 +385,54 @@ impl DeliveryEventSingleton {
 
         self.ensure_flush_task();
         self.record_read(path, bytes_read, lines_read, source_context, source_type, time_parity);
+    }
+
+    /// Records source events rejected before admission to the event pipeline.
+    /// These use a distinct delivery-event stage so the existing
+    /// delivered/read completeness ratio is unchanged, while callers can add
+    /// rejected events to the denominator for an admission-adjusted view.
+    pub fn emit_rejected(
+        &self,
+        path: &str,
+        rejected_events: usize,
+        source_context: &Option<HashMap<String, String>>,
+        service_system: Option<&str>,
+        source_type: &'static str,
+        time_parity: i64,
+        rejection_reason: &'static str,
+    ) {
+        if rejected_events == 0 {
+            return;
+        }
+
+        let empty = HashMap::new();
+        let ctx = source_context.as_ref().unwrap_or(&empty);
+        let topic = resolve_received_topic(ctx, path, source_type);
+        let service_system = service_system
+            .filter(|system| !system.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        counter!(
+            "delivery_events_total",
+            "delivery_event_type" => "VECTOR_SOURCE_REJECTED",
+            "rejection_reason" => rejection_reason,
+            "time_parity" => time_parity.to_string(),
+            "delivery_method" => delivery_method_for_source_type(source_type),
+            "topic" => topic.clone(),
+            "service_system" => service_system.clone(),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
+        )
+        .increment(rejected_events as u64);
+
+        // This counter omits delivery-only bucket and process labels so M3 can
+        // aggregate recent rejections by the affected service and topic.
+        counter!(
+            "source_rejected_events_total",
+            "rejection_reason" => rejection_reason,
+            "topic" => topic,
+            "service_system" => service_system,
+        )
+        .increment(rejected_events as u64);
     }
 
     /// Merges one read into the `(source_type, path, time_parity)` accumulator.
@@ -912,6 +964,7 @@ mod topic_inference_tests {
 #[cfg(test)]
 mod read_accumulation_tests {
     use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     // A fresh, isolated singleton per test. Leaked to obtain the `&'static`
     // reference `accumulate_read` requires; under `#[test]` there is no Tokio
@@ -1018,6 +1071,73 @@ mod read_accumulation_tests {
             s.reads.lock().unwrap().is_empty(),
             "inline mode (default) must not accumulate reads"
         );
+    }
+
+    #[test]
+    fn rejected_events_use_a_separate_stage_and_bounded_reason() {
+        let s = empty_singleton();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let source_context = Some(HashMap::from([(
+            "topic".to_string(),
+            "security-log".to_string(),
+        )]));
+
+        metrics::with_local_recorder(&recorder, || {
+            s.emit_rejected(
+                "/var/log/security.log",
+                3,
+                &source_context,
+                Some("money-settings"),
+                SOURCE_TYPE_FILE,
+                TP,
+                REJECTION_REASON_LINE_TOO_LONG,
+            );
+        });
+
+        let metrics = snapshotter.snapshot().into_vec();
+        assert_eq!(metrics.len(), 2);
+        let (key, _, _, value) = metrics
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == "delivery_events_total")
+            .expect("delivery metric");
+        assert_eq!(key.key().name(), "delivery_events_total");
+        assert_eq!(*value, DebugValue::Counter(3));
+
+        let labels = key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            labels.get("delivery_event_type"),
+            Some(&"VECTOR_SOURCE_REJECTED")
+        );
+        assert_eq!(
+            labels.get("rejection_reason"),
+            Some(&REJECTION_REASON_LINE_TOO_LONG)
+        );
+        assert_eq!(labels.get("topic"), Some(&"security-log"));
+        assert_eq!(labels.get("service_system"), Some(&"money-settings"));
+        assert_eq!(labels.get("delivery_method"), Some(&DELIVERY_METHOD_FILE));
+        let time_parity = TP.to_string();
+        assert_eq!(labels.get("time_parity"), Some(&time_parity.as_str()));
+
+        let (key, _, _, value) = metrics
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == "source_rejected_events_total")
+            .expect("alerting metric");
+        assert_eq!(*value, DebugValue::Counter(3));
+        let labels = key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(labels.get("rejection_reason"), Some(&"line_too_long"));
+        assert_eq!(labels.get("topic"), Some(&"security-log"));
+        assert_eq!(labels.get("service_system"), Some(&"money-settings"));
+        assert!(!labels.contains_key("time_parity"));
+        assert!(!labels.contains_key("process_generation_id"));
     }
 
     // flush() drains the read registry so each bucket is emitted exactly once.

@@ -76,6 +76,7 @@ pub(super) fn parse_log_file_path(path: &str) -> Option<LogFileInfo> {
         pod_name: pod_name.to_string(),
         pod_uid: pod_uid.to_string(),
         container_name: container_name.to_string(),
+        service_system: None,
     })
 }
 
@@ -161,6 +162,7 @@ mod tests {
                     pod_name: "sandbox0-name".to_string(),
                     pod_uid: "sandbox0-uid".to_string(),
                     container_name: "sandbox0-container0-name".to_string(),
+                    service_system: None,
                 }),
             ),
             // Invalid inputs.
