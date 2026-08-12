@@ -1,11 +1,7 @@
 use chrono::Utc;
 use md5::{Digest, Md5};
 use serde_json::Value as JsonValue;
-use vector_lib::{
-    configurable::configurable_component,
-    internal_event::{InternalEventHandle as _, Registered},
-    lookup::event_path,
-};
+use vector_lib::{configurable::configurable_component, lookup::event_path};
 use vrl::value::{KeyString, Value};
 
 use crate::{
@@ -14,7 +10,7 @@ use crate::{
         TransformOutput,
     },
     event::{Event, LogEvent, Metric, MetricValue},
-    internal_events::{MetricToLogHydraDrop, MetricToLogHydraEventsDropped},
+    internal_events::MetricToLogHydraDropped,
     schema::Definition,
     transforms::{FunctionTransform, OutputBuffer, Transform},
 };
@@ -33,12 +29,9 @@ use crate::{
 /// - Timestamp window (−10 min / +5 min) matches the VRL `abort` condition.
 /// - Optional tag fields (`workspace_id`, `cluster_id`, etc.) produce JSON `null`
 ///   when absent, matching VRL's `?? null` fallback.
-/// - Every drop is reported as a [`DropReason`] and recorded on the per-reason breakdown metric
-///   `metric_to_log_hydra_dropped_total{reason="..."}`. Reasons that count as loss
-///   ([`DropReason::counts_as_loss`]) — an invalid counter value, or a timestamp outside the
-///   window — also increment `component_discarded_events_total{intentional="true"}`. An invalid
-///   (NaN/±Inf) *gauge* value is a legitimate staleness marker, not loss: it is recorded on the
-///   breakdown metric but is kept off the discard/completeness metric.
+/// - Drops are counted on `metric_to_log_hydra_dropped_total{reason}`. Non-finite (NaN/±Inf)
+///   values are staleness markers, not loss; only out-of-window timestamps count as loss (see
+///   [`DropReason::counts_as_loss`]).
 ///
 /// **Do not use for new pipelines** — this encodes Hydra-specific field semantics.
 /// Use `metric_to_log` + VRL remap for a different output shape.
@@ -90,41 +83,29 @@ impl TransformConfig for MetricToLogHydraConfig {
 const TS_WINDOW_FUTURE_MS: i64 = 300_000;
 const TS_WINDOW_PAST_MS: i64 = 600_000;
 
-/// Why `transform_one` dropped a metric instead of producing a log event.
-///
-/// Extensible: add a variant here plus its arm in [`DropReason::as_str`] to introduce a new
-/// reason. Every drop path in `transform_one` names one of these, so a drop can never be
-/// unclassified. Each reason carries its loss policy ([`DropReason::counts_as_loss`]): every drop
-/// is recorded on the per-reason breakdown metric, but only "loss" reasons also increment the
-/// standard discard metric that the completeness/SLO dashboards consume.
+/// Why `transform_one` dropped a metric. The `reason` label on `metric_to_log_hydra_dropped_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropReason {
-    /// Gauge value is non-finite (NaN or ±Inf) — a legitimate Prometheus staleness marker
-    /// (absent scrape, recording-rule gap), not data loss.
-    InvalidGaugeValue,
-    /// Counter value is non-finite (NaN or ±Inf) — invalid for a monotonic counter.
-    InvalidCounterValue,
-    /// Metric timestamp is outside the accepted window (−10 min / +5 min from now).
+    /// Non-finite (NaN/±Inf) value — a staleness marker; gauge or counter.
+    NonFiniteValue,
+    /// Timestamp outside the accepted window (−10 min / +5 min).
     TimestampOutOfWindow,
 }
 
 impl DropReason {
-    /// Stable, low-cardinality value for the `reason` metric label and the log line.
+    /// Stable, low-cardinality `reason` label value.
     pub const fn as_str(self) -> &'static str {
         match self {
-            DropReason::InvalidGaugeValue => "invalid_gauge_value",
-            DropReason::InvalidCounterValue => "invalid_counter_value",
+            DropReason::NonFiniteValue => "non_finite_value",
             DropReason::TimestampOutOfWindow => "timestamp_out_of_window",
         }
     }
 
-    /// Whether a drop for this reason counts as data loss — i.e. whether it increments the
-    /// standard `component_discarded_events_total{intentional="true"}` metric the completeness/SLO
-    /// dashboards consume. An invalid gauge value is a legitimate Prometheus staleness marker, not
-    /// loss, so it does NOT (but it is still recorded on the per-reason breakdown metric so it
-    /// stays observable). Every other reason counts as loss.
+    /// Whether the drop also increments the standard `component_discarded_events_total` discard
+    /// metric. Non-finite values are staleness markers (not loss); an out-of-window timestamp is a
+    /// rejected sample (loss).
     pub const fn counts_as_loss(self) -> bool {
-        !matches!(self, DropReason::InvalidGaugeValue)
+        matches!(self, DropReason::TimestampOutOfWindow)
     }
 }
 
@@ -137,16 +118,12 @@ const SUFFIXES: &[(&str, &str)] = &[
     ("_summary", "summary"),
 ];
 
-#[derive(Clone)]
-pub struct MetricToLogHydra {
-    events_dropped: Registered<MetricToLogHydraEventsDropped>,
-}
+#[derive(Clone, Default)]
+pub struct MetricToLogHydra;
 
 impl MetricToLogHydra {
     pub fn new() -> Self {
-        Self {
-            events_dropped: register!(MetricToLogHydraEventsDropped),
-        }
+        Self
     }
 
     /// Strip a known prometheus suffix from `name`, returning (base, type_str).
@@ -173,9 +150,6 @@ impl MetricToLogHydra {
     }
 
     /// Consume a `Metric` and produce a `LogEvent`, or the [`DropReason`] it was dropped for.
-    ///
-    /// `transform_one` never decides how a drop is accounted — it always reports the reason and
-    /// leaves the loss policy to the caller (via [`DropReason::counts_as_loss`]).
     pub fn transform_one(metric: Metric) -> Result<LogEvent, DropReason> {
         let now_ms = Utc::now().timestamp_millis();
 
@@ -184,9 +158,7 @@ impl MetricToLogHydra {
             .map(|ts| ts.timestamp_millis())
             .unwrap_or(now_ms);
 
-        // Timestamp window is checked before the value: an out-of-window drop is reported as
-        // TimestampOutOfWindow regardless of the value (so a stale gauge is never mistaken for a
-        // InvalidGaugeValue drop).
+        // Checked before the value: out-of-window always reports TimestampOutOfWindow.
         if timestamp_ms > now_ms + TS_WINDOW_FUTURE_MS || timestamp_ms < now_ms - TS_WINDOW_PAST_MS
         {
             return Err(DropReason::TimestampOutOfWindow);
@@ -194,22 +166,14 @@ impl MetricToLogHydra {
 
         let timestamp_hour_ms = timestamp_ms - (timestamp_ms % 3_600_000);
 
-        // Values array [{ts, v}] — only Gauge and Counter carry a scalar value. Both families are
-        // handled identically: pair the value with the reason to report if it is non-finite, then
-        // one shared finite-check + build. A non-finite value (NaN or ±Inf) is invalid — `NotNan`
-        // (which `Value::Float` wraps) can represent ±Inf but not NaN, so `is_finite()` is checked
-        // explicitly to reject both uniformly. Other metric types carry no scalar → empty array.
-        let scalar = match metric.value() {
-            MetricValue::Gauge { value } => Some((*value, DropReason::InvalidGaugeValue)),
-            MetricValue::Counter { value } => Some((*value, DropReason::InvalidCounterValue)),
-            _ => None,
-        };
-        let values: Value = match scalar {
-            Some((value, invalid_reason)) => {
+        // Only Gauge/Counter carry a scalar; both handled the same. Non-finite (NaN/±Inf) → drop as
+        // NonFiniteValue (explicit is_finite: NotNan accepts ±Inf but not NaN). Others → [].
+        let values: Value = match metric.value() {
+            MetricValue::Gauge { value } | MetricValue::Counter { value } => {
                 if !value.is_finite() {
-                    return Err(invalid_reason);
+                    return Err(DropReason::NonFiniteValue);
                 }
-                let v = value
+                let v = (*value)
                     .try_into()
                     .expect("value checked finite above, NotNan cannot fail");
                 Value::Array(vec![Value::Object(
@@ -220,7 +184,7 @@ impl MetricToLogHydra {
                     .into(),
                 )])
             }
-            None => Value::Array(vec![]),
+            _ => Value::Array(vec![]),
         };
 
         let original_name: String = metric.name().to_owned();
@@ -343,11 +307,8 @@ impl FunctionTransform for MetricToLogHydra {
     fn transform(&mut self, output: &mut OutputBuffer, event: Event) {
         match Self::transform_one(event.into_metric()) {
             Ok(log) => output.push(log.into()),
-            // Every drop is recorded on the per-reason breakdown; whether it also counts as loss
-            // (the standard discard metric) is decided by the reason. FunctionTransform handles one
-            // event per call, so a drop here is a single event.
-            Err(reason) => self.events_dropped.emit(MetricToLogHydraDrop {
-                count: 1,
+            // Breakdown metric for every drop; standard discard only for loss reasons.
+            Err(reason) => emit!(MetricToLogHydraDropped {
                 reason: reason.as_str(),
                 counts_as_loss: reason.counts_as_loss(),
             }),
@@ -496,47 +457,28 @@ mod tests {
     }
 
     #[test]
-    fn invalid_gauge_value_is_dropped_but_not_loss() {
-        // A gauge with a non-finite value (NaN or ±Inf) is a Prometheus staleness marker: reported
-        // as InvalidGaugeValue and dropped, but it does NOT count as loss (recorded only on the
-        // per-reason breakdown metric, not the discard/completeness metric).
+    fn non_finite_gauge_and_counter_dropped_as_same_reason_not_loss() {
+        // Gauge and counter are not distinguished: any non-finite value (NaN or ±Inf) on either is
+        // reported as NonFiniteValue (a staleness marker) and does NOT count as loss.
         let now_ms = Utc::now().timestamp_millis();
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let reason = drop_reason(make_gauge("g", value, &[], now_ms));
-            assert_eq!(reason, DropReason::InvalidGaugeValue, "value {value}");
-            assert!(
-                !reason.counts_as_loss(),
-                "invalid gauge must not count as loss"
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_counter_value_is_dropped_and_counts_as_loss() {
-        // Counter is handled symmetrically with gauge: any non-finite value (NaN or ±Inf) is
-        // invalid → dropped as InvalidCounterValue, which counts as loss.
-        let now_ms = Utc::now().timestamp_millis();
-        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let reason = drop_reason(make_counter("c", value, &[], now_ms));
-            assert_eq!(reason, DropReason::InvalidCounterValue, "value {value}");
-            assert!(
-                reason.counts_as_loss(),
-                "invalid counter must count as loss"
-            );
+            for reason in [
+                drop_reason(make_gauge("g", value, &[], now_ms)),
+                drop_reason(make_counter("c", value, &[], now_ms)),
+            ] {
+                assert_eq!(reason, DropReason::NonFiniteValue, "value {value}");
+                assert!(
+                    !reason.counts_as_loss(),
+                    "non-finite value must not be loss"
+                );
+            }
         }
     }
 
     #[test]
     fn drop_reason_labels_are_stable() {
         // The metric `reason` label values must stay stable (dashboards/alerts key on them).
-        assert_eq!(
-            DropReason::InvalidGaugeValue.as_str(),
-            "invalid_gauge_value"
-        );
-        assert_eq!(
-            DropReason::InvalidCounterValue.as_str(),
-            "invalid_counter_value"
-        );
+        assert_eq!(DropReason::NonFiniteValue.as_str(), "non_finite_value");
         assert_eq!(
             DropReason::TimestampOutOfWindow.as_str(),
             "timestamp_out_of_window"
@@ -618,15 +560,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_invalid_gauge_reports_timestamp_and_counts_as_loss() {
-        // A gauge that is BOTH stale and non-finite must report TimestampOutOfWindow (which counts
-        // as loss), not InvalidGaugeValue — guards against deciding the reason from the value alone.
+    fn stale_and_non_finite_reports_timestamp_and_counts_as_loss() {
+        // A metric that is BOTH stale and non-finite must report TimestampOutOfWindow (which counts
+        // as loss), not NonFiniteValue — the timestamp window is checked before the value.
         let old_ms = Utc::now().timestamp_millis() - 700_000;
         let reason = drop_reason(make_gauge("foo", f64::NAN, &[], old_ms));
         assert_eq!(reason, DropReason::TimestampOutOfWindow);
         assert!(
             reason.counts_as_loss(),
-            "stale drop counts as loss, unlike a well-timed invalid gauge"
+            "stale drop counts as loss, unlike a well-timed non-finite value"
         );
     }
 
