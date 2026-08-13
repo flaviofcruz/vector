@@ -27,6 +27,13 @@ const LUMBERJACK_TOPIC_INFERRED_SENTINEL: &str = "lumberjackTopicInfered";
 // match. Mirrors `event_logs.libsonnet:155`.
 const KUBERNETES_LOGS_FALLBACK_TOPIC: &str = "sawmill-service-log";
 
+const UNKNOWN_SERVICE_SYSTEM: &str = "unknown";
+const UNKNOWN_SOURCE_POD_ID: &str = "unknown";
+// Kubernetes pod names cannot contain underscores, so this cannot collide with
+// a real source identity. The export transform selects this aggregate series
+// when source-pod cardinality is disabled.
+const ALL_SOURCE_PODS_ID: &str = "__all_source_pods__";
+
 /// Identifies which source emitted the event, used to align topic resolution
 /// with the woodchuck VRL's per-source fallback behavior.
 pub const SOURCE_TYPE_FILE: &str = "file";
@@ -150,6 +157,49 @@ fn delivery_method_from_value_map(value_map: &HashMap<String, String>) -> String
         .get("deliveryMethod")
         .cloned()
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Reads the source service identity from delivery-event granularity, falling
+/// back to a stable label value so every delivery counter has the same shape.
+fn service_system_from_value_map(value_map: &HashMap<String, String>) -> String {
+    service_system_label(value_map.get("system").map(String::as_str))
+}
+
+fn service_system_label(service_system: Option<&str>) -> String {
+    service_system
+        .filter(|system| !system.is_empty())
+        .unwrap_or(UNKNOWN_SERVICE_SYSTEM)
+        .to_string()
+}
+
+/// Reads the originating workload identity from delivery-event granularity,
+/// falling back to a stable label value so every delivery counter has the same shape.
+fn source_pod_id_from_value_map(value_map: &HashMap<String, String>) -> String {
+    source_pod_id_label(value_map.get("workloadInstanceId").map(String::as_str))
+}
+
+fn source_pod_id_label(source_pod_id: Option<&str>) -> String {
+    source_pod_id
+        .filter(|pod_id| !pod_id.is_empty())
+        .unwrap_or(UNKNOWN_SOURCE_POD_ID)
+        .to_string()
+}
+
+/// Extracts the source workload identity from file roots whose first child is
+/// the pod UID or pod name. This mirrors the logging-agent wrapper transform so
+/// file-source reads and sink deliveries use the same metric label.
+pub fn source_pod_id_from_file_path(path: &str) -> Option<&str> {
+    const SOURCE_POD_PATH_PREFIXES: [&str; 3] = [
+        "/var/lib/kubelet/pods/",
+        "/databricks/host-root/local_disk0/databricks/spark-logs/",
+        "/databricks/host-root/local_disk0/serverless-logs/internal/",
+    ];
+
+    SOURCE_POD_PATH_PREFIXES.iter().find_map(|prefix| {
+        path.strip_prefix(prefix)
+            .and_then(|suffix| suffix.split('/').next())
+            .filter(|source_pod_id| !source_pod_id.is_empty())
+    })
 }
 
 /// Maps a read source's `source_type` to the `deliveryMethod` value the VRL
@@ -342,6 +392,8 @@ impl DeliveryEventSingleton {
         bytes_read: usize,
         lines_read: usize,
         source_context: &Option<HashMap<String, String>>,
+        service_system: Option<&str>,
+        source_pod_id: Option<&str>,
         source_type: &'static str,
         time_parity: i64,
         emitted_after_multiline_agg: bool,
@@ -360,6 +412,20 @@ impl DeliveryEventSingleton {
             "time_parity" => time_parity.to_string(),
             "delivery_method" => delivery_method_for_source_type(source_type),
             "topic" => resolve_received_topic(ctx, &path, source_type),
+            "service_system" => service_system_label(service_system),
+            "source_pod_id" => source_pod_id_label(source_pod_id),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
+        )
+        .increment(lines_read as u64);
+
+        counter!(
+            "delivery_events_total",
+            "delivery_event_type" => "VECTOR_SOURCE_READ",
+            "time_parity" => time_parity.to_string(),
+            "delivery_method" => delivery_method_for_source_type(source_type),
+            "topic" => resolve_received_topic(ctx, &path, source_type),
+            "service_system" => service_system_label(service_system),
+            "source_pod_id" => ALL_SOURCE_PODS_ID,
             "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
         )
         .increment(lines_read as u64);
@@ -371,6 +437,20 @@ impl DeliveryEventSingleton {
             "time_parity" => time_parity.to_string(),
             "delivery_method" => delivery_method_for_source_type(source_type),
             "topic" => resolve_received_topic(ctx, &path, source_type),
+            "service_system" => service_system_label(service_system),
+            "source_pod_id" => source_pod_id_label(source_pod_id),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
+        )
+        .increment(bytes_read as u64);
+
+        counter!(
+            "delivery_event_bytes_total",
+            "delivery_event_type" => "VECTOR_SOURCE_READ",
+            "time_parity" => time_parity.to_string(),
+            "delivery_method" => delivery_method_for_source_type(source_type),
+            "topic" => resolve_received_topic(ctx, &path, source_type),
+            "service_system" => service_system_label(service_system),
+            "source_pod_id" => ALL_SOURCE_PODS_ID,
             "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
         )
         .increment(bytes_read as u64);
@@ -397,6 +477,7 @@ impl DeliveryEventSingleton {
         rejected_events: usize,
         source_context: &Option<HashMap<String, String>>,
         service_system: Option<&str>,
+        source_pod_id: Option<&str>,
         source_type: &'static str,
         time_parity: i64,
         rejection_reason: &'static str,
@@ -420,6 +501,20 @@ impl DeliveryEventSingleton {
             "delivery_method" => delivery_method_for_source_type(source_type),
             "topic" => topic.clone(),
             "service_system" => service_system.clone(),
+            "source_pod_id" => source_pod_id_label(source_pod_id),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
+        )
+        .increment(rejected_events as u64);
+
+        counter!(
+            "delivery_events_total",
+            "delivery_event_type" => "VECTOR_SOURCE_REJECTED",
+            "rejection_reason" => rejection_reason,
+            "time_parity" => time_parity.to_string(),
+            "delivery_method" => delivery_method_for_source_type(source_type),
+            "topic" => topic.clone(),
+            "service_system" => service_system.clone(),
+            "source_pod_id" => ALL_SOURCE_PODS_ID,
             "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
         )
         .increment(rejected_events as u64);
@@ -641,6 +736,20 @@ fn emit_sink_delivery_counters<'a>(
             "time_parity" => time_parity_from_value_map(&value.value_map),
             "topic" => topic_from_value_map(&value.value_map),
             "delivery_method" => delivery_method_from_value_map(&value.value_map),
+            "service_system" => service_system_from_value_map(&value.value_map),
+            "source_pod_id" => source_pod_id_from_value_map(&value.value_map),
+            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
+        )
+        .increment(value.count as u64);
+
+        counter!(
+            "delivery_events_total",
+            "delivery_event_type" => delivery_event_type.to_string(),
+            "time_parity" => time_parity_from_value_map(&value.value_map),
+            "topic" => topic_from_value_map(&value.value_map),
+            "delivery_method" => delivery_method_from_value_map(&value.value_map),
+            "service_system" => service_system_from_value_map(&value.value_map),
+            "source_pod_id" => ALL_SOURCE_PODS_ID,
             "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
         )
         .increment(value.count as u64);
@@ -959,6 +1068,71 @@ mod topic_inference_tests {
         let value_map = HashMap::new();
         assert_eq!(delivery_method_from_value_map(&value_map), "unknown");
     }
+
+    #[test]
+    fn service_system_from_value_map_reads_existing_key() {
+        let value_map = HashMap::from([("system".to_string(), "lakebase-proxy".to_string())]);
+        assert_eq!(service_system_from_value_map(&value_map), "lakebase-proxy");
+    }
+
+    #[test]
+    fn service_system_from_value_map_falls_back_when_missing_or_empty() {
+        assert_eq!(service_system_from_value_map(&HashMap::new()), "unknown");
+        assert_eq!(
+            service_system_from_value_map(&HashMap::from([("system".to_string(), String::new())])),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn source_pod_id_from_value_map_reads_workload_instance_id() {
+        let value_map = HashMap::from([(
+            "workloadInstanceId".to_string(),
+            "apps-123-main-abcde".to_string(),
+        )]);
+        assert_eq!(
+            source_pod_id_from_value_map(&value_map),
+            "apps-123-main-abcde"
+        );
+    }
+
+    #[test]
+    fn source_pod_id_from_value_map_falls_back_when_missing_or_empty() {
+        assert_eq!(source_pod_id_from_value_map(&HashMap::new()), "unknown");
+        assert_eq!(
+            source_pod_id_from_value_map(&HashMap::from([(
+                "workloadInstanceId".to_string(),
+                String::new(),
+            )])),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn source_pod_id_from_file_path_reads_supported_roots() {
+        for (path, expected) in [
+            (
+                "/var/lib/kubelet/pods/pod-uid/volumes/kubernetes.io~empty-dir/logs/auth/app.log",
+                "pod-uid",
+            ),
+            (
+                "/databricks/host-root/local_disk0/databricks/spark-logs/spark-pod/databricks/driver/logs/stdout",
+                "spark-pod",
+            ),
+            (
+                "/databricks/host-root/local_disk0/serverless-logs/internal/serverless-pod/databricks/driver/logs/stdout",
+                "serverless-pod",
+            ),
+        ] {
+            assert_eq!(source_pod_id_from_file_path(path), Some(expected));
+        }
+    }
+
+    #[test]
+    fn source_pod_id_from_file_path_ignores_unknown_or_empty_roots() {
+        assert_eq!(source_pod_id_from_file_path("/var/log/auth/app.log"), None);
+        assert_eq!(source_pod_id_from_file_path("/var/lib/kubelet/pods/"), None);
+    }
 }
 
 #[cfg(test)]
@@ -1063,6 +1237,8 @@ mod read_accumulation_tests {
             10,
             1,
             &None::<HashMap<String, String>>,
+            None,
+            None,
             SOURCE_TYPE_FILE,
             TP,
             false,
@@ -1089,6 +1265,7 @@ mod read_accumulation_tests {
                 3,
                 &source_context,
                 Some("money-settings"),
+                Some("money-settings-7d9f"),
                 SOURCE_TYPE_FILE,
                 TP,
                 REJECTION_REASON_LINE_TOO_LONG,
@@ -1096,10 +1273,15 @@ mod read_accumulation_tests {
         });
 
         let metrics = snapshotter.snapshot().into_vec();
-        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics.len(), 3);
         let (key, _, _, value) = metrics
             .iter()
-            .find(|(key, _, _, _)| key.key().name() == "delivery_events_total")
+            .find(|(key, _, _, _)| {
+                key.key().name() == "delivery_events_total"
+                    && key.key().labels().any(|label| {
+                        label.key() == "source_pod_id" && label.value() != ALL_SOURCE_PODS_ID
+                    })
+            })
             .expect("delivery metric");
         assert_eq!(key.key().name(), "delivery_events_total");
         assert_eq!(*value, DebugValue::Counter(3));
@@ -1119,9 +1301,29 @@ mod read_accumulation_tests {
         );
         assert_eq!(labels.get("topic"), Some(&"security-log"));
         assert_eq!(labels.get("service_system"), Some(&"money-settings"));
+        assert_eq!(labels.get("source_pod_id"), Some(&"money-settings-7d9f"));
         assert_eq!(labels.get("delivery_method"), Some(&DELIVERY_METHOD_FILE));
         let time_parity = TP.to_string();
         assert_eq!(labels.get("time_parity"), Some(&time_parity.as_str()));
+
+        let aggregate_labels = metrics
+            .iter()
+            .find(|(key, _, _, _)| {
+                key.key().name() == "delivery_events_total"
+                    && key.key().labels().any(|label| {
+                        label.key() == "source_pod_id" && label.value() == ALL_SOURCE_PODS_ID
+                    })
+            })
+            .expect("aggregate delivery metric")
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            aggregate_labels.get("source_pod_id"),
+            Some(&ALL_SOURCE_PODS_ID)
+        );
 
         let (key, _, _, value) = metrics
             .iter()

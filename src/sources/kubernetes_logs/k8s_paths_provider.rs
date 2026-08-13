@@ -69,6 +69,22 @@ fn service_system_from_pod(pod: &Pod) -> Option<String> {
         .map(str::to_string)
 }
 
+fn source_pod_id_from_pod(pod: &Pod) -> Option<String> {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("dblet.dev/pod-name"))
+        .filter(|pod_name| !pod_name.is_empty())
+        .cloned()
+        .or_else(|| {
+            pod.metadata
+                .name
+                .as_ref()
+                .filter(|pod_name| !pod_name.is_empty())
+                .cloned()
+        })
+}
+
 impl K8sPathsProvider {
     /// Create a new [`K8sPathsProvider`].
     pub fn new(
@@ -153,6 +169,7 @@ impl PathsProvider for K8sPathsProvider {
                             pod_uid: pod.metadata.uid.clone().unwrap_or_default().to_string(),
                             container_name,
                             service_system: service_system_from_pod(&pod),
+                            source_pod_id: source_pod_id_from_pod(&pod),
                         }),
                         path,
                     )
@@ -714,6 +731,7 @@ mod tests {
         extract_databricks_pod_logs_directory, extract_excluded_containers_for_pod,
         extract_hostpath_logging_annotation_directory, extract_pod_logs_directory, filter_paths,
         get_databricks_pod_logs_directories, list_pod_log_paths, service_system_from_pod,
+        source_pod_id_from_pod,
     };
 
     fn annotations(entries: Vec<(&str, &str)>) -> BTreeMap<String, String> {
@@ -760,6 +778,41 @@ mod tests {
             service_system_from_pod(&pod).as_deref(),
             Some("annotation-system")
         );
+    }
+
+    #[test]
+    fn source_pod_id_prefers_dblet_annotation() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("kubernetes-pod".to_string()),
+                annotations: Some(annotations(vec![("dblet.dev/pod-name", "dblet-pod")])),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        };
+
+        assert_eq!(source_pod_id_from_pod(&pod).as_deref(), Some("dblet-pod"));
+    }
+
+    #[test]
+    fn source_pod_id_falls_back_to_pod_name() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("kubernetes-pod".to_string()),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        };
+
+        assert_eq!(
+            source_pod_id_from_pod(&pod).as_deref(),
+            Some("kubernetes-pod")
+        );
+    }
+
+    #[test]
+    fn source_pod_id_is_missing_without_supported_metadata() {
+        assert_eq!(source_pod_id_from_pod(&Pod::default()), None);
     }
 
     #[test]

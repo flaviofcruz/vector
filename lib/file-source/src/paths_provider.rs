@@ -50,6 +50,7 @@ pub struct LogFileInfo {
     pub pod_uid: String,
     pub container_name: String,
     pub service_system: Option<String>,
+    pub source_pod_id: Option<String>,
 }
 
 impl<E: FileSourceInternalEvents> Glob<E> {

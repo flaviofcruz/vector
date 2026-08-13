@@ -21,6 +21,8 @@ use super::{Config, path_helpers::parse_log_file_path};
 use crate::event::{Event, LogEvent};
 use vector_lib::file_source::paths_provider::LogFileInfo;
 
+const POD_NAME_ANNOTATION_KEY: &str = "dblet.dev/pod-name";
+
 /// Configuration for how the events are enriched with Pod metadata.
 #[configurable_component]
 #[derive(Clone, Debug)]
@@ -201,14 +203,30 @@ impl PodMetadataAnnotator {
         file: &'a str,
         cached_file_info: Option<LogFileInfo>,
     ) -> Option<LogFileInfo> {
+        self.annotate_with_delivery_metric_metadata(event, file, cached_file_info)
+            .0
+    }
+
+    /// Annotates an event and returns delivery-metric identities resolved from
+    /// the same Pod metadata.
+    pub fn annotate_with_delivery_metric_metadata<'a>(
+        &self,
+        event: &mut Event,
+        file: &'a str,
+        cached_file_info: Option<LogFileInfo>,
+    ) -> (Option<LogFileInfo>, Option<String>, Option<String>) {
         let log = event.as_mut_log();
         let file_info_opt: Option<LogFileInfo> =
             cached_file_info.or_else(|| parse_log_file_path(file));
         if let Some(file_info) = file_info_opt {
             let obj =
                 ObjectRef::<Pod>::new(&(file_info.pod_name)).within(&(file_info.pod_namespace));
-            let resource = self.pods_state_reader.get(&obj)?;
+            let Some(resource) = self.pods_state_reader.get(&obj) else {
+                return (None, None, None);
+            };
             let pod: &Pod = resource.as_ref();
+            let service_system = service_system_from_metadata(&pod.metadata);
+            let source_pod_id = source_pod_id_from_metadata(&pod.metadata);
 
             annotate_from_file_info(log, &self.fields_spec, &file_info, self.log_namespace);
             annotate_from_metadata(log, &self.fields_spec, &pod.metadata, self.log_namespace);
@@ -242,11 +260,44 @@ impl PodMetadataAnnotator {
                     }
                 }
             }
-            Some(file_info)
+            (Some(file_info), service_system, source_pod_id)
         } else {
-            None
+            (None, None, None)
         }
     }
+}
+
+fn service_system_from_metadata(metadata: &ObjectMeta) -> Option<String> {
+    if let Some(system) = metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("system"))
+    {
+        return (!system.is_empty()).then(|| system.clone());
+    }
+
+    metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("databricks/system_uri"))
+        .and_then(|system_uri| system_uri.strip_prefix("system:"))
+        .filter(|system| !system.is_empty())
+        .map(str::to_string)
+}
+
+fn source_pod_id_from_metadata(metadata: &ObjectMeta) -> Option<String> {
+    metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(POD_NAME_ANNOTATION_KEY))
+        .filter(|pod_name| !pod_name.is_empty())
+        .or_else(|| {
+            metadata
+                .name
+                .as_ref()
+                .filter(|pod_name| !pod_name.is_empty())
+        })
+        .cloned()
 }
 
 fn annotate_from_file_info(
@@ -507,6 +558,108 @@ mod tests {
     use vector_lib::lookup::{event_path, metadata_path};
 
     use super::*;
+
+    #[test]
+    fn service_system_prefers_pod_label() {
+        let metadata = ObjectMeta {
+            labels: Some(
+                [("system".to_string(), "label-system".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            annotations: Some(
+                [(
+                    "databricks/system_uri".to_string(),
+                    "system:annotation-system".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..ObjectMeta::default()
+        };
+
+        assert_eq!(
+            service_system_from_metadata(&metadata).as_deref(),
+            Some("label-system")
+        );
+    }
+
+    #[test]
+    fn service_system_falls_back_to_system_uri_annotation() {
+        let metadata = ObjectMeta {
+            annotations: Some(
+                [(
+                    "databricks/system_uri".to_string(),
+                    "system:annotation-system".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..ObjectMeta::default()
+        };
+
+        assert_eq!(
+            service_system_from_metadata(&metadata).as_deref(),
+            Some("annotation-system")
+        );
+    }
+
+    #[test]
+    fn service_system_is_missing_without_supported_metadata() {
+        assert_eq!(service_system_from_metadata(&ObjectMeta::default()), None);
+
+        let metadata = ObjectMeta {
+            annotations: Some(
+                [(
+                    "databricks/system_uri".to_string(),
+                    "annotation-system".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..ObjectMeta::default()
+        };
+        assert_eq!(service_system_from_metadata(&metadata), None);
+    }
+
+    #[test]
+    fn source_pod_id_prefers_dblet_pod_name_annotation() {
+        let metadata = ObjectMeta {
+            name: Some("mirror-pod-with-node-suffix".to_string()),
+            annotations: Some(
+                [(
+                    POD_NAME_ANNOTATION_KEY.to_string(),
+                    "shadow-pod".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..ObjectMeta::default()
+        };
+
+        assert_eq!(
+            source_pod_id_from_metadata(&metadata).as_deref(),
+            Some("shadow-pod")
+        );
+    }
+
+    #[test]
+    fn source_pod_id_falls_back_to_metadata_name() {
+        let metadata = ObjectMeta {
+            name: Some("service-pod-abcde".to_string()),
+            ..ObjectMeta::default()
+        };
+
+        assert_eq!(
+            source_pod_id_from_metadata(&metadata).as_deref(),
+            Some("service-pod-abcde")
+        );
+    }
+
+    #[test]
+    fn source_pod_id_is_missing_without_supported_metadata() {
+        assert_eq!(source_pod_id_from_metadata(&ObjectMeta::default()), None);
+    }
 
     #[test]
     fn test_annotate_from_metadata() {

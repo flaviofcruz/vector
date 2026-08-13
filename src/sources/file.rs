@@ -10,6 +10,7 @@ use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 use tracing::{Instrument, Span};
+use vector_common::internal_event::vector_event::delivery_event::source_pod_id_from_file_path;
 use vector_lib::codecs::{BytesDeserializer, BytesDeserializerConfig};
 use vector_lib::configurable::configurable_component;
 use vector_lib::file_source::{
@@ -1006,6 +1007,8 @@ fn create_event(
         message_bytes,
         1,
         &meta.source_context,
+        None,
+        source_pod_id_from_file_path(file),
         vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
         time_parity,
         true,

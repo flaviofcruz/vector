@@ -29,6 +29,7 @@ use vector_common::internal_event::{
     delivery_singleton,
     vector_event::delivery_event::{
         REJECTION_REASON_LINE_TOO_LONG, current_hour_time_parity_ms_value,
+        source_pod_id_from_file_path,
     },
 };
 
@@ -112,6 +113,13 @@ where
                 .emit_file_line_too_long(buf, self.max_line_bytes, buf.len());
         }
 
+        let file_info = self.file_to_pod_map.as_ref().and_then(|file_to_pod_map| {
+            file_to_pod_map
+                .lock()
+                .expect("file-to-pod map lock poisoned")
+                .get(path)
+                .cloned()
+        });
         let service_system = self
             .source_context
             .as_ref()
@@ -119,13 +127,17 @@ where
             .filter(|system| !system.is_empty())
             .cloned()
             .or_else(|| {
-                self.file_to_pod_map.as_ref().and_then(|file_to_pod_map| {
-                    file_to_pod_map
-                        .lock()
-                        .expect("file-to-pod map lock poisoned")
-                        .get(path)
-                        .and_then(|file_info| file_info.service_system.clone())
-                })
+                file_info
+                    .as_ref()
+                    .and_then(|info| info.service_system.clone())
+            });
+        let source_pod_id = file_info
+            .as_ref()
+            .and_then(|info| info.source_pod_id.clone())
+            .or_else(|| {
+                path.to_str()
+                    .and_then(source_pod_id_from_file_path)
+                    .map(str::to_string)
             });
 
         delivery_singleton().emit_rejected(
@@ -133,6 +145,7 @@ where
             discarded.len(),
             &self.source_context,
             service_system.as_deref(),
+            source_pod_id.as_deref(),
             self.source_type,
             current_hour_time_parity_ms_value(),
             REJECTION_REASON_LINE_TOO_LONG,
@@ -526,11 +539,15 @@ where
                     // inline; only the VEL `info!` log is batched by the
                     // process-global delivery singleton. `source_context` is
                     // borrowed and only cloned on first sight of this path.
+                    let path = watcher.path.to_str().expect("not a valid path");
+                    let source_pod_id = source_pod_id_from_file_path(path);
                     delivery_singleton().accumulate_read(
-                        watcher.path.to_str().expect("not a valid path").to_owned(),
+                        path.to_owned(),
                         bytes_read,
                         lines_read,
                         &self.source_context,
+                        None,
+                        source_pod_id,
                         self.source_type,
                         vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value(),
                         false,
@@ -1254,6 +1271,7 @@ mod tests {
             pod_uid: "pod-uid".to_string(),
             container_name: "DEFAULT_CONTAINER_NAME".to_string(),
             service_system: Some("spark-driver".to_string()),
+            source_pod_id: Some("driver-pod".to_string()),
         }
     }
 

@@ -1298,6 +1298,8 @@ impl Source {
                 Box::new(events)
             };
         let events = messages.map(move |line| {
+            let message_bytes = line.text.len();
+            let time_parity = vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value();
             let mut event = create_event(
                 line.text,
                 &line.filename,
@@ -1306,6 +1308,7 @@ impl Source {
                 ingestion_timestamp_field.as_ref(),
                 log_namespace,
                 &self.source_context,
+                time_parity,
             );
 
             let cached_file_info = file_to_pod_map
@@ -1313,7 +1316,27 @@ impl Source {
                 .unwrap()
                 .get(&PathBuf::from(&line.filename))
                 .cloned();
-            let file_info = annotator.annotate(&mut event, &line.filename, cached_file_info.clone());
+            let (file_info, service_system, source_pod_id) = annotator
+                .annotate_with_delivery_metric_metadata(
+                    &mut event,
+                    &line.filename,
+                    cached_file_info.clone(),
+                );
+
+            // Pod metadata is available only after annotation. Emit the read
+            // counter here so it carries the source service identity while
+            // preserving the existing post-multiline event count.
+            delivery_singleton().accumulate_read(
+                line.filename.clone(),
+                message_bytes,
+                1,
+                &self.source_context,
+                service_system.as_deref(),
+                source_pod_id.as_deref(),
+                vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
+                time_parity,
+                true,
+            );
 
             emit!(KubernetesLogsEventsReceived {
                 file: &line.filename,
@@ -1454,6 +1477,7 @@ fn create_event(
     ingestion_timestamp_field: Option<&OwnedTargetPath>,
     log_namespace: LogNamespace,
     source_context: &Option<HashMap<String, String>>,
+    time_parity: i64,
 ) -> Event {
     // Raw read byte count, captured before `line` is moved into the deserializer.
     let message_bytes = line.len();
@@ -1502,26 +1526,6 @@ fn create_event(
             log.insert(path.as_str(), value.clone());
         }
     };
-
-    // Discovery-time hour bucket, stamped onto the event (below) so the
-    // staged/delivered legs bucket on the same value. Also passed to the
-    // immediate read counter so the metric buckets on the same read-time value.
-    let time_parity =
-        vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value();
-
-    // Post-multiline read spot (gated on EMIT_READ_EVENT_AFTER_MULTILINE_AGG).
-    // The `delivery_events_total` counter fires immediately; only the VEL
-    // `info!` log is batched through the singleton. Reports the raw read byte
-    // count rather than the in-memory estimated_json_encoded_size_of() estimate.
-    delivery_singleton().accumulate_read(
-        file.to_string(),
-        message_bytes,
-        1,
-        source_context,
-        vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
-        time_parity,
-        true,
-    );
 
     // Carry the discovery-time bucket downstream for the woodchuck VRL wrappers to
     // copy into logMetadata.timeParity (see file.rs for the rationale).
