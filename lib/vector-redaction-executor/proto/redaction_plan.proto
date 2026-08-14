@@ -82,10 +82,15 @@ message FieldAction {
     MapStripValue map_strip_value = 5;
     // Keep a tagged value only if its runtime label is centralizable.
     RedactTag redact_tag = 6;
-    // Centralizable string (PassThrough until shape enforcement lands).
+    // Centralizable string; enforces shape constraints via allowed_shapes.
     PassThroughString pass_through_string = 7;
-    // (-- TODO: additive arms for the deferred opcodes when implemented:
-    // RedactFrom (8), GenericAny (9), EmptyString (10), TodoRemove (11). --)
+    // Derive this field's value from a sibling source field via a transform (Phase 1: HMAC hash).
+    RedactFrom redact_from = 8;
+    // (-- GenericAny (9) stays deferred: it needs Any type resolution the executor lacks. --)
+    // Re-emit the field as a zero-length string (blank the value, keep presence).
+    EmptyString empty_string = 10;
+    // Drop the field (planner fail-safe for an unresolvable redaction).
+    TodoRemove todo_remove = 11;
   }
 }
 
@@ -108,6 +113,59 @@ message PassThroughString {
   // comment): matches ANY => kept. Empty means "declares no shape" — verbatim when enforcement is
   // Off, dropped when enforcement is On.
   repeated compliance.DataShape allowed_shapes = 1;
+}
+
+// Derive this field's value from a sibling source field's cleartext via a transform (1:1 with the
+// planner's REDACT_FROM opcode). Execution is a two-pass walk: Pass 1 collects the source value (it
+// may appear after the target in wire order), Pass 2 emits the derived value. Phase 1 implements only
+// HMAC_HASH; any other transform fails closed at serialization.
+message RedactFrom {
+  // Field number of the cleartext source field on the same message. A self-hash (a field that hashes
+  // its own value in place) points this at its own field number.
+  optional int32 source_field_number = 1;
+
+  // Derivation to apply to the collected source value. Phase 1 implements only HMAC_HASH.
+  optional RedactFromTransform transform = 2;
+
+  // Shape enforcement for the derived value (the planner's @Nullable DataShapeValidator[]). Absent =
+  // no enforcement (a non-centralizable self-hash); present = a centralizable target, kept under the
+  // runtime gate iff it matches one of `shapes` (an empty `shapes` wipes it). The wrapper gives the
+  // arm presence, keeping absent distinct from present-but-empty.
+  optional DerivedShapes derived_shapes = 3;
+
+  // True when the target (this) field is repeated: emit one derived value per collected source
+  // occurrence; false emits a single value from the last source occurrence.
+  // (-- named is_repeated, not `repeated`, which is a protobuf keyword and cannot be a field name. --)
+  optional bool is_repeated = 4;
+
+  // Wrapper giving `derived_shapes` message presence (see the field comment above).
+  message DerivedShapes {
+    // (compliance.data_shape) annotations to enforce on the derived value; an empty list means the
+    // target is centralizable but declares no shape, so it is wiped under the gate.
+    repeated compliance.DataShape shapes = 1;
+  }
+}
+
+// Transform applied to a RedactFrom source value (a subset of the planner's RedactFromTransform:
+// only the transforms the executor implements are enumerated). Phase 1 implements HMAC_HASH only.
+enum RedactFromTransform {
+  // Default when the transform is unset or unrecognized. A serialized plan must never carry this
+  // value; the executor treats it as a coverage gap and fails closed.
+  REDACT_FROM_TRANSFORM_UNSPECIFIED = 0;
+  // HMAC-SHA-512 the source value with the fleet hashing key, in the legacy signed-decimal encoding.
+  REDACT_FROM_TRANSFORM_HMAC_HASH = 1;
+}
+
+// Re-emit the field as a zero-length string (tag + 0-length prefix): blanks the value while keeping
+// the field present. 1:1 with the planner's EMPTY_STRING opcode (custom_redactor = EMPTY).
+message EmptyString {}
+
+// Drop the field, exactly like Remove. The planner's fail-safe fallback for a field whose redaction
+// couldn't be resolved. 1:1 with the planner's TODO_REMOVE opcode; the description is carried for
+// debugging/round-trip fidelity but does not affect redaction.
+message TodoRemove {
+  // Why the field's redaction couldn't be resolved. Debug/trace only; never gates redaction.
+  optional string description = 1;
 }
 
 // map<K, V> with a centralizable key but non-centralizable value: keep the key, strip the value.

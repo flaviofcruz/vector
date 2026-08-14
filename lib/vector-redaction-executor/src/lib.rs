@@ -10,10 +10,13 @@
 //!
 //! The engine walks the record's proto wire bytes tag-by-tag, looks up each field's [`FieldAction`]
 //! in the plan, and copies, drops, recurses into, or rewrites the field accordingly, emitting
-//! redacted wire bytes. It handles the structural opcodes only (PassThrough / PassThroughString /
-//! Remove / Recurse / MapEntry / MapStripValue / RedactTag); the deferred opcodes (RedactFrom /
-//! GenericAny / EmptyString / TodoRemove) never appear in a serialized plan. The executor fails
-//! closed on any `FieldAction` whose `oneof` is unset — never emitting the input unredacted.
+//! redacted wire bytes. It handles the structural opcodes (PassThrough / PassThroughString / Remove
+//! / EmptyString / TodoRemove / Recurse / MapEntry / MapStripValue / RedactTag) plus the `RedactFrom`
+//! derivation (Phase 1: HMAC_HASH). Derivation needs the fleet HMAC key, so it is only reachable via
+//! [`register_plan_with_key`]; the keyless [`register_plan`] entry point rejects any plan carrying a
+//! `RedactFrom` (so that path stays fail-closed until the key is provisioned). GenericAny never
+//! appears in a serialized plan. The executor also fails closed on any `FieldAction` whose `oneof`
+//! is unset — never emitting the input unredacted.
 //!
 //! Vendored copy; kept in sync with its upstream source. The only difference is the plan-proto
 //! binding below: `build.rs` (prost-build) emits it into `OUT_DIR` and it is `include!`d as the
@@ -29,12 +32,14 @@
 //! universe's canonical executor does NOT yet have it. See the `TODO(vendored)` on
 //! [`MAX_RECURSION_DEPTH`] — the fix must be ported upstream and re-vendored to converge.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
+use hmac::{Hmac, Mac};
 use plan_proto::field_action::Action;
 use prost::Message;
+use sha2::Sha512;
 
 mod shape;
 
@@ -165,13 +170,52 @@ type PlanRegistry = HashMap<u64, Arc<RegisteredPlan>>;
 struct RegisteredPlan {
     plan_set: plan_proto::RedactionPlanSet,
     action_index: Vec<HashMap<u32, usize>>,
+    /// Per-plan `RedactFrom` actions, sorted ascending by target field number. The Java redactor
+    /// emits derived fields in field-number order, so matching it keeps output byte-identical.
+    redact_from: Vec<Vec<PreparedRedactFrom>>,
+    /// Per-plan set of source field numbers referenced by any `RedactFrom` — the fields Pass 1
+    /// collects the cleartext of before Pass 2 emits the derived values.
+    source_fields: Vec<HashSet<u32>>,
+    /// Fleet HMAC key for HMAC_HASH derivation. Required (and non-empty) iff any plan carries a
+    /// `RedactFrom`; `None` on the keyless path, which rejects such plans.
+    hmac_key: Option<Vec<u8>>,
+}
+
+/// Shape-enforcement state of a `RedactFrom`'s derived value, mirroring the Java planner's
+/// `@Nullable DataShapeValidator[]` tri-state (the `derived_shapes` wrapper's message presence):
+/// `Absent` = no enforcement (a non-centralizable self-hash), always emitted; `Empty` = a
+/// centralizable target that declares no shape, wiped when enforcement is `On`; `Shapes` = kept when
+/// enforcement is `On` iff the derived value matches one of the shapes.
+enum DerivedShapesState {
+    Absent,
+    Empty,
+    Shapes(Vec<i32>),
+}
+
+/// A `RedactFrom` action prepared once at registration: the derived (target) field to emit, the
+/// sibling source field whose cleartext is hashed, whether the target is repeated, and how to
+/// shape-enforce the derived value.
+struct PreparedRedactFrom {
+    target_field_number: u32,
+    source_field_number: u32,
+    is_repeated: bool,
+    derived_shapes: DerivedShapesState,
 }
 
 impl RegisteredPlan {
-    /// Decodes the per-plan action index from `plan_set`. Proto field numbers are >= 1; an
-    /// absent/invalid field number is ignored.
-    fn new(plan_set: plan_proto::RedactionPlanSet) -> Self {
-        let action_index = plan_set
+    /// Decodes the per-plan action index, the `RedactFrom` derivation index, and the source-field
+    /// collect sets from `plan_set`, validating the derivation contract. Proto field numbers are
+    /// >= 1; an absent/invalid field number is ignored.
+    ///
+    /// Fails closed at registration when a `RedactFrom` is malformed (unset/unsupported transform,
+    /// missing source/target field number, missing `is_repeated`), when a source field is not
+    /// dropped (would leak cleartext), or when any plan carries a `RedactFrom` but no non-empty
+    /// `hmac_key` was supplied — so a keyless registration can never execute a derivation.
+    fn new(
+        plan_set: plan_proto::RedactionPlanSet,
+        hmac_key: Option<Vec<u8>>,
+    ) -> Result<Self, RedactError> {
+        let action_index: Vec<HashMap<u32, usize>> = plan_set
             .plans
             .iter()
             .map(|plan| {
@@ -186,10 +230,111 @@ impl RegisteredPlan {
                 map
             })
             .collect();
-        RegisteredPlan {
+
+        let mut redact_from: Vec<Vec<PreparedRedactFrom>> =
+            Vec::with_capacity(plan_set.plans.len());
+        let mut source_fields: Vec<HashSet<u32>> = Vec::with_capacity(plan_set.plans.len());
+        let mut any_redact_from = false;
+        for (plan_index, plan) in plan_set.plans.iter().enumerate() {
+            let mut prepared = Vec::new();
+            let mut sources = HashSet::new();
+            for entry in &plan.actions {
+                let Some(Action::RedactFrom(rf)) =
+                    entry.action.as_ref().and_then(|a| a.action.as_ref())
+                else {
+                    continue;
+                };
+                let target_field_number = match entry.field_number {
+                    Some(n) if n > 0 => n as u32,
+                    _ => {
+                        return Err(RedactError::InvalidPlan(format!(
+                            "RedactFrom in plan {plan_index} has no target field number"
+                        )));
+                    }
+                };
+                // Phase 1 executes only HMAC_HASH; any other/unset transform is a coverage gap.
+                if rf.transform != Some(plan_proto::RedactFromTransform::HmacHash as i32) {
+                    return Err(RedactError::InvalidPlan(format!(
+                        "RedactFrom on field {target_field_number} in plan {plan_index} has an \
+                         unsupported transform {:?} (only HMAC_HASH is implemented)",
+                        rf.transform
+                    )));
+                }
+                let source_field_number = match rf.source_field_number {
+                    Some(n) if n > 0 => n as u32,
+                    _ => {
+                        return Err(RedactError::InvalidPlan(format!(
+                            "RedactFrom on field {target_field_number} in plan {plan_index} has no \
+                             source field number"
+                        )));
+                    }
+                };
+                // The serializer always sets is_repeated; absent → malformed plan (the JVM
+                // deserializer rejects it too). Fail closed rather than default to scalar.
+                let Some(is_repeated) = rf.is_repeated else {
+                    return Err(RedactError::InvalidPlan(format!(
+                        "RedactFrom on field {target_field_number} in plan {plan_index} has no \
+                         is_repeated set"
+                    )));
+                };
+                // Source-drop invariant: the cleartext source must not be emitted, so its action in
+                // this plan must be Remove/TodoRemove or absent (dropped by the allowlist default).
+                // A self-hash (source == target) is fine — the target's own RedactFrom arm drops the
+                // incoming value in dispatch. Anything else would leave cleartext next to the hash.
+                let source_dropped = source_field_number == target_field_number
+                    || match action_index[plan_index].get(&source_field_number) {
+                        None => true,
+                        Some(&entry_index) => matches!(
+                            plan.actions[entry_index]
+                                .action
+                                .as_ref()
+                                .and_then(|a| a.action.as_ref()),
+                            Some(Action::Remove(_) | Action::TodoRemove(_))
+                        ),
+                    };
+                if !source_dropped {
+                    return Err(RedactError::InvalidPlan(format!(
+                        "RedactFrom on field {target_field_number} in plan {plan_index}: source \
+                         field {source_field_number} must be dropped (Remove) to preserve the \
+                         source-drop invariant, but its plan action would emit it"
+                    )));
+                }
+                let derived_shapes = match &rf.derived_shapes {
+                    None => DerivedShapesState::Absent,
+                    Some(ds) if ds.shapes.is_empty() => DerivedShapesState::Empty,
+                    Some(ds) => DerivedShapesState::Shapes(ds.shapes.clone()),
+                };
+                sources.insert(source_field_number);
+                prepared.push(PreparedRedactFrom {
+                    target_field_number,
+                    source_field_number,
+                    is_repeated,
+                    derived_shapes,
+                });
+            }
+            any_redact_from |= !prepared.is_empty();
+            prepared.sort_by_key(|p| p.target_field_number);
+            redact_from.push(prepared);
+            source_fields.push(sources);
+        }
+
+        // A RedactFrom needs a non-empty HMAC key (the JVM HashingUtils rejects an empty key, so
+        // matching keeps the Rust output authoritative). Enforced only when a RedactFrom is present.
+        if any_redact_from && !matches!(hmac_key.as_deref(), Some(key) if !key.is_empty()) {
+            return Err(RedactError::InvalidPlan(
+                "plan carries a RedactFrom (HMAC_HASH) action but no non-empty HMAC key was \
+                 provided; register via register_plan_with_key with the fleet key"
+                    .to_string(),
+            ));
+        }
+
+        Ok(RegisteredPlan {
             plan_set,
             action_index,
-        }
+            redact_from,
+            source_fields,
+            hmac_key,
+        })
     }
 }
 
@@ -216,7 +361,20 @@ static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 /// Decodes and validates `plan_bytes` once, caching it under a fresh handle so repeated [`redact`]
 /// calls for the same plan skip re-parsing it. Callers must eventually pass the handle to
 /// [`release_plan`].
+/// This keyless entry point cannot execute a `RedactFrom` derivation: [`RegisteredPlan::new`] fails
+/// closed when a plan carries one but no HMAC key was supplied. To run derivations, register via
+/// [`register_plan_with_key`] with the fleet HMAC key.
 pub fn register_plan(plan_bytes: &[u8]) -> Result<u64, RedactError> {
+    register_plan_with_key(plan_bytes, None)
+}
+
+/// Like [`register_plan`], but supplies the fleet HMAC key used by HMAC_HASH `RedactFrom`
+/// derivations. Registering a plan that carries a `RedactFrom` requires a non-empty key; the keyless
+/// [`register_plan`] rejects such plans.
+pub fn register_plan_with_key(
+    plan_bytes: &[u8],
+    hmac_key: Option<&[u8]>,
+) -> Result<u64, RedactError> {
     // Decode here so a malformed contract fails at the boundary rather than silently mis-redacting
     // (also exercises the prost binding).
     let plan_set =
@@ -227,10 +385,11 @@ pub fn register_plan(plan_bytes: &[u8]) -> Result<u64, RedactError> {
         return Err(RedactError::InvalidPlan("plans table is empty".to_string()));
     }
 
-    // Build the per-plan action index once here so repeated `redact` calls on this handle reuse it
-    // rather than rebuilding it per record.
+    // Build the per-plan action / derivation indexes once here (validating the RedactFrom contract)
+    // so repeated `redact` calls on this handle reuse them rather than rebuilding per record.
+    let registered = RegisteredPlan::new(plan_set, hmac_key.map(<[u8]>::to_vec))?;
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    registry_guard().insert(handle, Arc::new(RegisteredPlan::new(plan_set)));
+    registry_guard().insert(handle, Arc::new(registered));
     Ok(handle)
 }
 
@@ -288,6 +447,15 @@ struct WireReader<'a> {
 impl<'a> WireReader<'a> {
     fn new(buf: &'a [u8]) -> Self {
         WireReader { buf, pos: 0 }
+    }
+
+    /// A second cursor over the same buffer at this reader's current position, for the `RedactFrom`
+    /// Pass-1 source scan (which reads the whole message ahead without disturbing the Pass-2 walk).
+    fn fork(&self) -> WireReader<'a> {
+        WireReader {
+            buf: self.buf,
+            pos: self.pos,
+        }
     }
 
     fn position(&self) -> usize {
@@ -436,6 +604,9 @@ fn tag_size(field_number: u32) -> usize {
 struct PlanTable<'a> {
     plans: &'a [plan_proto::MessageRedactionPlan],
     action_index: &'a [HashMap<u32, usize>],
+    redact_from: &'a [Vec<PreparedRedactFrom>],
+    source_fields: &'a [HashSet<u32>],
+    hmac_key: Option<&'a [u8]>,
 }
 
 impl<'a> PlanTable<'a> {
@@ -443,7 +614,23 @@ impl<'a> PlanTable<'a> {
         PlanTable {
             plans: &registered.plan_set.plans,
             action_index: &registered.action_index,
+            redact_from: &registered.redact_from,
+            source_fields: &registered.source_fields,
+            hmac_key: registered.hmac_key.as_deref(),
         }
+    }
+
+    /// The `RedactFrom` actions at `plan_index`, sorted ascending by target field number. Empty for
+    /// a plan (or out-of-range index) with no derivations.
+    fn redact_from(&self, plan_index: usize) -> &'a [PreparedRedactFrom] {
+        self.redact_from.get(plan_index).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether `field_number` at `plan_index` is a source field some `RedactFrom` derives from.
+    fn is_source(&self, plan_index: usize, field_number: u32) -> bool {
+        self.source_fields
+            .get(plan_index)
+            .is_some_and(|s| s.contains(&field_number))
     }
 
     /// Looks up the action for `field_number` in the plan at `plan_index`.
@@ -498,7 +685,51 @@ fn process_message(
     if depth > MAX_RECURSION_DEPTH {
         return Err(RedactError::RecursionLimitExceeded(MAX_RECURSION_DEPTH));
     }
+
+    let redact_from = table.redact_from(plan_index);
+
+    // Fast path: no derivations at this level — a single pass, unchanged.
+    if redact_from.is_empty() {
+        while let Some((field_number, wire_type)) = reader.read_tag()? {
+            match table.action(plan_index, field_number)? {
+                None => drop_field(reader, wire_type)?,
+                Some(action) => dispatch(
+                    reader,
+                    out,
+                    table,
+                    field_number,
+                    wire_type,
+                    action,
+                    depth,
+                    enforcement,
+                )?,
+            }
+        }
+        return Ok(());
+    }
+
+    // Derivation levels are two-pass (mirrors the Java redactor): a derived (target) field is
+    // computed from a sibling source field that may appear after it in wire order, so Pass 1 scans
+    // ahead to collect the source cleartext, then Pass 2 walks the record and emits derived fields
+    // interleaved in ascending target-field order.
+    let collected = collect_sources(&mut reader.fork(), table, plan_index)?;
+
+    let mut next_derived = 0usize;
     while let Some((field_number, wire_type)) = reader.read_tag()? {
+        // Emit derived fields ordered strictly before this input field (a target equal to the
+        // current field waits — that field is the target's own RedactFrom entry, dropped below).
+        while next_derived < redact_from.len()
+            && redact_from[next_derived].target_field_number < field_number
+        {
+            emit_redact_from(
+                out,
+                &redact_from[next_derived],
+                &collected,
+                table.hmac_key,
+                enforcement,
+            )?;
+            next_derived += 1;
+        }
         match table.action(plan_index, field_number)? {
             None => drop_field(reader, wire_type)?,
             Some(action) => dispatch(
@@ -512,6 +743,17 @@ fn process_message(
                 enforcement,
             )?,
         }
+    }
+    // Derived fields whose target is greater than every input field: emit at the end.
+    while next_derived < redact_from.len() {
+        emit_redact_from(
+            out,
+            &redact_from[next_derived],
+            &collected,
+            table.hmac_key,
+            enforcement,
+        )?;
+        next_derived += 1;
     }
     Ok(())
 }
@@ -573,6 +815,17 @@ fn dispatch(
         Action::RedactTag(redact_tag) => {
             handle_redact_tag(reader, out, field_number, wire_type, redact_tag)
         }
+        // Drop the input value, re-emit the field as an empty string (tag + zero-length prefix),
+        // preserving presence while blanking content (custom_redactor = EMPTY).
+        Action::EmptyString(_) => handle_empty_string(reader, out, field_number, wire_type),
+        // Drop the field, exactly like Remove — the planner's fail-safe fallback for an unresolvable
+        // redaction. The carried `description` is debug-only and ignored here.
+        Action::TodoRemove(_) => drop_field(reader, wire_type),
+        // The derived value is emitted by `process_message` (interleaved in target-field order from
+        // the Pass-1 source scan), not here. An incoming target field on the wire — rare, since the
+        // emitter normally does not populate the derived field — is dropped so a caller-supplied
+        // value can neither leak nor double-emit alongside the derived one.
+        Action::RedactFrom(_) => drop_field(reader, wire_type),
     }
 }
 
@@ -622,6 +875,165 @@ fn drop_field(reader: &mut WireReader, wire_type: u32) -> Result<(), RedactError
             "cannot drop wire type {other}"
         ))),
     }
+}
+
+/// EMPTY_STRING: drop the input value and re-emit the field as a zero-length string (tag + 0-length
+/// prefix), preserving presence while blanking content. Only a length-delimited field can be blanked
+/// to a zero-length value; for any other wire type the field is simply dropped.
+fn handle_empty_string(
+    reader: &mut WireReader,
+    out: &mut Vec<u8>,
+    field_number: u32,
+    wire_type: u32,
+) -> Result<(), RedactError> {
+    drop_field(reader, wire_type)?;
+    if wire_type == wire_type::LENGTH_DELIMITED {
+        write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
+        write_varint(out, 0);
+    }
+    Ok(())
+}
+
+/// Pass 1 of a derivation level: scans the whole message (via a forked reader) and collects each
+/// `RedactFrom` source field's value as the string it will be hashed as, keyed by field number and
+/// preserving wire-encounter order (so a repeated target emits one derived value per occurrence in
+/// order). Mirrors the JVM `StreamingProtoRedactor.collectField` / `CollectedValues.valueAsString`:
+///
+/// - VARINT / FIXED64 / FIXED32 sources render as the signed-decimal `Long.toString` of the value
+///   (FIXED32 sign-extended to 64 bits).
+/// - A length-delimited source is read as a UTF-8 string; invalid UTF-8 aborts the whole record
+///   (fail closed), matching the JVM `readString()` throw.
+/// - A length-delimited source whose plan action is `Recurse` is a nested message, not a string; the
+///   JVM recurses instead of reading it as a string, so it is never a hash source. Skip it (the
+///   derived field is then treated as absent).
+fn collect_sources(
+    reader: &mut WireReader,
+    table: &PlanTable,
+    plan_index: usize,
+) -> Result<HashMap<u32, Vec<String>>, RedactError> {
+    let mut collected: HashMap<u32, Vec<String>> = HashMap::new();
+    while let Some((field_number, wire_type)) = reader.read_tag()? {
+        if !table.is_source(plan_index, field_number) {
+            drop_field(reader, wire_type)?;
+            continue;
+        }
+        let rendered: Option<String> = match wire_type {
+            wire_type::VARINT => Some((reader.read_varint64()? as i64).to_string()),
+            wire_type::FIXED64 => {
+                let bytes = reader.take_slice(8)?;
+                let v = i64::from_le_bytes(bytes.try_into().expect("take_slice(8) yields 8 bytes"));
+                Some(v.to_string())
+            }
+            wire_type::FIXED32 => {
+                let bytes = reader.take_slice(4)?;
+                let v = i32::from_le_bytes(bytes.try_into().expect("take_slice(4) yields 4 bytes"));
+                Some(i64::from(v).to_string())
+            }
+            wire_type::LENGTH_DELIMITED => {
+                let length = reader.read_varint32()? as usize;
+                let bytes = reader.take_slice(length)?;
+                if matches!(
+                    table.action(plan_index, field_number)?,
+                    Some(Action::Recurse(_))
+                ) {
+                    None
+                } else {
+                    let value = std::str::from_utf8(bytes).map_err(|_| {
+                        RedactError::MalformedRecord(format!(
+                            "RedactFrom source field {field_number} is not valid UTF-8"
+                        ))
+                    })?;
+                    Some(value.to_string())
+                }
+            }
+            other => {
+                return Err(RedactError::MalformedRecord(format!(
+                    "unsupported wire type {other} for RedactFrom source field {field_number}"
+                )));
+            }
+        };
+        if let Some(value) = rendered {
+            collected.entry(field_number).or_default().push(value);
+        }
+    }
+    Ok(collected)
+}
+
+/// Emits the derived field(s) for one `RedactFrom` action from the Pass-1 `collected` source values.
+/// A repeated target emits one derived value per collected source occurrence (in order); a scalar
+/// target emits a single value from the last occurrence (matching the JVM `CollectedValues`). If the
+/// source field was absent from the record, nothing is emitted.
+fn emit_redact_from(
+    out: &mut Vec<u8>,
+    prepared: &PreparedRedactFrom,
+    collected: &HashMap<u32, Vec<String>>,
+    hmac_key: Option<&[u8]>,
+    enforcement: ShapeEnforcement,
+) -> Result<(), RedactError> {
+    let Some(values) = collected.get(&prepared.source_field_number) else {
+        return Ok(());
+    };
+    // The key is validated present + non-empty at registration whenever a plan carries a RedactFrom;
+    // this guard keeps the invariant explicit and fails closed rather than emitting an unkeyed hash.
+    let key = hmac_key.ok_or_else(|| {
+        RedactError::InvalidPlan("RedactFrom reached execution without an HMAC key".to_string())
+    })?;
+    if prepared.is_repeated {
+        for value in values {
+            emit_one_derived(out, prepared, value, key, enforcement);
+        }
+    } else if let Some(last) = values.last() {
+        emit_one_derived(out, prepared, last, key, enforcement);
+    }
+    Ok(())
+}
+
+/// Hashes one already-rendered source string and, subject to `derived_shapes` enforcement, emits it
+/// as the target field (a length-delimited string). The `derived_shapes` tri-state mirrors the
+/// `PassThroughString` gate: `Absent` → always emit; `Empty` → emit only when enforcement is off
+/// (wiped under the gate); `Shapes` → emit when enforcement is off, or when a declared shape matches.
+fn emit_one_derived(
+    out: &mut Vec<u8>,
+    prepared: &PreparedRedactFrom,
+    source: &str,
+    key: &[u8],
+    enforcement: ShapeEnforcement,
+) {
+    let hashed = hmac_hash(key, source);
+    let keep = match &prepared.derived_shapes {
+        DerivedShapesState::Absent => true,
+        DerivedShapesState::Empty => enforcement == ShapeEnforcement::Off,
+        DerivedShapesState::Shapes(shapes) => {
+            enforcement == ShapeEnforcement::Off || shape::is_allowed_shape(shapes, &hashed)
+        }
+    };
+    if keep {
+        write_tag(
+            out,
+            prepared.target_field_number,
+            wire_type::LENGTH_DELIMITED,
+        );
+        write_varint(out, hashed.len() as u64);
+        out.extend_from_slice(hashed.as_bytes());
+    }
+}
+
+/// HMAC-SHA-512 of `value` under `key`, rendered in the legacy signed-decimal "mkString" encoding:
+/// the 64 MAC bytes each rendered as a signed decimal (`i8`, -128..=127) and concatenated with no
+/// separator. This is the wire format classic Lumberjack has written for years and downstream joins
+/// depend on byte-for-byte (Scala `HashingUtils(key).hash(value).mkString`), so it must not be
+/// "fixed" to hex. Both `value` and `key` are hashed as their UTF-8 bytes.
+fn hmac_hash(key: &[u8], value: &str) -> String {
+    // `Hmac::new_from_slice` accepts a key of any length, so this construction never errors.
+    let mut mac =
+        Hmac::<Sha512>::new_from_slice(key).expect("HMAC-SHA-512 accepts a key of any length");
+    mac.update(value.as_bytes());
+    let bytes = mac.finalize().into_bytes(); // 64 bytes
+    let mut encoded = String::with_capacity(bytes.len() * 4);
+    for byte in bytes.iter() {
+        encoded.push_str(&(*byte as i8).to_string());
+    }
+    encoded
 }
 
 /// Enforces a `PassThroughString` field's declared data shapes: keep the string iff at least one
@@ -920,12 +1332,51 @@ mod tests {
         record: &[u8],
         enforcement: ShapeEnforcement,
     ) -> Result<Vec<u8>, RedactError> {
-        let registered = RegisteredPlan::new(plan_set.clone());
+        try_run_keyed(plan_set, record, None, enforcement)
+    }
+
+    /// Like [`try_run_with`] but supplies an HMAC key, so `RedactFrom` (HMAC_HASH) plans register and
+    /// execute. Surfaces a registration error too, so fail-closed derivation tests can assert it.
+    fn try_run_keyed(
+        plan_set: &plan_proto::RedactionPlanSet,
+        record: &[u8],
+        hmac_key: Option<&[u8]>,
+        enforcement: ShapeEnforcement,
+    ) -> Result<Vec<u8>, RedactError> {
+        let registered = RegisteredPlan::new(plan_set.clone(), hmac_key.map(<[u8]>::to_vec))?;
         let table = PlanTable::new(&registered);
         let mut reader = WireReader::new(record);
         let mut out = Vec::new();
         process_message(&mut reader, &mut out, &table, 0, 0, enforcement)?;
         Ok(out)
+    }
+
+    /// Builds a `RedactFrom` (HMAC_HASH) entry on `target`, deriving from field `source`.
+    fn redact_from_entry(
+        target: i32,
+        source: i32,
+        is_repeated: bool,
+        derived_shapes: Option<Vec<i32>>,
+    ) -> plan_proto::FieldActionEntry {
+        field_entry(
+            target,
+            Action::RedactFrom(plan_proto::RedactFrom {
+                source_field_number: Some(source),
+                transform: Some(plan_proto::RedactFromTransform::HmacHash as i32),
+                is_repeated: Some(is_repeated),
+                derived_shapes: derived_shapes
+                    .map(|shapes| plan_proto::redact_from::DerivedShapes { shapes }),
+            }),
+        )
+    }
+
+    fn plan_of(actions: Vec<plan_proto::FieldActionEntry>) -> plan_proto::RedactionPlanSet {
+        plan_proto::RedactionPlanSet {
+            plans: vec![plan_proto::MessageRedactionPlan {
+                actions,
+                ..Default::default()
+            }],
+        }
     }
 
     /// [`try_run_with`] with shape enforcement off — the default for structural-opcode tests, which
@@ -1175,7 +1626,7 @@ mod tests {
         let mut record = Vec::new();
         push_len_field(&mut record, 1, &nested);
 
-        let registered = RegisteredPlan::new(plan_set);
+        let registered = RegisteredPlan::new(plan_set, None).unwrap();
         let table = PlanTable::new(&registered);
         let mut reader = WireReader::new(&record);
         let mut out = Vec::new();
@@ -1353,7 +1804,7 @@ mod tests {
         };
         let mut record = Vec::new();
         push_varint_field(&mut record, 1, 7);
-        let registered = RegisteredPlan::new(plan_set);
+        let registered = RegisteredPlan::new(plan_set, None).unwrap();
         let table = PlanTable::new(&registered);
         let mut reader = WireReader::new(&record);
         let mut out = Vec::new();
@@ -1433,5 +1884,283 @@ mod tests {
         write_tag(&mut record, 2, 3); // field 2 (no plan entry), wire type 3
         let err = try_run(&pass_through_plan(1), &record).unwrap_err();
         assert!(matches!(err, RedactError::MalformedRecord(_)));
+    }
+
+    // ===== EmptyString / TodoRemove =====
+
+    #[test]
+    fn empty_string_blanks_length_delimited_field() {
+        let plan = plan_of(vec![
+            field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
+            field_entry(2, Action::EmptyString(plan_proto::EmptyString {})),
+        ]);
+        let mut record = Vec::new();
+        push_varint_field(&mut record, 1, 7);
+        push_len_field(&mut record, 2, b"user@example.com");
+        let mut expected = Vec::new();
+        push_varint_field(&mut expected, 1, 7);
+        push_len_field(&mut expected, 2, b""); // present, blanked
+        assert_eq!(run(&plan, &record), expected);
+    }
+
+    #[test]
+    fn todo_remove_drops_field_like_remove() {
+        let plan = plan_of(vec![
+            field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
+            field_entry(
+                2,
+                Action::TodoRemove(plan_proto::TodoRemove {
+                    description: Some("unresolved".to_string()),
+                }),
+            ),
+        ]);
+        let mut record = Vec::new();
+        push_varint_field(&mut record, 1, 7);
+        push_len_field(&mut record, 2, b"gone");
+        let mut expected = Vec::new();
+        push_varint_field(&mut expected, 1, 7); // field 2 dropped entirely
+        assert_eq!(run(&plan, &record), expected);
+    }
+
+    // ===== RedactFrom (HMAC_HASH) derivation =====
+
+    // Parity fixture: HMAC-SHA-512(key, value) in the legacy signed-decimal mkString encoding.
+    const PARITY_KEY: &[u8] = b"fleet-hmac-key";
+    const PARITY_SOURCE: &str = "cleartext-table-name";
+    const PARITY_HASH: &str = "-722276-11-49-419425-115-31-40-652732-125-61104-231-7332-106-96-720-327-35-83-101-30-110-104-98112-1181131-8750-68-127823227-1461-4642572-9576-7712379-43556992-47909147";
+
+    #[test]
+    fn hmac_hash_matches_java_signed_decimal_encoding() {
+        // Byte-for-byte with Scala HashingUtils(key).hash(value).mkString.
+        assert_eq!(hmac_hash(PARITY_KEY, PARITY_SOURCE), PARITY_HASH);
+    }
+
+    #[test]
+    fn keyless_registration_rejects_redact_from() {
+        let plan = plan_of(vec![
+            field_entry(1, Action::Remove(plan_proto::Remove {})),
+            redact_from_entry(2, 1, false, None),
+        ]);
+        assert!(matches!(
+            register_plan(&plan.encode_to_vec()).unwrap_err(),
+            RedactError::InvalidPlan(_)
+        ));
+    }
+
+    #[test]
+    fn redact_from_derives_hash_and_drops_source() {
+        // Source-drop invariant: source (field 1, Remove) dropped; target (field 2) carries the hash.
+        let plan = plan_of(vec![
+            field_entry(1, Action::Remove(plan_proto::Remove {})),
+            redact_from_entry(2, 1, false, None),
+        ]);
+        let mut record = Vec::new();
+        push_len_field(&mut record, 1, PARITY_SOURCE.as_bytes());
+        let out = try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
+        let mut expected = Vec::new();
+        push_len_field(&mut expected, 2, PARITY_HASH.as_bytes());
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn redact_from_scalar_last_and_repeated_each() {
+        let scalar = plan_of(vec![
+            field_entry(1, Action::Remove(plan_proto::Remove {})),
+            redact_from_entry(2, 1, false, None),
+        ]);
+        let mut record = Vec::new();
+        push_len_field(&mut record, 1, b"first");
+        push_len_field(&mut record, 1, PARITY_SOURCE.as_bytes());
+        let out = try_run_keyed(&scalar, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
+        let mut expected = Vec::new();
+        push_len_field(&mut expected, 2, PARITY_HASH.as_bytes()); // scalar → last occurrence
+        assert_eq!(out, expected);
+
+        let repeated = plan_of(vec![
+            field_entry(1, Action::Remove(plan_proto::Remove {})),
+            redact_from_entry(2, 1, true, None),
+        ]);
+        let out =
+            try_run_keyed(&repeated, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
+        let mut expected = Vec::new();
+        push_len_field(&mut expected, 2, hmac_hash(PARITY_KEY, "first").as_bytes());
+        push_len_field(&mut expected, 2, PARITY_HASH.as_bytes()); // one per occurrence, in order
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn redact_from_absent_source_emits_nothing() {
+        let plan = plan_of(vec![
+            field_entry(1, Action::Remove(plan_proto::Remove {})),
+            redact_from_entry(2, 1, false, None),
+        ]);
+        let out = try_run_keyed(&plan, &[], Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn redact_from_self_hash_hashes_in_place() {
+        let plan = plan_of(vec![redact_from_entry(1, 1, false, None)]);
+        let mut record = Vec::new();
+        push_len_field(&mut record, 1, PARITY_SOURCE.as_bytes());
+        let out = try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
+        let mut expected = Vec::new();
+        push_len_field(&mut expected, 1, PARITY_HASH.as_bytes());
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn redact_from_numeric_source_renders_signed_decimal() {
+        let plan = plan_of(vec![
+            field_entry(1, Action::Remove(plan_proto::Remove {})),
+            redact_from_entry(2, 1, false, None),
+        ]);
+        let mut record = Vec::new();
+        push_varint_field(&mut record, 1, 12345);
+        let out = try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
+        let mut expected = Vec::new();
+        push_len_field(&mut expected, 2, hmac_hash(PARITY_KEY, "12345").as_bytes());
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn redact_from_malformed_utf8_source_fails_closed() {
+        let plan = plan_of(vec![
+            field_entry(1, Action::Remove(plan_proto::Remove {})),
+            redact_from_entry(2, 1, false, None),
+        ]);
+        let mut record = Vec::new();
+        push_len_field(&mut record, 1, &[0xFF, 0xFE, 0x00]);
+        assert!(matches!(
+            try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap_err(),
+            RedactError::MalformedRecord(_)
+        ));
+    }
+
+    #[test]
+    fn redact_from_empty_shapes_wiped_under_enforcement() {
+        // derived_shapes present-but-empty: emitted with enforcement off, wiped with enforcement on.
+        let plan = plan_of(vec![
+            field_entry(1, Action::Remove(plan_proto::Remove {})),
+            redact_from_entry(2, 1, false, Some(vec![])),
+        ]);
+        let mut record = Vec::new();
+        push_len_field(&mut record, 1, PARITY_SOURCE.as_bytes());
+
+        let off = try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
+        let mut expected = Vec::new();
+        push_len_field(&mut expected, 2, PARITY_HASH.as_bytes());
+        assert_eq!(off, expected);
+
+        let on = try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::On).unwrap();
+        assert!(
+            on.is_empty(),
+            "empty derived_shapes must be wiped under enforcement"
+        );
+    }
+
+    #[test]
+    fn redact_from_grows_nested_message() {
+        // A RedactFrom inside a nested message replaces a short source with a long hash; the child
+        // grows past the 1-byte varint length boundary. handle_recurse must length-prefix it right.
+        let plan_set = plan_proto::RedactionPlanSet {
+            plans: vec![
+                plan_proto::MessageRedactionPlan {
+                    actions: vec![field_entry(
+                        1,
+                        Action::Recurse(plan_proto::Recurse {
+                            child_plan_index: Some(1),
+                        }),
+                    )],
+                    ..Default::default()
+                },
+                plan_proto::MessageRedactionPlan {
+                    actions: vec![
+                        field_entry(1, Action::Remove(plan_proto::Remove {})),
+                        redact_from_entry(2, 1, false, None),
+                    ],
+                    ..Default::default()
+                },
+            ],
+        };
+        let mut child = Vec::new();
+        push_len_field(&mut child, 1, b"x");
+        let mut record = Vec::new();
+        push_len_field(&mut record, 1, &child);
+
+        let out =
+            try_run_keyed(&plan_set, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
+
+        let mut expected_child = Vec::new();
+        push_len_field(
+            &mut expected_child,
+            2,
+            hmac_hash(PARITY_KEY, "x").as_bytes(),
+        );
+        assert!(
+            expected_child.len() > 127,
+            "child must cross the 1-byte varint boundary"
+        );
+        let mut expected = Vec::new();
+        push_len_field(&mut expected, 1, &expected_child);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn redact_from_malformed_plans_fail_closed() {
+        // Missing transform, missing source, missing is_repeated, undropped source, empty key.
+        let missing_transform = plan_of(vec![field_entry(
+            2,
+            Action::RedactFrom(plan_proto::RedactFrom {
+                source_field_number: Some(1),
+                transform: None,
+                is_repeated: Some(false),
+                derived_shapes: None,
+            }),
+        )]);
+        assert!(
+            register_plan_with_key(&missing_transform.encode_to_vec(), Some(PARITY_KEY)).is_err()
+        );
+
+        let missing_source = plan_of(vec![field_entry(
+            2,
+            Action::RedactFrom(plan_proto::RedactFrom {
+                source_field_number: None,
+                transform: Some(plan_proto::RedactFromTransform::HmacHash as i32),
+                is_repeated: Some(false),
+                derived_shapes: None,
+            }),
+        )]);
+        assert!(register_plan_with_key(&missing_source.encode_to_vec(), Some(PARITY_KEY)).is_err());
+
+        let missing_is_repeated = plan_of(vec![
+            field_entry(1, Action::Remove(plan_proto::Remove {})),
+            field_entry(
+                2,
+                Action::RedactFrom(plan_proto::RedactFrom {
+                    source_field_number: Some(1),
+                    transform: Some(plan_proto::RedactFromTransform::HmacHash as i32),
+                    is_repeated: None,
+                    derived_shapes: None,
+                }),
+            ),
+        ]);
+        assert!(
+            register_plan_with_key(&missing_is_repeated.encode_to_vec(), Some(PARITY_KEY)).is_err()
+        );
+
+        let undropped_source = plan_of(vec![
+            field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
+            redact_from_entry(2, 1, false, None),
+        ]);
+        assert!(
+            register_plan_with_key(&undropped_source.encode_to_vec(), Some(PARITY_KEY)).is_err()
+        );
+
+        let ok_plan = plan_of(vec![
+            field_entry(1, Action::Remove(plan_proto::Remove {})),
+            redact_from_entry(2, 1, false, None),
+        ]);
+        assert!(register_plan_with_key(&ok_plan.encode_to_vec(), Some(b"")).is_err());
     }
 }
