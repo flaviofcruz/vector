@@ -30,6 +30,12 @@ impl Function for ApplyRedaction {
             `plan_file` must be a literal path to a serialized `RedactionPlanSet`. It is read and
             registered once when the VRL program is compiled.
 
+            `enforce_shapes` is an optional boolean (default false) that gates data-shape enforcement:
+            when true, `PassThroughString` fields are kept only if they match a declared shape;
+            when false or absent, they pass through verbatim. Set to true only for LP pipeline plans;
+            the LP splice sets this true, while Governator omits it (defaults false) to scope enforcement
+            to the LP write path.
+
             The function is fallible (call it as `apply_redaction!(...)`): it fails if the plan
             cannot be read or registered at compile time, or if the record is not valid protobuf at
             runtime.
@@ -47,6 +53,11 @@ impl Function for ApplyRedaction {
                 keyword: "plan_file",
                 kind: kind::BYTES,
                 required: true,
+            },
+            Parameter {
+                keyword: "enforce_shapes",
+                kind: kind::BOOLEAN,
+                required: false,
             },
         ]
     }
@@ -87,7 +98,14 @@ impl Function for ApplyRedaction {
             }) as Box<dyn DiagnosticMessage>
         })?;
 
-        Ok(ApplyRedactionFn { message, resolver }.as_expr())
+        let enforce_shapes = arguments.optional("enforce_shapes");
+
+        Ok(ApplyRedactionFn {
+            message,
+            resolver,
+            enforce_shapes,
+        }
+        .as_expr())
     }
 }
 
@@ -95,12 +113,26 @@ impl Function for ApplyRedaction {
 struct ApplyRedactionFn {
     message: Box<dyn Expression>,
     resolver: PlanResolver,
+    enforce_shapes: Option<Box<dyn Expression>>,
 }
 
 impl FunctionExpression for ApplyRedactionFn {
     fn resolve(&self, ctx: &mut Context) -> Resolved {
         let message = self.message.resolve(ctx)?;
         let bytes = message.try_bytes()?;
+
+        // Resolve enforce_shapes parameter; default to false (Off) if absent.
+        let enforcement = if let Some(enforce_expr) = &self.enforce_shapes {
+            let enforce_value = enforce_expr.resolve(ctx)?;
+            let enforce_bool = enforce_value.try_boolean()?;
+            if enforce_bool {
+                executor::ShapeEnforcement::On
+            } else {
+                executor::ShapeEnforcement::Off
+            }
+        } else {
+            executor::ShapeEnforcement::Off
+        };
 
         // PlanKey::default() selects the single plan registered at compile time. When the resolver
         // is populated with multiple plans (keyed by log type, policy group, or other record
@@ -110,8 +142,8 @@ impl FunctionExpression for ApplyRedactionFn {
             .handle_for(&PlanKey::default())
             .ok_or("apply_redaction: no redaction plan registered")?;
 
-        let redacted =
-            executor::redact(handle, &bytes).map_err(|e| format!("apply_redaction: {e}"))?;
+        let redacted = executor::redact(handle, &bytes, enforcement)
+            .map_err(|e| format!("apply_redaction: {e}"))?;
 
         Ok(Value::Bytes(Bytes::from(redacted)))
     }

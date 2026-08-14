@@ -113,7 +113,7 @@ mod tests {
         let clone = resolver.clone();
         drop(resolver);
         assert!(
-            executor::redact(handle, &[]).is_ok(),
+            executor::redact(handle, &[], executor::ShapeEnforcement::Off).is_ok(),
             "plan should stay registered while a clone still holds the handle"
         );
 
@@ -121,7 +121,7 @@ mod tests {
         drop(clone);
         assert!(
             matches!(
-                executor::redact(handle, &[]),
+                executor::redact(handle, &[], executor::ShapeEnforcement::Off),
                 Err(executor::RedactError::UnknownHandle(_))
             ),
             "plan should be released once the last clone is dropped"
