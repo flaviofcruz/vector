@@ -40,6 +40,12 @@ whatever MessagePlan.freeze() derives is recomputed by the Rust loader.
 message RedactionPlanSet {
   // Plans in index order; referenced by index elsewhere.
   repeated MessageRedactionPlan plans = 1;
+
+  // Whether this plan set should have data-shape enforcement applied (PassThroughString.allowed_shapes).
+  // Set true only for Lumberjack Prime PIPELINE plans; false (default/absent) for COMPLIANCE/Governator
+  // plans, which must not shape-drop (they have no runtime shape gate). Absent => false => shapes ignored
+  // (verbatim passthrough, fail-safe). Field number/name mirror universe redaction_plan.proto for wire-compat.
+  optional bool enforce_shapes = 2;
 }
 
 // Redaction plan for one proto message type (1:1 with MessagePlan).

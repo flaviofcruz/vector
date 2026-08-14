@@ -313,7 +313,9 @@ impl<'a> WireReader<'a> {
             }
             shift += 7;
             if shift >= 64 {
-                return Err(RedactError::MalformedRecord("varint exceeds 64 bits".to_string()));
+                return Err(RedactError::MalformedRecord(
+                    "varint exceeds 64 bits".to_string(),
+                ));
             }
         }
     }
@@ -413,6 +415,10 @@ fn tag_size(field_number: u32) -> usize {
 struct PlanTable<'a> {
     plans: &'a [plan_proto::MessageRedactionPlan],
     action_index: &'a [HashMap<u32, usize>],
+    // Whether to apply PassThroughString shape enforcement. Set only for LP pipeline plans; false for
+    // compliance/Governator plans (and absent/old plans), which pass centralizable strings through
+    // verbatim. See RedactionPlanSet.enforce_shapes.
+    enforce_shapes: bool,
 }
 
 impl<'a> PlanTable<'a> {
@@ -420,6 +426,7 @@ impl<'a> PlanTable<'a> {
         PlanTable {
             plans: &registered.plan_set.plans,
             action_index: &registered.action_index,
+            enforce_shapes: registered.plan_set.enforce_shapes.unwrap_or(false),
         }
     }
 
@@ -497,9 +504,14 @@ fn dispatch(
             write_tag(out, field_number, wire_type);
             copy_field_value(reader, out, wire_type)
         }
-        Action::PassThroughString(pass_through_string) => {
-            handle_pass_through_string(reader, out, field_number, wire_type, pass_through_string)
-        }
+        Action::PassThroughString(pass_through_string) => handle_pass_through_string(
+            reader,
+            out,
+            field_number,
+            wire_type,
+            pass_through_string,
+            table.enforce_shapes,
+        ),
         Action::Remove(_) => drop_field(reader, wire_type),
         Action::Recurse(recurse) => {
             handle_recurse(reader, out, table, field_number, wire_type, recurse, depth)
@@ -536,7 +548,9 @@ fn copy_field_value(
             reader.copy_bytes(out, length as usize)
         }
         wire_type::FIXED32 => reader.copy_bytes(out, 4),
-        other => Err(RedactError::MalformedRecord(format!("unsupported wire type {other}"))),
+        other => Err(RedactError::MalformedRecord(format!(
+            "unsupported wire type {other}"
+        ))),
     }
 }
 
@@ -554,19 +568,23 @@ fn drop_field(reader: &mut WireReader, wire_type: u32) -> Result<(), RedactError
             reader.skip_bytes(length)
         }
         wire_type::FIXED32 => reader.skip_bytes(4),
-        other => Err(RedactError::MalformedRecord(format!("cannot drop wire type {other}"))),
+        other => Err(RedactError::MalformedRecord(format!(
+            "cannot drop wire type {other}"
+        ))),
     }
 }
 
 /// PASS_THROUGH_STRING: keep a string field if it matches any of the allowed shapes, else drop it.
-/// Empty allowed_shapes means no constraint (pass through verbatim). When non-empty, the field
-/// value is kept only if it matches any of the listed shapes (union/OR semantics).
+/// Shape enforcement is applied only when `enforce_shapes` is set on the plan set (LP pipeline plans);
+/// otherwise, and when `allowed_shapes` is empty, the field passes through verbatim. When enforced with
+/// a non-empty list, the value is kept only if it matches any of the listed shapes (union/OR).
 fn handle_pass_through_string(
     reader: &mut WireReader,
     out: &mut Vec<u8>,
     field_number: u32,
     wire_type: u32,
     pass_through_string: &plan_proto::PassThroughString,
+    enforce_shapes: bool,
 ) -> Result<(), RedactError> {
     if wire_type != wire_type::LENGTH_DELIMITED {
         // Strings are always length-delimited; anything else is malformed → drop.
@@ -576,8 +594,9 @@ fn handle_pass_through_string(
     let length = reader.read_varint32()? as usize;
     let value_bytes = reader.take_slice(length)?;
 
-    // Empty allowed_shapes list means no constraint — pass through verbatim.
-    if pass_through_string.allowed_shapes.is_empty() {
+    // No shape constraint — pass through verbatim — when the plan set does not enforce shapes
+    // (compliance/Governator plans) or the field declares no shapes.
+    if !enforce_shapes || pass_through_string.allowed_shapes.is_empty() {
         write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
         write_varint(out, length as u64);
         out.extend_from_slice(value_bytes);
@@ -642,7 +661,13 @@ fn handle_recurse(
     // is checked at the top of `process_message`, bounding native-stack recursion.
     let mut child_reader = WireReader::new(content);
     let mut child_out = Vec::new();
-    process_message(&mut child_reader, &mut child_out, table, child_index as usize, depth + 1)?;
+    process_message(
+        &mut child_reader,
+        &mut child_out,
+        table,
+        child_index as usize,
+        depth + 1,
+    )?;
 
     // Emit even when the child redacts to empty (tag + 0).
     write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
@@ -871,6 +896,7 @@ mod tests {
     /// the malformed-input tests exercise the reader, not plan lookup.
     fn pass_through_plan(field_number: i32) -> plan_proto::RedactionPlanSet {
         plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![field_entry(
                     field_number,
@@ -908,6 +934,7 @@ mod tests {
     fn redact_fails_after_release() {
         // The handle lookup fails before the record is ever parsed, so any bytes are fine here.
         let plan = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan::default()],
         };
         let handle = register_plan(&plan.encode_to_vec()).unwrap();
@@ -927,12 +954,16 @@ mod tests {
     fn pass_through_keeps_field_verbatim() {
         // Plan: field 1 PASS_THROUGH (varint), field 2 PASS_THROUGH (length-delimited).
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![
                     field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
-                    field_entry(2, Action::PassThroughString(plan_proto::PassThroughString {
-                        allowed_shapes: vec![],  // Empty list means no shape constraint
-                    })),
+                    field_entry(
+                        2,
+                        Action::PassThroughString(plan_proto::PassThroughString {
+                            allowed_shapes: vec![], // Empty list means no shape constraint
+                        }),
+                    ),
                 ],
                 ..Default::default()
             }],
@@ -945,9 +976,63 @@ mod tests {
     }
 
     #[test]
+    fn pass_through_string_enforces_shape_when_enabled() {
+        // enforce_shapes=true (LP pipeline plan): field 1 is a PassThroughString gated to
+        // DATA_SHAPE_UUID. A non-UUID value is dropped; a valid UUID is kept verbatim.
+        let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
+            plans: vec![plan_proto::MessageRedactionPlan {
+                actions: vec![field_entry(
+                    1,
+                    Action::PassThroughString(plan_proto::PassThroughString {
+                        allowed_shapes: vec![1], // DATA_SHAPE_UUID
+                    }),
+                )],
+                ..Default::default()
+            }],
+        };
+        let mut bad = Vec::new();
+        push_len_field(&mut bad, 1, b"not-a-uuid");
+        assert!(
+            run(&plan_set, &bad).is_empty(),
+            "non-UUID must be dropped under enforcement"
+        );
+        let mut good = Vec::new();
+        push_len_field(&mut good, 1, b"550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(run(&plan_set, &good), good, "valid UUID must be kept");
+    }
+
+    #[test]
+    fn pass_through_string_skips_shape_enforcement_when_disabled() {
+        // enforce_shapes=false (compliance/Governator plan): the same UUID-gated field passes a
+        // non-UUID value through VERBATIM — shapes are not enforced. This is the LP-only gate that
+        // keeps Governator redaction from shape-dropping.
+        let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(false),
+            plans: vec![plan_proto::MessageRedactionPlan {
+                actions: vec![field_entry(
+                    1,
+                    Action::PassThroughString(plan_proto::PassThroughString {
+                        allowed_shapes: vec![1], // DATA_SHAPE_UUID
+                    }),
+                )],
+                ..Default::default()
+            }],
+        };
+        let mut record = Vec::new();
+        push_len_field(&mut record, 1, b"not-a-uuid");
+        assert_eq!(
+            run(&plan_set, &record),
+            record,
+            "gate off → kept verbatim despite shape mismatch"
+        );
+    }
+
+    #[test]
     fn remove_drops_field_but_keeps_others() {
         // Plan: field 1 PASS_THROUGH, field 2 REMOVE.
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![
                     field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
@@ -968,8 +1053,12 @@ mod tests {
     fn unknown_field_is_dropped() {
         // Plan only mentions field 1; field 2 has no entry → allowlist default drops it.
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(1, Action::PassThrough(plan_proto::PassThrough {}))],
+                actions: vec![field_entry(
+                    1,
+                    Action::PassThrough(plan_proto::PassThrough {}),
+                )],
                 ..Default::default()
             }],
         };
@@ -985,6 +1074,7 @@ mod tests {
     fn recurse_redacts_nested_message_by_child_plan() {
         // plans[0]: field 1 RECURSE -> plans[1]. plans[1]: field 1 PASS_THROUGH, field 2 REMOVE.
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![
                 plan_proto::MessageRedactionPlan {
                     actions: vec![field_entry(
@@ -1020,6 +1110,7 @@ mod tests {
     #[test]
     fn recurse_out_of_range_child_fails_closed() {
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![field_entry(
                     1,
@@ -1062,6 +1153,7 @@ mod tests {
     #[test]
     fn recursion_deeper_than_limit_fails_closed() {
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![field_entry(
                     1,
@@ -1088,6 +1180,7 @@ mod tests {
     fn map_entry_keeps_centralizable_key_drops_others() {
         // json_map field 5; entry key field 1. Default drop; "keep_this" kept (case-insensitively).
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![field_entry(
                     5,
@@ -1124,8 +1217,12 @@ mod tests {
     fn map_strip_value_keeps_key_drops_value() {
         // proto3 map<string,string> entry: field 1 = key, field 2 = value. Strip the value.
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(3, Action::MapStripValue(plan_proto::MapStripValue {}))],
+                actions: vec![field_entry(
+                    3,
+                    Action::MapStripValue(plan_proto::MapStripValue {}),
+                )],
                 ..Default::default()
             }],
         };
@@ -1146,6 +1243,7 @@ mod tests {
     fn redact_tag_keeps_value_for_centralizable_label() {
         // logging.Field tag: key(1), value(2), label(4). Keepable label 3 → whole tag kept.
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![field_entry(
                     7,
@@ -1170,6 +1268,7 @@ mod tests {
     fn redact_tag_strips_value_for_noncentralizable_label() {
         // Label 9 not in keepable set → keep only key(1) and label(4), drop value(2).
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![field_entry(
                     7,
@@ -1199,6 +1298,7 @@ mod tests {
     fn field_with_unset_action_fails_closed() {
         // An entry present but with no action oneof set → deferred/unknown opcode → fail closed.
         let plan_set = plan_proto::RedactionPlanSet {
+            enforce_shapes: Some(true),
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![plan_proto::FieldActionEntry {
                     field_number: Some(1),
