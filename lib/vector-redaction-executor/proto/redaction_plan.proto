@@ -95,12 +95,18 @@ message PassThrough {}
 // Drop the field.
 message Remove {}
 
-// Centralizable string; enforces shape constraints via allowed_shapes.
-// An empty allowed_shapes list means no shape constraint (behaves like PassThrough).
-// When non-empty, the field value is kept only if it matches any of the listed shapes.
+// Centralizable string; enforces shape constraints via allowed_shapes. Behavior depends on the
+// per-record ShapeEnforcement verdict passed to the executor (Off for Governator, On for the LP
+// write path):
+//   - Enforcement Off: always copies the field verbatim, regardless of allowed_shapes.
+//   - Enforcement On + non-empty allowed_shapes: keeps the field iff its value matches ANY listed
+//     shape (union), else drops it.
+//   - Enforcement On + empty allowed_shapes: DROPS the field (a centralizable string declaring no
+//     shape is wiped under the gate) — NOT a passthrough.
 message PassThroughString {
-  // Allowed shapes for this string field. Union semantics: field is kept if value
-  // matches ANY of the listed shapes. Empty list means no constraint (pass through).
+  // Allowed shapes for this string field. Union semantics under enforcement (see the message
+  // comment): matches ANY => kept. Empty means "declares no shape" — verbatim when enforcement is
+  // Off, dropped when enforcement is On.
   repeated compliance.DataShape allowed_shapes = 1;
 }
 

@@ -242,7 +242,11 @@ pub fn register_plan(plan_bytes: &[u8]) -> Result<u64, RedactError> {
 /// governs the `PassThroughString` arm only (see [`ShapeEnforcement`]); every other opcode is
 /// independent of it. Threaded through the walk so nested `PassThroughString` fields see the same
 /// verdict.
-pub fn redact(handle: u64, record_bytes: &[u8], enforcement: ShapeEnforcement) -> Result<Vec<u8>, RedactError> {
+pub fn redact(
+    handle: u64,
+    record_bytes: &[u8],
+    enforcement: ShapeEnforcement,
+) -> Result<Vec<u8>, RedactError> {
     // Clone the Arc out under a short lock so a concurrent `release_plan` can't drop the plan
     // mid-walk: the plan outlives the registry entry.
     let registered = registry_guard()
@@ -497,7 +501,16 @@ fn process_message(
     while let Some((field_number, wire_type)) = reader.read_tag()? {
         match table.action(plan_index, field_number)? {
             None => drop_field(reader, wire_type)?,
-            Some(action) => dispatch(reader, out, table, field_number, wire_type, action, depth, enforcement)?,
+            Some(action) => dispatch(
+                reader,
+                out,
+                table,
+                field_number,
+                wire_type,
+                action,
+                depth,
+                enforcement,
+            )?,
         }
     }
     Ok(())
@@ -543,9 +556,16 @@ fn dispatch(
             }
         }
         Action::Remove(_) => drop_field(reader, wire_type),
-        Action::Recurse(recurse) => {
-            handle_recurse(reader, out, table, field_number, wire_type, recurse, depth, enforcement)
-        }
+        Action::Recurse(recurse) => handle_recurse(
+            reader,
+            out,
+            table,
+            field_number,
+            wire_type,
+            recurse,
+            depth,
+            enforcement,
+        ),
         Action::MapEntry(map_entry) => {
             handle_map_entry(reader, out, field_number, wire_type, map_entry)
         }
@@ -1030,7 +1050,11 @@ mod tests {
         );
         let mut good = Vec::new();
         push_len_field(&mut good, 1, b"550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(run_enforced(&plan_set, &good), good, "valid UUID must be kept");
+        assert_eq!(
+            run_enforced(&plan_set, &good),
+            good,
+            "valid UUID must be kept"
+        );
     }
 
     #[test]
@@ -1155,7 +1179,8 @@ mod tests {
         let table = PlanTable::new(&registered);
         let mut reader = WireReader::new(&record);
         let mut out = Vec::new();
-        let err = process_message(&mut reader, &mut out, &table, 0, 0, ShapeEnforcement::Off).unwrap_err();
+        let err = process_message(&mut reader, &mut out, &table, 0, 0, ShapeEnforcement::Off)
+            .unwrap_err();
         assert!(matches!(err, RedactError::InvalidPlan(_)));
     }
 
@@ -1332,7 +1357,8 @@ mod tests {
         let table = PlanTable::new(&registered);
         let mut reader = WireReader::new(&record);
         let mut out = Vec::new();
-        let err = process_message(&mut reader, &mut out, &table, 0, 0, ShapeEnforcement::Off).unwrap_err();
+        let err = process_message(&mut reader, &mut out, &table, 0, 0, ShapeEnforcement::Off)
+            .unwrap_err();
         assert!(matches!(err, RedactError::InvalidPlan(_)));
     }
 
