@@ -12,6 +12,11 @@ use std::sync::Arc;
 
 use vector_redaction_executor as executor;
 
+/// Environment variable holding the fleet HMAC key for `RedactFrom` (HMAC_HASH) derivation. Set by
+/// the VA/VAP deployment once the key is provisioned and security-reviewed; until then it is unset
+/// and the executor fails closed on any plan carrying a `RedactFrom`.
+const HMAC_KEY_ENV_VAR: &str = "LUMBERJACK_PRIME_HMAC_KEY";
+
 /// Identifies which plan to use for a record. With a single plan the key is a default; the fields
 /// support selecting among multiple plans by log topic and policy group.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -34,7 +39,9 @@ pub enum LoadError {
 impl fmt::Display for LoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LoadError::Read(path, e) => write!(f, "could not read redaction plan file {path:?}: {e}"),
+            LoadError::Read(path, e) => {
+                write!(f, "could not read redaction plan file {path:?}: {e}")
+            }
             LoadError::Register(e) => write!(f, "could not register redaction plan: {e}"),
         }
     }
@@ -73,7 +80,17 @@ impl PlanResolver {
     /// [`handle_for`](Self::handle_for) lookup is the same either way; the caller supplies the key.
     pub fn from_plan_file(path: &str) -> Result<Self, LoadError> {
         let bytes = std::fs::read(path).map_err(|e| LoadError::Read(path.to_owned(), e))?;
-        let handle = executor::register_plan(&bytes).map_err(LoadError::Register)?;
+        // The fleet HMAC key for `RedactFrom` (HMAC_HASH) derivation is read from the environment,
+        // where the VA/VAP deployment mounts it (see the LP HMAC-hash design doc — key provisioning
+        // + security review are the gating step). Absent/empty ⇒ `None`, and the executor then
+        // rejects any plan carrying a `RedactFrom` (fail-closed): the whole feature stays dormant
+        // until the key is provisioned. Plans without a `RedactFrom` register regardless.
+        let hmac_key = std::env::var(HMAC_KEY_ENV_VAR)
+            .ok()
+            .filter(|k| !k.is_empty());
+        let handle =
+            executor::register_plan_with_key(&bytes, hmac_key.as_deref().map(str::as_bytes))
+                .map_err(LoadError::Register)?;
         let mut handles = HashMap::new();
         handles.insert(PlanKey::default(), Arc::new(PlanHandle(handle)));
         Ok(Self { handles })
@@ -107,7 +124,9 @@ mod tests {
     #[test]
     fn dropping_last_clone_releases_plan() {
         let resolver = PlanResolver::from_plan_file(&write_minimal_plan()).expect("register plan");
-        let handle = resolver.handle_for(&PlanKey::default()).expect("handle registered");
+        let handle = resolver
+            .handle_for(&PlanKey::default())
+            .expect("handle registered");
 
         // A clone shares the handle; the plan must stay registered while either owner lives.
         let clone = resolver.clone();

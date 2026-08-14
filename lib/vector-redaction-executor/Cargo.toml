@@ -15,6 +15,9 @@ publish = false
 prost = { workspace = true, features = ["derive"] }
 # For parsing the vendored shape-enforcement JSON vocabularies at runtime.
 serde_json = "1.0"
+# HMAC_HASH RedactFrom derivation. Versions match those already in the workspace lockfile.
+hmac = "0.12.1"
+sha2 = "0.10.9"
 
 [build-dependencies]
 prost-build.workspace = true
