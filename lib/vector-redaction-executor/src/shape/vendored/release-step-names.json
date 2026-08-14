@@ -1,0 +1,10 @@
+{
+  "constants": ["get-lkg", "get-master-head", "custom-version", "custom-branch-and-commit", "cut-and-cherry-pick", "hotfix-patching", "bad-commit-check", "rtg-validation", "build", "check-version-exists", "update-release-attempt-version", "container-scanning", "generate-commit-list", "manual-judgment", "execution-window", "bad-commit", "release-freeze", "update-active-version", "all-deployments-succeeded", "bypass-check", "soak", "tag-release-latest", "tag-release-candidate", "tag-gfm-release-latest", "tag-release-stable", "container-scanning-status", "rtg-validation-status"],
+  "regionUriPrefixes": ["deploy", "assign", "prober", "dust"],
+  "regionUriAnchor": "region:",
+  "stageCompletedPrefix": "stage-completed",
+  "stageEnumValues": ["RELEASE_STAGE_UNSPECIFIED", "RELEASE_STAGE_DEV", "RELEASE_STAGE_STAGING", "RELEASE_STAGE_ONE", "RELEASE_STAGE_ONE_POINT_FIVE", "RELEASE_STAGE_TWO", "RELEASE_STAGE_THREE_AM", "RELEASE_STAGE_THREE", "RELEASE_STAGE_SOURCE_DETERMINATION", "RELEASE_STAGE_SOURCE_VALIDATION", "RELEASE_STAGE_BUILD", "RELEASE_STAGE_VERSION_VALIDATION"],
+  "replayDiffSlugs": ["api-diff", "request-log-diff"],
+  "replayDiffRoles": ["test", "status"],
+  "bucketNumberMarker": "bucket"
+}

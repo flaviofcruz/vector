@@ -13,6 +13,8 @@ publish = false
 # re-enable `derive`, which the generated code needs (`#[derive(::prost::Message)]`) and which
 # default-features off would otherwise drop.
 prost = { workspace = true, features = ["derive"] }
+# For parsing the vendored shape-enforcement JSON vocabularies at runtime.
+serde_json = "1.0"
 
 [build-dependencies]
 prost-build.workspace = true

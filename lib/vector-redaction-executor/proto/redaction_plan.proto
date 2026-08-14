@@ -4,13 +4,15 @@ package databricks.logstructuredredactionplan;
 
 // Vendored copy. Two changes from the source: the scalapb import and option block are dropped, and
 // the taxonomy import points at the local DataLabel-only stub. Wire format and generated Rust are
-// unchanged.
+// unchanged. Also imports the vendored DataShape enum from compliance/shape.proto for shape
+// enforcement in PassThroughString.
 //
 // TODO(vendored): copy of universe's
 // log-sync/structured-logs/common/src/redaction/proto/redaction_plan.proto. When vrl/vector is
 // vendored into universe, converge this and the universe original to a single source of truth so the
 // contract isn't maintained in two places.
 import "compliance/taxonomy.proto";
+import "compliance/shape.proto";
 
 option java_package = "com.databricks.log.structured.redaction.streaming.plan.jproto";
 option java_outer_classname = "RedactionPlanProto";
@@ -93,9 +95,14 @@ message PassThrough {}
 // Drop the field.
 message Remove {}
 
-// Centralizable string; behaves like PassThrough while shape enforcement is off.
-// (-- TODO: allowed_shapes, once shape enforcement lands. --)
-message PassThroughString {}
+// Centralizable string; enforces shape constraints via allowed_shapes.
+// An empty allowed_shapes list means no shape constraint (behaves like PassThrough).
+// When non-empty, the field value is kept only if it matches any of the listed shapes.
+message PassThroughString {
+  // Allowed shapes for this string field. Union semantics: field is kept if value
+  // matches ANY of the listed shapes. Empty list means no constraint (pass through).
+  repeated compliance.DataShape allowed_shapes = 1;
+}
 
 // map<K, V> with a centralizable key but non-centralizable value: keep the key, strip the value.
 message MapStripValue {}

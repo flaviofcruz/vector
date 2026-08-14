@@ -36,6 +36,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use plan_proto::field_action::Action;
 use prost::Message;
 
+mod shape;
+
 /// prost-generated bindings for `proto/redaction_plan.proto`. `build.rs` emits `_bindings.rs`, which
 /// wires each proto package into a nested module tree; the plan proto references `compliance.DataLabel`
 /// across packages, so the nested layout is required.
@@ -491,11 +493,12 @@ fn dispatch(
     depth: usize,
 ) -> Result<(), RedactError> {
     match action {
-        // PASS_THROUGH_STRING behaves exactly like PASS_THROUGH while shape enforcement is deferred
-        // (the serializer emits it with no shapes).
-        Action::PassThrough(_) | Action::PassThroughString(_) => {
+        Action::PassThrough(_) => {
             write_tag(out, field_number, wire_type);
             copy_field_value(reader, out, wire_type)
+        }
+        Action::PassThroughString(pass_through_string) => {
+            handle_pass_through_string(reader, out, field_number, wire_type, pass_through_string)
         }
         Action::Remove(_) => drop_field(reader, wire_type),
         Action::Recurse(recurse) => {
@@ -553,6 +556,56 @@ fn drop_field(reader: &mut WireReader, wire_type: u32) -> Result<(), RedactError
         wire_type::FIXED32 => reader.skip_bytes(4),
         other => Err(RedactError::MalformedRecord(format!("cannot drop wire type {other}"))),
     }
+}
+
+/// PASS_THROUGH_STRING: keep a string field if it matches any of the allowed shapes, else drop it.
+/// Empty allowed_shapes means no constraint (pass through verbatim). When non-empty, the field
+/// value is kept only if it matches any of the listed shapes (union/OR semantics).
+fn handle_pass_through_string(
+    reader: &mut WireReader,
+    out: &mut Vec<u8>,
+    field_number: u32,
+    wire_type: u32,
+    pass_through_string: &plan_proto::PassThroughString,
+) -> Result<(), RedactError> {
+    if wire_type != wire_type::LENGTH_DELIMITED {
+        // Strings are always length-delimited; anything else is malformed → drop.
+        return drop_field(reader, wire_type);
+    }
+
+    let length = reader.read_varint32()? as usize;
+    let value_bytes = reader.take_slice(length)?;
+
+    // Empty allowed_shapes list means no constraint — pass through verbatim.
+    if pass_through_string.allowed_shapes.is_empty() {
+        write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
+        write_varint(out, length as u64);
+        out.extend_from_slice(value_bytes);
+        return Ok(());
+    }
+
+    // Shapes validate `&str`, so a field whose bytes are not valid UTF-8 cannot match any shape
+    // and is dropped (fail-closed) — matches the universe executor's strict from_utf8 (NOT lossy):
+    // a non-UTF-8 value is not a centralizable string, and lossy-decoding could let a mangled
+    // string match a loose shape and leak. from_utf8 does not allocate on the success path.
+    let value_str = match std::str::from_utf8(value_bytes) {
+        Ok(s) => s,
+        Err(_) => return Ok(()), // no shape matches a non-UTF-8 string → drop (no emit)
+    };
+    let allowed_shapes: Vec<i32> = pass_through_string
+        .allowed_shapes
+        .iter()
+        .map(|shape| *shape as i32)
+        .collect();
+
+    if shape::is_allowed_shape(&allowed_shapes, value_str) {
+        // Shape matches: emit the field verbatim.
+        write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
+        write_varint(out, length as u64);
+        out.extend_from_slice(value_bytes);
+    }
+    // Shape doesn't match: drop the field (emit nothing).
+    Ok(())
 }
 
 /// RECURSE: redact a nested length-delimited message with the referenced child plan, then emit
@@ -877,7 +930,9 @@ mod tests {
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![
                     field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
-                    field_entry(2, Action::PassThroughString(plan_proto::PassThroughString {})),
+                    field_entry(2, Action::PassThroughString(plan_proto::PassThroughString {
+                        allowed_shapes: vec![],  // Empty list means no shape constraint
+                    })),
                 ],
                 ..Default::default()
             }],
