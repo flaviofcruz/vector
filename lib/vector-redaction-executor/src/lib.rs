@@ -36,6 +36,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use plan_proto::field_action::Action;
 use prost::Message;
 
+mod shape;
+
 /// prost-generated bindings for `proto/redaction_plan.proto`. `build.rs` emits `_bindings.rs`, which
 /// wires each proto package into a nested module tree; the plan proto references `compliance.DataLabel`
 /// across packages, so the nested layout is required.
@@ -123,6 +125,18 @@ impl std::fmt::Display for RedactError {
 }
 
 impl std::error::Error for RedactError {}
+
+/// Per-record data-shape enforcement verdict, resolved upstream (the VRL gate in prod) and threaded
+/// through the walk. Governs the `PassThroughString` arm only: `Off` copies each such field
+/// verbatim; `On` enforces its declared `allowed_shapes`. Every other opcode ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeEnforcement {
+    /// Copy `PassThroughString` fields verbatim, ignoring their declared shapes.
+    Off,
+    /// Enforce declared shapes: keep a `PassThroughString` field iff a shape matches, else drop
+    /// (empty shapes drop everything).
+    On,
+}
 
 // ===== The plan model (recap) =====
 //
@@ -223,7 +237,16 @@ pub fn register_plan(plan_bytes: &[u8]) -> Result<u64, RedactError> {
 /// Redact `record_bytes` per the plan registered under `handle` ([`register_plan`]). On error
 /// returns [`RedactError`], which the caller must treat as "drop the record", never "emit the
 /// input".
-pub fn redact(handle: u64, record_bytes: &[u8]) -> Result<Vec<u8>, RedactError> {
+///
+/// `enforcement` is the per-record verdict resolved upstream (driven by the VRL gate in prod). It
+/// governs the `PassThroughString` arm only (see [`ShapeEnforcement`]); every other opcode is
+/// independent of it. Threaded through the walk so nested `PassThroughString` fields see the same
+/// verdict.
+pub fn redact(
+    handle: u64,
+    record_bytes: &[u8],
+    enforcement: ShapeEnforcement,
+) -> Result<Vec<u8>, RedactError> {
     // Clone the Arc out under a short lock so a concurrent `release_plan` can't drop the plan
     // mid-walk: the plan outlives the registry entry.
     let registered = registry_guard()
@@ -236,7 +259,7 @@ pub fn redact(handle: u64, record_bytes: &[u8]) -> Result<Vec<u8>, RedactError> 
     let table = PlanTable::new(&registered);
     let mut reader = WireReader::new(record_bytes);
     let mut out = Vec::with_capacity(record_bytes.len());
-    process_message(&mut reader, &mut out, &table, 0, 0)?;
+    process_message(&mut reader, &mut out, &table, 0, 0, enforcement)?;
     Ok(out)
 }
 
@@ -311,7 +334,9 @@ impl<'a> WireReader<'a> {
             }
             shift += 7;
             if shift >= 64 {
-                return Err(RedactError::MalformedRecord("varint exceeds 64 bits".to_string()));
+                return Err(RedactError::MalformedRecord(
+                    "varint exceeds 64 bits".to_string(),
+                ));
             }
         }
     }
@@ -459,12 +484,16 @@ impl<'a> PlanTable<'a> {
 /// `depth` is the current submessage-nesting level (0 at the top-level record); it increments on each
 /// recursion into a nested message and is capped at [`MAX_RECURSION_DEPTH`] to fail closed rather
 /// than overflow the native stack (see [`handle_recurse`]).
+///
+/// `enforcement` is the per-record shape-enforcement verdict (see [`ShapeEnforcement`]); it governs
+/// the `PassThroughString` arm only and is threaded through recursion.
 fn process_message(
     reader: &mut WireReader,
     out: &mut Vec<u8>,
     table: &PlanTable,
     plan_index: usize,
     depth: usize,
+    enforcement: ShapeEnforcement,
 ) -> Result<(), RedactError> {
     if depth > MAX_RECURSION_DEPTH {
         return Err(RedactError::RecursionLimitExceeded(MAX_RECURSION_DEPTH));
@@ -472,7 +501,16 @@ fn process_message(
     while let Some((field_number, wire_type)) = reader.read_tag()? {
         match table.action(plan_index, field_number)? {
             None => drop_field(reader, wire_type)?,
-            Some(action) => dispatch(reader, out, table, field_number, wire_type, action, depth)?,
+            Some(action) => dispatch(
+                reader,
+                out,
+                table,
+                field_number,
+                wire_type,
+                action,
+                depth,
+                enforcement,
+            )?,
         }
     }
     Ok(())
@@ -489,18 +527,45 @@ fn dispatch(
     wire_type: u32,
     action: &Action,
     depth: usize,
+    enforcement: ShapeEnforcement,
 ) -> Result<(), RedactError> {
     match action {
-        // PASS_THROUGH_STRING behaves exactly like PASS_THROUGH while shape enforcement is deferred
-        // (the serializer emits it with no shapes).
-        Action::PassThrough(_) | Action::PassThroughString(_) => {
+        Action::PassThrough(_) => {
             write_tag(out, field_number, wire_type);
             copy_field_value(reader, out, wire_type)
         }
-        Action::Remove(_) => drop_field(reader, wire_type),
-        Action::Recurse(recurse) => {
-            handle_recurse(reader, out, table, field_number, wire_type, recurse, depth)
+        // Enforce the field's declared data shapes, but only when `enforcement` is `On` (the
+        // per-record verdict resolved upstream). Three-way branch:
+        //   enforcement off         → copy verbatim
+        //   on + no shapes declared → drop
+        //   on + shapes declared    → keep the string iff any allowed shape matches, else drop
+        // Enforcement off is distinct from "shapes declared empty": a plan built before shape
+        // enforcement existed simply runs with enforcement off and copies verbatim.
+        Action::PassThroughString(pts) => {
+            if enforcement == ShapeEnforcement::Off {
+                // Enforcement off → copy verbatim.
+                write_tag(out, field_number, wire_type);
+                copy_field_value(reader, out, wire_type)
+            } else if pts.allowed_shapes.is_empty() {
+                // Enforcement on + no shapes declared → drop.
+                drop_field(reader, wire_type)
+            } else {
+                // allowed_shapes is serialized as Vec<i32> (the DataShape enum numbers), and the
+                // shape crate validates them via the crate-agnostic is_allowed_shape(&[i32], &str).
+                handle_shape_enforce(reader, out, field_number, wire_type, &pts.allowed_shapes)
+            }
         }
+        Action::Remove(_) => drop_field(reader, wire_type),
+        Action::Recurse(recurse) => handle_recurse(
+            reader,
+            out,
+            table,
+            field_number,
+            wire_type,
+            recurse,
+            depth,
+            enforcement,
+        ),
         Action::MapEntry(map_entry) => {
             handle_map_entry(reader, out, field_number, wire_type, map_entry)
         }
@@ -533,7 +598,9 @@ fn copy_field_value(
             reader.copy_bytes(out, length as usize)
         }
         wire_type::FIXED32 => reader.copy_bytes(out, 4),
-        other => Err(RedactError::MalformedRecord(format!("unsupported wire type {other}"))),
+        other => Err(RedactError::MalformedRecord(format!(
+            "unsupported wire type {other}"
+        ))),
     }
 }
 
@@ -551,8 +618,50 @@ fn drop_field(reader: &mut WireReader, wire_type: u32) -> Result<(), RedactError
             reader.skip_bytes(length)
         }
         wire_type::FIXED32 => reader.skip_bytes(4),
-        other => Err(RedactError::MalformedRecord(format!("cannot drop wire type {other}"))),
+        other => Err(RedactError::MalformedRecord(format!(
+            "cannot drop wire type {other}"
+        ))),
     }
+}
+
+/// Enforces a `PassThroughString` field's declared data shapes: keep the string iff at least one
+/// `allowed_shape` matches, else drop it (no emit).
+///
+/// Only length-delimited (string) wire is meaningful; the plan builder applies PassThroughString to
+/// declared string fields, so any other wire type is defensive — skip the field without emitting.
+///
+/// `shape_numbers` is non-empty (the caller routes empty shapes to the verbatim copy branch). It
+/// carries the i32 enum numbers of the plan's `DataShape` values, so the shape crate (a distinct
+/// prost crate with its own `DataShape` type) validates them via the crate-agnostic
+/// `is_allowed_shape(&[i32], &str)`.
+fn handle_shape_enforce(
+    reader: &mut WireReader,
+    out: &mut Vec<u8>,
+    field_number: u32,
+    wire_type: u32,
+    shape_numbers: &[i32],
+) -> Result<(), RedactError> {
+    if wire_type != wire_type::LENGTH_DELIMITED {
+        // Defensive: PassThroughString is only applied to declared string fields by the plan
+        // builder, so a non-length-delimited wire type is unexpected — skip without emitting.
+        return drop_field(reader, wire_type);
+    }
+    let length = reader.read_varint32()? as usize;
+    let value_bytes = reader.take_slice(length)?;
+    // Shapes validate `&str`, so a field whose bytes are not valid UTF-8 cannot match any shape
+    // and is dropped (fail-closed) — a non-UTF-8 value is not a centralizable string. from_utf8
+    // does not allocate on the success path.
+    let value = match std::str::from_utf8(value_bytes) {
+        Ok(s) => s,
+        Err(_) => return Ok(()), // no shape matches a non-string → drop (no emit)
+    };
+    if shape::is_allowed_shape(shape_numbers, value) {
+        write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
+        write_varint(out, length as u64);
+        out.extend_from_slice(value_bytes); // re-emit the original bytes verbatim
+    }
+    // else: no shape matched → drop the field (no emit)
+    Ok(())
 }
 
 /// RECURSE: redact a nested length-delimited message with the referenced child plan, then emit
@@ -565,6 +674,7 @@ fn handle_recurse(
     wire_type: u32,
     recurse: &plan_proto::Recurse,
     depth: usize,
+    enforcement: ShapeEnforcement,
 ) -> Result<(), RedactError> {
     if wire_type != wire_type::LENGTH_DELIMITED {
         // TODO(vendored): DATABRICKS-ONLY divergence — universe passes through verbatim, but
@@ -589,7 +699,14 @@ fn handle_recurse(
     // is checked at the top of `process_message`, bounding native-stack recursion.
     let mut child_reader = WireReader::new(content);
     let mut child_out = Vec::new();
-    process_message(&mut child_reader, &mut child_out, table, child_index as usize, depth + 1)?;
+    process_message(
+        &mut child_reader,
+        &mut child_out,
+        table,
+        child_index as usize,
+        depth + 1,
+        enforcement,
+    )?;
 
     // Emit even when the child redacts to empty (tag + 0).
     write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
@@ -795,23 +912,39 @@ mod tests {
         }
     }
 
-    /// Runs the engine directly against a plan set (bypassing the handle registry), returning the
-    /// raw result so tests can assert either success bytes or a fail-closed error.
-    fn try_run(
+    /// Runs the engine directly against a plan set (bypassing the handle registry) at the given
+    /// `enforcement` verdict, returning the raw result so tests can assert either success bytes or a
+    /// fail-closed error.
+    fn try_run_with(
         plan_set: &plan_proto::RedactionPlanSet,
         record: &[u8],
+        enforcement: ShapeEnforcement,
     ) -> Result<Vec<u8>, RedactError> {
         let registered = RegisteredPlan::new(plan_set.clone());
         let table = PlanTable::new(&registered);
         let mut reader = WireReader::new(record);
         let mut out = Vec::new();
-        process_message(&mut reader, &mut out, &table, 0, 0)?;
+        process_message(&mut reader, &mut out, &table, 0, 0, enforcement)?;
         Ok(out)
     }
 
-    /// Runs the engine and unwraps, for the common success-path assertions.
+    /// [`try_run_with`] with shape enforcement off — the default for structural-opcode tests, which
+    /// carry no `PassThroughString` and are therefore independent of the verdict.
+    fn try_run(
+        plan_set: &plan_proto::RedactionPlanSet,
+        record: &[u8],
+    ) -> Result<Vec<u8>, RedactError> {
+        try_run_with(plan_set, record, ShapeEnforcement::Off)
+    }
+
+    /// Runs the engine (enforcement off) and unwraps, for the common success-path assertions.
     fn run(plan_set: &plan_proto::RedactionPlanSet, record: &[u8]) -> Vec<u8> {
         try_run(plan_set, record).expect("redaction failed")
+    }
+
+    /// Runs the engine with shape enforcement on and unwraps — for the `PassThroughString` tests.
+    fn run_enforced(plan_set: &plan_proto::RedactionPlanSet, record: &[u8]) -> Vec<u8> {
+        try_run_with(plan_set, record, ShapeEnforcement::On).expect("redaction failed")
     }
 
     /// A single-plan set keeping `field_number` as PASS_THROUGH — enough to reach the wire walk so
@@ -847,7 +980,7 @@ mod tests {
     #[test]
     fn redact_rejects_unknown_handle() {
         // 0 is never returned by register_plan, so it is unknown regardless of test execution order.
-        let err = redact(0, b"record").unwrap_err();
+        let err = redact(0, b"record", ShapeEnforcement::Off).unwrap_err();
         assert!(matches!(err, RedactError::UnknownHandle(0)));
     }
 
@@ -859,7 +992,7 @@ mod tests {
         };
         let handle = register_plan(&plan.encode_to_vec()).unwrap();
         release_plan(handle);
-        let err = redact(handle, b"anything").unwrap_err();
+        let err = redact(handle, b"anything", ShapeEnforcement::Off).unwrap_err();
         assert!(matches!(err, RedactError::UnknownHandle(_)));
     }
 
@@ -877,7 +1010,12 @@ mod tests {
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![
                     field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
-                    field_entry(2, Action::PassThroughString(plan_proto::PassThroughString {})),
+                    field_entry(
+                        2,
+                        Action::PassThroughString(plan_proto::PassThroughString {
+                            allowed_shapes: vec![], // Empty list means no shape constraint
+                        }),
+                    ),
                 ],
                 ..Default::default()
             }],
@@ -887,6 +1025,60 @@ mod tests {
         push_len_field(&mut record, 2, b"keep me");
         // Both fields kept → output is byte-identical to the (canonical) input.
         assert_eq!(run(&plan_set, &record), record);
+    }
+
+    #[test]
+    fn pass_through_string_enforces_shape_when_enabled() {
+        // enforcement=On (LP pipeline plans): field 1 is a PassThroughString gated to
+        // DATA_SHAPE_UUID. A non-UUID value is dropped; a valid UUID is kept verbatim.
+        let plan_set = plan_proto::RedactionPlanSet {
+            plans: vec![plan_proto::MessageRedactionPlan {
+                actions: vec![field_entry(
+                    1,
+                    Action::PassThroughString(plan_proto::PassThroughString {
+                        allowed_shapes: vec![1], // DATA_SHAPE_UUID
+                    }),
+                )],
+                ..Default::default()
+            }],
+        };
+        let mut bad = Vec::new();
+        push_len_field(&mut bad, 1, b"not-a-uuid");
+        assert!(
+            run_enforced(&plan_set, &bad).is_empty(),
+            "non-UUID must be dropped under enforcement"
+        );
+        let mut good = Vec::new();
+        push_len_field(&mut good, 1, b"550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(
+            run_enforced(&plan_set, &good),
+            good,
+            "valid UUID must be kept"
+        );
+    }
+
+    #[test]
+    fn pass_through_string_skips_shape_enforcement_when_disabled() {
+        // enforcement=Off (compliance/Governator plan): the same UUID-gated field passes a
+        // non-UUID value through VERBATIM — shapes are not enforced.
+        let plan_set = plan_proto::RedactionPlanSet {
+            plans: vec![plan_proto::MessageRedactionPlan {
+                actions: vec![field_entry(
+                    1,
+                    Action::PassThroughString(plan_proto::PassThroughString {
+                        allowed_shapes: vec![1], // DATA_SHAPE_UUID
+                    }),
+                )],
+                ..Default::default()
+            }],
+        };
+        let mut record = Vec::new();
+        push_len_field(&mut record, 1, b"not-a-uuid");
+        assert_eq!(
+            run(&plan_set, &record),
+            record,
+            "enforcement off → kept verbatim despite shape mismatch"
+        );
     }
 
     #[test]
@@ -914,7 +1106,10 @@ mod tests {
         // Plan only mentions field 1; field 2 has no entry → allowlist default drops it.
         let plan_set = plan_proto::RedactionPlanSet {
             plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(1, Action::PassThrough(plan_proto::PassThrough {}))],
+                actions: vec![field_entry(
+                    1,
+                    Action::PassThrough(plan_proto::PassThrough {}),
+                )],
                 ..Default::default()
             }],
         };
@@ -984,7 +1179,8 @@ mod tests {
         let table = PlanTable::new(&registered);
         let mut reader = WireReader::new(&record);
         let mut out = Vec::new();
-        let err = process_message(&mut reader, &mut out, &table, 0, 0).unwrap_err();
+        let err = process_message(&mut reader, &mut out, &table, 0, 0, ShapeEnforcement::Off)
+            .unwrap_err();
         assert!(matches!(err, RedactError::InvalidPlan(_)));
     }
 
@@ -1070,7 +1266,10 @@ mod tests {
         // proto3 map<string,string> entry: field 1 = key, field 2 = value. Strip the value.
         let plan_set = plan_proto::RedactionPlanSet {
             plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(3, Action::MapStripValue(plan_proto::MapStripValue {}))],
+                actions: vec![field_entry(
+                    3,
+                    Action::MapStripValue(plan_proto::MapStripValue {}),
+                )],
                 ..Default::default()
             }],
         };
@@ -1158,7 +1357,8 @@ mod tests {
         let table = PlanTable::new(&registered);
         let mut reader = WireReader::new(&record);
         let mut out = Vec::new();
-        let err = process_message(&mut reader, &mut out, &table, 0, 0).unwrap_err();
+        let err = process_message(&mut reader, &mut out, &table, 0, 0, ShapeEnforcement::Off)
+            .unwrap_err();
         assert!(matches!(err, RedactError::InvalidPlan(_)));
     }
 

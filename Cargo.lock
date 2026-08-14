@@ -14149,6 +14149,7 @@ version = "0.1.0"
 dependencies = [
  "prost 0.12.6",
  "prost-build 0.12.6",
+ "serde_json",
 ]
 
 [[package]]

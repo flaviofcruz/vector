@@ -1,0 +1,258 @@
+main
+Reference Handler
+Finalizer
+Signal Dispatcher
+Common-Cleaner
+Notification Thread
+Attach Listener
+Service Thread
+VM Thread
+VM Periodic Task Thread
+Sweeper thread
+Monitor Deflation Thread
+DestroyJavaVM
+Java2D Disposer
+process reaper
+process reaper (pid {DIGITS})
+CompilerThread{DIGITS}
+C1 CompilerThread{DIGITS}
+C2 CompilerThread{DIGITS}
+GC Thread#{DIGITS}
+G1 Main Marker
+G1 Young RemSet Sampling
+G1 Conc#{DIGITS}
+G1 Refine#{DIGITS}
+G1 Service
+Cleaner-{DIGITS}
+Keep-Alive-Timer
+Timer-{DIGITS}
+org.apache.hadoop.fs.FileSystem$Statistics$StatisticsDataReferenceCleaner
+Thread-{DIGITS}
+pool-{DIGITS}-thread-{DIGITS}
+ForkJoinPool-worker-{DIGITS}
+ForkJoinPool-{DIGITS}-worker-{DIGITS}
+ForkJoinPool.commonPool-worker-{DIGITS}
+threadDeathWatcher-{DIGITS}-{DIGITS}
+scala-execution-context-global-{DIGITS}
+JFR Recorder Thread
+JFR Periodic Tasks
+JFR Recording Scheduler
+com.databricks.common.javaflightrecorder.RollingJavaFlightRecorder-{DIGITS}
+qtp{DIGITS}-{DIGITS}
+etp{DIGITS}-{DIGITS}
+nioEventLoopGroup-{DIGITS}-{DIGITS}
+globalEventExecutor-{DIGITS}-{DIGITS}
+epollEventLoopGroup-{DIGITS}-{DIGITS}
+armeria-worker-{DIGITS}-{DIGITS}
+armeria-grpc-client-worker-{DIGITS}-{DIGITS}
+armeria-web-client-worker-{DIGITS}-{DIGITS}
+armeria-common-blocking-tasks-{DIGITS}
+armeria-common-worker-epoll-{DIGITS}-{DIGITS}
+armeria-dns-cache-executor-{DIGITS}-{DIGITS}
+grpc-default-executor-{DIGITS}
+grpc-default-worker-ELG-{DIGITS}-{DIGITS}
+grpc-default-boss-ELG-{DIGITS}-{DIGITS}
+grpc-timer-{DIGITS}
+gRPC-client-shared-request-instrumentation-executor-{DIGITS}
+initializeFirstGrpcClientExecutor-{DIGITS}
+Jetty9Client-Cancellations-{DIGITS}
+Executor task launch worker-{DIGITS}
+Executor task launch worker for task {DIGITS}
+Executor task launch worker for task {DIGITS}.{DIGITS}
+Executor task launch worker for task {DIGITS} in stage {DIGITS} (TID {DIGITS})
+Executor task launch worker for task {DIGITS} in stage {DIGITS}.{DIGITS} (TID {DIGITS})
+Executor task launch worker for task {DIGITS}.{DIGITS} in stage {DIGITS} (TID {DIGITS})
+Executor task launch worker for task {DIGITS}.{DIGITS} in stage {DIGITS}.{DIGITS} (TID {DIGITS})
+dispatcher-event-loop-{DIGITS}
+dag-scheduler-event-loop
+task-result-getter-{DIGITS}
+map-output-dispatcher-{DIGITS}
+map-output-aggregate-{DIGITS}
+task-serialization-worker-{DIGITS}
+block-manager-storage-async-thread-pool-{DIGITS}
+block-manager-ask-thread-pool-{DIGITS}
+shuffle-exchange-{DIGITS}
+shuffle-client-{DIGITS}-{DIGITS}
+shuffle-server-{DIGITS}-{DIGITS}
+shuffle-boss-{DIGITS}-{DIGITS}
+rpc-server-{DIGITS}-{DIGITS}
+rpc-client-{DIGITS}-{DIGITS}
+rpc-boss-{DIGITS}-{DIGITS}
+netty-rpc-env-timeout
+netty-rpc-connection-{DIGITS}
+SparkUI-{DIGITS}
+Thrift-RPC-Worker-Pool-{DIGITS}
+task-scheduler-event-loop-worker
+task-starvation-timer
+task-abort-timer
+kill-executor-thread
+element-tracking-store-worker
+appstatus-dropped-event-recovery
+appclient-registration-retry-thread
+appclient-register-master-threadpool-{DIGITS}
+inter-executor-connectivity-tracker
+deferred-mapstatuses-broadcast-cache-invalidation-timer
+ResultQueryStageExecution-{DIGITS}
+QueryStageCreator-{DIGITS}
+AQEPlanUpdateService
+AQEInProgressReplanningService
+subquery-{DIGITS}
+delta-scan-preparation-{DIGITS}
+delta-event-logging-{DIGITS}
+delta-log-threadpool-{DIGITS}
+analyzer-resolve-relations-table-resolution-{DIGITS}
+analyzer-resolve-relations-metastore-{DIGITS}
+query-rejection-cost-estimation-{DIGITS}
+query-status-monitor
+plan-evolution-thread-{DIGITS}
+plan-evolution-softstore-thread-{DIGITS}
+pipeline-inline-{DIGITS}
+hash-generation-pool-{DIGITS}
+driver-heartbeater
+executor-heartbeater
+driver-revive-thread
+heartbeat-receiver-event-loop-thread
+dispatcher-BlockManagerMaster
+dispatcher-BlockManagerEndpoint{DIGITS}
+dispatcher-HeartbeatReceiver
+dispatcher-CoarseGrainedScheduler
+dispatcher-org.apache.spark.internal.plugin.PluginEndpoint
+spark-listener-group-appStatus
+spark-listener-group-appStatus-thriftServer
+spark-listener-group-executorManagement
+spark-listener-group-shared
+spark-listener-group-streams
+spark-listener-group-dbrEventLog
+spark-listener-group-runtime-info-builder
+spark-listener-group-aqe
+spark-listener-group-query-profile-logging-queue
+spark-listener-group-streamingQplStage
+spark-listener-group-sql-query-logs
+spark-listener-group-lumberjackQpl
+spark-dynamic-executor-allocation
+Spark Context Cleaner
+context-cleaner-periodic-gc
+context-cleaner-periodic-watchdog
+RemoteBlock-temp-file-clean-thread
+aether-task-launch-pool-{DIGITS}
+aether-task-scheduler-{DIGITS}
+aether-task-runtime-timer
+aether-server-memory-logger
+aether-nql-slow-event-loop-timer
+aether-liveness-checker
+aether-heartbeat-timer
+Aether QueryDAGSchedulerLoop-{DIGITS}
+DriverDaemon-HttpClient-{DIGITS}
+DriverDaemon-scheduler-{DIGITS}
+DriverCorralReporterThreadPool-{DIGITS}
+DriverLoopMetricsTimer
+DriverMemoryCapacity-ReservationCleanupThread
+driverCorralStatsReporter
+replStatusReporter
+DBCEventLoggingListener-event-processing-execution-context-{DIGITS}
+DBCEventLoggingListener-gzip-compression-execution-context-{DIGITS}
+DBCEventLoggingListener-event-writer-thread
+DBCEventLoggingListener flush timer
+dbr-activity-recorder-batch-emitter-FRAME_PROFILER
+dbr-activity-recorder-batch-emitter-SPARK_SQL_EXECUTION
+dbr-activity-recorder-batch-emitter-SPARK_STAGE
+dbr-activity-recorder-batch-emitter-DELTA_GENERIC
+dbr-activity-recorder-batch-emitter-DRIVER_LIFECYCLE
+dbr-activity-recorder-SPARK_SQL_EXECUTION
+dbr-activity-recorder-SPARK_STAGE
+dbr-activity-recorder-DELTA_GENERIC
+dbr-activity-recorder-DRIVER_LIFECYCLE
+startDbrActivityRecorder
+SoftstoreKeylibImpl-{DIGITS}
+SoftstoreSyncer
+LocalSyncSoftMap-consistency-checker
+unified-softstore-{DIGITS}
+softstore-snapshot-preload-{DIGITS}
+ObservedStatsStoreSoftstoreInit-{DIGITS}
+cachelet-cache-listener-pool-{DIGITS}
+SAFE config record refresher
+saferFlagLoader
+LDBasedSafeFlagClient
+FlagSettingCacheMetricsTimer
+safer-event-flush-{DIGITS}
+safer-config-refresh-execution-context-{DIGITS}
+SqlGatewayHistoryClient-{DIGITS}
+SqlGatewayHistoryQueryPlanClient-{DIGITS}
+SqlgatewayHistoryProxyRpcClient-nonblockingExecutionContext-{DIGITS}
+SqlGatewayHistorySparkListener-initialize-{DIGITS}
+sqlgateway-insight-publisher-{DIGITS}
+sqlgateway-history-publisher
+sqlgateway-history-publisher-{DIGITS}
+sqlgateway-history-plan-upload-ec-{DIGITS}
+sqlgateway-history-publisher-nonblocking-ec-{DIGITS}
+sqlgateway-history-plan-publisher
+gateway-history-scheduled-execution-publisher
+gateway-history-scheduled-metric-poller
+gateway-history-execution-cleaner
+PrometheusMetricsExporter
+prometheus-metrics-logger
+SparkMetricsSyncer
+MutableQuantiles-{DIGITS}
+OpenCensus.Disruptor-{DIGITS}
+ExportComponent.ServiceExporterThread-{DIGITS}
+JaegerHttpsExporter-HttpClient-{DIGITS}
+JaegerHttpsExporter-scheduler-{DIGITS}
+TelemetryThread
+PredictionBackendLoggingAsyncLoggingEC
+profiler-service-{DIGITS}
+scheduler-profiler-thread
+scheduler-stats-logger
+event-loop-sampler-{DIGITS}
+signature-generator-ec-{DIGITS}
+hadoop-fs-usage-log-reporter-{DIGITS}
+SQL-usage-logging-{DIGITS}
+conf-access-logger-{DIGITS}
+StallTracker
+heartBeatDaemon
+hanging-detector-manager-{DIGITS}
+hanging-task-detection-prober-{DIGITS}
+hanging-thread-detection
+deadlock-detection
+hiccup-sampling-dry-run-thread
+disk_health_monitor
+node_status_monitor
+unmanaged-memory-poller
+cluster-load-moving-average-thread
+ema-load-monitor-thread
+LoggingSiteTrackerLogger
+UptimeLogger:driver
+CpuUsageTracker timer, window: {DIGITS} ms, interval: {DIGITS} ms
+reschedule-tasks-timer
+notify-active-queries-timer
+purge-stuck-queries-timer
+runtime_info_listener_stage_cleanup
+runtime_info_listener_executor_cleanup
+maintenance-auto-compute-retry-thread-{DIGITS}
+Simple Cleaner - UCSHandle
+Simple Cleaner - ArtifactManager
+Simple Cleaner - DynamicPhotonCoalescingRDDBase
+DBFS-mount-refresh-{DIGITS}
+dbfsChecker
+metastoreChecker
+executionChecker
+unity-credential-manager-{DIGITS}
+uc-fuse-server
+pcs-token-cache-{DIGITS}
+dbl-jni/{DIGITS}
+python-factory-watcher
+stacktrace-logger-executor-{DIGITS}
+stm-backend-init-thread
+stm-shadow-{DIGITS}
+Writer:Driver>Chauffeur - writer thread
+StreamingQueryStatusPoller-{DIGITS}
+ShortTermMemoryAsync-{DIGITS}
+DataLineageExecContext-{DIGITS}
+java-sdk-http-connection-reaper
+java-sdk-progress-listener-callback-thread
+databricks-server-startstop-support-{DIGITS}
+HiveServer2-Background-Pool: Thread-{DIGITS}
+HiveServer2-HttpHandler-JettyScheduler-{DIGITS}
+ThriftHttpCLIService
+orphanedRProcessKiller
+R stdout reader
+RBackend-{DIGITS}-{DIGITS}

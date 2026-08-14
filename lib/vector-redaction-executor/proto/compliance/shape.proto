@@ -1,0 +1,349 @@
+syntax = "proto2";
+
+package compliance;
+
+// Enum representing the expected format/shape of a string field's value.
+// Used as a proto field option to annotate fields with their expected data format.
+// Validators for each shape are defined in the Rust shape module.
+// Multiple shapes on a single field are treated as a union (OR / ONE-OF):
+// the value is valid if it matches ANY of the listed shapes.
+enum DataShape {
+  // Sentinel / default value — no shape constraint specified.
+  DATA_SHAPE_UNSPECIFIED = 0;
+  // UUID format with hyphens: 8-4-4-4-12 hex characters.
+  DATA_SHAPE_UUID = 1;
+  // 32-character hex string (UUID without hyphens).
+  DATA_SHAPE_HEX32 = 2;
+  // Integer string: one or more digits with an optional single leading '-'.
+  DATA_SHAPE_NUMERIC = 3;
+  // OpenAI ChatCompletion response ID format.
+  DATA_SHAPE_CHAT_COMPLETION_RESPONSE_ID = 4;
+  // AWS EC2 instance ID: "i-" prefix followed by 17 lowercase hex characters.
+  DATA_SHAPE_AWS_EC2_INSTANCE_ID = 5;
+  // ISO-8601 UTC timestamp with trailing 'Z'.
+  DATA_SHAPE_ISO8601_TIMESTAMP = 6;
+  // W3C trace context "traceparent" header value.
+  DATA_SHAPE_W3C_TRACEPARENT = 7;
+  // IP address (IPv4 or IPv6) with the final octet/group redacted to "x".
+  DATA_SHAPE_TRUNCATED_IP = 8;
+  // Databricks Runtime cluster ID.
+  DATA_SHAPE_DBR_CLUSTER_ID = 9;
+  // JA4 TLS client fingerprint.
+  DATA_SHAPE_JA4_FINGERPRINT = 10;
+  // ISO 3166-1 alpha-2 country code (two uppercase ASCII letters).
+  DATA_SHAPE_ISO_COUNTRY_CODE = 11;
+  // Boolean string: any ASCII case variant of "true"/"false"/"yes"/"no"/etc.
+  DATA_SHAPE_BOOLEAN = 12;
+  // HTTP request method per RFC 9110 + RFC 5789.
+  DATA_SHAPE_HTTP_METHOD = 13;
+  // HTTP protocol identifier "HTTP/<major>" or "HTTP/<major>.<minor>".
+  DATA_SHAPE_HTTP_PROTOCOL = 14;
+  // TLS protocol version "TLSv<digit>.<digit>".
+  DATA_SHAPE_TLS_VERSION = 15;
+  // gRPC status code in the PascalCase form Envoy emits.
+  DATA_SHAPE_GRPC_STATUS = 16;
+  // Databricks SQL proxy / inspector protocol name.
+  DATA_SHAPE_SQL_PROTOCOL = 17;
+  // Top-level Envoy access-log type tag.
+  DATA_SHAPE_ENVOY_LOG_TYPE = 18;
+  // Envoy AccessLogType enum in the PascalCase form Envoy emits.
+  DATA_SHAPE_ENVOY_ACCESS_LOG_TYPE = 19;
+  // A single Envoy %RESPONSE_FLAGS% access-log code.
+  DATA_SHAPE_ENVOY_RESPONSE_FLAGS = 20;
+  // Sec-Fetch-Dest request header value per the W3C Fetch spec.
+  DATA_SHAPE_SEC_FETCH_DEST = 21;
+  // Databricks principal URI.
+  DATA_SHAPE_DATABRICKS_PRINCIPAL_URI = 22;
+  // Databricks task run identifier: literal "TaskRunId-" followed by decimal digits.
+  DATA_SHAPE_TASK_RUN_ID = 23;
+  // Cloud region identifier for a recognized AWS / Azure / GCP region.
+  DATA_SHAPE_CLOUD_REGION = 24;
+  // JIRA ticket key.
+  DATA_SHAPE_JIRA_TICKET_KEY = 25;
+  reserved 26;
+  reserved "DATA_SHAPE_DBR_VERSION";
+  // Postgres-style timestamp with named UTC timezone abbreviation.
+  DATA_SHAPE_POSTGRES_TIMESTAMP_TZ = 27;
+  // Databricks internal cluster ID.
+  DATA_SHAPE_INTERNAL_CLUSTER_ID = 28;
+  // Databricks cluster creator.
+  DATA_SHAPE_CLUSTER_CREATOR = 29;
+  // 16-character lowercase hex string.
+  DATA_SHAPE_HEX16 = 30;
+  // Databricks approval system entry ID.
+  DATA_SHAPE_APPROVAL_ID = 31;
+  // Kubernetes API version per the K8s versioning convention.
+  DATA_SHAPE_K8S_API_VERSION = 32;
+  // Databricks cluster-pool name.
+  DATA_SHAPE_CLUSTER_POOL_NAME = 33;
+  // Databricks serverless node-type identifier.
+  DATA_SHAPE_SERVERLESS_NODE_TYPE_ID = 34;
+  // Databricks cluster_event source.
+  DATA_SHAPE_EVENT_SOURCE = 35;
+  // Databricks cluster workload type.
+  DATA_SHAPE_WORKLOAD_TYPE = 36;
+  // Databricks cluster sub-workload type.
+  DATA_SHAPE_SUB_WORKLOAD_TYPE = 37;
+  // Databricks cluster performance-target setting.
+  DATA_SHAPE_PERFORMANCE_TARGET = 38;
+  // Databricks cluster termination reason code.
+  DATA_SHAPE_TERMINATION_REASON_CODE = 39;
+  // Databricks cluster termination reason type.
+  DATA_SHAPE_TERMINATION_REASON_TYPE = 40;
+  // Databricks Notebooks workload ID.
+  DATA_SHAPE_NOTEBOOKS_ID = 41;
+  // Pair of 16-character lowercase hex strings joined by a single '-'.
+  DATA_SHAPE_HEX16_PAIR = 42;
+  // Generic dotted version-number string.
+  DATA_SHAPE_VERSION_NUMBER = 43;
+  // Salesforce account ID.
+  DATA_SHAPE_SALESFORCE_ACCOUNT_ID = 44;
+  // Databricks employee email address.
+  DATA_SHAPE_BRICKSTER_EMAIL = 45;
+  // SLA outcome-type string.
+  DATA_SHAPE_SLA_OUTCOME_TYPE = 46;
+  // SHL service-health event name.
+  DATA_SHAPE_SHL_EVENT_NAME = 47;
+  // Protobuf fully-qualified gRPC service name.
+  DATA_SHAPE_GRPC_SERVICE = 48;
+  // gRPC method (RPC) name.
+  DATA_SHAPE_GRPC_METHOD = 49;
+  // Cloud provider instance type identifier.
+  DATA_SHAPE_CLOUD_INSTANCE_TYPE = 50;
+  // Nexus workload attribute type.
+  DATA_SHAPE_NEXUS_ATTRIBUTE_TYPE = 51;
+  // Nexus workload attribute ID.
+  DATA_SHAPE_NEXUS_ATTRIBUTE_ID = 52;
+  // PredictionDriverNodeSize.
+  DATA_SHAPE_PREDICTION_DRIVER_NODE_SIZE = 53;
+  // VirtualClusterSize.
+  DATA_SHAPE_VIRTUAL_CLUSTER_SIZE = 54;
+  // Measurement unit for utilization metrics.
+  DATA_SHAPE_MEASUREMENT_UNIT = 55;
+  // Driver utilization metric name.
+  DATA_SHAPE_DRIVER_UTILIZATION_METRIC_NAME = 56;
+  // PredictionWorkerNodeSize.
+  DATA_SHAPE_PREDICTION_WORKER_NODE_SIZE = 57;
+  // Single OOM reason from the vertical autoscaler's OomReason enum.
+  DATA_SHAPE_OOM_REASON = 58;
+  // Pipe-separated list of OOM reasons.
+  DATA_SHAPE_OOM_REASON_PIPED = 59;
+  // 64-character lowercase hex string (SHA-256 / HMAC-SHA-256).
+  DATA_SHAPE_HEX64 = 60;
+  // A Databricks Runtime image / Spark version label.
+  DATA_SHAPE_DBR_IMAGE_LABEL = 61;
+  // Apache Spark / Databricks Delta Live Tables configuration key name.
+  DATA_SHAPE_SPARK_CONFIG_NAME = 62;
+  // Protobuf fully-qualified message class name.
+  DATA_SHAPE_PROTO_MESSAGE_FQN = 63;
+  // Databricks internal service name.
+  DATA_SHAPE_DATABRICKS_SERVICE_NAME = 64;
+  // KA ingestion job error category.
+  DATA_SHAPE_KA_INGESTION_ERROR_CATEGORY = 65;
+  // KA ingestion job granular error type.
+  DATA_SHAPE_KA_INGESTION_ERROR_TYPE = 66;
+  // Private / non-routable IPv4 address.
+  DATA_SHAPE_PRIVATE_IP_ADDRESS = 67;
+  // Log-emitter plane.
+  DATA_SHAPE_PLANE = 68;
+  // Databricks cluster type.
+  DATA_SHAPE_CLUSTER_TYPE = 69;
+  // Databricks control-plane multitenant shard name.
+  DATA_SHAPE_SHARD_NAME = 70;
+  // Databricks build/deploy branch tag.
+  DATA_SHAPE_BRANCH_NAME = 71;
+  // Databricks system actor URI.
+  DATA_SHAPE_SYSTEM_URI = 72;
+  // Databricks Spark runtime version string.
+  DATA_SHAPE_SPARK_VERSION = 73;
+  // Databricks cluster size type.
+  DATA_SHAPE_CLUSTER_SIZE_TYPE = 74;
+  // Databricks cluster Unity Catalog access mode.
+  DATA_SHAPE_CLUSTER_UNITY_CATALOG_MODE = 75;
+  // Databricks platform channel string.
+  DATA_SHAPE_PLATFORM_CHANNEL = 76;
+  // Databricks dblet machine-image label.
+  DATA_SHAPE_DBLET_IMAGE_LABEL = 77;
+  // KaaS controllers release version name.
+  DATA_SHAPE_KAAS_RELEASE_VERSION_NAME = 78;
+  // Unity Catalog securable type.
+  DATA_SHAPE_UC_SECURABLE_TYPE = 79;
+  // Unity Catalog securable kind.
+  DATA_SHAPE_UC_SECURABLE_KIND = 80;
+  // Unity Catalog privilege name.
+  DATA_SHAPE_UC_PRIVILEGE = 81;
+  // Unity Catalog authz action name.
+  DATA_SHAPE_UC_ACTION_NAME = 82;
+  // Unity Catalog authz target type.
+  DATA_SHAPE_UC_TARGET_TYPE = 83;
+  // Unity Catalog principal type.
+  DATA_SHAPE_UC_PRINCIPAL_TYPE = 84;
+  // Unity Catalog authz argument name.
+  DATA_SHAPE_UC_ARGUMENT_NAME = 85;
+  // Hot-pool cluster claim discovery method.
+  DATA_SHAPE_DISCOVERY_METHOD = 86;
+  // Databricks Kubernetes context name.
+  DATA_SHAPE_KUBE_CONTEXT = 87;
+  // Budget-alert action type.
+  DATA_SHAPE_BUDGET_ACTION_TYPE = 88;
+  // Budget-alert evaluation time period.
+  DATA_SHAPE_BUDGET_ALERT_TIME_PERIOD = 89;
+  // Budget-alert trigger type.
+  DATA_SHAPE_BUDGET_ALERT_TRIGGER_TYPE = 90;
+  // Budget-alert quantity type.
+  DATA_SHAPE_BUDGET_ALERT_QUANTITY_TYPE = 91;
+  // Databricks-owned fully-qualified domain name.
+  DATA_SHAPE_DATABRICKS_FQDN = 92;
+  // UPPER_SNAKE_CASE error code.
+  DATA_SHAPE_GENERIC_ERROR_CODE = 93;
+  // Product-event proto type name.
+  DATA_SHAPE_METRIC_NAME = 94;
+  // Foundation model base model ID.
+  DATA_SHAPE_FOUNDATION_MODEL_ID = 95;
+  // Cluster unhealthy-reason code.
+  DATA_SHAPE_CLUSTER_UNHEALTHY_REASON = 96;
+  // Logging file source file_id.
+  DATA_SHAPE_LOGGING_FILE_ID = 97;
+  // Estore schema-qualified namespace.
+  DATA_SHAPE_ESTORE_NAMESPACE = 98;
+  // Deployment environment.
+  DATA_SHAPE_ENV = 99;
+  // Google API endpoint hostname.
+  DATA_SHAPE_GOOGLE_API_ENDPOINT = 100;
+  // Unity Catalog sub-securable type.
+  DATA_SHAPE_UC_SUB_SECURABLE_TYPE = 101;
+  // One line (frame) of a redacted DBR/JVM stack trace.
+  DATA_SHAPE_REDACTED_STACK_TRACE = 102;
+  // Infra Data Model URI.
+  DATA_SHAPE_INFRA_DATA_MODEL_URI = 103;
+  // A canonical DBR/Spark error class.
+  DATA_SHAPE_DBR_ERROR_CLASS = 104;
+  // An ANSI/ISO SQLSTATE.
+  DATA_SHAPE_SQL_STATE = 105;
+  // Release-engineering step name.
+  DATA_SHAPE_RELEASE_STEP_NAME = 106;
+  // Cloud provider name.
+  DATA_SHAPE_CLOUD_PROVIDER = 107;
+  // SQL API constant.
+  DATA_SHAPE_SQL_API_CONST = 108;
+  // SQL Gateway ReleaseIdempotencyToken request type.
+  DATA_SHAPE_SQLGW_RELEASE_IDEMPOTENCY_TOKEN_REQUEST_TYPE = 109;
+  // Well-known constants in the Data Rooms API.
+  DATA_SHAPE_DATA_ROOMS_API_CONST = 110;
+  // Release-attempt constant.
+  DATA_SHAPE_RELEASE_ATTEMPT_CONST = 111;
+  // Databricks engine-request ID.
+  DATA_SHAPE_ENGINE_REQUEST_ID = 112;
+  // Databricks engine-request outcome.
+  DATA_SHAPE_ENGINE_REQUEST_OUTCOME = 113;
+  // Exception class name.
+  DATA_SHAPE_EXCEPTION_TYPE = 114;
+  // Unity Catalog common enum constant.
+  DATA_SHAPE_UC_COMMON_ENUMS = 115;
+  // 40-character lowercase hex string (git commit SHA-1).
+  DATA_SHAPE_HEX40 = 116;
+  // Databricks workspace deployment name.
+  DATA_SHAPE_DEPLOYMENT_NAME = 117;
+  // A two-digit prefix, a hyphen, then a hyphenated UUID.
+  DATA_SHAPE_PREFIXED_UUID = 118;
+  // Databricks SQL warehouse / SQL Gateway endpoint ID.
+  DATA_SHAPE_SQL_GATEWAY_ENDPOINT_ID = 119;
+  // HiveServer2 / Spark Thrift session protocol version string.
+  DATA_SHAPE_SPARK_THRIFT_SESSION_PROTOCOL = 120;
+  // UUID with a positive numeric version suffix.
+  DATA_SHAPE_UUID_WITH_VERSION = 121;
+  // Composite metadata-operation parameter selectivity string.
+  DATA_SHAPE_SPARK_THRIFT_METADATA_OPS_PARAM_SELECTIVITY = 122;
+  // Closed Spark Thrift constants.
+  DATA_SHAPE_SPARK_THRIFT_CONST = 123;
+  // Query result-cache status strings.
+  DATA_SHAPE_SPARK_RESULT_CACHE_STATUS = 124;
+  // DBSQL trigger attribution enum values.
+  DATA_SHAPE_DBSQL_TRIGGER_ATTRIBUTION = 125;
+  // DBSQL Redash run-as mode.
+  DATA_SHAPE_DBSQL_REDASH_RUN_AS = 126;
+  // Redacted Spark Thrift user agent.
+  DATA_SHAPE_SPARK_THRIFT_USER_AGENT = 128;
+  // Spark Thrift result schema.
+  DATA_SHAPE_SPARK_THRIFT_RESULT_SCHEMA = 129;
+  // Spark Thrift partition-size histogram.
+  DATA_SHAPE_SPARK_THRIFT_PARTITION_SIZE_BUCKETS = 130;
+  // Per-user AI Parse Document tile id.
+  DATA_SHAPE_PD_TILE_ID = 131;
+  // Automatic Identity Management enum strings.
+  DATA_SHAPE_AIM_ENUM = 132;
+  // GCP Compute Engine instance locator.
+  DATA_SHAPE_GCP_COMPUTE_INSTANCE_ID = 133;
+  // Kubernetes object Kind.
+  DATA_SHAPE_K8S_OBJECT_KIND = 134;
+  // Google Cloud-prefixed 32-character hex identifier.
+  DATA_SHAPE_GOOGLE_CLOUD_HEX32_ID = 135;
+  // Webapp workspace tree node type.
+  DATA_SHAPE_WORKSPACE_TREE_NODE_TYPE = 136;
+  // Constants used by the serverless enablement workflow.
+  DATA_SHAPE_SERVERLESS_COMMON_TYPES = 137;
+  // ULID (Universally Unique Lexicographically Sortable Identifier).
+  DATA_SHAPE_ULID = 138;
+  // A DBR/Spark runtime Prometheus metric name.
+  DATA_SHAPE_DBR_PROMETHEUS_METRIC_NAME = 139;
+  // Alphanumeric string of fixed lengths.
+  DATA_SHAPE_BOUNDED_ALPHANUMERIC = 140;
+  // Common types from the maintenance-auto-compute service.
+  DATA_SHAPE_MAINTENANCESTORE_COMMON_TYPES = 141;
+  // Date-only calendar date as a STRING: YYYY-MM-DD.
+  DATA_SHAPE_CALENDAR_DATE = 142;
+  // A `jdk.*` event type name read from JFR.
+  DATA_SHAPE_JFR_EVENT_TYPE = 143;
+  // A HotSpot enum value from a JFR OOM event.
+  DATA_SHAPE_JVM_COMMON_TYPES = 144;
+  // An already-redacted JFR object/allocation type name.
+  DATA_SHAPE_JFR_REDACTED_TYPE_NAME = 145;
+  // A 32-character lowercase hexadecimal string and a 16-character lowercase hexadecimal string.
+  DATA_SHAPE_HEX32_HEX16 = 146;
+  // The `.name()` of any lifecyclemanagement proto enum.
+  DATA_SHAPE_LIFECYCLE_MANAGEMENT_COMMON_TYPES = 147;
+  // A Databricks-owned FQDN with a UUID remainder.
+  DATA_SHAPE_DATABRICKS_ACCOUNT_CONSOLE_URL = 148;
+  // The literal "/subscriptions/" followed by a hyphenated UUID.
+  DATA_SHAPE_AZURE_SUBSCRIPTION_PATH = 149;
+  // The literal prefix "PARTNER_CHANGE_EVENT_REGISTRATION_V".
+  DATA_SHAPE_PARTNER_CHANGE_EVENT_REGISTRATION_ID = 150;
+  // accounts-manager enum strings.
+  DATA_SHAPE_ACCOUNT_COMMON_ENUMS = 151;
+  // eng-anti-abuse-team Kafka enum strings.
+  DATA_SHAPE_ANTI_ABUSE_ENUMS = 152;
+  // Activation Engine enum strings.
+  DATA_SHAPE_ACTIVATIONENGINE_COMMON_TYPES = 153;
+  // An already-redacted JFR JVM thread name.
+  DATA_SHAPE_JFR_REDACTED_THREAD_NAME = 154;
+  // Auth handler / authenticator class name.
+  DATA_SHAPE_AUTH_HANDLER_NAME = 155;
+  // Data Rooms embedding cache key.
+  DATA_SHAPE_DATA_ROOMS_EMBEDDING_PATH = 156;
+  // Notifications-service idempotency key.
+  DATA_SHAPE_NOTIFSVC_IDEMPOTENCY_KEY = 157;
+  // CPDR asset-sync enum strings.
+  DATA_SHAPE_CPDR_ASSET_SYNC_ENUM = 158;
+  // The `.name()` of any entity-replication placement proto enum.
+  DATA_SHAPE_ENTITY_PLACEMENT_COMMON_TYPES = 159;
+  // Frontend ES (engineering system) component id.
+  DATA_SHAPE_ES_COMPONENT = 160;
+  // Nimbus REPL ID.
+  DATA_SHAPE_NIMBUS_REPL_ID = 161;
+  // AWS availability zone.
+  DATA_SHAPE_CLOUD_AVAILABILITY_ZONE = 162;
+  // AWS EBS volume ID.
+  DATA_SHAPE_AWS_EBS_VOLUME_ID = 163;
+  // AWS EBS snapshot ID.
+  DATA_SHAPE_AWS_EBS_SNAPSHOT_ID = 164;
+  // Arca (arca-environment-platform) internal developer-environment enum strings.
+  DATA_SHAPE_ARCA_COMMON_TYPES = 165;
+  // Kubernetes event common enums.
+  DATA_SHAPE_K8S_COMMON_TYPES = 166;
+  // Kubernetes node name.
+  DATA_SHAPE_K8S_NODE_NAME = 167;
+  // Lakesense / LLM Proxy client id.
+  DATA_SHAPE_LAKESENSE_CLIENT_ID = 168;
+  // 8-character lowercase hex string.
+  DATA_SHAPE_HEX8 = 169;
+}

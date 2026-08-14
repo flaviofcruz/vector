@@ -30,6 +30,14 @@ impl Function for ApplyRedaction {
             `plan_file` must be a literal path to a serialized `RedactionPlanSet`. It is read and
             registered once when the VRL program is compiled.
 
+            `enforce_shapes` is an optional literal boolean (default false) that gates data-shape
+            enforcement: when true, `PassThroughString` fields are kept only if they match a declared
+            shape; when false or absent, they pass through verbatim. It must be a literal so the
+            verdict is a static property of the VRL program, resolved once at compile time and NOT
+            influenceable by record content (this gate is the fail-closed boundary). Set to true only
+            for LP pipeline plans; the LP splice sets this true, while Governator omits it (defaults
+            false) to scope enforcement to the LP write path.
+
             The function is fallible (call it as `apply_redaction!(...)`): it fails if the plan
             cannot be read or registered at compile time, or if the record is not valid protobuf at
             runtime.
@@ -47,6 +55,11 @@ impl Function for ApplyRedaction {
                 keyword: "plan_file",
                 kind: kind::BYTES,
                 required: true,
+            },
+            Parameter {
+                keyword: "enforce_shapes",
+                kind: kind::BOOLEAN,
+                required: false,
             },
         ]
     }
@@ -87,7 +100,32 @@ impl Function for ApplyRedaction {
             }) as Box<dyn DiagnosticMessage>
         })?;
 
-        Ok(ApplyRedactionFn { message, resolver }.as_expr())
+        // A literal (not a per-record expression) so the enforcement verdict is a static property
+        // of the VRL program: record content cannot flip the fail-closed gate off. Absent => Off.
+        let enforcement = match arguments.optional_literal("enforce_shapes", state)? {
+            Some(value) => {
+                let enforce = value.try_boolean().map_err(|_| {
+                    Box::new(ExpressionError::Error {
+                        message: "apply_redaction: enforce_shapes must be a boolean".to_owned(),
+                        labels: vec![],
+                        notes: vec![],
+                    }) as Box<dyn DiagnosticMessage>
+                })?;
+                if enforce {
+                    executor::ShapeEnforcement::On
+                } else {
+                    executor::ShapeEnforcement::Off
+                }
+            }
+            None => executor::ShapeEnforcement::Off,
+        };
+
+        Ok(ApplyRedactionFn {
+            message,
+            resolver,
+            enforcement,
+        }
+        .as_expr())
     }
 }
 
@@ -95,6 +133,9 @@ impl Function for ApplyRedaction {
 struct ApplyRedactionFn {
     message: Box<dyn Expression>,
     resolver: PlanResolver,
+    // Resolved once at compile time from the literal `enforce_shapes` arg (see `compile`); a static
+    // property of the program, so record content cannot disable enforcement.
+    enforcement: executor::ShapeEnforcement,
 }
 
 impl FunctionExpression for ApplyRedactionFn {
@@ -110,8 +151,8 @@ impl FunctionExpression for ApplyRedactionFn {
             .handle_for(&PlanKey::default())
             .ok_or("apply_redaction: no redaction plan registered")?;
 
-        let redacted =
-            executor::redact(handle, &bytes).map_err(|e| format!("apply_redaction: {e}"))?;
+        let redacted = executor::redact(handle, &bytes, self.enforcement)
+            .map_err(|e| format!("apply_redaction: {e}"))?;
 
         Ok(Value::Bytes(Bytes::from(redacted)))
     }
@@ -132,9 +173,9 @@ mod tests {
     use vector_redaction_executor::plan_proto;
 
     use super::*;
-    use vrl::compiler::CompileConfig;
     use vrl::compiler::function::FunctionCompileContext;
     use vrl::compiler::state::{self, TypeState};
+    use vrl::compiler::CompileConfig;
     use vrl::diagnostic::Span;
 
     /// Encodes a two-field proto record on the wire: field 1 and field 2, both varints.
@@ -189,6 +230,32 @@ mod tests {
         let expr = ApplyRedaction
             .compile(&type_state, &mut cctx, args.into())
             .expect("compile should succeed with a valid plan file");
+
+        let mut runtime_state = state::RuntimeState::default();
+        let mut object: Value = Value::Object(BTreeMap::new());
+        let tz = TimeZone::default();
+        let mut ctx = Context::new(&mut object, &mut runtime_state, &tz);
+
+        let value = expr.resolve(&mut ctx).expect("resolve should succeed");
+        assert_eq!(value, Value::Bytes(Bytes::from(vec![(1u8 << 3), 7u8])));
+    }
+
+    /// A literal `enforce_shapes: true` compiles through the compile-time literal path and resolves.
+    /// The plan here carries no PassThroughString, so On vs Off produce identical output; this only
+    /// exercises the literal-arg binding (the enforcement semantics are covered by the executor's
+    /// run_enforced tests and the E2E). A non-literal arg would be rejected by optional_literal.
+    #[test]
+    fn enforce_shapes_literal_compiles_and_resolves() {
+        let type_state = TypeState::default();
+        let mut cctx = FunctionCompileContext::new(Span::new(0, 0), CompileConfig::default());
+        let args = func_args![
+            message: Bytes::from(record(7, 9)),
+            plan_file: write_pass1_drop2_plan(),
+            enforce_shapes: true,
+        ];
+        let expr = ApplyRedaction
+            .compile(&type_state, &mut cctx, args.into())
+            .expect("compile should succeed with a literal enforce_shapes");
 
         let mut runtime_state = state::RuntimeState::default();
         let mut object: Value = Value::Object(BTreeMap::new());
