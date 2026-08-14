@@ -12,6 +12,7 @@ use kube::{
     config::{self, KubeConfigOptions},
     runtime::{WatchStreamExt, reflector, watcher},
 };
+use regex::Regex;
 use serde_with::serde_as;
 use tokio::time;
 use tracing::{debug, info, warn};
@@ -111,6 +112,21 @@ pub struct PrometheusK8sScrapeConfig {
     #[configurable(metadata(docs::examples = "metrics", docs::examples = "prometheus"))]
     named_port: Option<String>,
 
+    /// A regex matched against container port names for endpoint discovery.
+    ///
+    /// Every container port whose name matches is scraped, so a single pod
+    /// exposing multiple matching ports (e.g. `metrics0` and `metrics1`)
+    /// produces multiple endpoints — unlike `named_port`, which matches exactly
+    /// and yields at most one endpoint per pod. The pattern is anchored (it must
+    /// match the whole port name). The number of endpoints a pod contributes via
+    /// this path is capped by `max_endpoints_per_pod`. This path is independent
+    /// of `named_port` and `annotation_name`; endpoints discovered by more than
+    /// one path are deduplicated by URL. Set to `null` (the default) to disable
+    /// regex-based discovery.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "metrics.*", docs::examples = "^metrics\\d+$"))]
+    named_port_regex: Option<String>,
+
     /// The pod annotation key used for annotation-based endpoint discovery.
     ///
     /// Pods carrying this annotation will be scraped on the port number(s) given as
@@ -125,13 +141,12 @@ pub struct PrometheusK8sScrapeConfig {
 
     /// The maximum number of scrape endpoints produced per pod.
     ///
-    /// Caps how many endpoints a single pod can contribute via annotation-based
-    /// discovery (the named-port path already produces at most one endpoint per
-    /// pod, so the effective per-pod ceiling is `max_endpoints_per_pod + 1`
-    /// when both paths fire on distinct ports). Successfully parsed annotation
-    /// ports beyond this limit are silently dropped (a warning is logged at
-    /// most once per minute per scrape). This guards against accidental or
-    /// malicious annotations that would otherwise generate a large number of
+    /// Caps how many endpoints a single pod can contribute via the
+    /// annotation-based and regex named-port paths (the exact `named_port` path
+    /// already produces at most one endpoint per pod). Ports beyond this limit
+    /// are silently dropped (a warning is logged at most once per minute per
+    /// scrape). This guards against accidental or malicious annotations, or a
+    /// broad `named_port_regex`, that would otherwise generate a large number of
     /// scrape targets.
     #[serde(default = "default_max_endpoints_per_pod")]
     #[configurable(metadata(docs::advanced))]
@@ -177,6 +192,7 @@ impl Default for PrometheusK8sScrapeConfig {
             pod_namespace_tag: Some("pod_namespace".to_string()),
             honor_labels: false,
             named_port: default_named_port(),
+            named_port_regex: None,
             annotation_name: default_annotation_name(),
             max_endpoints_per_pod: default_max_endpoints_per_pod(),
             namespace_annotation_labels: HashMap::new(),
@@ -201,6 +217,17 @@ impl SourceConfig for PrometheusK8sScrapeConfig {
 
         let field_selector = prepare_field_selector(&self.extra_field_selector, &self_node_name)?;
         let label_selector = prepare_label_selector(&self.extra_label_selector);
+
+        // Compile the port-name regex once, anchored so it must match the whole
+        // port name (Prometheus-style full match) rather than any substring.
+        let named_port_regex = self
+            .named_port_regex
+            .as_deref()
+            .map(|pattern| {
+                Regex::new(&format!("^(?:{pattern})$"))
+                    .map_err(|e| format!("invalid `named_port_regex` {pattern:?}: {e}"))
+            })
+            .transpose()?;
 
         // Setup Kubernetes client
         let mut client_config = match &self.kube_config_file {
@@ -237,6 +264,7 @@ impl SourceConfig for PrometheusK8sScrapeConfig {
                 config.pod_namespace_tag,
                 config.honor_labels,
                 config.named_port,
+                named_port_regex,
                 config.annotation_name,
                 config.max_endpoints_per_pod,
                 config.namespace_annotation_labels,
@@ -274,6 +302,7 @@ async fn run_source(
     pod_namespace_tag: Option<String>,
     honor_labels: bool,
     named_port: Option<String>,
+    named_port_regex: Option<Regex>,
     annotation_name: Option<String>,
     max_endpoints_per_pod: usize,
     namespace_annotation_labels: NamespaceAnnotationLabels,
@@ -322,6 +351,7 @@ async fn run_source(
     let endpoint_provider = K8sEndpointProvider::new(
         pod_state,
         named_port,
+        named_port_regex,
         annotation_name,
         max_endpoints_per_pod,
         namespace_annotation_labels,
@@ -522,7 +552,10 @@ async fn scrape_endpoint(
 
                     for (label_name, value) in &endpoint.extra_labels {
                         if honor_labels
-                            && metric.tags().and_then(|t| t.get(label_name.as_str())).is_some()
+                            && metric
+                                .tags()
+                                .and_then(|t| t.get(label_name.as_str()))
+                                .is_some()
                         {
                             // honor_labels: scrape-target label wins
                         } else {
@@ -1258,10 +1291,7 @@ http_requests_total{method="POST",status="201"} 5678
     /// value.
     #[tokio::test]
     async fn test_scrape_endpoint_extra_labels_honor_labels() {
-        let (addr, tx) = spawn_metrics_server(
-            "test_metric{tenant=\"original_tenant\"} 1\n",
-        )
-        .await;
+        let (addr, tx) = spawn_metrics_server("test_metric{tenant=\"original_tenant\"} 1\n").await;
 
         let tls = TlsSettings::default();
         let proxy = ProxyConfig::default();
@@ -1354,11 +1384,7 @@ http_requests_total{method="POST",status="201"} 5678
 
         let endpoint = endpoint_with_labels(
             addr,
-            &[
-                ("tenant", "alpha"),
-                ("svc", "checkout"),
-                ("ver", "1.2.3"),
-            ],
+            &[("tenant", "alpha"), ("svc", "checkout"), ("ver", "1.2.3")],
         );
         let result = scrape_endpoint(
             endpoint,
