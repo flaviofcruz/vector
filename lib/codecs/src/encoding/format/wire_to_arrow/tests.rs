@@ -937,12 +937,14 @@ fn int64_to_timestamp_micros_coercion() {
     let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
 
     // Two rows, plus one with the field absent (should produce null).
+    // Inputs are epoch-milliseconds; the encoder must scale them ms->us (x1000) into the
+    // micros Arrow column.
     let mut row0 = Vec::new();
     row0.push((1u8 << 3) | 0); // tag 1, varint
-    encode_varint_into(&mut row0, 1_700_000_000_000_000_u64);
+    encode_varint_into(&mut row0, 1_700_000_000_000_u64);
     let mut row1 = Vec::new();
     row1.push((1u8 << 3) | 0);
-    encode_varint_into(&mut row1, 1_800_000_000_000_000_u64);
+    encode_varint_into(&mut row1, 1_800_000_000_000_u64);
 
     let batch = enc
         .encode_batch(&[
@@ -958,8 +960,9 @@ fn int64_to_timestamp_micros_coercion() {
         .as_any()
         .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
         .expect("TimestampMicrosecondArray");
-    assert_eq!(col.value(0), 1_700_000_000_000_000);
-    assert_eq!(col.value(1), 1_800_000_000_000_000);
+    // ms input scaled x1000 -> micros stored.
+    assert_eq!(col.value(0), 1_700_000_000_000 * 1000);
+    assert_eq!(col.value(1), 1_800_000_000_000 * 1000);
     assert!(col.is_null(2));
 }
 
