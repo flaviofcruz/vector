@@ -104,28 +104,26 @@ pub struct PrometheusK8sScrapeConfig {
     #[configurable(metadata(docs::advanced))]
     honor_labels: bool,
 
-    /// The name of the container port to look for when discovering pods.
-    ///
-    /// Only pods with a container port matching this name will be scraped.
-    /// Set to `null` to disable named-port-based discovery entirely.
-    #[serde(default = "default_named_port")]
-    #[configurable(metadata(docs::examples = "metrics", docs::examples = "prometheus"))]
-    named_port: Option<String>,
-
     /// A regex matched against container port names for endpoint discovery.
     ///
-    /// Every container port whose name matches is scraped, so a single pod
-    /// exposing multiple matching ports (e.g. `metrics0` and `metrics1`)
-    /// produces multiple endpoints — unlike `named_port`, which matches exactly
-    /// and yields at most one endpoint per pod. The pattern is anchored (it must
-    /// match the whole port name). The number of endpoints a pod contributes via
-    /// this path is capped by `max_endpoints_per_pod`. This path is independent
-    /// of `named_port` and `annotation_name`; endpoints discovered by more than
-    /// one path are deduplicated by URL. Set to `null` (the default) to disable
-    /// regex-based discovery.
-    #[serde(default)]
-    #[configurable(metadata(docs::examples = "metrics.*", docs::examples = "^metrics\\d+$"))]
-    named_port_regex: Option<String>,
+    /// Every container port whose name matches is scraped. The pattern is
+    /// anchored — it must match the whole port name (Prometheus-style full
+    /// match) — so a plain name like `"user-metrics"` matches only that exact
+    /// port, exactly as before. Because Kubernetes port names are unique within
+    /// a pod and cannot contain regex metacharacters, such an exact value still
+    /// yields at most one endpoint per pod. A wildcard pattern (e.g.
+    /// `"metrics.*"`), however, matches every container port whose name it
+    /// covers, so a single pod exposing `metrics0` and `metrics1` produces two
+    /// endpoints — capped by `max_endpoints_per_pod`.
+    ///
+    /// Set to `null` to disable named-port-based discovery entirely.
+    #[serde(default = "default_named_port")]
+    #[configurable(metadata(
+        docs::examples = "user-metrics",
+        docs::examples = "metrics.*",
+        docs::examples = "^metrics\\d+$"
+    ))]
+    named_port: Option<String>,
 
     /// The pod annotation key used for annotation-based endpoint discovery.
     ///
@@ -141,13 +139,13 @@ pub struct PrometheusK8sScrapeConfig {
 
     /// The maximum number of scrape endpoints produced per pod.
     ///
-    /// Caps how many endpoints a single pod can contribute via the
-    /// annotation-based and regex named-port paths (the exact `named_port` path
-    /// already produces at most one endpoint per pod). Ports beyond this limit
-    /// are silently dropped (a warning is logged at most once per minute per
-    /// scrape). This guards against accidental or malicious annotations, or a
-    /// broad `named_port_regex`, that would otherwise generate a large number of
-    /// scrape targets.
+    /// Caps how many endpoints a single pod can contribute via the named-port
+    /// and annotation-based paths. An exact `named_port` value matches at most
+    /// one port per pod, so this cap only bites for a wildcard `named_port` or a
+    /// multi-valued annotation. Ports beyond this limit are silently dropped (a
+    /// warning is logged at most once per minute per scrape). This guards
+    /// against accidental or malicious annotations, or a broad `named_port`
+    /// pattern, that would otherwise generate a large number of scrape targets.
     #[serde(default = "default_max_endpoints_per_pod")]
     #[configurable(metadata(docs::advanced))]
     max_endpoints_per_pod: usize,
@@ -192,7 +190,6 @@ impl Default for PrometheusK8sScrapeConfig {
             pod_namespace_tag: Some("pod_namespace".to_string()),
             honor_labels: false,
             named_port: default_named_port(),
-            named_port_regex: None,
             annotation_name: default_annotation_name(),
             max_endpoints_per_pod: default_max_endpoints_per_pod(),
             namespace_annotation_labels: HashMap::new(),
@@ -219,13 +216,15 @@ impl SourceConfig for PrometheusK8sScrapeConfig {
         let label_selector = prepare_label_selector(&self.extra_label_selector);
 
         // Compile the port-name regex once, anchored so it must match the whole
-        // port name (Prometheus-style full match) rather than any substring.
-        let named_port_regex = self
-            .named_port_regex
+        // port name (Prometheus-style full match) rather than any substring. A
+        // plain name (the common case) is a literal that matches only itself, so
+        // this stays exact for existing configs.
+        let named_port = self
+            .named_port
             .as_deref()
             .map(|pattern| {
                 Regex::new(&format!("^(?:{pattern})$"))
-                    .map_err(|e| format!("invalid `named_port_regex` {pattern:?}: {e}"))
+                    .map_err(|e| format!("invalid `named_port` {pattern:?}: {e}"))
             })
             .transpose()?;
 
@@ -263,8 +262,7 @@ impl SourceConfig for PrometheusK8sScrapeConfig {
                 config.pod_name_tag,
                 config.pod_namespace_tag,
                 config.honor_labels,
-                config.named_port,
-                named_port_regex,
+                named_port,
                 config.annotation_name,
                 config.max_endpoints_per_pod,
                 config.namespace_annotation_labels,
@@ -301,8 +299,7 @@ async fn run_source(
     pod_name_tag: Option<String>,
     pod_namespace_tag: Option<String>,
     honor_labels: bool,
-    named_port: Option<String>,
-    named_port_regex: Option<Regex>,
+    named_port: Option<Regex>,
     annotation_name: Option<String>,
     max_endpoints_per_pod: usize,
     namespace_annotation_labels: NamespaceAnnotationLabels,
@@ -351,7 +348,6 @@ async fn run_source(
     let endpoint_provider = K8sEndpointProvider::new(
         pod_state,
         named_port,
-        named_port_regex,
         annotation_name,
         max_endpoints_per_pod,
         namespace_annotation_labels,
@@ -705,6 +701,33 @@ mod tests {
     #[test]
     fn test_generate_config() {
         crate::test_util::test_generate_config::<PrometheusK8sScrapeConfig>();
+    }
+
+    /// The single `named_port` config field accepts both a plain name and a
+    /// regex. It compiles (the way `build()` does, anchored as `^(?:{})$`) in
+    /// both cases: a plain value matches only itself, a wildcard matches every
+    /// name it covers. This is the backward-compat contract of consolidating
+    /// exact and regex discovery onto one field.
+    #[test]
+    fn test_named_port_accepts_exact_and_regex() {
+        let anchored = |pattern: &str| Regex::new(&format!("^(?:{pattern})$")).unwrap();
+
+        let exact: PrometheusK8sScrapeConfig =
+            toml::from_str(r#"named_port = "user-metrics""#).unwrap();
+        assert_eq!(exact.named_port.as_deref(), Some("user-metrics"));
+        let exact_re = anchored(exact.named_port.as_deref().unwrap());
+        assert!(exact_re.is_match("user-metrics"));
+        assert!(!exact_re.is_match("metrics0"));
+        assert!(!exact_re.is_match("user-metrics-extra")); // anchored full match
+
+        let wildcard: PrometheusK8sScrapeConfig =
+            toml::from_str(r#"named_port = "metrics.*""#).unwrap();
+        assert_eq!(wildcard.named_port.as_deref(), Some("metrics.*"));
+        let wildcard_re = anchored(wildcard.named_port.as_deref().unwrap());
+        assert!(wildcard_re.is_match("metrics0"));
+        assert!(wildcard_re.is_match("metrics1"));
+        assert!(!wildcard_re.is_match("xmetrics")); // anchored, not a substring
+        assert!(!wildcard_re.is_match("http"));
     }
 
     #[test]

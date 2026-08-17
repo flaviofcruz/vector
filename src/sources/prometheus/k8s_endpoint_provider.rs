@@ -3,16 +3,16 @@
 //! This module provides functionality to discover Prometheus scrape endpoints
 //! from Kubernetes pods via two independent paths:
 //!
-//! 1. **Named-port discovery** — pods that expose a container port with a
-//!    configured name (e.g. `"user-metrics"`) are scraped on that port. This
-//!    path yields at most one endpoint per pod (first matching port).
-//! 2. **Regex named-port discovery** — pods that expose one or more container
-//!    ports whose names match a configured regex (e.g. `"metrics.*"`) are
-//!    scraped on every matching port. Unlike the exact named-port path, this
-//!    yields one endpoint per matching port, so a single pod exposing
-//!    `metrics0` and `metrics1` produces two endpoints (capped by
+//! 1. **Named-port discovery** — pods that expose one or more container ports
+//!    whose names match a configured regex are scraped on every matching port.
+//!    The pattern is anchored (it must match the whole port name), so a plain
+//!    name (e.g. `"user-metrics"`) matches only that exact port, and because
+//!    Kubernetes port names are unique within a pod it yields at most one
+//!    endpoint per pod — the classic exact-match behavior. A wildcard (e.g.
+//!    `"metrics.*"`) instead yields one endpoint per matching port, so a single
+//!    pod exposing `metrics0` and `metrics1` produces two endpoints (capped by
 //!    `max_endpoints_per_pod`).
-//! 3. **Annotation-based discovery** — pods that carry a configured annotation
+//! 2. **Annotation-based discovery** — pods that carry a configured annotation
 //!    (e.g. `"system_metrics_enabled"`) are scraped on the port number(s) given
 //!    as the annotation value. The value may be a single port (`"9091"`) or a
 //!    comma-separated list (`"9091,9092"`), in which case the pod yields one
@@ -70,8 +70,8 @@ pub trait EndpointProvider {
 ///
 /// Two discovery paths are supported and can be enabled independently:
 ///
-/// - **Named-port**: pods whose container spec includes a port with `named_port`
-///   as its name are scraped on that port.
+/// - **Named-port**: pods that expose a container port whose name matches
+///   `named_port` (an anchored regex) are scraped on every matching port.
 /// - **Annotation**: pods that carry `annotation_name` as a pod annotation are
 ///   scraped on the port number given as the annotation value.
 ///
@@ -79,13 +79,11 @@ pub trait EndpointProvider {
 /// returned.
 pub struct K8sEndpointProvider {
     pod_state: Store<Pod>,
-    /// The container port name used for exact named-port discovery, or `None`
-    /// to disable that discovery path entirely.
-    named_port: Option<String>,
-    /// A regex matched against container port names for regex named-port
-    /// discovery, or `None` to disable that path. Every port whose name matches
-    /// yields an endpoint (capped by `max_endpoints_per_pod`).
-    named_port_regex: Option<Regex>,
+    /// A regex matched against container port names for named-port discovery,
+    /// or `None` to disable that path. Every port whose name matches yields an
+    /// endpoint (capped by `max_endpoints_per_pod`). An anchored plain name
+    /// matches at most one port per pod, preserving exact-match behavior.
+    named_port: Option<Regex>,
     /// The pod annotation key used for annotation-based discovery, or `None` to
     /// disable that discovery path entirely. The annotation value must be a
     /// valid TCP port number, or a comma-separated list of port numbers.
@@ -105,22 +103,20 @@ impl K8sEndpointProvider {
     /// # Arguments
     ///
     /// * `pod_state` - A read-only view of the Kubernetes pod state from the reflector
-    /// * `named_port` - The name of the container port to look for when discovering pods,
-    ///   or `None` to disable exact named-port-based discovery entirely
-    /// * `named_port_regex` - A regex matched against container port names; every
-    ///   matching port yields an endpoint, or `None` to disable regex named-port
-    ///   discovery entirely
+    /// * `named_port` - A regex matched against container port names; every
+    ///   matching port yields an endpoint, or `None` to disable named-port
+    ///   discovery entirely. An anchored plain name matches at most one port
+    ///   per pod (exact-match behavior).
     /// * `annotation_name` - The pod annotation key whose value is the port number to
     ///   scrape, or `None` to disable annotation-based discovery entirely
     /// * `max_endpoints_per_pod` - Caps the number of endpoints a single pod
-    ///   can contribute via the annotation and regex named-port paths;
-    ///   additional ports are silently dropped
+    ///   can contribute via the named-port and annotation paths; additional
+    ///   ports are silently dropped
     /// * `namespace_annotation_labels` - Per-namespace map of annotation key
     ///   → label name; empty disables the feature
     pub fn new(
         pod_state: Store<Pod>,
-        named_port: Option<String>,
-        named_port_regex: Option<Regex>,
+        named_port: Option<Regex>,
         annotation_name: Option<String>,
         max_endpoints_per_pod: usize,
         namespace_annotation_labels: NamespaceAnnotationLabels,
@@ -128,7 +124,6 @@ impl K8sEndpointProvider {
         Self {
             pod_state,
             named_port,
-            named_port_regex,
             annotation_name,
             max_endpoints_per_pod,
             namespace_annotation_labels,
@@ -143,8 +138,7 @@ impl EndpointProvider for K8sEndpointProvider {
         let state = self.pod_state.state();
         compute_endpoints(
             &state,
-            self.named_port.as_deref(),
-            self.named_port_regex.as_ref(),
+            self.named_port.as_ref(),
             self.annotation_name.as_deref(),
             self.max_endpoints_per_pod,
             &self.namespace_annotation_labels,
@@ -160,38 +154,26 @@ impl EndpointProvider for K8sEndpointProvider {
 /// # Arguments
 ///
 /// * `state` - Current snapshot of all pods from the reflector store
-/// * `named_port` - Container port name used for the exact named-port discovery
-///   path, or `None` to disable it entirely
-/// * `named_port_regex` - Regex matched against container port names for the
-///   regex named-port discovery path, or `None` to disable it entirely
+/// * `named_port` - Regex matched against container port names for the
+///   named-port discovery path, or `None` to disable it entirely. Every
+///   matching port yields an endpoint; an anchored plain name matches at most
+///   one port per pod.
 /// * `annotation_name` - Pod annotation key used for the annotation-based discovery path;
 ///   its value is expected to be a TCP port number or a comma-separated list of port
 ///   numbers. Pass `None` to disable annotation-based discovery entirely.
 /// * `max_endpoints_per_pod` - Caps the number of endpoints contributed per pod
-///   by the annotation and regex named-port paths; additional ports are silently
+///   by the named-port and annotation paths; additional ports are silently
 ///   dropped.
 /// * `namespace_annotation_labels` - Per-namespace map of annotation key → label
 ///   name. When empty, every endpoint carries `extra_labels = {}`.
 fn compute_endpoints(
     state: &[Arc<Pod>],
-    named_port: Option<&str>,
-    named_port_regex: Option<&Regex>,
+    named_port: Option<&Regex>,
     annotation_name: Option<&str>,
     max_endpoints_per_pod: usize,
     namespace_annotation_labels: &NamespaceAnnotationLabels,
 ) -> Vec<Endpoint> {
     let named_port_endpoints: Vec<Endpoint> = match named_port {
-        Some(port) => state
-            .iter()
-            .filter(|pod| pod_has_named_port(pod.as_ref(), port))
-            .filter_map(|pod| {
-                extract_metrics_endpoint(pod.as_ref(), port, namespace_annotation_labels)
-            })
-            .collect(),
-        None => vec![],
-    };
-
-    let regex_endpoints: Vec<Endpoint> = match named_port_regex {
         Some(re) => state
             .iter()
             .flat_map(|pod| {
@@ -224,39 +206,9 @@ fn compute_endpoints(
     let mut seen = HashSet::new();
     named_port_endpoints
         .into_iter()
-        .chain(regex_endpoints)
         .chain(annotation_endpoints)
         .filter(|endpoint| seen.insert(endpoint.url.clone()))
         .collect()
-}
-
-/// Check if a pod has a container port with the specified name
-///
-/// # Arguments
-///
-/// * `pod` - The Kubernetes pod to check
-/// * `port_name` - The name of the port to look for
-///
-/// # Returns
-///
-/// `true` if any container in the pod has a port with the specified name, `false` otherwise
-fn pod_has_named_port(pod: &Pod, port_name: &str) -> bool {
-    pod.spec
-        .as_ref()
-        .map(|spec| {
-            spec.containers.iter().any(|container| {
-                container
-                    .ports
-                    .as_ref()
-                    .map(|ports| {
-                        ports
-                            .iter()
-                            .any(|port| port.name.as_ref().is_some_and(|name| name == port_name))
-                    })
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
 }
 
 /// Build the per-pod `extra_labels` map from the configured
@@ -298,64 +250,14 @@ fn extract_extra_labels(
     out
 }
 
-/// Extract the endpoint (pod_ip:port) for pods with the specified named port
-///
-/// # Arguments
-///
-/// * `pod` - The Kubernetes pod to extract the endpoint from
-/// * `port_name` - The name of the port to look for
-/// * `namespace_annotation_labels` - Per-namespace map driving `extra_labels`
-///
-/// # Returns
-///
-/// An `Option<Endpoint>` containing the HTTP endpoint URL if the pod has an IP
-/// and a matching port, or `None` otherwise
-fn extract_metrics_endpoint(
-    pod: &Pod,
-    port_name: &str,
-    namespace_annotation_labels: &NamespaceAnnotationLabels,
-) -> Option<Endpoint> {
-    let pod_ip = pod.status.as_ref()?.pod_ip.as_ref()?;
-    let name = pod.metadata.name.clone().unwrap_or_default();
-    let namespace = pod.metadata.namespace.clone().unwrap_or_default();
-
-    let port_number = pod.spec.as_ref()?.containers.iter().find_map(|container| {
-        container.ports.as_ref()?.iter().find_map(|port| {
-            if port.name.as_ref()? == port_name {
-                Some(port.container_port)
-            } else {
-                None
-            }
-        })
-    })?;
-
-    let url = format!("http://{}:{}/metrics", pod_ip, port_number);
-    let extra_labels = extract_extra_labels(pod, namespace_annotation_labels);
-
-    trace!(
-        message = "Created endpoint for pod with named port.",
-        pod = %name,
-        namespace = %namespace,
-        port_name,
-        endpoint = %url,
-        extra_labels = ?extra_labels,
-    );
-
-    Some(Endpoint {
-        url,
-        name,
-        namespace,
-        extra_labels,
-    })
-}
-
 /// Extract endpoints for a pod by matching container port names against a regex.
 ///
 /// Every container port (across all containers) whose name matches `port_re`
 /// yields one endpoint, so a pod exposing several matching ports (e.g.
-/// `metrics0` and `metrics1`) produces several endpoints — unlike
-/// [`extract_metrics_endpoint`], which is exact-match and single-port. Port
-/// numbers are deduplicated (first-seen wins) so a port declared more than once
+/// `metrics0` and `metrics1`) produces several endpoints. An anchored plain
+/// pattern (e.g. `^(?:user-metrics)$`) matches a single port name, so it stays
+/// exact-match and single-port — Kubernetes port names are unique within a pod.
+/// Port numbers are deduplicated (first-seen wins) so a port declared more than once
 /// does not consume extra cap slots, and the result is capped at `max_ports`
 /// (ports beyond that are dropped and a warning is logged). Returns an empty
 /// `Vec` if the pod has no IP address yet, no port name matches, or `max_ports`
@@ -527,78 +429,62 @@ mod tests {
         HashMap::new()
     }
 
+    /// Backward compatibility: an anchored plain `named_port` value behaves like
+    /// the old exact-match path — it selects exactly the port with that name and
+    /// ignores others, yielding at most one endpoint per pod.
     #[test]
-    fn test_pod_has_named_port_with_matching_port() {
-        let pod = Pod {
-            spec: Some(PodSpec {
-                containers: vec![Container {
-                    name: "test-container".to_string(),
-                    ports: Some(vec![
-                        ContainerPort {
-                            name: Some("http".to_string()),
-                            container_port: 8080,
-                            ..Default::default()
-                        },
-                        ContainerPort {
-                            name: Some("user-metrics".to_string()),
-                            container_port: 9090,
-                            ..Default::default()
-                        },
-                    ]),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+    fn test_named_port_exact_match_selects_single_port() {
+        let pod = make_pod_with_named_ports(
+            "exact",
+            "10.244.1.5",
+            &[("http", 8080), ("user-metrics", 9090)],
+        );
 
-        assert!(pod_has_named_port(&pod, "user-metrics"));
-        assert!(pod_has_named_port(&pod, "http"));
-        assert!(!pod_has_named_port(&pod, "nonexistent"));
-    }
+        let endpoints = extract_endpoints_by_port_regex(
+            &pod,
+            &port_re("user-metrics"),
+            UNLIMITED,
+            &no_labels(),
+        );
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].url, "http://10.244.1.5:9090/metrics");
 
-    #[test]
-    fn test_extract_metrics_endpoint() {
-        let pod = Pod {
-            metadata: ObjectMeta {
-                name: Some("test-pod".to_string()),
-                namespace: Some("test-namespace".to_string()),
-                ..Default::default()
-            },
-            spec: Some(PodSpec {
-                containers: vec![Container {
-                    name: "test-container".to_string(),
-                    ports: Some(vec![ContainerPort {
-                        name: Some("user-metrics".to_string()),
-                        container_port: 9090,
-                        ..Default::default()
-                    }]),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-            status: Some(PodStatus {
-                pod_ip: Some("10.244.1.5".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let endpoint = extract_metrics_endpoint(&pod, "user-metrics", &no_labels());
-        assert_eq!(
-            endpoint,
-            Some(Endpoint {
-                url: "http://10.244.1.5:9090/metrics".to_string(),
-                name: "test-pod".to_string(),
-                namespace: "test-namespace".to_string(),
-                extra_labels: BTreeMap::new(),
-            })
+        // A different exact name selects its own port; an absent name selects none.
+        let http = extract_endpoints_by_port_regex(&pod, &port_re("http"), UNLIMITED, &no_labels());
+        assert_eq!(http.len(), 1);
+        assert_eq!(http[0].url, "http://10.244.1.5:8080/metrics");
+        assert!(
+            extract_endpoints_by_port_regex(&pod, &port_re("nonexistent"), UNLIMITED, &no_labels())
+                .is_empty()
         );
     }
 
+    /// Backward compatibility: exact-name discovery builds the expected
+    /// `pod_ip:container_port/metrics` endpoint with pod metadata.
     #[test]
-    fn test_extract_metrics_endpoint_without_ip() {
-        let pod = Pod {
+    fn test_named_port_exact_match_builds_endpoint() {
+        let pod = make_pod_with_named_ports("test-pod", "10.244.1.5", &[("user-metrics", 9090)]);
+        let endpoints = extract_endpoints_by_port_regex(
+            &pod,
+            &port_re("user-metrics"),
+            UNLIMITED,
+            &no_labels(),
+        );
+        assert_eq!(
+            endpoints,
+            vec![Endpoint {
+                url: "http://10.244.1.5:9090/metrics".to_string(),
+                name: "test-pod".to_string(),
+                namespace: "default".to_string(),
+                extra_labels: BTreeMap::new(),
+            }]
+        );
+    }
+
+    /// Backward compatibility: a pod without an IP yields no endpoint.
+    #[test]
+    fn test_named_port_exact_match_without_ip() {
+        let pod = Arc::new(Pod {
             spec: Some(PodSpec {
                 containers: vec![Container {
                     name: "test-container".to_string(),
@@ -613,10 +499,15 @@ mod tests {
             }),
             status: None,
             ..Default::default()
-        };
+        });
 
-        let endpoint = extract_metrics_endpoint(&pod, "user-metrics", &no_labels());
-        assert_eq!(endpoint, None);
+        let endpoints = extract_endpoints_by_port_regex(
+            &pod,
+            &port_re("user-metrics"),
+            UNLIMITED,
+            &no_labels(),
+        );
+        assert!(endpoints.is_empty());
     }
 
     #[test]
@@ -1165,8 +1056,7 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            Some("user-metrics"),
-            None,
+            Some(&port_re("user-metrics")),
             Some("system_metrics_enabled"),
             UNLIMITED,
             &no_labels(),
@@ -1185,8 +1075,7 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            Some("user-metrics"),
-            None,
+            Some(&port_re("user-metrics")),
             Some("system_metrics_enabled"),
             UNLIMITED,
             &no_labels(),
@@ -1205,8 +1094,7 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            Some("user-metrics"),
-            None,
+            Some(&port_re("user-metrics")),
             Some("system_metrics_enabled"),
             UNLIMITED,
             &no_labels(),
@@ -1225,8 +1113,7 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            Some("user-metrics"),
-            None,
+            Some(&port_re("user-metrics")),
             Some("system_metrics_enabled"),
             UNLIMITED,
             &no_labels(),
@@ -1250,8 +1137,7 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            Some("user-metrics"),
-            None,
+            Some(&port_re("user-metrics")),
             Some("system_metrics_enabled"),
             UNLIMITED,
             &no_labels(),
@@ -1280,8 +1166,7 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            Some("user-metrics"),
-            None,
+            Some(&port_re("user-metrics")),
             None,
             UNLIMITED,
             &no_labels(),
@@ -1309,7 +1194,6 @@ mod tests {
         let endpoints = compute_endpoints(
             &state,
             None,
-            None,
             Some("system_metrics_enabled"),
             UNLIMITED,
             &no_labels(),
@@ -1331,7 +1215,7 @@ mod tests {
         );
         let state = vec![pod];
 
-        let endpoints = compute_endpoints(&state, None, None, None, UNLIMITED, &no_labels());
+        let endpoints = compute_endpoints(&state, None, None, UNLIMITED, &no_labels());
 
         assert!(endpoints.is_empty());
     }
@@ -1352,8 +1236,7 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            Some("user-metrics"),
-            None,
+            Some(&port_re("user-metrics")),
             Some("system_metrics_enabled"),
             UNLIMITED,
             &no_labels(),
@@ -1389,7 +1272,6 @@ mod tests {
         let endpoints = compute_endpoints(
             &state,
             None,
-            None,
             Some("system_metrics_enabled"),
             2,
             &no_labels(),
@@ -1412,8 +1294,7 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            Some("user-metrics"),
-            None,
+            Some(&port_re("user-metrics")),
             Some("system_metrics_enabled"),
             UNLIMITED,
             &no_labels(),
@@ -1585,7 +1466,7 @@ mod tests {
 
     /// Named-port path: `extra_labels` populated from the configured rule.
     #[test]
-    fn test_extract_metrics_endpoint_attaches_extra_labels() {
+    fn test_named_port_attaches_extra_labels() {
         let pod = make_pod_in_ns(
             "tenant-pod",
             "team-a",
@@ -1596,9 +1477,11 @@ mod tests {
         );
         let cfg = labels_map(&[("team-a", &[("databricks_tenant", "tenant")])]);
 
-        let endpoint = extract_metrics_endpoint(pod.as_ref(), "user-metrics", &cfg).unwrap();
+        let endpoints =
+            extract_endpoints_by_port_regex(&pod, &port_re("user-metrics"), UNLIMITED, &cfg);
+        assert_eq!(endpoints.len(), 1);
         assert_eq!(
-            endpoint.extra_labels.get("tenant").map(String::as_str),
+            endpoints[0].extra_labels.get("tenant").map(String::as_str),
             Some("alpha")
         );
     }
@@ -1656,8 +1539,7 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            Some("user-metrics"),
-            None,
+            Some(&port_re("user-metrics")),
             Some("system_metrics_enabled"),
             UNLIMITED,
             &cfg,
@@ -1688,8 +1570,7 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            Some("user-metrics"),
-            None,
+            Some(&port_re("user-metrics")),
             Some("system_metrics_enabled"),
             UNLIMITED,
             &HashMap::new(),
@@ -1727,7 +1608,6 @@ mod tests {
 
         let endpoints = compute_endpoints(
             &state,
-            None,
             None,
             Some("system_metrics_enabled"),
             UNLIMITED,
@@ -1783,8 +1663,13 @@ mod tests {
             ],
         )]);
 
-        let endpoints =
-            compute_endpoints(&state, Some("user-metrics"), None, None, UNLIMITED, &cfg);
+        let endpoints = compute_endpoints(
+            &state,
+            Some(&port_re("user-metrics")),
+            None,
+            UNLIMITED,
+            &cfg,
+        );
 
         assert_eq!(endpoints.len(), 1);
         let labels = &endpoints[0].extra_labels;
@@ -1941,23 +1826,27 @@ mod tests {
         assert!(endpoints.is_empty());
     }
 
-    /// Through `compute_endpoints`: the regex path emits both ports, and an
-    /// overlapping exact `named_port` on the same port number dedupes by URL.
+    /// Through `compute_endpoints`: a wildcard `named_port` emits one endpoint
+    /// per matching port, and a port also reached via the annotation path
+    /// dedupes by URL.
     #[test]
-    fn test_compute_endpoints_regex_path_and_dedup_with_exact() {
-        let pod = make_pod_with_named_ports(
+    fn test_compute_endpoints_regex_path_and_dedup_with_annotation() {
+        let mut annotations = BTreeMap::new();
+        // Annotation points at 7788, which the wildcard also matches.
+        annotations.insert("system_metrics_enabled".to_string(), "7788".to_string());
+        let mut pod = (*make_pod_with_named_ports(
             "combo",
             "10.1.0.5",
             &[("metrics0", 7788), ("metrics1", 7789)],
-        );
-        let state = vec![pod];
+        ))
+        .clone();
+        pod.metadata.annotations = Some(annotations);
+        let state = vec![Arc::new(pod)];
 
-        // Exact named_port "metrics0" (7788) overlaps the regex match on 7788.
         let endpoints = compute_endpoints(
             &state,
-            Some("metrics0"),
             Some(&port_re("metrics.*")),
-            None,
+            Some("system_metrics_enabled"),
             UNLIMITED,
             &no_labels(),
         );
@@ -1966,5 +1855,53 @@ mod tests {
         assert_eq!(urls.len(), 2, "7788 from both paths must dedupe to one");
         assert!(urls.contains("http://10.1.0.5:7788/metrics"));
         assert!(urls.contains("http://10.1.0.5:7789/metrics"));
+    }
+
+    /// End-to-end over one shared pod state, exercising the `build()` anchoring
+    /// (`^(?:{pattern})$`): the *same* `named_port` field yields exact
+    /// single-port behavior for a plain value and multi-port behavior for a
+    /// wildcard. This is the backward-compat contract of the consolidated field.
+    #[test]
+    fn test_named_port_field_handles_both_exact_and_wildcard() {
+        let pod = make_pod_with_named_ports(
+            "driver",
+            "10.2.0.1",
+            &[
+                ("user-metrics", 9090),
+                ("metrics0", 7788),
+                ("metrics1", 7789),
+                ("http", 8080),
+            ],
+        );
+        let state = vec![pod];
+
+        // Exact value: matches only "user-metrics" → one endpoint.
+        let exact = compute_endpoints(
+            &state,
+            Some(&port_re("user-metrics")),
+            None,
+            UNLIMITED,
+            &no_labels(),
+        );
+        let exact_urls: HashSet<&str> = exact.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(exact_urls, HashSet::from(["http://10.2.0.1:9090/metrics"]));
+
+        // Wildcard value: matches metrics0 and metrics1 → two endpoints, and
+        // neither "user-metrics" nor "http" is scraped (anchored full match).
+        let wildcard = compute_endpoints(
+            &state,
+            Some(&port_re("metrics.*")),
+            None,
+            UNLIMITED,
+            &no_labels(),
+        );
+        let wildcard_urls: HashSet<&str> = wildcard.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(
+            wildcard_urls,
+            HashSet::from([
+                "http://10.2.0.1:7788/metrics",
+                "http://10.2.0.1:7789/metrics",
+            ])
+        );
     }
 }
