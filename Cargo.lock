@@ -13808,6 +13808,7 @@ dependencies = [
  "regex",
  "regex-automata",
  "reqwest 0.11.27",
+ "reqwest 0.12.28",
  "rmp-serde",
  "rmpv",
  "roaring 0.11.3",

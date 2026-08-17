@@ -2,6 +2,7 @@
 use std::{convert::TryInto, sync::Arc};
 
 // Azure SDK imports for blob and queue operations
+use azure_core_for_storage::{HttpClient, TransportOptions};
 use azure_storage::{ConnectionString, StorageCredentials};
 use azure_storage_blobs::prelude::*;
 use azure_storage_queues::prelude::*;
@@ -376,7 +377,12 @@ impl AzureBlobConfig {
         };
 
         // Create Azure clients with connection string
-        let blob_client = BlobServiceClient::new(account.clone(), creds.clone());
+        // Disable transport-level gzip decompression so `Content-Length` survives: see
+        // `no_decompression_transport`. The queue client is left as-is (queue responses are
+        // never gzip-encoded).
+        let blob_client = ClientBuilder::new(account.clone(), creds.clone())
+            .transport(no_decompression_transport())
+            .blob_service_client();
         let queue_client = QueueServiceClient::new(account, creds);
 
         Ok((blob_client, queue_client))
@@ -409,11 +415,38 @@ impl AzureBlobConfig {
         let storage_credentials = StorageCredentials::token_credential(Arc::new(client_credential));
 
         let account = client_cert_config.storage_account.clone();
-        let blob_client = BlobServiceClient::new(account.clone(), storage_credentials.clone());
+        // Disable transport-level gzip decompression so `Content-Length` survives: see
+        // `no_decompression_transport`. The queue client is left as-is (queue responses are
+        // never gzip-encoded).
+        let blob_client = ClientBuilder::new(account.clone(), storage_credentials.clone())
+            .transport(no_decompression_transport())
+            .blob_service_client();
         let queue_client = QueueServiceClient::new(account, storage_credentials);
 
         Ok((blob_client, queue_client))
     }
+}
+
+/// Builds the Azure Storage HTTP transport with response decompression disabled.
+///
+/// Reqwest's `gzip` feature is enabled across vector's build (via `azure_core` 0.25) and the
+/// storage SDK shares that single `reqwest`. Left on, reqwest decompresses
+/// `Content-Encoding: gzip` responses and drops `Content-Length`, which `azure_storage_blobs`
+/// requires when parsing a blob GET. Disabling it keeps responses byte-for-byte: the source
+/// decompresses blobs itself in [`blob_object_decoder`].
+///
+/// Removable once the storage SDK no longer shares a gzip-enabled `reqwest`.
+fn no_decompression_transport() -> TransportOptions {
+    // Mirror azure_core's own `new_reqwest_client`, which only sets `pool_max_idle_per_host(0)`
+    // (a hyper idle-connection hang workaround, hyperium/hyper#2312) and default TLS. We add
+    // `.no_gzip()`/`.no_deflate()` on top so responses are handed back untouched.
+    let client = reqwest_012::ClientBuilder::new()
+        .no_gzip()
+        .no_deflate()
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("azure_blob source: failed to build reqwest client for Azure Storage");
+    TransportOptions::new(Arc::new(client) as Arc<dyn HttpClient>)
 }
 
 async fn blob_object_decoder(
@@ -456,6 +489,91 @@ enum CreateQueueIngestorError {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Fetching a `Content-Encoding: gzip` blob: the default (decompressing) transport drops
+    /// `Content-Length` and errors, while [`no_decompression_transport`] preserves it and the
+    /// GET succeeds.
+    #[tokio::test]
+    async fn gzip_blob_get_requires_no_decompression_transport() {
+        use azure_storage::CloudLocation;
+        use futures::StreamExt;
+        use std::io::Write;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b"regression-guard\n").unwrap();
+            e.finish().unwrap()
+        };
+
+        // One-shot mock answering every request with a well-formed Azure block-blob GET:
+        // 206 + Content-Encoding: gzip + Content-Length (exactly what real Azure returns).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let n = body.len();
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Encoding: gzip\r\n\
+                 Content-Length: {n}\r\n\
+                 Content-Range: bytes 0-{last}/{n}\r\n\
+                 Accept-Ranges: bytes\r\n\
+                 ETag: \"0x1\"\r\n\
+                 Last-Modified: Fri, 14 Aug 2026 12:00:00 GMT\r\n\
+                 x-ms-creation-time: Fri, 14 Aug 2026 11:00:00 GMT\r\n\
+                 Date: Fri, 14 Aug 2026 12:00:00 GMT\r\n\
+                 x-ms-request-id: abcdef01-2345-6789-abcd-ef0123456789\r\n\
+                 x-ms-version: 2021-08-06\r\n\
+                 x-ms-blob-type: BlockBlob\r\n\
+                 x-ms-server-encrypted: true\r\n\
+                 Connection: close\r\n\r\n",
+                n = n,
+                last = n - 1,
+            );
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut discard = [0u8; 4096];
+                let _ = sock.read(&mut discard).await;
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let creds = StorageCredentials::access_key("devacct", "Zm9vYmFyYmF6");
+        let loc = || CloudLocation::Custom {
+            account: "devacct".to_string(),
+            uri: uri.clone(),
+        };
+        async fn fetch(builder: ClientBuilder) -> Result<(), String> {
+            builder
+                .blob_service_client()
+                .container_client("c")
+                .blob_client("b")
+                .get()
+                .into_stream()
+                .next()
+                .await
+                .expect("stream yields a page")
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
+        }
+
+        // Default transport decompresses the gzip response and drops Content-Length. (Also
+        // confirms the build has reqwest's gzip feature on; if that changes, revisit here.)
+        let err = fetch(ClientBuilder::with_location(loc(), creds.clone()))
+            .await
+            .expect_err("default transport must drop Content-Length");
+        assert!(
+            err.to_lowercase().contains("content-length"),
+            "expected a content-length error, got: {err}"
+        );
+
+        // The source's transport disables decompression -> Content-Length survives -> success.
+        fetch(ClientBuilder::with_location(loc(), creds).transport(no_decompression_transport()))
+            .await
+            .expect("no_decompression_transport must fetch the gzip blob");
+    }
 
     /// Tests valid configuration parsing
     /// This test only checks if the TOML -> AzureBlobConfig object is happening
