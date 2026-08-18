@@ -29,11 +29,10 @@ pub enum TypedBuilder {
     Boolean(BooleanBuilder),
     LargeUtf8(LargeStringBuilder),
     LargeBinary(LargeBinaryBuilder),
-    /// `TimestampMicrosecondBuilder` for the `_event_time` coercion and any
-    /// other proto int64 field whose Arrow column is declared as
-    /// `Timestamp(Microsecond, ...)`. The underlying i64 is written as
-    /// microseconds since Unix epoch — we don't transform values, only the
-    /// Arrow column type.
+    /// Builder for a proto int64 field whose Arrow column is declared as
+    /// `Timestamp(Microsecond, ...)`. The source int64 is epoch-milliseconds, so
+    /// `append` scales it ms->us (x1000) before writing (see append.rs). A raw,
+    /// unscaled ms value written as micros lands ~1970.
     TimestampMicros(TimestampMicrosecondBuilder),
 }
 

@@ -61,7 +61,10 @@ pub(super) fn append_scalar_from_wire(
                     return Ok(());
                 }
                 TypedBuilder::TimestampMicros(b) => {
-                    b.append_value(v as i64);
+                    // int64 timestamp fields are epoch-milliseconds; the Arrow column is
+                    // microseconds, so scale ms->us. Without this the raw ms value written as
+                    // micros lands ~1970. saturating_mul avoids an overflow panic.
+                    b.append_value((v as i64).saturating_mul(1000));
                     return Ok(());
                 }
                 _ => {}
@@ -96,7 +99,8 @@ pub(super) fn append_scalar_from_wire(
                     return Ok(());
                 }
                 TypedBuilder::TimestampMicros(b) => {
-                    b.append_value(decode_zigzag64(v));
+                    // ms -> micros (see the TimestampMicros scaling note above).
+                    b.append_value(decode_zigzag64(v).saturating_mul(1000));
                     return Ok(());
                 }
                 _ => {}
@@ -138,7 +142,10 @@ pub(super) fn append_scalar_from_wire(
                     return Ok(());
                 }
                 TypedBuilder::TimestampMicros(b) => {
-                    b.append_value(v as i64);
+                    // int64 timestamp fields are epoch-milliseconds; the Arrow column is
+                    // microseconds, so scale ms->us. Without this the raw ms value written as
+                    // micros lands ~1970. saturating_mul avoids an overflow panic.
+                    b.append_value((v as i64).saturating_mul(1000));
                     return Ok(());
                 }
                 _ => {}

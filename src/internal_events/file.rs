@@ -329,6 +329,8 @@ mod source {
                 file = %self.file.display(),
                 reached_eof,
                 internal_log_rate_limit = false,
+                vector_event_type = "VECTOR_FILE_EVENT",
+                vector_file_event_type = "LOGGING_AGENT_FILE_STOPPED"
             );
             if self.include_file_metric_tag {
                 counter!(

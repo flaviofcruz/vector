@@ -246,7 +246,7 @@ vector-config-macros.workspace = true
 vector-vrl-functions = { workspace = true, features = ["vrl-metrics"] }
 vector-vrl-metrics = { path = "lib/vector-vrl-metrics" }
 loki-logproto = { path = "lib/loki-logproto", optional = true }
-databricks-zerobus-ingest-sdk = { version = "2.5.0", optional = true, features = ["arrow-flight"] }
+databricks-zerobus-ingest-sdk = { version = "2.7.0", optional = true, features = ["arrow-flight"] }
 
 # Tokio / Futures
 async-stream.workspace = true
@@ -313,6 +313,10 @@ azure_storage_queues = { version = "0.21", default-features = false, optional = 
 azure_core_for_storage = { package = "azure_core", version = "0.21.0", default-features = false, features = ["enable_reqwest", "reqwest", "hmac_openssl"] }
 azure_identity_for_storage = { package = "azure_identity", version = "0.21.0", default-features = false, features = ["enable_reqwest", "client_certificate"], optional = true }
 
+# reqwest 0.12 handle for the azure_blob source's storage transport.
+# See `no_decompression_transport` in src/sources/azure_blob/mod.rs.
+reqwest_012 = { package = "reqwest", version = "0.12", default-features = false, features = ["default-tls", "gzip", "deflate"], optional = true }
+
 
 # OpenDAL
 opendal = { version = "0.54", default-features = false, features = ["services-webhdfs"], optional = true }
@@ -360,8 +364,8 @@ greptimedb-ingester = { git = "https://github.com/GreptimeTeam/greptimedb-ingest
 arc-swap = { workspace = true, default-features = false, optional = true }
 async-compression = { version = "0.4.27", default-features = false, features = ["tokio", "gzip", "zstd"], optional = true }
 apache-avro = { version = "0.16.0", default-features = false, optional = true }
-arrow = { version = "59.1.0", default-features = false, features = ["ipc", "json"], optional = true }
-arrow-schema = { version = "59.1.0", default-features = false, optional = true }
+arrow = { version = "59.2.0", default-features = false, features = ["ipc", "json"], optional = true }
+arrow-schema = { version = "59.2.0", default-features = false, optional = true }
 axum = { version = "0.6.20", default-features = false }
 base64 = { workspace = true, optional = true }
 bloomy = { version = "1.2.0", default-features = false, optional = true }
@@ -680,7 +684,7 @@ sources-aws_ecs_metrics = ["sources-utils-http-client"]
 sources-aws_kinesis_firehose = ["dep:base64"]
 sources-aws_s3 = ["aws-core", "dep:aws-sdk-sqs", "dep:aws-sdk-s3", "dep:async-compression", "sources-aws_sqs", "tokio-util/io"]
 sources-aws_sqs = ["aws-core", "dep:aws-sdk-sqs"]
-sources-azure_blob = ["dep:azure_core", "dep:azure_identity", "dep:azure_identity_for_storage", "dep:azure_storage", "dep:azure_storage_blobs", "dep:azure_storage_queues", "dep:async-compression", "dep:base64", "sources-utils-http-client" ]
+sources-azure_blob = ["dep:azure_core", "dep:azure_identity", "dep:azure_identity_for_storage", "dep:azure_storage", "dep:azure_storage_blobs", "dep:azure_storage_queues", "dep:async-compression", "dep:base64", "dep:reqwest_012", "sources-utils-http-client" ]
 sources-datadog_agent = ["sources-utils-http-encoding", "protobuf-build", "dep:prost"]
 sources-demo_logs = ["dep:fakedata"]
 sources-dnstap = ["sources-utils-net-tcp", "dep:base64", "dep:hickory-proto", "dep:dnsmsg-parser", "dep:dnstap-parser", "protobuf-build", "dep:prost", "vector-vrl-functions/dnstap"]
