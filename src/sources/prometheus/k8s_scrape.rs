@@ -475,6 +475,9 @@ async fn scrape_endpoint(
     honor_labels: bool,
     emit_pod_metadata: bool,
 ) -> Result<Vec<Event>> {
+    use std::io::Read as _;
+
+    use flate2::read::MultiGzDecoder;
     use http_body::Body as _;
     use hyper::{Body, Request};
 
@@ -505,8 +508,30 @@ async fn scrape_endpoint(
             e
         })?;
 
+    // Some scrape targets (e.g. the classic-DBR driver) gzip-encode the metrics
+    // response unconditionally — they compress even when we send no
+    // `Accept-Encoding` and ignore `Accept-Encoding: identity`. `parse_text`
+    // needs decoded UTF-8, so inflate when the response is gzip, detected from the
+    // Content-Encoding header and falling back to the gzip magic bytes.
+    let content_encoding_gzip = response
+        .headers()
+        .get(hyper::header::CONTENT_ENCODING)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
+
     let body_bytes = response.into_body().collect().await?.to_bytes();
-    let body_str = std::str::from_utf8(body_bytes.as_ref())
+
+    let decoded_body = if content_encoding_gzip || body_bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut decoder = MultiGzDecoder::new(body_bytes.as_ref());
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).map_err(|e| {
+            format!("Failed to gzip-decode response body from {}: {}", endpoint.url, e)
+        })?;
+        out
+    } else {
+        body_bytes.to_vec()
+    };
+
+    let body_str = std::str::from_utf8(&decoded_body)
         .map_err(|e| format!("Invalid UTF-8 in response body: {}", e))?;
 
     // Parse Prometheus metrics
@@ -518,7 +543,7 @@ async fn scrape_endpoint(
                     .url
                     .parse()
                     .unwrap_or_else(|_| http::Uri::default()),
-                body: String::from_utf8_lossy(body_bytes.as_ref())
+                body: String::from_utf8_lossy(&decoded_body)
             });
         })
         .unwrap_or_default();
@@ -1211,6 +1236,78 @@ http_requests_total{method="POST",status="201"} 5678
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         (addr, tx)
+    }
+
+    /// Like `spawn_metrics_server` but gzip-compresses the body and sets
+    /// `Content-Encoding: gzip`, mirroring targets (e.g. the classic-DBR driver)
+    /// that compress the metrics response unconditionally.
+    async fn spawn_gzip_metrics_server(body: &'static str) -> (SocketAddr, oneshot::Sender<()>) {
+        use std::io::Write as _;
+
+        let (tx, rx) = oneshot::channel();
+
+        let make_svc = make_service_fn(move |_conn| async move {
+            Ok::<_, Infallible>(service_fn(move |_req| async move {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(body.as_bytes()).unwrap();
+                let compressed = encoder.finish().unwrap();
+                let response = Response::builder()
+                    .header(hyper::header::CONTENT_ENCODING, "gzip")
+                    .body(Body::from(compressed))
+                    .unwrap();
+                Ok::<_, Infallible>(response)
+            }))
+        });
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Server::bind(&addr).serve(make_svc);
+        let addr = server.local_addr();
+
+        tokio::spawn(async move {
+            let server = server.with_graceful_shutdown(async {
+                rx.await.ok();
+            });
+            server.await.ok();
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (addr, tx)
+    }
+
+    /// A gzip-encoded metrics response is transparently inflated and parsed, so
+    /// unconditionally-compressing targets (e.g. the classic-DBR driver) work.
+    #[tokio::test]
+    async fn test_scrape_endpoint_decodes_gzip_response() {
+        let (addr, tx) = spawn_gzip_metrics_server(
+            "# TYPE http_requests_total counter\nhttp_requests_total{method=\"GET\"} 7\n",
+        )
+        .await;
+
+        let tls = TlsSettings::default();
+        let proxy = ProxyConfig::default();
+        let client = http_client::build_client(&tls, &proxy).unwrap();
+
+        let result = scrape_endpoint(
+            endpoint_with_labels(addr, &[]),
+            client,
+            Duration::from_secs(5),
+            None,
+            Some("pod_name".to_string()),
+            Some("pod_namespace".to_string()),
+            false,
+            true,
+        )
+        .await;
+
+        tx.send(()).ok();
+
+        let events = result.unwrap();
+        assert_eq!(events.len(), 1, "gzip body should inflate to one metric");
+        match &events[0] {
+            Event::Metric(metric) => assert_eq!(metric.name(), "http_requests_total"),
+            _ => panic!("expected a metric event"),
+        }
     }
 
     fn endpoint_with_labels(addr: SocketAddr, labels: &[(&str, &str)]) -> Endpoint {

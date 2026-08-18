@@ -1,6 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{borrow::Cow, collections::HashMap, io::Read as _, time::Duration};
 
 use bytes::Bytes;
+use flate2::read::MultiGzDecoder;
 use futures_util::FutureExt;
 use http::{Uri, response::Parts};
 use serde_with::serde_as;
@@ -282,8 +283,34 @@ impl HttpClientContext for PrometheusScrapeContext {
     }
 
     /// Parses the Prometheus HTTP response into metric events
-    fn on_response(&mut self, url: &Uri, _header: &Parts, body: &Bytes) -> Option<Vec<Event>> {
-        let body = String::from_utf8_lossy(body);
+    fn on_response(&mut self, url: &Uri, header: &Parts, body: &Bytes) -> Option<Vec<Event>> {
+        // Some targets gzip-encode the response, sometimes without advertising it
+        // via Content-Encoding (see `prometheus_k8s_scrape`; some servers ignore
+        // `Accept-Encoding: identity`). Inflate when the header says gzip or the
+        // body carries the gzip magic bytes; a plaintext exposition never begins
+        // with 0x1f, so this can't misfire on real metrics text.
+        let is_gzip = header
+            .headers
+            .get(http::header::CONTENT_ENCODING)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"))
+            || body.starts_with(&[0x1f, 0x8b]);
+
+        let decoded: Cow<[u8]> = if is_gzip {
+            let mut out = Vec::new();
+            if let Err(error) = MultiGzDecoder::new(body.as_ref()).read_to_end(&mut out) {
+                warn!(
+                    message = "Failed to gzip-decode scrape response body.",
+                    endpoint = %url,
+                    %error,
+                );
+                return None;
+            }
+            Cow::Owned(out)
+        } else {
+            Cow::Borrowed(body.as_ref())
+        };
+
+        let body = String::from_utf8_lossy(&decoded);
 
         match parser::parse_text(&body) {
             Ok(events) => Some(events),
@@ -376,6 +403,52 @@ mod test {
         )
         .await;
         assert!(!events.is_empty());
+    }
+
+    // A gzip-encoded scrape response (Content-Encoding: gzip) is transparently
+    // inflated and parsed, so targets that compress the response still ingest.
+    #[tokio::test]
+    async fn test_prometheus_decodes_gzip_response() {
+        use std::io::Write as _;
+
+        let (_guard, in_addr) = next_addr();
+
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(b"promhttp_metric_handler_requests_total{code=\"200\"} 100 1612411516789\n")
+            .unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let dummy_endpoint = warp::path!("metrics").map(move || {
+            warp::reply::with_header(compressed.clone(), "content-encoding", "gzip")
+        });
+
+        tokio::spawn(warp::serve(dummy_endpoint).run(in_addr));
+        wait_for_tcp(in_addr).await;
+
+        let config = PrometheusScrapeConfig {
+            endpoints: vec![format!("http://{}/metrics", in_addr)],
+            interval: Duration::from_secs(1),
+            timeout: default_timeout(),
+            instance_tag: Some("instance".to_string()),
+            endpoint_tag: Some("endpoint".to_string()),
+            honor_labels: true,
+            query: HashMap::new(),
+            auth: None,
+            tls: None,
+        };
+
+        let events = run_and_assert_source_compliance(
+            config,
+            Duration::from_secs(3),
+            &HTTP_PULL_SOURCE_TAGS,
+        )
+        .await;
+        assert!(
+            !events.is_empty(),
+            "gzip-encoded scrape response should decode to metrics"
+        );
     }
 
     #[tokio::test]
