@@ -55,7 +55,12 @@ message MessageRedactionPlan {
   optional int32 account_id_field_number = 4;
   optional int32 metastore_id_field_number = 5;
 
-  // (-- TODO: key-shape gate (key_shape_field_number + key_shapes), once shape enforcement lands. --)
+  // Key-shape gate for a synthetic map-entry plan: under enforcement, the key (this field) must
+  // match one of `key_shapes` or the whole entry is dropped (a bad key can't be wiped to "" without
+  // colliding entries onto one key). Unset = no gate; set-but-empty = drop every entry under
+  // enforcement. Mirrors PassThroughString.allowed_shapes, applied to the map key.
+  optional int32 key_shape_field_number = 6;
+  repeated compliance.DataShape key_shapes = 7;
 }
 
 // One (field number -> action) pair; a repeated list replaces map<int32, FieldAction> (awkward in Rust).
