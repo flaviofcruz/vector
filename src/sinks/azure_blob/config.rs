@@ -224,17 +224,18 @@ const DEFAULT_FILENAME_APPEND_UUID: bool = true;
 impl AzureBlobSinkConfig {
     pub fn build_processor(&self, client: Arc<ContainerClient>) -> crate::Result<VectorSink> {
         let request_limits = self.request.into_settings();
+        let bucket = self.storage_account.clone().unwrap_or_default();
         let service = ServiceBuilder::new()
             .settings(request_limits, AzureBlobRetryLogic)
             // Add another layer after retries for emitting our event log message
             // Returns back the same result so it continues to work downstream
-            .map_result(|result: StdResult<AzureBlobResponse, _>| {
+            .map_result(move |result: StdResult<AzureBlobResponse, _>| {
                 if let Ok(ref response) = result {
                     response.event_log_metadata.emit_upload_event();
                 }
                 // One settled PutBlockBlob is one upload attempt. The Azure SDK surfaces
                 // non-2xx as `Err`, so `Ok`/`Err` is already the success/failure split.
-                emit_blob_file_upload_attempt(result.is_ok());
+                emit_blob_file_upload_attempt(result.is_ok(), &bucket);
                 result
             })
             .service(AzureBlobService::new(client));

@@ -24,13 +24,14 @@ use vector_common::internal_event::vector_event::delivery_event::MetadataValuesC
 /// rather than one HTTP request. Note that `Ok(response)` alone does not mean success
 /// on `gcp_cloud_storage`, where a non-retriable 4xx still surfaces as `Ok`.
 ///
-/// `status` is the only explicit label. The enclosing sink request span adds
+/// `status` and `bucket` are the explicit labels. The enclosing sink request span adds
 /// `component_id` / `component_type` / `component_kind` automatically (see
 /// `VectorLabelFilter`), giving per-sink attribution without extra cardinality.
-pub fn emit_blob_file_upload_attempt(success: bool) {
+pub fn emit_blob_file_upload_attempt(success: bool, bucket: &str) {
     counter!(
         "blob_sink_file_uploads_total",
         "status" => if success { "success" } else { "failure" },
+        "bucket" => bucket.to_string(),
     )
     .increment(1);
 }
@@ -139,6 +140,10 @@ mod tests {
                 MetricValue::Counter { value } => *value as u64,
                 other => panic!("expected a counter, got {other:?}"),
             };
+            assert!(
+                metric.tag_value("bucket").is_some(),
+                "blob_sink_file_uploads_total emitted without a bucket label",
+            );
             match metric.tag_value("status").as_deref() {
                 Some("success") => success = Some(value),
                 Some("failure") => failure = Some(value),
@@ -158,13 +163,29 @@ mod tests {
 
         // Each attempt counts once regardless of how many events it carried, which is
         // what distinguishes this from `delivery_events_total`.
-        emit_blob_file_upload_attempt(true);
-        emit_blob_file_upload_attempt(true);
-        emit_blob_file_upload_attempt(false);
+        emit_blob_file_upload_attempt(true, "test-bucket");
+        emit_blob_file_upload_attempt(true, "test-bucket");
+        emit_blob_file_upload_attempt(false, "test-bucket");
 
         // Failures are recorded rather than dropped, so the two series sum to the
         // total attempts and support a failure ratio.
         assert_eq!(upload_counts(controller), (Some(2), Some(1)));
+    }
+
+    #[test]
+    fn labels_the_destination_bucket() {
+        init_test();
+        let controller = Controller::get().unwrap();
+        controller.reset();
+
+        emit_blob_file_upload_attempt(true, "my-bucket");
+
+        let bucket = controller
+            .capture_metrics()
+            .into_iter()
+            .find(|metric| metric.name() == "blob_sink_file_uploads_total")
+            .and_then(|metric| metric.tag_value("bucket"));
+        assert_eq!(bucket.as_deref(), Some("my-bucket"));
     }
 
     // The GCS sink is the one caller that must inspect HTTP status itself, because
@@ -185,7 +206,7 @@ mod tests {
             let success = result
                 .as_ref()
                 .is_ok_and(|response| response.inner.status().is_success());
-            emit_blob_file_upload_attempt(success);
+            emit_blob_file_upload_attempt(success, "test-bucket");
         }
 
         fn response(status: StatusCode) -> Result<GcsResponse, ()> {

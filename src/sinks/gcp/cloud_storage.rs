@@ -312,11 +312,12 @@ impl GcsSinkConfig {
 
         let protocol = get_http_scheme_from_uri(&base_url.parse::<Uri>().unwrap());
 
+        let bucket = self.bucket.clone();
         let svc = ServiceBuilder::new()
             .settings(request, GcsRetryLogic::default())
             // Add another layer after retries for emitting our event log message
             // Returns back the same result so it continues to work downstream
-            .map_result(|result: Result<GcsResponse, _>| {
+            .map_result(move |result: Result<GcsResponse, _>| {
                 if let Ok(ref response) = result {
                     response.event_log_metadata.emit_upload_event();
                 }
@@ -327,7 +328,7 @@ impl GcsSinkConfig {
                 let success = result
                     .as_ref()
                     .is_ok_and(|response| response.inner.status().is_success());
-                emit_blob_file_upload_attempt(success);
+                emit_blob_file_upload_attempt(success, &bucket);
                 result
             })
             .service(GcsService::new(client, base_url, auth));
