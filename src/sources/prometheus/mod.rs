@@ -1,6 +1,8 @@
 pub(crate) mod parser;
 
 #[cfg(feature = "sources-prometheus-scrape")]
+pub(crate) mod decompress;
+#[cfg(feature = "sources-prometheus-scrape")]
 mod k8s_endpoint_provider;
 #[cfg(feature = "sources-prometheus-scrape")]
 mod k8s_scrape;

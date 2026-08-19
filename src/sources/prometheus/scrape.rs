@@ -1,14 +1,13 @@
-use std::{borrow::Cow, collections::HashMap, io::Read as _, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use bytes::Bytes;
-use flate2::read::MultiGzDecoder;
 use futures_util::FutureExt;
 use http::{Uri, response::Parts};
 use serde_with::serde_as;
 use snafu::ResultExt;
 use vector_lib::{config::LogNamespace, configurable::configurable_component, event::Event};
 
-use super::parser;
+use super::{decompress, parser};
 use crate::{
     Result,
     config::{GenerateConfig, SourceConfig, SourceContext, SourceOutput},
@@ -284,20 +283,12 @@ impl HttpClientContext for PrometheusScrapeContext {
 
     /// Parses the Prometheus HTTP response into metric events
     fn on_response(&mut self, url: &Uri, header: &Parts, body: &Bytes) -> Option<Vec<Event>> {
-        // Some targets gzip-encode the response, sometimes without advertising it
-        // via Content-Encoding (see `prometheus_k8s_scrape`; some servers ignore
-        // `Accept-Encoding: identity`). Inflate when the header says gzip or the
-        // body carries the gzip magic bytes; a plaintext exposition never begins
-        // with 0x1f, so this can't misfire on real metrics text.
-        let is_gzip = header
-            .headers
-            .get(http::header::CONTENT_ENCODING)
-            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"))
-            || body.starts_with(&[0x1f, 0x8b]);
-
-        let decoded: Cow<[u8]> = if is_gzip {
-            let mut out = Vec::new();
-            if let Err(error) = MultiGzDecoder::new(body.as_ref()).read_to_end(&mut out) {
+        let decoded = match decompress::maybe_gunzip(
+            header.headers.get(http::header::CONTENT_ENCODING).map(|v| v.as_bytes()),
+            body,
+        ) {
+            Ok(decoded) => decoded,
+            Err(error) => {
                 warn!(
                     message = "Failed to gzip-decode scrape response body.",
                     endpoint = %url,
@@ -305,9 +296,6 @@ impl HttpClientContext for PrometheusScrapeContext {
                 );
                 return None;
             }
-            Cow::Owned(out)
-        } else {
-            Cow::Borrowed(body.as_ref())
         };
 
         let body = String::from_utf8_lossy(&decoded);

@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use vector_lib::{config::LogNamespace, configurable::configurable_component, event::Event};
 
 use super::{
+    decompress,
     k8s_endpoint_provider::{
         Endpoint, EndpointProvider, K8sEndpointProvider, NamespaceAnnotationLabels,
     },
@@ -475,9 +476,6 @@ async fn scrape_endpoint(
     honor_labels: bool,
     emit_pod_metadata: bool,
 ) -> Result<Vec<Event>> {
-    use std::io::Read as _;
-
-    use flate2::read::MultiGzDecoder;
     use http_body::Body as _;
     use hyper::{Body, Request};
 
@@ -508,30 +506,18 @@ async fn scrape_endpoint(
             e
         })?;
 
-    // Some scrape targets (e.g. the classic-DBR driver) gzip-encode the metrics
-    // response unconditionally — they compress even when we send no
-    // `Accept-Encoding` and ignore `Accept-Encoding: identity`. `parse_text`
-    // needs decoded UTF-8, so inflate when the response is gzip, detected from the
-    // Content-Encoding header and falling back to the gzip magic bytes.
-    let content_encoding_gzip = response
+    // Capture Content-Encoding before `into_body()` consumes the response.
+    let content_encoding = response
         .headers()
         .get(hyper::header::CONTENT_ENCODING)
-        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"gzip"));
+        .map(|v| v.as_bytes().to_vec());
 
     let body_bytes = response.into_body().collect().await?.to_bytes();
 
-    let decoded_body = if content_encoding_gzip || body_bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut decoder = MultiGzDecoder::new(body_bytes.as_ref());
-        let mut out = Vec::new();
-        decoder.read_to_end(&mut out).map_err(|e| {
-            format!("Failed to gzip-decode response body from {}: {}", endpoint.url, e)
-        })?;
-        out
-    } else {
-        body_bytes.to_vec()
-    };
+    let decoded_body = decompress::maybe_gunzip(content_encoding.as_deref(), body_bytes.as_ref())
+        .map_err(|e| format!("Failed to gzip-decode response body from {}: {}", endpoint.url, e))?;
 
-    let body_str = std::str::from_utf8(&decoded_body)
+    let body_str = std::str::from_utf8(decoded_body.as_ref())
         .map_err(|e| format!("Invalid UTF-8 in response body: {}", e))?;
 
     // Parse Prometheus metrics
@@ -543,7 +529,7 @@ async fn scrape_endpoint(
                     .url
                     .parse()
                     .unwrap_or_else(|_| http::Uri::default()),
-                body: String::from_utf8_lossy(&decoded_body)
+                body: String::from_utf8_lossy(decoded_body.as_ref())
             });
         })
         .unwrap_or_default();
