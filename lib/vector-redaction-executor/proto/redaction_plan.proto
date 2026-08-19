@@ -57,8 +57,9 @@ message MessageRedactionPlan {
 
   // Key-shape gate for a synthetic map-entry plan: under enforcement, the key (this field) must
   // match one of `key_shapes` or the whole entry is dropped (a bad key can't be wiped to "" without
-  // colliding entries onto one key). Unset = no gate; set-but-empty = drop every entry under
-  // enforcement. Mirrors PassThroughString.allowed_shapes, applied to the map key.
+  // colliding entries onto one key). Unset = no gate; set with empty `key_shapes` = drop every entry
+  // under enforcement. NB: this is the INVERSE of PassThroughString.allowed_shapes, where empty means
+  // "no constraint" (keep) — an empty key-shape gate means "drop all".
   optional int32 key_shape_field_number = 6;
   repeated compliance.DataShape key_shapes = 7;
 }
