@@ -70,4 +70,21 @@ mod tests {
         let compressed = gzip(plain);
         assert_eq!(maybe_gunzip(Some(b"GZIP"), &compressed).unwrap().as_ref(), plain);
     }
+
+    #[test]
+    fn errors_on_truncated_gzip_from_header() {
+        // Header says gzip so we inflate, but the stream is cut mid-body: surface
+        // the error rather than parsing garbage. Callers turn this into a warn! + skip.
+        let compressed = gzip(b"# TYPE foo counter\nfoo 7\n");
+        let truncated = &compressed[..compressed.len() / 2];
+        assert!(maybe_gunzip(Some(b"gzip"), truncated).is_err());
+    }
+
+    #[test]
+    fn errors_on_corrupt_gzip_detected_by_magic() {
+        // Leading gzip magic triggers inflate even with no header; a corrupt body
+        // errors rather than silently passing through.
+        let corrupt = [0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef];
+        assert!(maybe_gunzip(None, &corrupt).is_err());
+    }
 }
