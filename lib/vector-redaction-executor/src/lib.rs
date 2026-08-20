@@ -42,6 +42,7 @@ use prost::Message;
 use sha2::Sha512;
 
 mod shape;
+mod metadata_shape;
 
 /// prost-generated bindings for `proto/redaction_plan.proto`. `build.rs` emits `_bindings.rs`, which
 /// wires each proto package into a nested module tree; the plan proto references `compliance.DataLabel`
@@ -57,6 +58,13 @@ mod proto_bindings {
 
 /// The generated `RedactionPlanSet` contract types. Public so callers can construct or inspect plans.
 pub use proto_bindings::databricks::logstructuredredactionplan as plan_proto;
+
+/// Log-metadata shape-enforcement policy (the LP port of Scala `LogMetadataShapeEnforcer`). The
+/// `enforce_metadata_shape` VRL function walks the `_log_metadata` object and applies these maps.
+pub use metadata_shape::{
+    field_value_conforms, DATA_PLANE_METADATA_SHAPES, LOG_DAEMON_METADATA_SHAPES,
+    SERVICE_METADATA_SHAPES,
+};
 
 /// Protobuf wire types (the low 3 bits of a field tag). Groups (start/end, wire types 3 and 4) are
 /// unsupported — the redactor rejects them as malformed.

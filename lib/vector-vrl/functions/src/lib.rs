@@ -13,6 +13,7 @@
 use vrl::{compiler::Function, path::OwnedTargetPath};
 
 pub mod apply_redaction;
+pub mod enforce_metadata_shape;
 pub mod get_secret;
 pub mod redaction;
 pub mod remove_secret;
@@ -40,7 +41,10 @@ pub fn secret_functions() -> Vec<Box<dyn Function>> {
 
 /// Returns Vector-specific redaction functions.
 pub fn redaction_functions() -> Vec<Box<dyn Function>> {
-    vec![Box::new(apply_redaction::ApplyRedaction) as _]
+    vec![
+        Box::new(apply_redaction::ApplyRedaction) as _,
+        Box::new(enforce_metadata_shape::EnforceMetadataShape) as _,
+    ]
 }
 
 /// Returns all VRL functions available in Vector.
