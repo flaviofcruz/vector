@@ -11,6 +11,7 @@ use rand::Rng;
 use snafu::{ResultExt, Snafu};
 use tower::ServiceBuilder;
 use uuid::Uuid;
+use vector_common::internal_event::vector_event::file_send_event::FileEventMetadata;
 use vector_lib::event::event_log::generate_count_map;
 use vector_lib::{
     TimeZone, codecs::encoding::Framer, configurable::configurable_component, event::Finalizable,
@@ -40,6 +41,7 @@ use crate::{
             TowerRequestConfig, batch::BatchConfig, metadata::RequestMetadataBuilder,
             partitioner::KeyPartitioner, request_builder::EncodeResult,
             service::TowerRequestConfigDefaults, timezone_to_offset,
+            vector_event_log::EventLoggingService,
         },
     },
     template::{Template, TemplateParseError},
@@ -333,6 +335,11 @@ impl GcsSinkConfig {
             })
             .service(GcsService::new(client, base_url, auth));
 
+        // Wrap the service so the same delivery/file-send events the S3 and Azure
+        // blob sinks emit are emitted here too (staged before the request, delivered
+        // on success). Transparent when `ENABLE_SINK_EVENT_LOGGING` is off.
+        let svc = EventLoggingService::new(svc);
+
         let request_settings = RequestSettings::new(self, cx)?;
 
         let sink = GcsSink::new(svc, request_settings, partitioner, batch_settings, protocol);
@@ -392,7 +399,14 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
     ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
         let (partition_key, mut events) = input;
         let finalizers = events.take_finalizers();
-        let builder = RequestMetadataBuilder::from_events(&events);
+        // Attach delivery + file-send event metadata so the EventLoggingService wrapper
+        // can emit VECTOR_SINK_UPLOAD_{STAGED,DELIVERED} delivery events and
+        // VECTOR_FILE_SEND_EVENT for each upload, matching the S3 and Azure blob sinks.
+        // The concrete blob name and byte count are filled in below in build_request().
+        let builder = RequestMetadataBuilder::from_events_with_event_log(
+            &events,
+            Some(FileEventMetadata::default()),
+        );
 
         // Create event metadata here as this is where the list of events are available pre-encoding
         // And we want to access this list to process the raw events to see specific field values
@@ -452,6 +466,16 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
         let key = format!("{}{}.{}", key, filename, self.extension);
         let body = payload.into_payload();
 
+        let mut metadata = metadata;
+        // Fill in the now-known blob name and byte count so the file-send events
+        // emitted by the EventLoggingService wrapper carry them.
+        metadata.update_file_metadata(
+            body.len(),
+            gcs_metadata.event_log_metadata.events_len,
+            key.clone(),
+            self.bucket.clone(),
+            Some(self.bucket.clone()),
+        );
         gcs_metadata.event_log_metadata.bytes = body.len();
         gcs_metadata.event_log_metadata.blob = key.clone();
         gcs_metadata.event_log_metadata.emit_sending_event();
