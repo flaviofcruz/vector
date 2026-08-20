@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
+
 use chrono::Utc;
 use md5::{Digest, Md5};
-use serde_json::Value as JsonValue;
 use vector_lib::{configurable::configurable_component, lookup::event_path};
 use vrl::value::{KeyString, Value};
 
@@ -140,21 +141,21 @@ impl MetricToLogHydra {
         format!("{:x}", Md5::digest(s.as_bytes()))
     }
 
-    /// Compute `metric_part`: first 8 hex chars of md5(metric_name) as u64 mod 100.
+    /// Compute `metric_part`: the first 4 bytes of md5(metric_name) as a big-endian u32, mod 100.
+    /// Byte-identical to reducing the first 8 hex chars of the md5 mod 100, without formatting hex.
     fn metric_part(metric_name: &str) -> i64 {
-        let hex = Self::md5_hex(metric_name);
-        (i64::from_str_radix(&hex[..8], 16)
-            .unwrap_or(0)
-            .unsigned_abs()
-            % 100) as i64
+        let digest = Md5::digest(metric_name.as_bytes());
+        (u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) as i64) % 100
     }
 
     /// Consume a `Metric` and produce a `LogEvent`, or the [`DropReason`] it was dropped for.
     pub fn transform_one(metric: Metric) -> Result<LogEvent, DropReason> {
         let now_ms = Utc::now().timestamp_millis();
+        let (series, data, metadata) = metric.into_parts();
 
-        let timestamp_ms: i64 = metric
-            .timestamp()
+        let timestamp_ms: i64 = data
+            .time
+            .timestamp
             .map(|ts| ts.timestamp_millis())
             .unwrap_or(now_ms);
 
@@ -168,12 +169,12 @@ impl MetricToLogHydra {
 
         // Only Gauge/Counter carry a scalar; both handled the same. Non-finite (NaN/±Inf) → drop as
         // NonFiniteValue (explicit is_finite: NotNan accepts ±Inf but not NaN). Others → [].
-        let values: Value = match metric.value() {
+        let values: Value = match data.value {
             MetricValue::Gauge { value } | MetricValue::Counter { value } => {
                 if !value.is_finite() {
                     return Err(DropReason::NonFiniteValue);
                 }
-                let v = (*value)
+                let v = value
                     .try_into()
                     .expect("value checked finite above, NotNan cannot fail");
                 Value::Array(vec![Value::Object(
@@ -187,38 +188,31 @@ impl MetricToLogHydra {
             _ => Value::Array(vec![]),
         };
 
-        let original_name: String = metric.name().to_owned();
+        // Take ownership of the name and tags so their string buffers can be moved into the output.
+        let tags = series.tags;
+        let original_name: String = series.name.name;
         let (metric_name, metric_type) = {
             let (base, t) = Self::parse_metric_name(&original_name);
             (base.to_owned(), t)
         };
         let part = Self::metric_part(&metric_name);
 
-        // Build tag map once; used for both labels field and individual tag lookups.
-        let tags_iter = metric.tags().map(|t| t.iter_single()).into_iter().flatten();
-
-        // Collect into a Vec so we can iterate twice (labels + individual fields).
-        let tags: Vec<(String, String)> = tags_iter
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-
-        // md5_labels: hash a canonical JSON representation of the sorted tag map,
-        // matching VRL's `md5(encode_json(.tags))`. Use serde_json for correct
-        // escaping of any special characters in tag keys/values.
-        // Tags from iter_single are already in BTreeMap sorted order.
+        // md5_labels: hash a canonical JSON representation of the sorted tag map, matching VRL's
+        // `md5(encode_json(.tags))`. serde_json over borrowed `&str` keys/values yields the same
+        // compact, BTreeMap-sorted, correctly-escaped output as an owned map — with no string copy.
         let tags_json = {
-            let map: serde_json::Map<String, JsonValue> = tags
-                .iter()
-                .map(|(k, v)| (k.clone(), JsonValue::String(v.clone())))
-                .collect();
+            let map: BTreeMap<&str, &str> = tags
+                .as_ref()
+                .map(|t| t.iter_single().collect())
+                .unwrap_or_default();
             serde_json::to_string(&map).unwrap_or_default()
         };
         let md5_labels = Self::md5_hex(&tags_json);
 
-        let get_tag = |key: &str| -> Option<String> {
-            tags.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-        };
-
+        // Promoted columns also appear as top-level fields, so they are copied here (bounded by the
+        // number of promoted keys, not the tag count). `get` resolves each tag the same single value
+        // `iter_single` does, without a linear scan.
+        let get_tag = |key: &str| tags.as_ref().and_then(|t| t.get(key)).map(String::from);
         let system_label = get_tag("system").unwrap_or_default();
         let workspace_id = get_tag("workspace_id");
         let cluster_id = get_tag("cluster_id");
@@ -231,7 +225,7 @@ impl MetricToLogHydra {
 
         let tenant_cluster_column: Value = cluster_id
             .clone()
-            .or_else(|| endpoint_name)
+            .or(endpoint_name)
             .or_else(|| tenant_id.clone())
             .or_else(|| workspace_id.clone())
             .map(|s| Value::Bytes(s.into()))
@@ -243,15 +237,16 @@ impl MetricToLogHydra {
             Value::Null
         };
 
-        // Labels as a nested object.
+        // Labels as a nested object — move the tag string buffers straight in (no per-tag copy).
         let labels: Value = Value::Object(
-            tags.into_iter()
-                .map(|(k, v)| (KeyString::from(k), Value::Bytes(v.into())))
-                .collect(),
+            tags.map(|t| {
+                t.into_iter_single()
+                    .map(|(k, v)| (KeyString::from(k), Value::Bytes(v.into())))
+                    .collect()
+            })
+            .unwrap_or_default(),
         );
 
-        // Extract EventMetadata before consuming metric.
-        let (_, _, metadata) = metric.into_parts();
         let mut log = LogEvent::new_with_metadata(metadata);
 
         log.insert(event_path!("name"), Value::Bytes(original_name.into()));
