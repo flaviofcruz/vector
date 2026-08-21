@@ -163,7 +163,6 @@ impl MetricToLogHydra {
         (name, "gauge")
     }
 
-
     /// `metric_part`: first 4 md5 bytes as big-endian u32, mod 100 (== first 8 hex chars, mod 100).
     fn metric_part(metric_name: &str) -> i64 {
         let digest = Md5::digest(metric_name.as_bytes());
