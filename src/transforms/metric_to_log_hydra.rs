@@ -121,10 +121,8 @@ const SUFFIXES: &[(&str, &str)] = &[
 #[derive(Clone, Default)]
 pub struct MetricToLogHydra;
 
-/// Serializes a metric's tags as a JSON object straight from `iter_single()`. `MetricTags` is
-/// `BTreeMap`-backed, so the iterator is already sorted by key — no intermediate map is allocated,
-/// and the output is byte-identical to serializing a sorted map (matching VRL's `encode_json(.tags)`,
-/// which `md5_labels` must reproduce). `None`/empty tags serialize to `{}`.
+/// Serializes tags as a sorted JSON object from `iter_single()` (MetricTags is BTreeMap-backed, so
+/// already key-sorted) with no intermediate map. Matches VRL's `encode_json(.tags)`; `None` → `{}`.
 struct TagsJson<'a>(Option<&'a MetricTags>);
 
 impl Serialize for TagsJson<'_> {
@@ -136,8 +134,7 @@ impl Serialize for TagsJson<'_> {
     }
 }
 
-/// `io::Write` that feeds bytes straight into an `Md5` hasher, so the tag JSON can be hashed as it
-/// is serialized without materializing an intermediate `String`.
+/// `io::Write` that feeds bytes into an `Md5` hasher, so tag JSON is hashed as it serializes.
 struct HashWriter<'a>(&'a mut Md5);
 
 impl std::io::Write for HashWriter<'_> {
@@ -167,8 +164,7 @@ impl MetricToLogHydra {
     }
 
 
-    /// Compute `metric_part`: the first 4 bytes of md5(metric_name) as a big-endian u32, mod 100.
-    /// Byte-identical to reducing the first 8 hex chars of the md5 mod 100, without formatting hex.
+    /// `metric_part`: first 4 md5 bytes as big-endian u32, mod 100 (== first 8 hex chars, mod 100).
     fn metric_part(metric_name: &str) -> i64 {
         let digest = Md5::digest(metric_name.as_bytes());
         (u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) as i64) % 100
@@ -214,7 +210,7 @@ impl MetricToLogHydra {
             _ => Value::Array(vec![]),
         };
 
-        // Take ownership of the name and tags so their string buffers can be moved into the output.
+        // Own name + tags so their buffers move into the output.
         let tags = series.tags;
         let original_name: String = series.name.name;
         let (metric_name, metric_type) = {
@@ -223,19 +219,14 @@ impl MetricToLogHydra {
         };
         let part = Self::metric_part(&metric_name);
 
-        // md5_labels: hash a canonical JSON representation of the sorted tag map, matching VRL's
-        // `md5(encode_json(.tags))`. `TagsJson` serializes directly from the already-sorted
-        // `iter_single()`, streamed into the hasher via `HashWriter` — no intermediate JSON string
-        // or tag map is allocated on the hot path.
+        // md5_labels == md5(encode_json(.tags)); stream the sorted tag JSON into the hasher.
         let md5_labels = {
             let mut hasher = Md5::new();
             serde_json::to_writer(HashWriter(&mut hasher), &TagsJson(tags.as_ref())).ok();
             format!("{:x}", hasher.finalize())
         };
 
-        // Promoted columns also appear as top-level fields, so they are copied here (bounded by the
-        // number of promoted keys, not the tag count). `get` resolves each tag the same single value
-        // `iter_single` does, without a linear scan.
+        // Promoted columns are also emitted as top-level fields; `get` is a keyed lookup, no scan.
         let get_tag = |key: &str| tags.as_ref().and_then(|t| t.get(key)).map(String::from);
         let system_label = get_tag("system").unwrap_or_default();
         let workspace_id = get_tag("workspace_id");
@@ -261,7 +252,7 @@ impl MetricToLogHydra {
             Value::Null
         };
 
-        // Labels as a nested object — move the tag string buffers straight in (no per-tag copy).
+        // Nested labels object; tag buffers moved in, not copied.
         let labels: Value = Value::Object(
             tags.map(|t| {
                 t.into_iter_single()
