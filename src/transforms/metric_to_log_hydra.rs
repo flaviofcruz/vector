@@ -1,7 +1,6 @@
-use std::collections::BTreeMap;
-
 use chrono::Utc;
 use md5::{Digest, Md5};
+use serde::{Serialize, Serializer};
 use vector_lib::{configurable::configurable_component, lookup::event_path};
 use vrl::value::{KeyString, Value};
 
@@ -10,7 +9,7 @@ use crate::{
         DataType, GenerateConfig, Input, OutputId, TransformConfig, TransformContext,
         TransformOutput,
     },
-    event::{Event, LogEvent, Metric, MetricValue},
+    event::{Event, LogEvent, Metric, MetricTags, MetricValue},
     internal_events::MetricToLogHydraDropped,
     schema::Definition,
     transforms::{FunctionTransform, OutputBuffer, Transform},
@@ -122,6 +121,21 @@ const SUFFIXES: &[(&str, &str)] = &[
 #[derive(Clone, Default)]
 pub struct MetricToLogHydra;
 
+/// Serializes a metric's tags as a JSON object straight from `iter_single()`. `MetricTags` is
+/// `BTreeMap`-backed, so the iterator is already sorted by key — no intermediate map is allocated,
+/// and the output is byte-identical to serializing a sorted map (matching VRL's `encode_json(.tags)`,
+/// which `md5_labels` must reproduce). `None`/empty tags serialize to `{}`.
+struct TagsJson<'a>(Option<&'a MetricTags>);
+
+impl Serialize for TagsJson<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(tags) => serializer.collect_map(tags.iter_single()),
+            None => serializer.collect_map(std::iter::empty::<(&str, &str)>()),
+        }
+    }
+}
+
 impl MetricToLogHydra {
     pub fn new() -> Self {
         Self
@@ -198,15 +212,9 @@ impl MetricToLogHydra {
         let part = Self::metric_part(&metric_name);
 
         // md5_labels: hash a canonical JSON representation of the sorted tag map, matching VRL's
-        // `md5(encode_json(.tags))`. serde_json over borrowed `&str` keys/values yields the same
-        // compact, BTreeMap-sorted, correctly-escaped output as an owned map — with no string copy.
-        let tags_json = {
-            let map: BTreeMap<&str, &str> = tags
-                .as_ref()
-                .map(|t| t.iter_single().collect())
-                .unwrap_or_default();
-            serde_json::to_string(&map).unwrap_or_default()
-        };
+        // `md5(encode_json(.tags))`. `TagsJson` serializes directly from the already-sorted
+        // `iter_single()` — no intermediate map is allocated on the hot path.
+        let tags_json = serde_json::to_string(&TagsJson(tags.as_ref())).unwrap_or_default();
         let md5_labels = Self::md5_hex(&tags_json);
 
         // Promoted columns also appear as top-level fields, so they are copied here (bounded by the
