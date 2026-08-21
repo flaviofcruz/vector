@@ -1,3 +1,5 @@
+use std::sync::{Arc, atomic::AtomicBool};
+
 use aws_sdk_kinesis::operation::{
     describe_stream::DescribeStreamError, put_records::PutRecordsError,
 };
@@ -70,6 +72,18 @@ pub struct KinesisStreamsSinkConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub batch: BatchConfig<KinesisDefaultBatchSettings>,
+
+    /// Fail over to the public AWS endpoint when the configured PrivateLink `endpoint` is
+    /// unreachable.
+    ///
+    /// When set, the sink builds a second client that ignores the `endpoint` override (targeting
+    /// the default public regional endpoint) and, on a transport failure to the override endpoint
+    /// (DNS/NXDOMAIN, connection refused/reset, TLS, or a connect/read timeout), latches to it for
+    /// the remainder of the process; a process restart re-attempts the override endpoint. Has no
+    /// effect unless an `endpoint` override is configured.
+    #[serde(default)]
+    #[configurable(metadata(docs::advanced))]
+    pub private_link_failover: bool,
 }
 
 impl KinesisStreamsSinkConfig {
@@ -112,6 +126,21 @@ impl KinesisStreamsSinkConfig {
         )
         .await
     }
+
+    /// Build a client that ignores the `endpoint` override, targeting the default public regional
+    /// endpoint. Used as the PrivateLink failover target.
+    pub async fn create_public_client(&self, proxy: &ProxyConfig) -> crate::Result<KinesisClient> {
+        create_client::<KinesisClientBuilder>(
+            &KinesisClientBuilder {},
+            &self.base.auth,
+            self.base.region.region(),
+            None,
+            proxy,
+            self.base.tls.as_ref(),
+            None,
+        )
+        .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -120,6 +149,16 @@ impl SinkConfig for KinesisStreamsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let client = self.create_client(&cx.proxy).await?;
         let healthcheck = self.clone().healthcheck(client.clone()).boxed();
+
+        // When failover is enabled and an `endpoint` override is configured, build a public/NAT
+        // client to fall back to if the override endpoint is unreachable. With no override there is
+        // nothing to fail over from.
+        let fallback_client = if self.private_link_failover && self.base.region.endpoint().is_some()
+        {
+            Some(self.create_public_client(&cx.proxy).await?)
+        } else {
+            None
+        };
 
         let batch_settings = self
             .batch
@@ -138,7 +177,11 @@ impl SinkConfig for KinesisStreamsSinkConfig {
             &self.base,
             self.base.partition_key_field.clone(),
             batch_settings,
-            KinesisStreamClient { client },
+            KinesisStreamClient {
+                client,
+                fallback_client,
+                private_link_disabled: Arc::new(AtomicBool::new(false)),
+            },
             KinesisRetryLogic {
                 retry_partial: self.base.request_retry_partial,
             },
