@@ -236,6 +236,18 @@ impl RegisteredPlan {
         let mut source_fields: Vec<HashSet<u32>> = Vec::with_capacity(plan_set.plans.len());
         let mut any_redact_from = false;
         for (plan_index, plan) in plan_set.plans.iter().enumerate() {
+            // A key-shape gate must name a real, positive field the plan handles (the planner sets a
+            // map entry's key field to PassThrough). Reject a malformed/stale gate here so a bad plan
+            // fails loudly at registration instead of silently dropping every entry under enforcement
+            // (an unreadable/unknown key field fails the runtime gate for every entry).
+            if let Some(key_field) = plan.key_shape_field_number {
+                if key_field <= 0 || !action_index[plan_index].contains_key(&(key_field as u32)) {
+                    return Err(RedactError::InvalidPlan(format!(
+                        "plan {plan_index} has a key-shape gate on field {key_field} that is not a \
+                         positive field the plan handles"
+                    )));
+                }
+            }
             let mut prepared = Vec::new();
             let mut sources = HashSet::new();
             for entry in &plan.actions {
@@ -1107,6 +1119,19 @@ fn handle_recurse(
     let length = reader.read_varint32()? as usize;
     let content = reader.take_slice(length)?;
 
+    // Map-entry key-shape gate: under enforcement, drop the whole entry when its key matches no
+    // allowed shape (a bad key can't be wiped to "" without colliding entries onto one key). Mirrors
+    // StreamingProtoRedactor; enforcement off never fires the gate.
+    let child_plan = &table.plans[child_index as usize];
+    if enforcement == ShapeEnforcement::On {
+        if let Some(key_field) = child_plan.key_shape_field_number {
+            let key = read_string_field(content, key_field as u32)?;
+            if !key_passes_shape_gate(key.as_deref(), &child_plan.key_shapes) {
+                return Ok(());
+            }
+        }
+    }
+
     // Recurse into a fresh child buffer since the redacted length isn't known up front. `depth + 1`
     // is checked at the top of `process_message`, bounding native-stack recursion.
     let mut child_reader = WireReader::new(content);
@@ -1281,6 +1306,16 @@ fn read_string_field(bytes: &[u8], target_field: u32) -> Result<Option<String>, 
         drop_field(&mut reader, wire_type)?;
     }
     Ok(None)
+}
+
+/// True iff `key` matches at least one of `key_shapes`. Mirrors
+/// `StreamingProtoRedactor.keyPassesShapeGate`: a missing key or empty `key_shapes` fails every key
+/// (empty => drop all under enforcement, unlike `PassThroughString` where empty = no constraint).
+fn key_passes_shape_gate(key: Option<&str>, key_shapes: &[i32]) -> bool {
+    match key {
+        Some(k) if !key_shapes.is_empty() => shape::is_allowed_shape(key_shapes, k),
+        _ => false,
+    }
 }
 
 /// Scans a `logging.Field` tag for its `label` varint (field 4) and returns the enum number, or 0
@@ -2162,5 +2197,120 @@ mod tests {
             redact_from_entry(2, 1, false, None),
         ]);
         assert!(register_plan_with_key(&ok_plan.encode_to_vec(), Some(b"")).is_err());
+    }
+
+    // ===== Key-shape gate (map entry) =====
+
+    /// Root field 1 recurses into a synthetic map-entry plan (plans[1]) whose key (field 1) is gated
+    /// to `key_shapes`; the value (field 2) is a plain PassThrough to isolate the KEY gate.
+    fn key_shape_gate_plan(key_shapes: Vec<i32>) -> plan_proto::RedactionPlanSet {
+        plan_proto::RedactionPlanSet {
+            plans: vec![
+                plan_proto::MessageRedactionPlan {
+                    actions: vec![field_entry(
+                        1,
+                        Action::Recurse(plan_proto::Recurse {
+                            child_plan_index: Some(1),
+                        }),
+                    )],
+                    ..Default::default()
+                },
+                plan_proto::MessageRedactionPlan {
+                    actions: vec![
+                        field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
+                        field_entry(2, Action::PassThrough(plan_proto::PassThrough {})),
+                    ],
+                    key_shape_field_number: Some(1),
+                    key_shapes,
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+
+    /// A record with one map entry (root field 1) holding a string key (entry field 1) + value.
+    fn string_key_map_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut entry = Vec::new();
+        push_len_field(&mut entry, 1, key);
+        push_len_field(&mut entry, 2, value);
+        let mut record = Vec::new();
+        push_len_field(&mut record, 1, &entry);
+        record
+    }
+
+    #[test]
+    fn key_shape_gate_keeps_entry_with_conforming_key_under_enforcement() {
+        let plan = key_shape_gate_plan(vec![1]); // DATA_SHAPE_UUID
+        let record = string_key_map_record(b"550e8400-e29b-41d4-a716-446655440000", b"v");
+        assert_eq!(
+            run_enforced(&plan, &record),
+            record,
+            "a UUID key passes the gate — the entry is kept verbatim"
+        );
+    }
+
+    #[test]
+    fn key_shape_gate_drops_entry_with_nonconforming_key_under_enforcement() {
+        let plan = key_shape_gate_plan(vec![1]); // DATA_SHAPE_UUID
+        let record = string_key_map_record(b"not-a-uuid", b"v");
+        assert!(
+            run_enforced(&plan, &record).is_empty(),
+            "a non-UUID key fails the gate — the whole entry is dropped, not wiped to \"\""
+        );
+    }
+
+    #[test]
+    fn key_shape_gate_copies_verbatim_when_enforcement_off() {
+        let plan = key_shape_gate_plan(vec![1]); // DATA_SHAPE_UUID
+        let record = string_key_map_record(b"not-a-uuid", b"v");
+        assert_eq!(
+            try_run_with(&plan, &record, ShapeEnforcement::Off).unwrap(),
+            record,
+            "enforcement off copies the entry verbatim regardless of key shape"
+        );
+    }
+
+    #[test]
+    fn key_shape_gate_empty_shapes_drops_every_entry_under_enforcement() {
+        // Empty key_shapes = "centralizable key, no shape annotation": every key fails under
+        // enforcement, so every entry is dropped (distinct from PassThroughString's empty = keep).
+        let plan = key_shape_gate_plan(vec![]);
+        let record = string_key_map_record(b"550e8400-e29b-41d4-a716-446655440000", b"v");
+        assert!(
+            run_enforced(&plan, &record).is_empty(),
+            "an empty key-shape gate drops every entry under enforcement"
+        );
+    }
+
+    #[test]
+    fn key_shape_gate_drops_non_string_key_under_enforcement() {
+        // A varint key can't be read as a string to shape-check, so it fails the gate (defensive —
+        // the planner only gates string keys). Mirrors StreamingProtoRedactor.readKeyFromEntry.
+        let plan = key_shape_gate_plan(vec![1]); // DATA_SHAPE_UUID
+        let mut entry = Vec::new();
+        push_varint_field(&mut entry, 1, 123); // numeric key, not length-delimited
+        push_len_field(&mut entry, 2, b"v");
+        let mut record = Vec::new();
+        push_len_field(&mut record, 1, &entry);
+        assert!(
+            run_enforced(&plan, &record).is_empty(),
+            "a non-string key can't be shape-checked, so the entry is dropped under enforcement"
+        );
+    }
+
+    #[test]
+    fn register_rejects_key_shape_gate_on_unhandled_field() {
+        // A key-shape gate whose field the plan carries no action for is malformed (the planner
+        // always sets a map entry's key field to PassThrough). Registration must reject it rather
+        // than let the runtime silently drop every entry under enforcement.
+        let plan_set = plan_proto::RedactionPlanSet {
+            plans: vec![plan_proto::MessageRedactionPlan {
+                actions: vec![field_entry(1, Action::PassThrough(plan_proto::PassThrough {}))],
+                key_shape_field_number: Some(2), // no action for field 2 in this plan
+                ..Default::default()
+            }],
+        };
+        let err = register_plan(&plan_set.encode_to_vec()).unwrap_err();
+        assert!(matches!(err, RedactError::InvalidPlan(_)));
     }
 }
