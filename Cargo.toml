@@ -500,6 +500,7 @@ criterion = { version = "0.7.0", features = ["html_reports", "async_tokio"] }
 itertools.workspace = true
 libc.workspace = true
 mock_instant.workspace = true
+metrics-util = { workspace = true, features = ["debugging"] }
 proptest.workspace = true
 quickcheck = "1.0.3"
 reqwest.workspace = true
@@ -757,6 +758,7 @@ transforms-logs = [
   "transforms-aws_ec2_metadata",
   "transforms-bricklens_config_enricher",
   "transforms-dedupe",
+  "transforms-delivery_event_counter",
   "transforms-dynamic_rls_throttle",
   "transforms-filter",
   "transforms-window",
@@ -792,6 +794,7 @@ transforms-aggregate = []
 transforms-aws_ec2_metadata = ["dep:arc-swap"]
 transforms-bricklens_config_enricher = ["dep:prost-reflect", "dep:prost"]
 transforms-dedupe = ["transforms-impl-dedupe"]
+transforms-delivery_event_counter = []
 transforms-dynamic_rls_throttle = ["dep:arc-swap", "dep:prost-reflect", "dep:prost"]
 transforms-filter = []
 transforms-incremental_to_absolute = []

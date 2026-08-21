@@ -62,10 +62,17 @@ fn build_key(
     event: &LogEvent,
     log_metadata_field: &str,
     granularity_fields: &Vec<String>,
+    for_delivery_events: bool,
 ) -> String {
     let mut key_vals: Vec<String> = Vec::new();
     // Get the field that holds the metadata struct itself
     for key_part in granularity_fields {
+        if for_delivery_events && key_part == "system" {
+            if let Some(service_system) = event.metadata().delivery_event_service_system() {
+                key_vals.push(format!("{}={}", key_part, service_system));
+                continue;
+            }
+        }
         if let Ok(Some(val)) =
             event.parse_path_and_get_value(format!("{}.{}", log_metadata_field, key_part))
         {
@@ -80,9 +87,16 @@ fn build_map(
     event: &LogEvent,
     log_metadata_field: &str,
     granularity_fields: &Vec<String>,
+    for_delivery_events: bool,
 ) -> HashMap<String, String> {
     let mut val_map = HashMap::new();
     for key_part in granularity_fields {
+        if for_delivery_events && key_part == "system" {
+            if let Some(service_system) = event.metadata().delivery_event_service_system() {
+                val_map.insert(key_part.to_string(), service_system.to_string());
+                continue;
+            }
+        }
         if let Ok(Some(val)) =
             event.parse_path_and_get_value(format!("{}.{}", log_metadata_field, key_part))
         {
@@ -102,6 +116,13 @@ fn get_message_count(
     message_count_override_field: &str,
     for_delivery_events: bool,
 ) -> usize {
+    if message_count_override_field.is_empty() {
+        return if for_delivery_events {
+            event.as_log().metadata().delivery_event_count()
+        } else {
+            1
+        };
+    }
     let path = format!("{}.{}", log_metadata_field, message_count_override_field);
     match event.as_log().parse_path_and_get_value(path) {
         Ok(Some(value)) => {
@@ -139,7 +160,7 @@ fn get_message_bytes(log_event: &LogEvent, log_metadata_field: &str) -> usize {
 * and MetadataValuesCount is a struct that holds the count, size, and a map of the values
 */
 pub fn generate_count_map(
-    events: &Vec<Event>,
+    events: &[Event],
     for_delivery_events: bool,
 ) -> HashMap<String, MetadataValuesCount> {
     let log_metadata_field = get_event_log_metadata_field();
@@ -157,13 +178,23 @@ pub fn generate_count_map(
             );
             let message_bytes = get_message_bytes(log_event, log_metadata_field);
             count_map
-                .entry(build_key(log_event, log_metadata_field, granularity_fields))
+                .entry(build_key(
+                    log_event,
+                    log_metadata_field,
+                    granularity_fields,
+                    for_delivery_events,
+                ))
                 .and_modify(|x: &mut MetadataValuesCount| {
                     x.count += message_count;
                     x.size += message_bytes;
                 })
                 .or_insert(MetadataValuesCount {
-                    value_map: build_map(log_event, log_metadata_field, granularity_fields),
+                    value_map: build_map(
+                        log_event,
+                        log_metadata_field,
+                        granularity_fields,
+                        for_delivery_events,
+                    ),
                     count: message_count,
                     size: message_bytes,
                 });
@@ -270,6 +301,53 @@ mod tests {
         assert_eq!(
             get_message_count(&event, "log_metadata", "message_count", true),
             9
+        );
+    }
+
+    fn event_with_service_system(service_system: &str) -> LogEvent {
+        let mut event = LogEvent::from("message");
+        event
+            .metadata_mut()
+            .set_delivery_event_service_system(service_system.to_string());
+        event
+    }
+
+    #[test]
+    fn delivery_map_uses_internal_service_system() {
+        let event = event_with_service_system("money-settings");
+
+        assert_eq!(
+            build_map(&event, "log_metadata", &vec!["system".to_string()], true,)
+                .get("system")
+                .map(String::as_str),
+            Some("money-settings")
+        );
+    }
+
+    #[test]
+    fn internal_service_system_takes_precedence_over_event_field() {
+        let mut event = event_with_service_system("source-system");
+        event.insert("log_metadata.system", "explicit-system");
+
+        assert_eq!(
+            build_map(&event, "log_metadata", &vec!["system".to_string()], true,)
+                .get("system")
+                .map(String::as_str),
+            Some("source-system")
+        );
+        assert_eq!(
+            build_key(&event, "log_metadata", &vec!["system".to_string()], true),
+            "system=source-system"
+        );
+    }
+
+    #[test]
+    fn file_send_map_does_not_use_delivery_service_system() {
+        let event = event_with_service_system("money-settings");
+
+        assert!(
+            !build_map(&event, "log_metadata", &vec!["system".to_string()], false,)
+                .contains_key("system")
         );
     }
 }

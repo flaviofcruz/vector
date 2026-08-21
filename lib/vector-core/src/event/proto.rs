@@ -628,6 +628,7 @@ impl From<EventMetadata> for Metadata {
             datadog_origin_metadata,
             source_event_id,
             delivery_event_count,
+            delivery_event_service_system,
             ..
         } = value.into_owned();
 
@@ -642,6 +643,7 @@ impl From<EventMetadata> for Metadata {
             secrets,
             source_event_id: source_event_id.map_or(vec![], std::convert::Into::into),
             delivery_event_count: delivery_event_count.map(|count| count as u64),
+            delivery_event_service_system,
         }
     }
 }
@@ -657,6 +659,7 @@ impl From<Metadata> for EventMetadata {
             datadog_origin_metadata,
             source_event_id,
             delivery_event_count,
+            delivery_event_service_system,
         } = value;
 
         let metadata_value = metadata_value.and_then(decode_value);
@@ -693,6 +696,7 @@ impl From<Metadata> for EventMetadata {
             datadog_origin_metadata,
             source_event_id,
             delivery_event_count,
+            delivery_event_service_system,
         }))
     }
 }

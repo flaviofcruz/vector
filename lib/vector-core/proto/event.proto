@@ -95,6 +95,7 @@ message Metadata {
   Secrets secrets = 6;
   bytes source_event_id = 7;
   optional uint64 delivery_event_count = 8;
+  optional string delivery_event_service_system = 9;
 }
 
 message Metric {
