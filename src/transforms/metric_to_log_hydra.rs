@@ -136,6 +136,21 @@ impl Serialize for TagsJson<'_> {
     }
 }
 
+/// `io::Write` that feeds bytes straight into an `Md5` hasher, so the tag JSON can be hashed as it
+/// is serialized without materializing an intermediate `String`.
+struct HashWriter<'a>(&'a mut Md5);
+
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl MetricToLogHydra {
     pub fn new() -> Self {
         Self
@@ -151,9 +166,6 @@ impl MetricToLogHydra {
         (name, "gauge")
     }
 
-    fn md5_hex(s: &str) -> String {
-        format!("{:x}", Md5::digest(s.as_bytes()))
-    }
 
     /// Compute `metric_part`: the first 4 bytes of md5(metric_name) as a big-endian u32, mod 100.
     /// Byte-identical to reducing the first 8 hex chars of the md5 mod 100, without formatting hex.
@@ -213,9 +225,13 @@ impl MetricToLogHydra {
 
         // md5_labels: hash a canonical JSON representation of the sorted tag map, matching VRL's
         // `md5(encode_json(.tags))`. `TagsJson` serializes directly from the already-sorted
-        // `iter_single()` — no intermediate map is allocated on the hot path.
-        let tags_json = serde_json::to_string(&TagsJson(tags.as_ref())).unwrap_or_default();
-        let md5_labels = Self::md5_hex(&tags_json);
+        // `iter_single()`, streamed into the hasher via `HashWriter` — no intermediate JSON string
+        // or tag map is allocated on the hot path.
+        let md5_labels = {
+            let mut hasher = Md5::new();
+            serde_json::to_writer(HashWriter(&mut hasher), &TagsJson(tags.as_ref())).ok();
+            format!("{:x}", hasher.finalize())
+        };
 
         // Promoted columns also appear as top-level fields, so they are copied here (bounded by the
         // number of promoted keys, not the tag count). `get` resolves each tag the same single value
