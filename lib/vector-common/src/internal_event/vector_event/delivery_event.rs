@@ -711,7 +711,7 @@ fn emit_sink_delivery_log(
 /// delivery legs of the singleton flush. Each entry's component span is
 /// re-entered so the trace BroadcastLayer copies `.vector.component_*` onto the
 /// log. The matching counters are emitted separately and inline by
-/// [`emit_sink_delivery_counters`].
+/// [`emit_delivery_counters`].
 fn emit_sink_delivery_logs<'a>(
     accums: impl Iterator<Item = &'a SinkAccum>,
     message: &'static str,
@@ -725,7 +725,7 @@ fn emit_sink_delivery_logs<'a>(
 
 /// Emits the `delivery_events_total` counter per `value_map`. Called inline
 /// (per sink request) so the metric is not affected by the log batching.
-fn emit_sink_delivery_counters<'a>(
+pub fn emit_delivery_counters<'a>(
     values: impl Iterator<Item = &'a MetadataValuesCount>,
     delivery_event_type: &'static str,
 ) {
@@ -798,13 +798,13 @@ impl VectorSinkDeliveryEvent {
         // VECTOR_DELIVERED_MESSAGES_EVENT. The counter is emitted inline per
         // request (left as-is); only the VEL `info!` log is batched through the
         // process-global singleton.
-        emit_sink_delivery_counters(self.count_map.values(), "VECTOR_SINK_UPLOAD_DELIVERED");
+        emit_delivery_counters(self.count_map.values(), "VECTOR_SINK_UPLOAD_DELIVERED");
         delivery_singleton().accumulate_delivered(&self.count_map);
     }
 
     pub fn emit_staged_event(&self) {
         // VECTOR_STAGED_MESSAGES_EVENT — see `emit_delivered_event`.
-        emit_sink_delivery_counters(self.count_map.values(), "VECTOR_SINK_UPLOAD_STAGED");
+        emit_delivery_counters(self.count_map.values(), "VECTOR_SINK_UPLOAD_STAGED");
         delivery_singleton().accumulate_staged(&self.count_map);
     }
 }

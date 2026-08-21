@@ -81,6 +81,9 @@ pub(super) struct Inner {
 
     /// Number of source events represented by this event after cardinality-reducing transforms.
     pub(crate) delivery_event_count: Option<usize>,
+
+    /// Source service identity retained for delivery-event accounting.
+    pub(crate) delivery_event_service_system: Option<String>,
 }
 
 /// Metric Origin metadata for submission to Datadog.
@@ -255,6 +258,17 @@ impl EventMetadata {
     pub fn set_delivery_event_count(&mut self, count: usize) {
         self.get_mut().delivery_event_count = Some(count);
     }
+
+    /// Returns the source service identity used by delivery-event accounting.
+    #[must_use]
+    pub fn delivery_event_service_system(&self) -> Option<&str> {
+        self.0.delivery_event_service_system.as_deref()
+    }
+
+    /// Sets the source service identity used by delivery-event accounting.
+    pub fn set_delivery_event_service_system(&mut self, service_system: String) {
+        self.get_mut().delivery_event_service_system = Some(service_system);
+    }
 }
 
 impl Default for Inner {
@@ -271,6 +285,7 @@ impl Default for Inner {
             datadog_origin_metadata: None,
             source_event_id: Some(Uuid::new_v4()),
             delivery_event_count: None,
+            delivery_event_service_system: None,
         }
     }
 }
@@ -367,6 +382,9 @@ impl EventMetadata {
         // Update `source_event_id` if necessary.
         if inner.source_event_id.is_none() {
             inner.source_event_id = other.source_event_id;
+        }
+        if inner.delivery_event_service_system.is_none() {
+            inner.delivery_event_service_system = other.delivery_event_service_system;
         }
     }
 
@@ -593,5 +611,19 @@ mod test {
 
         metadata.set_delivery_event_count(7);
         assert_eq!(metadata.delivery_event_count(), 7);
+    }
+
+    #[test]
+    fn delivery_event_service_system_survives_metadata_merge() {
+        let mut merged = EventMetadata::default();
+        let mut source = EventMetadata::default();
+        source.set_delivery_event_service_system("money-settings".to_string());
+
+        merged.merge(source);
+
+        assert_eq!(
+            merged.delivery_event_service_system(),
+            Some("money-settings")
+        );
     }
 }

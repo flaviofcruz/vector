@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 
 pub mod dedupe;
+#[cfg(feature = "transforms-delivery_event_counter")]
+pub mod delivery_event_counter;
 pub mod reduce;
 #[cfg(feature = "transforms-impl-sample")]
 pub mod sample;

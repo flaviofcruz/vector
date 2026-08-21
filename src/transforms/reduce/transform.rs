@@ -410,6 +410,22 @@ mod test {
         assert_eq!(reduce_delivery_event_count(&[1]), 1);
     }
 
+    #[test]
+    fn reduce_preserves_delivery_service_system() {
+        let mut state = ReduceState::new();
+        let mut event = LogEvent::from("message");
+        event
+            .metadata_mut()
+            .set_delivery_event_service_system("money-settings".to_string());
+
+        state.add_event(event, &IndexMap::new());
+
+        assert_eq!(
+            state.flush().metadata().delivery_event_service_system(),
+            Some("money-settings")
+        );
+    }
+
     #[tokio::test]
     async fn reduce_from_condition() {
         let reduce_config = toml::from_str::<ReduceConfig>(

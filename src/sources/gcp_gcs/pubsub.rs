@@ -1,4 +1,4 @@
-use std::{num::NonZeroUsize, panic, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroUsize, panic, sync::Arc, time::Duration};
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -139,7 +139,63 @@ pub(crate) struct DirectIngestMessage {
 #[serde(untagged)]
 pub(crate) enum QueueEvent {
     DirectIngest(DirectIngestMessage),
-    // Future variants (e.g. GcsNativeNotification) can be added here.
+    // Native GCS notifications are NOT parsed here: GCS carries the event kind and object
+    // identity in the Pub/Sub message *attributes* (not the JSON body), so they are handled
+    // out of band in `MessageFormat::GcsNative` via `parse_gcs_native_notification`.
+}
+
+/// How the source interprets messages on the Pub/Sub subscription. Selected by the source
+/// `strategy`: on-demand ingestion pushes custom [`DirectIngestMessage`]s, whereas the LP
+/// blob-ingest path drains the archive bucket's native GCS `OBJECT_FINALIZE` notifications
+/// (the GCP analog of `aws_s3`'s SQS strategy and `azure_blob`'s Event Grid queue).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MessageFormat {
+    DirectIngest,
+    GcsNative,
+}
+
+// GCS notification attribute keys (see the notification schema, `payloadFormat=JSON_API_V1`).
+// GCS puts the event kind and object identity in the Pub/Sub message *attributes*, not the body.
+const GCS_EVENT_TYPE_ATTR: &str = "eventType";
+const GCS_BUCKET_ID_ATTR: &str = "bucketId";
+const GCS_OBJECT_ID_ATTR: &str = "objectId";
+/// The only event that means "a new object is fully written and readable". Other kinds
+/// (`OBJECT_DELETE`, `OBJECT_ARCHIVE`, `OBJECT_METADATA_UPDATE`) carry no object to ingest.
+const GCS_OBJECT_FINALIZE: &str = "OBJECT_FINALIZE";
+
+/// What a native GCS notification resolves to once its attributes are interpreted.
+enum GcsNativeOutcome {
+    /// An `OBJECT_FINALIZE` for `gs://bucket/object` — download and ingest it.
+    Ingest { bucket: String, object: String },
+    /// A non-finalize event — acknowledge and move on, nothing to fetch.
+    Skip,
+}
+
+/// Interpret a native GCS -> Pub/Sub notification from its message attributes.
+///
+/// `objectId` is the raw object name (not URL-encoded), so it is used as the GCS key as-is.
+/// `Err` is a permanently-invalid message (missing required attributes): the caller acks it so
+/// it does not poison the subscription.
+fn parse_gcs_native_notification(
+    attributes: &BTreeMap<String, String>,
+) -> Result<GcsNativeOutcome, String> {
+    let event_type = attributes
+        .get(GCS_EVENT_TYPE_ATTR)
+        .ok_or_else(|| format!("missing `{GCS_EVENT_TYPE_ATTR}` attribute"))?;
+    if event_type != GCS_OBJECT_FINALIZE {
+        return Ok(GcsNativeOutcome::Skip);
+    }
+    let non_empty = |k: &str| {
+        attributes
+            .get(k)
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| format!("{GCS_OBJECT_FINALIZE} missing `{k}` attribute"))
+    };
+    Ok(GcsNativeOutcome::Ingest {
+        bucket: non_empty(GCS_BUCKET_ID_ATTR)?,
+        object: non_empty(GCS_OBJECT_ID_ATTR)?,
+    })
 }
 
 // ============================================================================
@@ -167,6 +223,10 @@ pub enum ProcessingError {
         source: serde_json::Error,
         message_id: String,
     },
+
+    /// A native GCS notification was missing required attributes (`eventType`/`bucketId`/`objectId`).
+    #[snafu(display("Invalid native GCS notification {}: {}", message_id, reason))]
+    InvalidNativeNotification { message_id: String, reason: String },
 
     /// Failed to fetch the GCS object (HTTP-level error).
     #[snafu(display("HTTP error fetching gs://{}/{}: {}", bucket, key, source))]
@@ -235,6 +295,7 @@ impl ProcessingError {
             // Permanently-invalid: message payload is broken, or the object is
             // gone for good. No amount of retrying will ever succeed.
             ProcessingError::InvalidPubSubMessage { .. }
+            | ProcessingError::InvalidNativeNotification { .. }
             | ProcessingError::EmptyFileId { .. }
             | ProcessingError::ObjectNotFound { .. } => false,
 
@@ -275,6 +336,10 @@ struct PubSubMessage {
     /// RFC 3339 publish timestamp.
     #[serde(default)]
     publish_time: Option<String>,
+    /// Message attributes. Native GCS notifications carry the event kind + object identity here
+    /// (`eventType`/`bucketId`/`objectId`); custom INGEST messages leave it empty.
+    #[serde(default)]
+    attributes: Option<BTreeMap<String, String>>,
 }
 
 /// Request body for the Pub/Sub `acknowledge` endpoint.
@@ -300,6 +365,7 @@ struct State {
     acknowledge_message: bool,
     acknowledge_failed_message: bool,
     callback_client: Option<IngestionCallbackClient>,
+    message_format: MessageFormat,
 }
 
 pub(super) struct Ingestor {
@@ -315,6 +381,7 @@ impl Ingestor {
         config: Config,
         downloader: Arc<GcsDownloader>,
         callback_client: Option<IngestionCallbackClient>,
+        message_format: MessageFormat,
     ) -> Result<Self, IngestorNewError> {
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 1000 {
             return Err(IngestorNewError::InvalidNumberOfMessages {
@@ -339,6 +406,7 @@ impl Ingestor {
             acknowledge_message: config.acknowledge_message,
             acknowledge_failed_message: config.acknowledge_failed_message,
             callback_client,
+            message_format,
         });
 
         Ok(Self { state, downloader })
@@ -463,7 +531,12 @@ impl IngestorProcess {
                 .map(|dt| dt.with_timezone(&Utc));
 
             match self
-                .handle_message(&msg.message.data, &message_id, publish_time)
+                .handle_message(
+                    &msg.message.data,
+                    msg.message.attributes.as_ref(),
+                    &message_id,
+                    publish_time,
+                )
                 .await
             {
                 Ok(()) => {
@@ -500,8 +573,28 @@ impl IngestorProcess {
         }
     }
 
-    /// Decodes and dispatches a single Pub/Sub message.
+    /// Decodes and dispatches a single Pub/Sub message according to the configured format.
     async fn handle_message(
+        &mut self,
+        data_b64: &str,
+        attributes: Option<&BTreeMap<String, String>>,
+        message_id: &str,
+        publish_time: Option<DateTime<Utc>>,
+    ) -> Result<(), ProcessingError> {
+        match self.state.message_format {
+            MessageFormat::DirectIngest => {
+                self.handle_direct_ingest_message(data_b64, message_id, publish_time)
+                    .await
+            }
+            MessageFormat::GcsNative => {
+                self.handle_gcs_native(attributes, message_id, publish_time)
+                    .await
+            }
+        }
+    }
+
+    /// Decodes and dispatches a custom INGEST message (on-demand ingestion path).
+    async fn handle_direct_ingest_message(
         &mut self,
         data_b64: &str,
         message_id: &str,
@@ -539,6 +632,68 @@ impl IngestorProcess {
                     .await
             }
         }
+    }
+
+    /// Processes a native GCS `OBJECT_FINALIZE` notification (LP blob-ingest path). The object
+    /// identity lives in the message attributes, not the body; non-finalize events are acked and
+    /// skipped, and there is no ingestion callback (no upstream requester on this path).
+    async fn handle_gcs_native(
+        &mut self,
+        attributes: Option<&BTreeMap<String, String>>,
+        message_id: &str,
+        publish_time: Option<DateTime<Utc>>,
+    ) -> Result<(), ProcessingError> {
+        let attributes = attributes.ok_or_else(|| ProcessingError::InvalidNativeNotification {
+            message_id: message_id.to_string(),
+            reason: "message has no attributes".to_string(),
+        })?;
+
+        let (bucket, object) = match parse_gcs_native_notification(attributes).map_err(|reason| {
+            ProcessingError::InvalidNativeNotification {
+                message_id: message_id.to_string(),
+                reason,
+            }
+        })? {
+            GcsNativeOutcome::Skip => {
+                debug!(
+                    message = "Skipping non-finalize GCS notification.",
+                    message_id = %message_id,
+                    internal_log_rate_limit = true,
+                );
+                return Ok(());
+            }
+            GcsNativeOutcome::Ingest { bucket, object } => (bucket, object),
+        };
+
+        if let Some(ts) = publish_time {
+            let lag_secs = Utc::now().signed_duration_since(ts).num_milliseconds() as f64 / 1000.0;
+            emit!(QueueNotificationProcessLag {
+                lag_seconds: lag_secs,
+                cloud: "gcp",
+                bucket: &bucket,
+            });
+        }
+
+        debug!(
+            message = "Processing native GCS notification.",
+            bucket = %bucket,
+            key = %object,
+            message_id = %message_id,
+        );
+
+        self.downloader
+            .process_object(
+                &bucket,
+                &object,
+                None,
+                &mut self.out,
+                self.log_namespace,
+                self.acknowledgements,
+                self.state.acknowledge_failed_message,
+                &self.bytes_received,
+                &self.events_received,
+            )
+            .await
     }
 
     /// Emits lag metrics and delegates to the GCS downloader.
@@ -933,5 +1088,98 @@ mod tests {
         for (err, expected, reason) in cases {
             assert_eq!(err.is_retriable(), *expected, "{err:?}: {reason}");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Native GCS notification parsing (MessageFormat::GcsNative)
+    // -------------------------------------------------------------------------
+
+    fn attrs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// An OBJECT_FINALIZE notification yields the bucket + object to ingest, read from attributes
+    /// (not the JSON body).
+    #[test]
+    fn native_finalize_parses_to_ingest() {
+        let a = attrs(&[
+            ("eventType", "OBJECT_FINALIZE"),
+            ("bucketId", "my-logs-bucket"),
+            ("objectId", "archived-log/2026/03/21/events.log"),
+            ("payloadFormat", "JSON_API_V1"),
+        ]);
+        match parse_gcs_native_notification(&a).expect("finalize must parse") {
+            GcsNativeOutcome::Ingest { bucket, object } => {
+                assert_eq!(bucket, "my-logs-bucket");
+                assert_eq!(object, "archived-log/2026/03/21/events.log");
+            }
+            GcsNativeOutcome::Skip => panic!("OBJECT_FINALIZE must ingest, not skip"),
+        }
+    }
+
+    /// Non-finalize events (delete/archive/metadata) carry no object to fetch and must be skipped
+    /// (acked), not errored.
+    #[test]
+    fn native_non_finalize_is_skipped() {
+        for event in ["OBJECT_DELETE", "OBJECT_ARCHIVE", "OBJECT_METADATA_UPDATE"] {
+            let a = attrs(&[
+                ("eventType", event),
+                ("bucketId", "my-logs-bucket"),
+                ("objectId", "archived-log/x.log"),
+            ]);
+            assert!(
+                matches!(
+                    parse_gcs_native_notification(&a),
+                    Ok(GcsNativeOutcome::Skip)
+                ),
+                "{event} must be skipped"
+            );
+        }
+    }
+
+    /// A message with no `eventType` is malformed — a permanent error so the caller acks it rather
+    /// than poisoning the subscription.
+    #[test]
+    fn native_missing_event_type_errors() {
+        let a = attrs(&[("bucketId", "b"), ("objectId", "k")]);
+        assert!(parse_gcs_native_notification(&a).is_err());
+    }
+
+    /// OBJECT_FINALIZE without a bucket or object (or with an empty one) is unusable.
+    #[test]
+    fn native_finalize_missing_or_empty_ids_error() {
+        let cases = [
+            attrs(&[("eventType", "OBJECT_FINALIZE"), ("objectId", "k")]),
+            attrs(&[("eventType", "OBJECT_FINALIZE"), ("bucketId", "b")]),
+            attrs(&[
+                ("eventType", "OBJECT_FINALIZE"),
+                ("bucketId", ""),
+                ("objectId", "k"),
+            ]),
+            attrs(&[
+                ("eventType", "OBJECT_FINALIZE"),
+                ("bucketId", "b"),
+                ("objectId", ""),
+            ]),
+        ];
+        for a in &cases {
+            assert!(
+                parse_gcs_native_notification(a).is_err(),
+                "missing/empty bucket or object must error: {a:?}"
+            );
+        }
+    }
+
+    /// A malformed native notification must be non-retriable so it is acked, not redelivered forever.
+    #[test]
+    fn invalid_native_notification_is_non_retriable() {
+        let err = ProcessingError::InvalidNativeNotification {
+            message_id: "m-1".into(),
+            reason: "missing `eventType` attribute".into(),
+        };
+        assert!(!err.is_retriable());
     }
 }

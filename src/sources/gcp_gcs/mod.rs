@@ -40,6 +40,11 @@ enum Strategy {
     /// `{"kind": "INGEST", "bucket": "...", "key": "...", "file_id": "..."}`.
     #[derivative(Default)]
     PubSubCustomPoll,
+
+    /// Consumes objects by polling a GCP Pub/Sub subscription bound to a bucket's native GCS
+    /// notifications, ingesting each `OBJECT_FINALIZE` event. The GCP analog of `aws_s3`'s SQS
+    /// strategy and `azure_blob`'s Event Grid queue.
+    GcsNativeNotifications,
 }
 
 /// Configuration for the `gcp_gcs` source.
@@ -132,13 +137,15 @@ impl SourceConfig for GcpGcsConfig {
             .map(|config| config.try_into())
             .transpose()?;
 
-        match self.strategy {
-            Strategy::PubSubCustomPoll => Ok(Box::pin(
-                self.create_pubsub_ingestor(multiline_config, log_namespace, &cx.proxy)
-                    .await?
-                    .run(cx, self.acknowledgements, log_namespace),
-            )),
-        }
+        let message_format = match self.strategy {
+            Strategy::PubSubCustomPoll => pubsub::MessageFormat::DirectIngest,
+            Strategy::GcsNativeNotifications => pubsub::MessageFormat::GcsNative,
+        };
+        Ok(Box::pin(
+            self.create_pubsub_ingestor(multiline_config, log_namespace, &cx.proxy, message_format)
+                .await?
+                .run(cx, self.acknowledgements, log_namespace),
+        ))
     }
 
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
@@ -190,6 +197,7 @@ impl GcpGcsConfig {
         multiline: Option<line_agg::Config>,
         log_namespace: LogNamespace,
         proxy: &crate::config::ProxyConfig,
+        message_format: pubsub::MessageFormat,
     ) -> crate::Result<pubsub::Ingestor> {
         if self.project.is_empty() {
             return Err(CreateIngestorError::EmptyProject.into());
@@ -237,6 +245,7 @@ impl GcpGcsConfig {
             pubsub_config.clone(),
             downloader,
             callback_client,
+            message_format,
         )
         .await?;
 
@@ -246,7 +255,7 @@ impl GcpGcsConfig {
 
 #[derive(Debug, Snafu)]
 enum CreateIngestorError {
-    #[snafu(display("Configuration for `pubsub` required when strategy=pub_sub_custom_poll"))]
+    #[snafu(display("Configuration for `pubsub` required for a Pub/Sub-based strategy"))]
     ConfigMissing,
     #[snafu(display("`project` must not be empty"))]
     EmptyProject,
@@ -510,6 +519,7 @@ mod ingestor_tests {
             config,
             make_test_downloader(),
             None,
+            super::pubsub::MessageFormat::DirectIngest,
         )
         .await
     }

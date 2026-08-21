@@ -83,6 +83,30 @@ fn delivery_event_count_round_trips_through_bytes() {
 }
 
 #[test]
+fn delivery_event_service_system_round_trips_through_bytes() {
+    let mut event = LogEvent::from("log line");
+    event
+        .metadata_mut()
+        .set_delivery_event_service_system("money-settings".to_string());
+    let events = EventArray::from(Event::from(event));
+
+    let mut buffer = BytesMut::with_capacity(64);
+    encode_value(events, &mut buffer);
+
+    let decoded = decode_value::<EventArray, _>(buffer);
+    assert_eq!(
+        decoded
+            .into_events()
+            .next()
+            .unwrap()
+            .as_log()
+            .metadata()
+            .delivery_event_service_system(),
+        Some("money-settings")
+    );
+}
+
+#[test]
 fn serialization() {
     let mut event = LogEvent::from("raw log line");
     event.insert("foo", "bar");

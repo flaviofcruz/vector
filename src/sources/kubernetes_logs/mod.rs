@@ -1322,6 +1322,11 @@ impl Source {
                     &line.filename,
                     cached_file_info.clone(),
                 );
+            if let Some(service_system) = service_system.as_ref() {
+                event
+                    .metadata_mut()
+                    .set_delivery_event_service_system(service_system.clone());
+            }
 
             // Pod metadata is available only after annotation. Emit the read
             // counter here so it carries the source service identity while
