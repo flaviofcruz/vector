@@ -89,6 +89,11 @@ pub(super) struct Config {
     #[configurable(metadata(docs::type_unit = "tasks"))]
     #[configurable(metadata(docs::examples = 4))]
     pub(super) client_concurrency: Option<NonZeroUsize>,
+
+    /// Overrides the Pub/Sub API endpoint. Defaults to the public Pub/Sub endpoint.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "https://pubsub.googleapis.com"))]
+    pub(super) endpoint: Option<String>,
 }
 
 // ============================================================================
@@ -356,6 +361,8 @@ struct AcknowledgeRequest<'a> {
 struct State {
     client: HttpClient,
     auth: GcpAuthenticator,
+    /// Base URL for the Pub/Sub REST API (defaults to [`PUBSUB_URL`]).
+    endpoint: String,
     /// Full Pub/Sub resource name: `projects/{project}/subscriptions/{subscription}`.
     subscription_resource_name: String,
     project: String,
@@ -366,6 +373,17 @@ struct State {
     acknowledge_failed_message: bool,
     callback_client: Option<IngestionCallbackClient>,
     message_format: MessageFormat,
+}
+
+/// Resolves the Pub/Sub base endpoint: the configured override with any trailing
+/// slash trimmed, or the public default [`PUBSUB_URL`]. Pub/Sub request URLs are
+/// built with `format!`, so a trailing slash would double the separator. The GCS
+/// side does not need this because it composes URLs with `url::Url`, which normalizes.
+fn resolve_endpoint(configured: Option<&str>) -> String {
+    configured
+        .unwrap_or(PUBSUB_URL)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 pub(super) struct Ingestor {
@@ -392,9 +410,12 @@ impl Ingestor {
         let subscription_resource_name =
             format!("projects/{project}/subscriptions/{}", config.subscription);
 
+        let endpoint = resolve_endpoint(config.endpoint.as_deref());
+
         let state = Arc::new(State {
             client,
             auth,
+            endpoint,
             subscription_resource_name,
             project,
             poll_secs: config.poll_secs,
@@ -774,8 +795,8 @@ impl IngestorProcess {
     /// Pulls up to `max_number_of_messages` from the subscription.
     async fn pull_messages(&self) -> crate::Result<Vec<ReceivedMessage>> {
         let url = format!(
-            "{PUBSUB_URL}/v1/{}:pull",
-            self.state.subscription_resource_name
+            "{}/v1/{}:pull",
+            self.state.endpoint, self.state.subscription_resource_name
         );
 
         let body = serde_json::json!({
@@ -834,8 +855,8 @@ impl IngestorProcess {
     /// Acknowledges a batch of messages by their ack IDs.
     async fn acknowledge_messages(&self, ack_ids: &[String]) -> Result<(), HttpError> {
         let url = format!(
-            "{PUBSUB_URL}/v1/{}:acknowledge",
-            self.state.subscription_resource_name
+            "{}/v1/{}:acknowledge",
+            self.state.endpoint, self.state.subscription_resource_name
         );
 
         let body = serde_json::to_string(&AcknowledgeRequest { ack_ids })
@@ -917,6 +938,37 @@ mod tests {
             result.is_err(),
             "unknown fields must be rejected at parse time"
         );
+    }
+
+    /// The Pub/Sub endpoint is unset by default (the public endpoint is applied
+    /// at ingestor construction) and can be overridden via config.
+    #[test]
+    fn config_endpoint_parses() {
+        let default: Config = toml::from_str(r#"subscription = "s""#).unwrap();
+        assert_eq!(default.endpoint, None, "endpoint must be unset by default");
+
+        let overridden: Config =
+            toml::from_str("subscription = \"s\"\nendpoint = \"https://pubsub.example.com\"")
+                .unwrap();
+        assert_eq!(
+            overridden.endpoint.as_deref(),
+            Some("https://pubsub.example.com")
+        );
+    }
+
+    /// The resolved endpoint is the public default when unset, and an override is
+    /// used verbatim with any trailing slash trimmed so request URLs never double
+    /// the separator.
+    #[test]
+    fn resolve_endpoint_defaults_and_trims() {
+        let cases: [(Option<&str>, &str); 3] = [
+            (None, PUBSUB_URL),
+            (Some("https://pubsub.example.com"), "https://pubsub.example.com"),
+            (Some("https://pubsub.example.com/"), "https://pubsub.example.com"),
+        ];
+        for (configured, expected) in cases {
+            assert_eq!(resolve_endpoint(configured), expected, "configured {configured:?}");
+        }
     }
 
     // max_number_of_messages bounds are tested via Ingestor::new in mod.rs::tests.

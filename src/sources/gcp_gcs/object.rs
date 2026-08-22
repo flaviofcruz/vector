@@ -45,8 +45,22 @@ pub(super) struct GcsDownloader {
     decoder: Decoder,
     multiline: Option<line_agg::Config>,
     project: String,
-    /// Base URL for GCS requests. Overridable in tests to point at a mock server.
-    base_url: String,
+    /// GCS base URL, parsed and validated at construction. Defaults to
+    /// [`GCS_BASE_URL`] and can be overridden via the source's `storage_endpoint` config.
+    base_url: url::Url,
+}
+
+/// Parses the GCS base URL, defaulting to [`GCS_BASE_URL`]. Returns a config error
+/// (rather than letting the source panic on the first download) for an endpoint that
+/// is unparseable or cannot be a base URL, so a bad `storage_endpoint` fails at startup.
+fn parse_base_url(endpoint: Option<String>) -> crate::Result<url::Url> {
+    let raw = endpoint.unwrap_or_else(|| GCS_BASE_URL.to_string());
+    let url = url::Url::parse(&raw)
+        .map_err(|e| format!("invalid gcp_gcs storage_endpoint {raw:?}: {e}"))?;
+    if url.cannot_be_a_base() {
+        return Err(format!("gcp_gcs storage_endpoint {raw:?} must be a base URL (e.g. https://host)").into());
+    }
+    Ok(url)
 }
 
 impl GcsDownloader {
@@ -57,24 +71,17 @@ impl GcsDownloader {
         decoder: Decoder,
         multiline: Option<line_agg::Config>,
         project: String,
-    ) -> Self {
-        Self {
+        endpoint: Option<String>,
+    ) -> crate::Result<Self> {
+        Ok(Self {
             client,
             auth,
             compression,
             decoder,
             multiline,
             project,
-            base_url: GCS_BASE_URL.to_string(),
-        }
-    }
-
-    /// Creates a downloader with a custom base URL. Used in tests to point at a
-    /// mock HTTP server instead of the real GCS endpoint.
-    #[cfg(test)]
-    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
+            base_url: parse_base_url(endpoint)?,
+        })
     }
 
     /// Downloads a GCS object, decompresses, frames, decodes, and emits events.
@@ -95,14 +102,14 @@ impl GcsDownloader {
         let key = key.to_owned();
         let log_type = log_type.map(|s| s.to_owned());
 
-        // Build the URL using url::Url so object key segments are percent-encoded.
-        // Special characters (?, #, &, spaces etc.) would break URL parsing if left
-        // raw. self.base_url is used instead of GCS_BASE_URL so tests can redirect
-        // to a local mock server.
+        // Extend the pre-validated base URL with percent-encoded path segments, so
+        // special characters (?, #, &, spaces, etc.) in the key can't corrupt the URL.
+        // `base_url` was validated as a base at construction, so `path_segments_mut`
+        // cannot fail here.
         let url = {
-            let mut u = url::Url::parse(&self.base_url).expect("base_url must be valid");
+            let mut u = self.base_url.clone();
             u.path_segments_mut()
-                .expect("base_url must have a path")
+                .expect("base_url is validated as a base at construction")
                 .push(&bucket)
                 .extend(key.split('/'));
             u
@@ -401,8 +408,29 @@ mod tests {
             decoder,
             None,
             "test-project".into(),
+            Some(base_url.into()),
         )
-        .with_base_url(base_url)
+        .expect("test downloader must build")
+    }
+
+    /// A bad `storage_endpoint` fails fast at construction with a config error
+    /// rather than panicking on the first download. Absent one, the public default
+    /// is used. `Some(url)` expects that URL as the parsed base, `None` expects an error.
+    #[test]
+    fn parse_base_url_defaults_and_rejects_invalid() {
+        let cases: [(Option<&str>, Option<&str>); 4] = [
+            (None, Some("https://storage.googleapis.com/")),
+            (Some("https://gcs.example.com"), Some("https://gcs.example.com/")),
+            (Some("not a url"), None),
+            (Some("mailto:x@example.com"), None),
+        ];
+        for (endpoint, expected) in cases {
+            let result = parse_base_url(endpoint.map(String::from));
+            match expected {
+                Some(url) => assert_eq!(result.unwrap().as_str(), url, "endpoint {endpoint:?}"),
+                None => assert!(result.is_err(), "endpoint {endpoint:?} must be rejected"),
+            }
+        }
     }
 
     /// Spawns a one-shot HTTP server that returns the given bytes with `status`.
@@ -557,8 +585,9 @@ mod tests {
             decoder,
             None,
             "my-project".into(),
+            Some(format!("http://{addr}")),
         )
-        .with_base_url(&format!("http://{addr}"));
+        .expect("test downloader must build");
 
         let (mut tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
         let result = downloader

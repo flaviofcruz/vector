@@ -57,6 +57,12 @@ pub struct GcpGcsConfig {
     #[configurable(metadata(docs::examples = "my-project"))]
     pub project: String,
 
+    /// Overrides the Cloud Storage API endpoint. Defaults to the public Google
+    /// Cloud Storage endpoint.
+    #[configurable(metadata(docs::examples = "https://storage.googleapis.com"))]
+    #[serde(default)]
+    pub storage_endpoint: Option<String>,
+
     /// The compression scheme used for decompressing objects retrieved from GCS.
     compression: Compression,
 
@@ -227,7 +233,8 @@ impl GcpGcsConfig {
             decoder,
             multiline,
             self.project.clone(),
-        ));
+            self.storage_endpoint.clone(),
+        )?);
 
         let callback_client = self
             .ingestion_callback
@@ -494,14 +501,18 @@ mod ingestor_tests {
         let decoder = DecodingConfig::new(framing, default_decoding(), LogNamespace::Legacy)
             .build()
             .expect("Decoder must build");
-        Arc::new(GcsDownloader::new(
-            client,
-            GcpAuthenticator::None,
-            Compression::Auto,
-            decoder,
-            None,
-            "test-project".into(),
-        ))
+        Arc::new(
+            GcsDownloader::new(
+                client,
+                GcpAuthenticator::None,
+                Compression::Auto,
+                decoder,
+                None,
+                "test-project".into(),
+                None,
+            )
+            .expect("test downloader must build"),
+        )
     }
 
     async fn build_ingestor(max_number_of_messages: u32) -> Result<Ingestor, IngestorNewError> {
