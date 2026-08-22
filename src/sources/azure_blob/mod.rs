@@ -3,8 +3,9 @@ use std::{convert::TryInto, sync::Arc};
 
 // Azure SDK imports for blob and queue operations
 use azure_core_for_storage::{HttpClient, TransportOptions};
-use azure_storage::{ConnectionString, StorageCredentials};
+use azure_storage::{CloudLocation, ConnectionString, StorageCredentials};
 use azure_storage_blobs::prelude::*;
+use azure_storage_queues::QueueServiceClientBuilder;
 use azure_storage_queues::prelude::*;
 
 // Utility and serialization imports
@@ -376,14 +377,38 @@ impl AzureBlobConfig {
             return Err(CreateQueueIngestorError::CreationFailed);
         };
 
-        // Create Azure clients with connection string
+        // The connection string may carry an explicit endpoint (`BlobEndpoint` /
+        // `QueueEndpoint`): honor it via `CloudLocation::Custom`, else default to the public
+        // cloud. The SDK parses these fields but does not wire them into the client itself.
+        //
         // Disable transport-level gzip decompression so `Content-Length` survives: see
         // `no_decompression_transport`. The queue client is left as-is (queue responses are
         // never gzip-encoded).
-        let blob_client = ClientBuilder::new(account.clone(), creds.clone())
+        let blob_builder = match conn.blob_endpoint {
+            Some(endpoint) => ClientBuilder::with_location(
+                CloudLocation::Custom {
+                    account: account.clone(),
+                    uri: endpoint.to_string(),
+                },
+                creds.clone(),
+            ),
+            None => ClientBuilder::new(account.clone(), creds.clone()),
+        };
+        let blob_client = blob_builder
             .transport(no_decompression_transport())
             .blob_service_client();
-        let queue_client = QueueServiceClient::new(account, creds);
+
+        let queue_client = match conn.queue_endpoint {
+            Some(endpoint) => QueueServiceClientBuilder::with_location(
+                CloudLocation::Custom {
+                    account,
+                    uri: endpoint.to_string(),
+                },
+                creds,
+            )
+            .build(),
+            None => QueueServiceClient::new(account, creds),
+        };
 
         Ok((blob_client, queue_client))
     }
@@ -828,6 +853,73 @@ mod test {
             conn.is_ok(),
             "Connection string without account name should still parse"
         );
+    }
+
+    /// The connection string's `BlobEndpoint` / `QueueEndpoint` become the client
+    /// base URLs (via `CloudLocation::Custom`), and absent endpoints fall back to the
+    /// public cloud. Asserts the composed container/blob URL and the queue base URL.
+    #[test]
+    fn connection_string_endpoint_is_honored() {
+        struct Case {
+            name: &'static str,
+            connection_string: String,
+            // Composed object URL for container "c" / blob "b".
+            expected_blob_object_url: &'static str,
+            // Queue service base URL.
+            expected_queue_url: &'static str,
+        }
+
+        // Any valid base64 account key parses.
+        let key = "Zm9vYmFyYmF6";
+        let cases = [
+            Case {
+                name: "explicit endpoints are honored",
+                connection_string: format!(
+                    "DefaultEndpointsProtocol=https;AccountName=testaccount;AccountKey={key};\
+                     BlobEndpoint=https://blob.example.com;QueueEndpoint=https://queue.example.com"
+                ),
+                expected_blob_object_url: "https://blob.example.com/c/b",
+                expected_queue_url: "https://queue.example.com/",
+            },
+            Case {
+                name: "a trailing slash on the endpoint is not doubled",
+                connection_string: format!(
+                    "DefaultEndpointsProtocol=https;AccountName=testaccount;AccountKey={key};\
+                     BlobEndpoint=https://blob.example.com/;QueueEndpoint=https://queue.example.com/"
+                ),
+                expected_blob_object_url: "https://blob.example.com/c/b",
+                expected_queue_url: "https://queue.example.com/",
+            },
+            Case {
+                name: "no endpoint falls back to the public cloud",
+                connection_string: format!(
+                    "DefaultEndpointsProtocol=https;AccountName=testaccount;AccountKey={key}"
+                ),
+                expected_blob_object_url: "https://testaccount.blob.core.windows.net/c/b",
+                expected_queue_url: "https://testaccount.queue.core.windows.net/",
+            },
+        ];
+
+        let config = AzureBlobConfig::default();
+        for case in cases {
+            let (blob, queue) = config
+                .create_clients_from_connection_string(&case.connection_string)
+                .unwrap_or_else(|_| panic!("clients must build: {}", case.name));
+
+            let object_url = blob.container_client("c").blob_client("b").url().unwrap();
+            assert_eq!(
+                object_url.as_str(),
+                case.expected_blob_object_url,
+                "blob object URL mismatch: {}",
+                case.name
+            );
+            assert_eq!(
+                queue.url().unwrap().as_str(),
+                case.expected_queue_url,
+                "queue URL mismatch: {}",
+                case.name
+            );
+        }
     }
 
     /// Tests creating queue ingestor with invalid configuration
