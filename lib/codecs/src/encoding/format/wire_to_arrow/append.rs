@@ -25,6 +25,36 @@ pub(super) fn expect_len<'a>(wv: &'a WireValue<'a>) -> Result<&'a [u8]> {
     }
 }
 
+/// Decode a length-delimited VARIANT wire value — a proto `string` carrying
+/// UTF-8 JSON text — into the Parquet Variant `(metadata, value)` binary pair.
+///
+/// Called by [`scan_message`]. The `validate_message` pre-pass runs the cheaper
+/// [`validate_variant_from_wire`] (parse only) so it can drop an unparseable-JSON
+/// row via per-row isolation without paying for the full Variant build twice; a
+/// Variant *build* failure (e.g. exceeding Variant size limits) is rare and fails
+/// the batch here rather than isolating the row.
+///
+/// [`scan_message`]: super::scan::scan_message
+pub(super) fn encode_variant_from_wire(wv: &WireValue) -> Result<(Vec<u8>, Vec<u8>)> {
+    let bytes = expect_len(wv)?;
+    let json: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|source| WireToArrowError::VariantJson { source })?;
+    crate::encoding::format::variant::value_to_variant(&json)
+        .map_err(|source| WireToArrowError::VariantEncode { source })
+}
+
+/// Parse-check a VARIANT wire value for the `validate_message` pre-pass: confirm
+/// the length-delimited bytes are valid UTF-8 JSON, without building the Variant
+/// binary (that heavyweight step runs once, in [`encode_variant_from_wire`] on
+/// the real scan). Catches the realistic malformed-row case so it drops via
+/// per-row isolation.
+pub(super) fn validate_variant_from_wire(wv: &WireValue) -> Result<()> {
+    let bytes = expect_len(wv)?;
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .map(|_| ())
+        .map_err(|source| WireToArrowError::VariantJson { source })
+}
+
 /// Proto wire type numeric code for a `WireValue`. Used for error reporting.
 #[inline]
 pub(super) fn wire_type_byte(wv: &WireValue) -> u8 {
@@ -664,4 +694,3 @@ pub(super) fn read_packed_element<'a>(
         }),
     }
 }
-

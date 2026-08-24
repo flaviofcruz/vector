@@ -12,7 +12,7 @@ use arrow::array::{
     TimestampMicrosecondBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 
 use super::append::append_proto3_default;
 use super::errors::{Result, WireToArrowError};
@@ -204,6 +204,29 @@ pub enum BuilderNode {
         current_offset: i32,
         entry_field: Arc<Field>,
     },
+    /// VARIANT -> Arrow `Struct<metadata, value>`. The two children
+    /// are non-nullable `LargeBinary`; a null variant row is masked by the
+    /// struct null buffer while the children carry placeholder empty bytes
+    /// (appending a child null would fail `StructArray::try_new`).
+    /// `validity[i]` tracks whether row `i` had the field present.
+    Variant {
+        metadata: LargeBinaryBuilder,
+        value: LargeBinaryBuilder,
+        fields: Fields,
+        validity: Vec<bool>,
+    },
+    /// `ARRAY<VARIANT>` -> Arrow `List<Struct<metadata, value>>`. Elements are
+    /// flattened across rows into the two `LargeBinary` builders (proto repeated
+    /// strings are always present on the wire, so every element is a valid
+    /// non-null variant struct); `offsets` delimit each row's run, like the
+    /// other repeated slots. `item_fields` are the item struct's children.
+    RepeatedVariant {
+        metadata: LargeBinaryBuilder,
+        value: LargeBinaryBuilder,
+        item_fields: Fields,
+        offsets: Vec<i32>,
+        current_offset: i32,
+    },
 }
 
 impl BuilderNodeList {
@@ -299,6 +322,48 @@ impl BuilderNodeList {
                         entry_field,
                     }
                 }
+                PlanSlot::Variant => {
+                    let fields = match field.data_type() {
+                        DataType::Struct(fs) => fs.clone(),
+                        _ => {
+                            return Err(WireToArrowError::PlanBuilderMismatch {
+                                site: "with_capacity:variant_non_struct",
+                            });
+                        }
+                    };
+                    BuilderNode::Variant {
+                        metadata: LargeBinaryBuilder::with_capacity(capacity, 0),
+                        value: LargeBinaryBuilder::with_capacity(capacity, 0),
+                        fields,
+                        validity: Vec::with_capacity(capacity),
+                    }
+                }
+                PlanSlot::RepeatedVariant => {
+                    let item_fields = match field.data_type() {
+                        DataType::List(item) => match item.data_type() {
+                            DataType::Struct(fs) => fs.clone(),
+                            _ => {
+                                return Err(WireToArrowError::PlanBuilderMismatch {
+                                    site: "with_capacity:repeated_variant_item_non_struct",
+                                });
+                            }
+                        },
+                        _ => {
+                            return Err(WireToArrowError::PlanBuilderMismatch {
+                                site: "with_capacity:repeated_variant_non_list",
+                            });
+                        }
+                    };
+                    let mut offsets = Vec::with_capacity(capacity + 1);
+                    offsets.push(0);
+                    BuilderNode::RepeatedVariant {
+                        metadata: LargeBinaryBuilder::with_capacity(capacity * 2, 0),
+                        value: LargeBinaryBuilder::with_capacity(capacity * 2, 0),
+                        item_fields,
+                        offsets,
+                        current_offset: 0,
+                    }
+                }
                 // No proto tag points here, so the slot is null-padded each
                 // row by `finalize_row`'s "tag wasn't seen" branch.
                 PlanSlot::Absent => build_absent_node(field, capacity)?,
@@ -368,6 +433,21 @@ impl BuilderNodeList {
                         children.fill_null_row();
                     }
                 }
+                // Present rows already had their (metadata, value) bytes
+                // appended by `scan_message`; an absent row gets placeholder
+                // empty bytes masked by the struct null buffer at finish.
+                BuilderNode::Variant {
+                    metadata,
+                    value,
+                    validity,
+                    ..
+                } => {
+                    validity.push(was_present);
+                    if !was_present {
+                        metadata.append_value(b"");
+                        value.append_value(b"");
+                    }
+                }
                 // All list-flavored slots push an offsets marker per row.
                 // For proto repeated fields (including maps), the outer list
                 // itself is never null — absent just means empty list.
@@ -382,6 +462,11 @@ impl BuilderNodeList {
                     ..
                 }
                 | BuilderNode::RepeatedEnumString {
+                    offsets,
+                    current_offset,
+                    ..
+                }
+                | BuilderNode::RepeatedVariant {
                     offsets,
                     current_offset,
                     ..
@@ -402,13 +487,24 @@ impl BuilderNodeList {
     pub fn fill_null_row(&mut self) {
         for node in self.nodes.iter_mut() {
             match node {
-                BuilderNode::Scalar { builder, .. }
-                | BuilderNode::EnumString { builder, .. } => builder.append_null(),
+                BuilderNode::Scalar { builder, .. } | BuilderNode::EnumString { builder, .. } => {
+                    builder.append_null()
+                }
                 BuilderNode::Struct {
                     children, validity, ..
                 } => {
                     validity.push(false);
                     children.fill_null_row();
+                }
+                BuilderNode::Variant {
+                    metadata,
+                    value,
+                    validity,
+                    ..
+                } => {
+                    validity.push(false);
+                    metadata.append_value(b"");
+                    value.append_value(b"");
                 }
                 BuilderNode::RepeatedMessage {
                     offsets,
@@ -421,6 +517,11 @@ impl BuilderNodeList {
                     ..
                 }
                 | BuilderNode::RepeatedEnumString {
+                    offsets,
+                    current_offset,
+                    ..
+                }
+                | BuilderNode::RepeatedVariant {
                     offsets,
                     current_offset,
                     ..
@@ -444,8 +545,9 @@ impl BuilderNodeList {
         for (idx, node) in self.nodes.iter_mut().enumerate() {
             let arrow_field = &plan.arrow_fields[idx];
             let arr: ArrayRef = match node {
-                BuilderNode::Scalar { builder, .. }
-                | BuilderNode::EnumString { builder, .. } => builder.finish(),
+                BuilderNode::Scalar { builder, .. } | BuilderNode::EnumString { builder, .. } => {
+                    builder.finish()
+                }
                 BuilderNode::Struct {
                     sub_plan,
                     children,
@@ -498,7 +600,9 @@ impl BuilderNodeList {
                         })?,
                     )
                 }
-                BuilderNode::RepeatedScalar { values, offsets, .. } => {
+                BuilderNode::RepeatedScalar {
+                    values, offsets, ..
+                } => {
                     let values_array = values.finish();
                     let offset_buffer =
                         OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
@@ -523,7 +627,9 @@ impl BuilderNodeList {
                             })?,
                     )
                 }
-                BuilderNode::RepeatedEnumString { values, offsets, .. } => {
+                BuilderNode::RepeatedEnumString {
+                    values, offsets, ..
+                } => {
                     let values_array = values.finish();
                     let offset_buffer =
                         OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
@@ -544,6 +650,65 @@ impl BuilderNodeList {
                                 kind: "list (enum string)",
                                 source: e,
                             })?,
+                    )
+                }
+                BuilderNode::Variant {
+                    metadata,
+                    value,
+                    fields,
+                    validity,
+                } => {
+                    let child_arrays: Vec<ArrayRef> =
+                        vec![Arc::new(metadata.finish()), Arc::new(value.finish())];
+                    let null_buf = NullBuffer::from(std::mem::take(validity));
+                    Arc::new(
+                        StructArray::try_new(fields.clone(), child_arrays, Some(null_buf))
+                            .map_err(|e| WireToArrowError::ArrayAssembly {
+                                kind: "variant",
+                                source: e,
+                            })?,
+                    )
+                }
+                BuilderNode::RepeatedVariant {
+                    metadata,
+                    value,
+                    item_fields,
+                    offsets,
+                    ..
+                } => {
+                    let child_arrays: Vec<ArrayRef> =
+                        vec![Arc::new(metadata.finish()), Arc::new(value.finish())];
+                    // Proto repeated strings are always present on the wire, so
+                    // every item struct is non-null (no item null buffer).
+                    let struct_arr = StructArray::try_new(item_fields.clone(), child_arrays, None)
+                        .map_err(|e| WireToArrowError::ArrayAssembly {
+                            kind: "list variant item struct",
+                            source: e,
+                        })?;
+                    let offset_buffer =
+                        OffsetBuffer::new(ScalarBuffer::from(std::mem::take(offsets)));
+                    let element_field = match arrow_field.data_type() {
+                        DataType::List(f) => Arc::clone(f),
+                        other => {
+                            return Err(WireToArrowError::UnsupportedCombination {
+                                name: arrow_field.name().to_string(),
+                                kind: "RepeatedVariant".to_string(),
+                                arrow_type: format!("{other:?}"),
+                                repeated: true,
+                            });
+                        }
+                    };
+                    Arc::new(
+                        ListArray::try_new(
+                            element_field,
+                            offset_buffer,
+                            Arc::new(struct_arr),
+                            None,
+                        )
+                        .map_err(|e| WireToArrowError::ArrayAssembly {
+                            kind: "list (variant)",
+                            source: e,
+                        })?,
                     )
                 }
                 BuilderNode::Map {

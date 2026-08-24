@@ -41,9 +41,7 @@ pub enum WireToArrowError {
     },
 
     /// The proto field's Kind cannot be represented by any supported scalar.
-    #[snafu(display(
-        "unsupported proto kind for field '{name}': {kind} (scalar PoC only)"
-    ))]
+    #[snafu(display("unsupported proto kind for field '{name}': {kind} (scalar PoC only)"))]
     UnsupportedKind {
         /// The proto field name.
         name: String,
@@ -94,9 +92,7 @@ pub enum WireToArrowError {
     },
 
     /// Wire type for a field doesn't match the plan's expectation.
-    #[snafu(display(
-        "wire type mismatch: plan expected {expected}, wire bytes had {actual}"
-    ))]
+    #[snafu(display("wire type mismatch: plan expected {expected}, wire bytes had {actual}"))]
     WireTypeMismatch {
         /// The wire type the plan expected for this field.
         expected: u8,
@@ -151,9 +147,7 @@ pub enum WireToArrowError {
     /// wire bytes (which can't recurse deeper than the plan).
     ///
     /// [`MAX_NESTING_DEPTH`]: super::plan::MAX_NESTING_DEPTH
-    #[snafu(display(
-        "wire-to-Arrow plan exceeds max nesting depth of {limit}"
-    ))]
+    #[snafu(display("wire-to-Arrow plan exceeds max nesting depth of {limit}"))]
     SchemaTooDeep {
         /// The configured maximum depth.
         limit: usize,
@@ -163,9 +157,7 @@ pub enum WireToArrowError {
     /// build a column for (e.g. `Date32`, `Time64`, decimal). Caught at
     /// plan-build so the failure surfaces at serializer init rather than
     /// panicking inside `TypedBuilder::new` on the first batch.
-    #[snafu(display(
-        "Arrow field '{name}' has unsupported leaf data type {arrow_type}"
-    ))]
+    #[snafu(display("Arrow field '{name}' has unsupported leaf data type {arrow_type}"))]
     UnsupportedArrowLeafType {
         /// The Arrow field name carrying the unsupported leaf type.
         name: String,
@@ -205,9 +197,7 @@ pub enum WireToArrowError {
     /// column lengths and fail batch assembly. Surfaced from
     /// `validate_message` so the offending row is dropped via the normal
     /// per-row isolation path instead of poisoning the whole batch.
-    #[snafu(display(
-        "duplicate singular proto field {field_number} in one message"
-    ))]
+    #[snafu(display("duplicate singular proto field {field_number} in one message"))]
     DuplicateSingularField {
         /// The proto field number whose tag appeared more than once.
         field_number: u32,
@@ -233,6 +223,22 @@ pub enum WireToArrowError {
     MapEntryFieldNotInProto {
         /// The Arrow Map entry field name that doesn't match proto MapEntry.
         name: String,
+    },
+
+    /// A VARIANT column's wire bytes (a proto string carrying JSON text) did
+    /// not parse as JSON. Surfaced from `validate_message` so the offending
+    /// row is dropped via per-row isolation rather than failing the batch.
+    #[snafu(display("VARIANT field wire bytes are not valid JSON: {source}"))]
+    VariantJson {
+        /// The underlying `serde_json` parse error.
+        source: serde_json::Error,
+    },
+
+    /// Encoding a VARIANT value into the Parquet Variant binary form failed.
+    #[snafu(display("failed to encode VARIANT value: {source}"))]
+    VariantEncode {
+        /// The underlying Arrow error from the Variant builder.
+        source: arrow::error::ArrowError,
     },
 
     /// The Arrow schema declares a singular column as non-nullable, but the
@@ -293,7 +299,10 @@ mod tests {
             name: "foo".to_string(),
         };
         let msg = format!("{e}");
-        assert!(msg.contains("foo"), "display must contain field name: {msg}");
+        assert!(
+            msg.contains("foo"),
+            "display must contain field name: {msg}"
+        );
     }
 
     #[test]
