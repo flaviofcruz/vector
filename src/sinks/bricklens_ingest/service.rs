@@ -635,10 +635,8 @@ impl BricklensIngestService {
         accepted_count
     }
 
-    /// Returns 1 whenever the gRPC status was OK, because the proxy returns OK only once the
-    /// surviving rows are durably written — a batch where nothing lands is a non-OK status the
-    /// retry layer handles before this runs. So an OK response means the batch landed, minus any
-    /// records in `record_errors`.
+    /// Returns 1 whenever the gRPC status was OK: the proxy returns OK only once the surviving
+    /// rows are durably written, so an OK response means the batch landed, minus any `record_errors`.
     ///
     /// The unit is deliberately the *request*, not the record, mirroring `ExportResponse => 1`:
     /// `build_grpc_request` encodes and sends exactly ONE message per call (the merged event; it
