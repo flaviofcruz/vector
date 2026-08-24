@@ -425,8 +425,14 @@ impl ZerobusService {
                 )
                 .await?;
 
-                databricks_zerobus_ingest_sdk::schema::arrow_schema_from_uc_schema(
+                // Mark VARIANT columns with `arrow.parquet.variant` so the batch
+                // encoders can detect them; without the marker they'd write all-null.
+                let mut options =
+                    databricks_zerobus_ingest_sdk::schema::ArrowSchemaOptions::default();
+                options.annotate_variant_extension = true;
+                databricks_zerobus_ingest_sdk::schema::arrow_schema_from_uc_schema_with_options(
                     &table_schema.to_sdk_uc_schema(),
+                    &options,
                 )
                 .map_err(|e| ZerobusSinkError::ConfigError {
                     message: format!("Failed to convert UC schema to Arrow: {}", e),
@@ -1805,7 +1811,10 @@ mod tests {
         assert!(!returned.is_retryable());
         // Cache still on the original generation, and the scripted fetch was
         // never consumed — no reload was attempted.
-        assert!(Arc::ptr_eq(&service.cached_schema().await.unwrap(), &schema));
+        assert!(Arc::ptr_eq(
+            &service.cached_schema().await.unwrap(),
+            &schema
+        ));
         assert_eq!(service.scripted_fetch_count(), 1);
     }
 

@@ -37,7 +37,10 @@ fn packed_element_varint_roundtrip() {
     for v in [0u64, 1, 127, 128, 255, 16384, u32::MAX as u64, u64::MAX] {
         let encoded = encode_varint_for_test(v);
         let (decoded, rest) = read_packed_element(ScalarKind::Int64, &encoded).unwrap();
-        assert!(matches!(decoded, WireValue::Varint(d) if d == v), "mismatch on {v}");
+        assert!(
+            matches!(decoded, WireValue::Varint(d) if d == v),
+            "mismatch on {v}"
+        );
         assert!(rest.is_empty(), "buffer not fully consumed for {v}");
     }
 }
@@ -254,7 +257,9 @@ fn absent_proto_field_becomes_all_null_column() {
     assert!(missing.is_null(0));
     assert!(missing.is_null(1));
 
-    let ids = batch.column(2).as_primitive::<arrow::datatypes::Int32Type>();
+    let ids = batch
+        .column(2)
+        .as_primitive::<arrow::datatypes::Int32Type>();
     assert_eq!(ids.value(0), 1);
     assert_eq!(ids.value(1), 2);
 }
@@ -601,7 +606,10 @@ fn json_map_repeated_keyvalue_roundtrips_to_map() {
     let pairs: std::collections::HashMap<String, String> = (0..2)
         .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
         .collect();
-    assert_eq!(pairs.get("spark.app.id").map(String::as_str), Some("app-123"));
+    assert_eq!(
+        pairs.get("spark.app.id").map(String::as_str),
+        Some("app-123")
+    );
     assert_eq!(
         pairs.get("spark.executor.id").map(String::as_str),
         Some("driver")
@@ -756,7 +764,11 @@ fn map_entry_with_empty_string_key_encodes_as_empty_string_not_null() {
         .expect("MapArray");
     assert_eq!(map.value_length(0), 1);
     let keys = map.keys().as_string::<i64>();
-    assert_eq!(keys.value(0), "", "empty-default key must materialize as \"\"");
+    assert_eq!(
+        keys.value(0),
+        "",
+        "empty-default key must materialize as \"\""
+    );
     assert!(!keys.is_null(0), "key column must contain no nulls");
     let values = map.values().as_primitive::<arrow::datatypes::Int32Type>();
     assert_eq!(values.value(0), 1);
@@ -804,7 +816,11 @@ fn map_entry_with_default_int_value_encodes_as_zero_not_null() {
     let keys = map.keys().as_string::<i64>();
     let values = map.values().as_primitive::<arrow::datatypes::Int32Type>();
     assert_eq!(keys.value(0), "foo");
-    assert_eq!(values.value(0), 0, "default-int value must materialize as 0");
+    assert_eq!(
+        values.value(0),
+        0,
+        "default-int value must materialize as 0"
+    );
     assert!(!values.is_null(0));
 }
 
@@ -994,7 +1010,9 @@ fn oneof_variants_map_to_separate_columns() {
         .unwrap();
     assert_eq!(batch.num_rows(), 2);
 
-    let a = batch.column(0).as_primitive::<arrow::datatypes::Int32Type>();
+    let a = batch
+        .column(0)
+        .as_primitive::<arrow::datatypes::Int32Type>();
     assert_eq!(a.value(0), 42);
     assert!(a.is_null(1));
 
@@ -1144,7 +1162,11 @@ fn plan_build_allows_non_nullable_outer_list_and_map() {
             /* nullable */ false,
         ),
         // Outer map non-nullable: OK, same reason.
-        Field::new("data", DataType::Map(entry_field, false), /* nullable */ false),
+        Field::new(
+            "data",
+            DataType::Map(entry_field, false),
+            /* nullable */ false,
+        ),
     ]);
     WireToArrowEncoder::new(&desc, schema).expect("should build");
 }
@@ -1157,7 +1179,11 @@ fn plan_build_rejects_non_nullable_absent_column() {
     let desc = scalar_descriptor();
     let schema = Schema::new(vec![
         Field::new("name", DataType::LargeUtf8, true),
-        Field::new("dropped_from_proto", DataType::Int64, /* nullable */ false),
+        Field::new(
+            "dropped_from_proto",
+            DataType::Int64,
+            /* nullable */ false,
+        ),
     ]);
     let err = WireToArrowEncoder::new(&desc, schema).expect_err("should reject");
     assert!(
@@ -1202,8 +1228,8 @@ fn plan_build_rejects_unsupported_arrow_leaf_in_absent_slot() {
         Field::new("name", DataType::LargeUtf8, true),
         Field::new("created_at", DataType::Date32, true),
     ]);
-    let err = WireToArrowEncoder::new(&desc, schema)
-        .expect_err("should reject Date32 on absent slot");
+    let err =
+        WireToArrowEncoder::new(&desc, schema).expect_err("should reject Date32 on absent slot");
     assert!(
         matches!(
             &err,
@@ -1229,7 +1255,9 @@ fn multiple_rows_preserve_order() {
     }
 
     let batch = enc.encode_batch(&messages).unwrap();
-    let ids = batch.column(0).as_primitive::<arrow::datatypes::Int32Type>();
+    let ids = batch
+        .column(0)
+        .as_primitive::<arrow::datatypes::Int32Type>();
     assert_eq!(ids.len(), 5);
     for i in 0..5 {
         assert_eq!(ids.value(i), (i as i32) * 10);
@@ -1371,7 +1399,9 @@ fn encode_batch_drops_malformed_row_in_mixed_batch() {
     let names = batch.column(0).as_string::<i64>();
     assert_eq!(names.value(0), "alice");
     assert_eq!(names.value(1), "bob");
-    let ids = batch.column(1).as_primitive::<arrow::datatypes::Int32Type>();
+    let ids = batch
+        .column(1)
+        .as_primitive::<arrow::datatypes::Int32Type>();
     assert_eq!(ids.value(0), 1);
     assert_eq!(ids.value(1), 2);
 }
@@ -1491,7 +1521,9 @@ fn encode_batch_drops_row_with_duplicate_singular_scalar_tag() {
     let names = batch.column(0).as_string::<i64>();
     assert_eq!(names.value(0), "alice");
     assert_eq!(names.value(1), "bob");
-    let ids = batch.column(1).as_primitive::<arrow::datatypes::Int32Type>();
+    let ids = batch
+        .column(1)
+        .as_primitive::<arrow::datatypes::Int32Type>();
     assert_eq!(ids.value(0), 1);
     assert_eq!(ids.value(1), 2);
 }
@@ -1771,7 +1803,10 @@ fn repeated_enum_to_string_empty_when_absent() {
     let batch = enc.encode_batch(&[Bytes::new()]).unwrap();
     assert_eq!(batch.num_rows(), 1);
     let list = batch.column(0).as_list::<i32>();
-    assert!(!list.is_null(0), "absent repeated enum must be empty list, not null");
+    assert!(
+        !list.is_null(0),
+        "absent repeated enum must be empty list, not null"
+    );
     assert_eq!(list.value(0).len(), 0);
 }
 
@@ -1799,13 +1834,141 @@ fn repeated_enum_to_string_unknown_value_renders_placeholder() {
     let batch = enc
         .encode_batch(&[Bytes::from(buf)])
         .expect("unknown-enum element must not fail the batch");
-    assert_eq!(batch.num_rows(), 1, "the row with an unknown element must be kept");
+    assert_eq!(
+        batch.num_rows(),
+        1,
+        "the row with an unknown element must be kept"
+    );
     let list = batch.column(0).as_list::<i32>();
     let strs = list.value(0);
     let strs = strs.as_string::<i64>();
     assert_eq!(strs.len(), 2);
     assert_eq!(strs.value(0), "SUCCESS");
     assert_eq!(strs.value(1), "UNKNOWN_ENUM_VALUE_Outcome_99");
+}
+
+// -------------------------------------------------------------------------
+// VARIANT: a proto string carrying JSON text -> Arrow Struct<metadata, value>
+// marked with the `arrow.parquet.variant` extension, encoded into the Parquet
+// Variant binary form.
+// -------------------------------------------------------------------------
+
+/// A VARIANT Arrow field: marked `Struct<metadata, value>` (both non-nullable
+/// LargeBinary), as the zerobus SDK emits with `annotate_variant_extension`.
+fn variant_arrow_field(name: &str) -> Field {
+    let children = ArrowFields::from(vec![
+        Field::new("metadata", DataType::LargeBinary, false),
+        Field::new("value", DataType::LargeBinary, false),
+    ]);
+    Field::new(name, DataType::Struct(children), true).with_metadata(
+        std::collections::HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "arrow.parquet.variant".to_string(),
+        )]),
+    )
+}
+
+/// Decode a VARIANT cell back to a `serde_json::Value` for order-independent
+/// comparison.
+fn decode_variant_wire(col: &arrow::array::ArrayRef, row: usize) -> serde_json::Value {
+    use arrow::array::LargeBinaryArray;
+    use parquet_variant::Variant;
+    use parquet_variant_json::VariantToJson;
+
+    let s = col.as_struct();
+    let metadata = s
+        .column(0)
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .unwrap();
+    let value = s
+        .column(1)
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .unwrap();
+    let variant = Variant::new(metadata.value(row), value.value(row));
+    serde_json::from_str(&variant.to_json_string().unwrap()).unwrap()
+}
+
+#[test]
+fn variant_column_from_json_string() {
+    // Person.name is a proto string; declare its Arrow column as a VARIANT so
+    // the JSON text on the wire is re-encoded into Parquet Variant binary.
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        variant_arrow_field("name"),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut msg = DynamicMessage::new(desc.clone());
+    msg.set_field_by_name("name", ProtoValue::String(r#"{"a":1,"b":"x"}"#.into()));
+    msg.set_field_by_name("id", ProtoValue::I32(7));
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc.encode_batch(&[Bytes::from(buf)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(!batch.column(0).is_null(0));
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 0),
+        serde_json::json!({"a": 1, "b": "x"})
+    );
+}
+
+#[test]
+fn variant_column_absent_is_null() {
+    // proto3 elides an unset (or empty) string field, so an absent `name`
+    // yields a null VARIANT row.
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        variant_arrow_field("name"),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut msg = DynamicMessage::new(desc.clone());
+    msg.set_field_by_name("id", ProtoValue::I32(7)); // name omitted
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc.encode_batch(&[Bytes::from(buf)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(batch.column(0).is_null(0));
+}
+
+#[test]
+fn variant_column_drops_malformed_json_row() {
+    // Non-JSON text in a VARIANT wire field is caught by the pre-validate pass
+    // and the row is dropped, matching the per-row isolation of other decode
+    // failures. A valid row in the same batch survives.
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        variant_arrow_field("name"),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut good = DynamicMessage::new(desc.clone());
+    good.set_field_by_name("name", ProtoValue::String(r#"{"ok":true}"#.into()));
+    good.set_field_by_name("id", ProtoValue::I32(1));
+    let mut buf_good = Vec::new();
+    good.encode(&mut buf_good).unwrap();
+
+    let mut bad = DynamicMessage::new(desc.clone());
+    bad.set_field_by_name("name", ProtoValue::String("not json".into()));
+    bad.set_field_by_name("id", ProtoValue::I32(2));
+    let mut buf_bad = Vec::new();
+    bad.encode(&mut buf_bad).unwrap();
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(buf_bad), Bytes::from(buf_good)])
+        .expect("malformed variant row must not fail the batch");
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 0),
+        serde_json::json!({"ok": true})
+    );
 }
 
 // -------------------------------------------------------------------------

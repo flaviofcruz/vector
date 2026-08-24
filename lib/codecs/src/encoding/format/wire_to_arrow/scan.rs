@@ -11,9 +11,8 @@ use zeroparser::wire::try_parse_field;
 
 use super::append::{
     append_enum_string_from_wire, append_repeated_enum_string, append_repeated_scalar,
-    append_scalar_from_wire, expect_len, validate_enum_string_from_wire,
-    validate_repeated_enum_string, validate_repeated_scalar,
-    validate_scalar_from_wire,
+    append_scalar_from_wire, encode_variant_from_wire, expect_len, validate_enum_string_from_wire,
+    validate_repeated_enum_string, validate_repeated_scalar, validate_scalar_from_wire,
 };
 use super::builders::{self, BuilderNodeList};
 use super::errors::{Result, WireToArrowError};
@@ -56,6 +55,14 @@ pub(super) fn scan_message(
             }
             builders::BuilderNode::EnumString { desc, builder } => {
                 append_enum_string_from_wire(desc, &field.value, builder)?;
+                present[slot_idx] = true;
+            }
+            builders::BuilderNode::Variant {
+                metadata, value, ..
+            } => {
+                let (m, v) = encode_variant_from_wire(&field.value)?;
+                metadata.append_value(&m);
+                value.append_value(&v);
                 present[slot_idx] = true;
             }
             builders::BuilderNode::Struct {
@@ -201,6 +208,16 @@ pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<(
                     });
                 }
                 validate_enum_string_from_wire(desc, &field.value)?;
+            }
+            // Singular field: dedup like Scalar/Struct, and parse+encode so a
+            // malformed JSON row is dropped identically to the scan path.
+            PlanSlot::Variant => {
+                if seen_singular.test_and_set(slot_idx) {
+                    return Err(WireToArrowError::DuplicateSingularField {
+                        field_number: field.field_num as u32,
+                    });
+                }
+                encode_variant_from_wire(&field.value)?;
             }
             // No proto field number ever points at an Absent slot (Absent
             // slots are Arrow columns the proto descriptor lacks), so this

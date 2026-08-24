@@ -156,6 +156,11 @@ pub enum PlanSlot {
     /// enum paired with `List<Int32>` still falls through to
     /// [`PlanSlot::RepeatedScalar`] and stays numeric.
     RepeatedEnumString(EnumDescriptor),
+    /// Databricks `VARIANT`: a proto `string`/`bytes` field carrying JSON text,
+    /// paired to an Arrow `Struct<metadata, value>` column marked with the
+    /// `arrow.parquet.variant` extension. Scan decodes the JSON and encodes it
+    /// into the Parquet Variant binary form; finish assembles the struct.
+    Variant,
     /// Proto `map<K, V>` -> Arrow `Map<Struct(key, value)>`. On the wire, maps
     /// are encoded as `repeated MapEntry` where `MapEntry` is a generated
     /// message with field 1 = key and field 2 = value; we scan them the same
@@ -362,6 +367,15 @@ impl MessagePlan {
                 PlanSlot::Map(Arc::new(sub))
             } else {
                 match (&kind, arrow_field.data_type(), is_repeated) {
+                    // VARIANT: proto string/bytes (JSON text) -> Arrow
+                    // Struct<metadata, value> marked with arrow.parquet.variant.
+                    // Must precede the generic struct/scalar arms, which would
+                    // otherwise reject a String/Struct pairing.
+                    (Kind::String | Kind::Bytes, DataType::Struct(_), false)
+                        if crate::encoding::format::variant::is_variant_field(arrow_field) =>
+                    {
+                        PlanSlot::Variant
+                    }
                     // Singular proto enum -> STRING column: render the enum
                     // value *name* rather than its number. Enum + an integer
                     // column falls through to the generic scalar arm below,
@@ -476,7 +490,10 @@ impl MessagePlan {
                     // EnumString is a singular field too: absent -> null (parity
                     // with `proto_to_value`), so a non-nullable column can't be
                     // guaranteed and is rejected alongside Scalar/Struct.
-                    PlanSlot::Scalar(_) | PlanSlot::Struct(_) | PlanSlot::EnumString(_) => {
+                    PlanSlot::Scalar(_)
+                    | PlanSlot::Struct(_)
+                    | PlanSlot::EnumString(_)
+                    | PlanSlot::Variant => {
                         return Err(WireToArrowError::NonNullableNotGuaranteed {
                             name: arrow_field.name().to_string(),
                             reason: "proto3 singular fields are omitted at default value, \
@@ -532,7 +549,6 @@ impl MessagePlan {
             inside_map_entry,
         })
     }
-
 }
 
 /// Recursively walk an Arrow `DataType` tree and verify every primitive
@@ -613,9 +629,15 @@ mod tests {
         ]);
         let plan = MessagePlan::build(&desc, &Fields::from(schema.fields().clone())).unwrap();
         assert_eq!(plan.slots.len(), 3);
-        assert!(matches!(plan.slots[0], PlanSlot::Scalar(ScalarKind::String)));
+        assert!(matches!(
+            plan.slots[0],
+            PlanSlot::Scalar(ScalarKind::String)
+        ));
         assert!(matches!(plan.slots[1], PlanSlot::Scalar(ScalarKind::Int32)));
-        assert!(matches!(plan.slots[2], PlanSlot::Scalar(ScalarKind::String)));
+        assert!(matches!(
+            plan.slots[2],
+            PlanSlot::Scalar(ScalarKind::String)
+        ));
     }
 
     #[test]
@@ -632,7 +654,10 @@ mod tests {
             Field::new("id", DataType::Int32, true),
         ]);
         let plan = MessagePlan::build(&desc, &Fields::from(schema.fields().clone())).unwrap();
-        assert!(matches!(plan.slots[0], PlanSlot::Scalar(ScalarKind::String)));
+        assert!(matches!(
+            plan.slots[0],
+            PlanSlot::Scalar(ScalarKind::String)
+        ));
         assert!(matches!(plan.slots[1], PlanSlot::Absent));
         assert!(matches!(plan.slots[2], PlanSlot::Scalar(ScalarKind::Int32)));
         // No proto tag for slot 1 — so the reverse index never points at it.
@@ -651,7 +676,10 @@ mod tests {
         )]);
         let err = MessagePlan::build(&desc, &Fields::from(schema.fields().clone()))
             .expect_err("should fail");
-        assert!(matches!(err, WireToArrowError::UnsupportedCombination { .. }));
+        assert!(matches!(
+            err,
+            WireToArrowError::UnsupportedCombination { .. }
+        ));
     }
 
     #[test]

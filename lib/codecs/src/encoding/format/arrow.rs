@@ -29,6 +29,8 @@ use vector_config::configurable_component;
 
 use vector_core::event::{Event, Value};
 
+use super::variant::{is_variant_field, value_to_variant};
+
 /// Field-metadata key holding a column's coercion default. Consumed when
 /// `coerce_missing_to_default` is set; always stripped from the schema before the wire.
 pub const COERCE_DEFAULT_METADATA_KEY: &str = "databricks.arrow.coerce_default";
@@ -1050,6 +1052,9 @@ fn build_column_for_path(
 ) -> Result<ArrayRef, ArrowEncodingError> {
     let nullable = field.is_nullable();
     match field.data_type() {
+        DataType::Struct(fields) if is_variant_field(field) => {
+            build_variant_array(events, path, fields, nullable, missing_default)
+        }
         DataType::Struct(fields) => {
             build_struct_array(events, path, fields, nullable, missing_default)
         }
@@ -1216,6 +1221,133 @@ fn build_struct_array(
     let struct_array = StructArray::try_new(fields.clone(), child_arrays, null_buffer)
         .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
     Ok(Arc::new(struct_array))
+}
+
+/// Assemble a VARIANT `StructArray` from pre-filled child builders + validity.
+///
+/// The two children (`metadata`, `value`) are declared non-nullable by the UC
+/// schema, so a null variant row is masked by the struct's null buffer while
+/// its children still carry placeholder (empty) bytes — appending a child null
+/// would fail `StructArray::try_new`.
+fn finish_variant_struct(
+    fields: &Fields,
+    mut metadata_builder: LargeBinaryBuilder,
+    mut value_builder: LargeBinaryBuilder,
+    validity: Vec<bool>,
+    has_null: bool,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let child_arrays: Vec<ArrayRef> = vec![
+        Arc::new(metadata_builder.finish()),
+        Arc::new(value_builder.finish()),
+    ];
+    let null_buffer = has_null.then(|| NullBuffer::from(validity));
+    let struct_array = StructArray::try_new(fields.clone(), child_arrays, null_buffer)
+        .map_err(|source| ArrowEncodingError::RecordBatchCreation { source })?;
+    Ok(Arc::new(struct_array))
+}
+
+/// Encode one Vector `Value` into the Parquet Variant `(metadata, value)`
+/// buffers and append them to the child builders.
+fn append_variant_value(
+    metadata_builder: &mut LargeBinaryBuilder,
+    value_builder: &mut LargeBinaryBuilder,
+    value: &Value,
+    field_name: &str,
+) -> Result<(), ArrowEncodingError> {
+    let json = serde_json::to_value(value).map_err(|_| ArrowEncodingError::InvalidValue {
+        field_name: field_name.into(),
+    })?;
+    let (metadata_bytes, value_bytes) =
+        value_to_variant(&json).map_err(|_| ArrowEncodingError::InvalidValue {
+            field_name: field_name.into(),
+        })?;
+    metadata_builder.append_value(&metadata_bytes);
+    value_builder.append_value(&value_bytes);
+    Ok(())
+}
+
+/// Builds a VARIANT column (Arrow `Struct<metadata, value>` carrying the
+/// `arrow.parquet.variant` marker) at a dot-separated path, encoding each
+/// event's value into the Parquet Variant binary form.
+fn build_variant_array(
+    events: &[Event],
+    path: &str,
+    fields: &Fields,
+    nullable: bool,
+    missing_default: Option<&str>,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let mut metadata_builder = LargeBinaryBuilder::with_capacity(events.len(), 0);
+    let mut value_builder = LargeBinaryBuilder::with_capacity(events.len(), 0);
+    let mut validity: Vec<bool> = Vec::with_capacity(events.len());
+    let mut has_null = false;
+
+    for event in events {
+        if let Event::Log(log) = event {
+            let present = match log.get(path) {
+                Some(value) if !matches!(value, Value::Null) => Some(value),
+                _ => None,
+            };
+            let valid = if let Some(value) = present {
+                append_variant_value(&mut metadata_builder, &mut value_builder, value, path)?;
+                true
+            } else if missing_default.is_some() {
+                // Coercion on: emit an explicit Variant null value (a valid row),
+                // matching the struct builder's "missing -> row of defaults".
+                append_variant_value(
+                    &mut metadata_builder,
+                    &mut value_builder,
+                    &Value::Null,
+                    path,
+                )?;
+                true
+            } else if nullable {
+                metadata_builder.append_value(b"");
+                value_builder.append_value(b"");
+                has_null = true;
+                false
+            } else {
+                return Err(ArrowEncodingError::NullConstraint {
+                    field_name: path.into(),
+                });
+            };
+            validity.push(valid);
+        }
+    }
+
+    finish_variant_struct(fields, metadata_builder, value_builder, validity, has_null)
+}
+
+/// Value-based VARIANT builder for nested positions (list item / map value),
+/// where the source values are already collected as `&[Value]`. A `Value::Null`
+/// becomes a masked null row.
+fn build_variant_value_array(
+    items: &[Value],
+    field: &Field,
+    fields: &Fields,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    let mut metadata_builder = LargeBinaryBuilder::with_capacity(items.len(), 0);
+    let mut value_builder = LargeBinaryBuilder::with_capacity(items.len(), 0);
+    let mut validity: Vec<bool> = Vec::with_capacity(items.len());
+    let mut has_null = false;
+
+    for item in items {
+        if matches!(item, Value::Null) {
+            metadata_builder.append_value(b"");
+            value_builder.append_value(b"");
+            validity.push(false);
+            has_null = true;
+        } else {
+            append_variant_value(
+                &mut metadata_builder,
+                &mut value_builder,
+                item,
+                field.name(),
+            )?;
+            validity.push(true);
+        }
+    }
+
+    finish_variant_struct(fields, metadata_builder, value_builder, validity, has_null)
 }
 
 /// Converts a string map key to the Arrow key type required by the schema.
@@ -1440,6 +1572,9 @@ fn build_list_array(
 /// For nested `List`, each item must be a `Value::Array`.
 fn build_list_item_array(items: &[Value], field: &Field) -> Result<ArrayRef, ArrowEncodingError> {
     match field.data_type() {
+        DataType::Struct(fields) if is_variant_field(field) => {
+            build_variant_value_array(items, field, fields)
+        }
         DataType::Struct(fields) => {
             let child_arrays: Vec<ArrayRef> = fields
                 .iter()
@@ -1973,6 +2108,111 @@ mod tests {
             .unwrap();
         assert_eq!(j.value(0), "{}"); // JSON column default for a missing value
         assert_eq!(j.value(1), "{}");
+    }
+
+    /// A VARIANT column: `Struct<metadata, value>` (both non-nullable
+    /// LargeBinary) marked with the `arrow.parquet.variant` extension, exactly
+    /// as the zerobus SDK emits it with `annotate_variant_extension`.
+    fn variant_field(name: &str, nullable: bool) -> Field {
+        let children = Fields::from(vec![
+            Field::new("metadata", DataType::LargeBinary, false),
+            Field::new("value", DataType::LargeBinary, false),
+        ]);
+        Field::new(name, DataType::Struct(children), nullable).with_metadata(
+            std::collections::HashMap::from([(
+                "ARROW:extension:name".to_string(),
+                "arrow.parquet.variant".to_string(),
+            )]),
+        )
+    }
+
+    /// Decode a variant cell (metadata + value LargeBinary children) back to a
+    /// `serde_json::Value` for order-independent comparison.
+    fn decode_variant_cell(col: &ArrayRef, row: usize) -> serde_json::Value {
+        use arrow::array::LargeBinaryArray;
+        use parquet_variant::Variant;
+        use parquet_variant_json::VariantToJson;
+
+        let s = col.as_any().downcast_ref::<StructArray>().unwrap();
+        let metadata = s
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        let value = s
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        let variant = Variant::new(metadata.value(row), value.value(row));
+        serde_json::from_str(&variant.to_json_string().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn variant_column_encodes_object_and_scalar() {
+        let mut obj_event = LogEvent::default();
+        obj_event.insert("v", Value::from(serde_json::json!({"a": 1, "b": "x"})));
+
+        let mut scalar_event = LogEvent::default();
+        scalar_event.insert("v", Value::from("hello"));
+
+        let events = vec![Event::Log(obj_event), Event::Log(scalar_event)];
+        let schema = Arc::new(Schema::new(vec![variant_field("v", true)]));
+
+        let batch = build_record_batch(schema, &events).expect("variant batch builds");
+        let col = batch.column(0);
+        assert!(!col.is_null(0));
+        assert!(!col.is_null(1));
+        assert_eq!(
+            decode_variant_cell(col, 0),
+            serde_json::json!({"a": 1, "b": "x"})
+        );
+        assert_eq!(decode_variant_cell(col, 1), serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn variant_column_null_when_missing_or_null() {
+        let mut present = LogEvent::default();
+        present.insert("v", Value::from("present"));
+        let mut explicit_null = LogEvent::default();
+        explicit_null.insert("v", Value::Null);
+        // Third event omits `v` entirely.
+        let events = vec![
+            Event::Log(present),
+            Event::Log(explicit_null),
+            Event::Log(LogEvent::default()),
+        ];
+        let schema = Arc::new(Schema::new(vec![variant_field("v", true)]));
+
+        let batch = build_record_batch(schema, &events).expect("variant batch builds");
+        let col = batch.column(0);
+        assert!(!col.is_null(0));
+        assert!(col.is_null(1), "explicit Null -> null struct row");
+        assert!(col.is_null(2), "missing -> null struct row");
+        assert_eq!(decode_variant_cell(col, 0), serde_json::json!("present"));
+    }
+
+    #[test]
+    fn variant_nested_in_struct() {
+        let mut event = LogEvent::default();
+        event.insert("payload.attrs", Value::from(serde_json::json!({"k": 7})));
+
+        let events = vec![Event::Log(event)];
+        let struct_field = Field::new(
+            "payload",
+            DataType::Struct(Fields::from(vec![variant_field("attrs", true)])),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![struct_field]));
+
+        let batch = build_record_batch(schema, &events).expect("nested variant batch builds");
+        let payload = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let attrs = payload.column(0);
+        assert_eq!(decode_variant_cell(attrs, 0), serde_json::json!({"k": 7}));
     }
 
     #[test]
@@ -3521,7 +3761,11 @@ mod tests {
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();
-        let item_structs = outer.values().as_any().downcast_ref::<StructArray>().unwrap();
+        let item_structs = outer
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
         let inner = item_structs
             .column_by_name("inner")
             .unwrap()

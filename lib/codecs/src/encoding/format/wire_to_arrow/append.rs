@@ -25,6 +25,24 @@ pub(super) fn expect_len<'a>(wv: &'a WireValue<'a>) -> Result<&'a [u8]> {
     }
 }
 
+/// Decode a length-delimited VARIANT wire value — a proto `string` carrying
+/// UTF-8 JSON text — into the Parquet Variant `(metadata, value)` binary pair.
+///
+/// Shared by [`scan_message`] (which appends the result) and
+/// [`validate_message`] (which discards it), so the two stay in lock-step: any
+/// JSON that fails to parse or encode is rejected identically on both paths,
+/// dropping the row via per-row isolation instead of failing the batch.
+///
+/// [`scan_message`]: super::scan::scan_message
+/// [`validate_message`]: super::scan::validate_message
+pub(super) fn encode_variant_from_wire(wv: &WireValue) -> Result<(Vec<u8>, Vec<u8>)> {
+    let bytes = expect_len(wv)?;
+    let json: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|source| WireToArrowError::VariantJson { source })?;
+    crate::encoding::format::variant::value_to_variant(&json)
+        .map_err(|source| WireToArrowError::VariantEncode { source })
+}
+
 /// Proto wire type numeric code for a `WireValue`. Used for error reporting.
 #[inline]
 pub(super) fn wire_type_byte(wv: &WireValue) -> u8 {
@@ -664,4 +682,3 @@ pub(super) fn read_packed_element<'a>(
         }),
     }
 }
-
