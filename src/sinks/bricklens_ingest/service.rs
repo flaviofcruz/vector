@@ -635,31 +635,27 @@ impl BricklensIngestService {
         accepted_count
     }
 
-    /// Returns 1 when the consumer accepted the whole batch, 0 when it rejected any record.
+    /// Returns 1 whenever the gRPC status was OK, because the proxy returns OK only once the
+    /// surviving rows are durably written — a batch where nothing lands is a non-OK status the
+    /// retry layer handles before this runs. So an OK response means the batch landed, minus any
+    /// records in `record_errors`.
     ///
     /// The unit is deliberately the *request*, not the record, mirroring `ExportResponse => 1`:
     /// `build_grpc_request` encodes and sends exactly ONE message per call (the merged event; it
-    /// warns and drops the tail if handed more than one), so `accepted_count` is a count of sent
-    /// messages the consumer took, and `event_status()` only distinguishes zero from non-zero.
-    /// Returning a record count here would inflate `accepted_count` above the number of events the
-    /// driver is acking.
+    /// warns and drops the tail if handed more than one), so `event_status()` only distinguishes
+    /// zero from non-zero and a per-record fraction cannot be expressed.
     ///
-    /// Inverted relative to `count_log_record_results`: `BatchCreateLogRecordsResponse` enumerates
-    /// every record with a `success` flag, whereas `IngestLogsResponse` carries only the records the
-    /// consumer rejected. A partial rejection therefore cannot be expressed as a fraction of one
-    /// message, so it is reported as Rejected: the batch is a single unit of acknowledgement, and
-    /// acking it as Delivered would silently drop the rejected records from the delivery accounting.
-    ///
-    /// Reaching here means the gRPC status was OK, which the consumer returns only once its write is
-    /// durable — a write failure is a non-OK status handled by the retry layer before this runs. So
-    /// an OK response listing no record errors means the whole batch landed.
+    /// `IngestLogsResponse` carries only the records the proxy rejected before the write (they could
+    /// not be projected or encoded), and those are permanent. Acking the message Delivered on a
+    /// partial write mirrors `count_log_record_results` (accepted_count > 0 => Delivered): the rows
+    /// that landed must not be counted as lost, and the dropped records are surfaced by the warn!
+    /// below rather than retried (a resend cannot fix them, and would double-write the survivors).
     fn count_ingest_logs_results(&self, response: &prost_reflect::DynamicMessage) -> usize {
         // Protobuf omits empty repeated fields on the wire, so a fully-successful batch arrives with
         // no `record_errors` bytes; `prost_reflect` surfaces that as an empty list rather than a
-        // missing field, and an empty list here means "every record accepted". Deliberately NOT the
-        // `else { return 0 }` guard `count_log_record_results` applies to a missing `results` field:
-        // there, absence signals a stale descriptor, whereas here it is the success path, and
-        // rejecting on it would retry every successful batch forever.
+        // missing field. An absent or empty list is the full-success path — deliberately NOT the
+        // `else { return 0 }` guard `count_log_record_results` applies to a missing `results` field,
+        // where absence signals a stale descriptor; here rejecting on it would fail every clean batch.
         let errors = response.get_field_by_name("record_errors");
         let Some(error_list) = errors.as_ref().and_then(|f| f.as_list()) else {
             return 1;
@@ -670,10 +666,8 @@ impl BricklensIngestService {
             return 1;
         }
 
-        // `rejected_count` is the list length, taken before this loop, so an entry that is not a
-        // message still counts against the rejection while contributing no diagnostic. That differs
-        // from `count_log_record_results`, where a skipped item is simply not tallied; the direction
-        // here is the safe one (a malformed entry rejects the batch rather than acking it).
+        // `rejected_count` is the list length, so an entry that is not a message still counts toward
+        // the diagnostic total while contributing no reason string.
         const MAX_REASON_SAMPLE: usize = 3;
         let mut reason_sample: Vec<String> = Vec::new();
         for item in error_list.iter().take(MAX_REASON_SAMPLE) {
@@ -684,15 +678,18 @@ impl BricklensIngestService {
         }
 
         // Rate-limited to once a minute: a systematic validation failure would otherwise log on
-        // every batch, and the loss is already counted via event_status.
+        // every batch. The dropped records are permanent (a resend cannot fix them), so this is a
+        // diagnostic, not a signal to retry.
         warn!(
             rejected_count,
             reason_sample = ?reason_sample,
             internal_log_rate_secs = 60,
-            "bricklens_ingest: consumer rejected one or more records in the batch"
+            "bricklens_ingest: consumer wrote the batch but rejected one or more records"
         );
 
-        0
+        // Delivered: the proxy wrote the survivors, so the message is acked rather than counted as
+        // lost; the rejected records were logged above.
+        1
     }
 }
 
@@ -1590,10 +1587,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_grpc_response_ingest_logs_partial_rejection_yields_rejected() {
-        // A partial rejection cannot be expressed as a fraction of the single message sent, so the
-        // batch is Rejected rather than acked as Delivered — acking would drop the rejected records
-        // from the delivery accounting entirely.
+    fn test_parse_grpc_response_ingest_logs_partial_rejection_yields_delivered() {
+        // A partial rejection means the proxy wrote the survivors and listed the records it dropped,
+        // so the single message is acked Delivered — acking Rejected would count the rows that landed
+        // as lost. The dropped records are logged (not asserted here), not retried.
         let svc = make_test_service_with_pool(
             "https://example.com:443",
             make_test_pool_with_ingest_logs_shape(),
@@ -1602,14 +1599,17 @@ mod tests {
         let resp = svc
             .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap();
-        assert_eq!(resp.accepted_count, 0);
-        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
+        assert_eq!(resp.accepted_count, 1);
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Delivered
+        );
     }
 
     #[test]
-    fn test_parse_grpc_response_ingest_logs_single_rejection_yields_rejected() {
-        // One rejected record is enough to reject the batch: the response carries only failures, so
-        // any entry at all means the message was not accepted whole.
+    fn test_parse_grpc_response_ingest_logs_single_rejection_yields_delivered() {
+        // One rejected record does not reject the batch: the proxy still wrote the rest, so the
+        // message is Delivered and the one failure is logged.
         let svc = make_test_service_with_pool(
             "https://example.com:443",
             make_test_pool_with_ingest_logs_shape(),
@@ -1618,8 +1618,11 @@ mod tests {
         let resp = svc
             .parse_grpc_response(body, GroupedCountByteSize::new_untagged(), 0)
             .unwrap();
-        assert_eq!(resp.accepted_count, 0);
-        assert_eq!(resp.event_status(), vector_lib::event::EventStatus::Rejected);
+        assert_eq!(resp.accepted_count, 1);
+        assert_eq!(
+            resp.event_status(),
+            vector_lib::event::EventStatus::Delivered
+        );
     }
 
     #[test]
