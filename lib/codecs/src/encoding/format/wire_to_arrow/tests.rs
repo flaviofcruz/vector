@@ -2035,6 +2035,181 @@ fn array_of_variant_from_repeated_json_strings() {
     assert_eq!(decode_variant_wire(items, 1), serde_json::json!("hi"));
 }
 
+/// `message Container { KV single = 1; repeated KV many = 2; }` with
+/// `message KV { string k = 1; int64 n = 2; }` — a singular and a repeated
+/// nested-message field, for the message-backed VARIANT path.
+fn message_variant_descriptor() -> MessageDescriptor {
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_msg_variant_test.proto".into()),
+        package: Some("wire_to_arrow_msg_variant_test".into()),
+        message_type: vec![
+            DescriptorProto {
+                name: Some("Container".into()),
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("single".into()),
+                        number: Some(1),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::Message as i32),
+                        type_name: Some(".wire_to_arrow_msg_variant_test.KV".into()),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("many".into()),
+                        number: Some(2),
+                        label: Some(Label::Repeated as i32),
+                        r#type: Some(ProtoType::Message as i32),
+                        type_name: Some(".wire_to_arrow_msg_variant_test.KV".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            DescriptorProto {
+                name: Some("KV".into()),
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("k".into()),
+                        number: Some(1),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::String as i32),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("n".into()),
+                        number: Some(2),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::Int64 as i32),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes).unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_msg_variant_test.Container")
+        .unwrap()
+}
+
+/// Fetch the `KV` sub-message descriptor from `Container`'s `single` field.
+fn kv_descriptor(container: &MessageDescriptor) -> MessageDescriptor {
+    container
+        .get_field_by_name("single")
+        .unwrap()
+        .kind()
+        .as_message()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn variant_column_from_singular_message() {
+    // A singular nested proto message pointed at a variant-marked struct column
+    // is decoded and serialized to JSON, then encoded into Parquet Variant.
+    // int64 stays numeric; the unset `n` on the second field is skipped
+    // (skip_default_fields), so only present fields appear.
+    let desc = message_variant_descriptor();
+    let kv = kv_descriptor(&desc);
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut sub = DynamicMessage::new(kv);
+    sub.set_field_by_name("k", ProtoValue::String("x".into()));
+    sub.set_field_by_name("n", ProtoValue::I64(5));
+    let mut msg = DynamicMessage::new(desc.clone());
+    msg.set_field_by_name("single", ProtoValue::Message(sub));
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc.encode_batch(&[Bytes::from(buf)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(!batch.column(0).is_null(0));
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 0),
+        serde_json::json!({"k": "x", "n": 5})
+    );
+}
+
+#[test]
+fn array_of_variant_from_repeated_messages() {
+    use arrow::array::ListArray;
+
+    // A `repeated KV` field pointed at Arrow List<variant> — each element is a
+    // message decoded to JSON then Variant. The default-valued `n` on the
+    // second element is skipped.
+    let desc = message_variant_descriptor();
+    let kv = kv_descriptor(&desc);
+    let schema = Schema::new(vec![Field::new(
+        "many",
+        DataType::List(Arc::new(variant_arrow_field("item"))),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut kv1 = DynamicMessage::new(kv.clone());
+    kv1.set_field_by_name("k", ProtoValue::String("a".into()));
+    kv1.set_field_by_name("n", ProtoValue::I64(1));
+    let mut kv2 = DynamicMessage::new(kv);
+    kv2.set_field_by_name("k", ProtoValue::String("b".into())); // n unset -> skipped
+    let mut msg = DynamicMessage::new(desc.clone());
+    msg.set_field_by_name(
+        "many",
+        ProtoValue::List(vec![ProtoValue::Message(kv1), ProtoValue::Message(kv2)]),
+    );
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc.encode_batch(&[Bytes::from(buf)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let list = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let items = list.values();
+    assert_eq!(items.len(), 2);
+    assert_eq!(decode_variant_wire(items, 0), serde_json::json!({"k": "a", "n": 1}));
+    assert_eq!(decode_variant_wire(items, 1), serde_json::json!({"k": "b"}));
+}
+
+#[test]
+fn variant_message_drops_undecodable_row() {
+    // A variant-message column whose sub-message bytes are a valid LEN blob at
+    // the outer level but fail proto decode (truncated varint) drops via
+    // per-row isolation — VariantMessageDecode caught in the pre-pass — while a
+    // valid row in the same batch survives.
+    let desc = message_variant_descriptor();
+    let kv = kv_descriptor(&desc);
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // Outer: field 1 (single, message) tag 0x0a, length 1, payload 0x08 — a KV
+    // sub-message with a field-1 varint tag and no value byte => decode error.
+    let bad = vec![0x0a, 0x01, 0x08];
+
+    let mut sub = DynamicMessage::new(kv);
+    sub.set_field_by_name("k", ProtoValue::String("ok".into()));
+    let mut good = DynamicMessage::new(desc.clone());
+    good.set_field_by_name("single", ProtoValue::Message(sub));
+    let mut buf_good = Vec::new();
+    good.encode(&mut buf_good).unwrap();
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(bad), Bytes::from(buf_good)])
+        .expect("undecodable variant-message row must not fail the batch");
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 0),
+        serde_json::json!({"k": "ok"})
+    );
+}
+
 // -------------------------------------------------------------------------
 // Fuzz: random wire bytes through `encode_batch` must not panic. Any
 // `Result` outcome is acceptable — we only care that bad input is reported

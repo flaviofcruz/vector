@@ -241,6 +241,16 @@ pub enum WireToArrowError {
         source: arrow::error::ArrowError,
     },
 
+    /// A VARIANT column backed by a nested proto message failed to decode from
+    /// its wire bytes. Surfaced so the offending row drops via per-row
+    /// isolation rather than failing the batch.
+    #[snafu(display("VARIANT message field wire bytes failed to decode: {source}"))]
+    VariantMessageDecode {
+        /// The underlying prost decode error (from prost-reflect's prost, which
+        /// may differ from the crate's direct prost version).
+        source: prost_reflect::prost::DecodeError,
+    },
+
     /// The Arrow schema declares a singular column as non-nullable, but the
     /// encoder cannot guarantee a value will be present on every row.
     ///

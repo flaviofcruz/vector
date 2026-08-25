@@ -130,6 +130,17 @@ impl ScalarKind {
     }
 }
 
+/// How a variant column's wire value is turned into the Parquet Variant binary.
+#[derive(Debug, Clone)]
+pub enum VariantSource {
+    /// A proto `string`/`bytes` field carrying UTF-8 JSON text; parsed as JSON.
+    JsonText,
+    /// A nested proto message; decoded with its descriptor and serialized to a
+    /// JSON value (original field names, numeric 64-bit ints, all fields
+    /// present) to match the arrow_stream encoder's structured-value path.
+    Message(MessageDescriptor),
+}
+
 /// One entry per Arrow field at this message level: describes how to route
 /// wire-bytes values into the corresponding Arrow column builder.
 #[derive(Debug)]
@@ -156,16 +167,18 @@ pub enum PlanSlot {
     /// enum paired with `List<Int32>` still falls through to
     /// [`PlanSlot::RepeatedScalar`] and stays numeric.
     RepeatedEnumString(EnumDescriptor),
-    /// `VARIANT`: a proto `string`/`bytes` field carrying JSON text,
-    /// paired to an Arrow `Struct<metadata, value>` column marked with the
-    /// `arrow.parquet.variant` extension. Scan decodes the JSON and encodes it
-    /// into the Parquet Variant binary form; finish assembles the struct.
-    Variant,
-    /// `ARRAY<VARIANT>`: a `repeated string`/`bytes` field of JSON text, paired
-    /// to Arrow `List<Struct<metadata, value>>` whose item is variant-marked.
-    /// Each wire element is decoded into the Parquet Variant binary form; finish
-    /// assembles the item `StructArray` and wraps it in a `ListArray`.
-    RepeatedVariant,
+    /// `VARIANT`: a proto field paired to an Arrow `Struct<metadata, value>`
+    /// column marked with the `arrow.parquet.variant` extension. The
+    /// [`VariantSource`] says whether the wire value is JSON text (a
+    /// `string`/`bytes` field) or a nested proto message; either way scan
+    /// produces the Parquet Variant binary form and finish assembles the struct.
+    Variant(VariantSource),
+    /// `ARRAY<VARIANT>`: a repeated proto field paired to Arrow
+    /// `List<Struct<metadata, value>>` whose item is variant-marked. Each wire
+    /// element is decoded into the Parquet Variant binary form (per its
+    /// [`VariantSource`]); finish assembles the item `StructArray` and wraps it
+    /// in a `ListArray`.
+    RepeatedVariant(VariantSource),
     /// Proto `map<K, V>` -> Arrow `Map<Struct(key, value)>`. On the wire, maps
     /// are encoded as `repeated MapEntry` where `MapEntry` is a generated
     /// message with field 1 = key and field 2 = value; we scan them the same
@@ -379,7 +392,16 @@ impl MessagePlan {
                     (Kind::String | Kind::Bytes, DataType::Struct(_), false)
                         if crate::encoding::format::variant::is_variant_field(arrow_field) =>
                     {
-                        PlanSlot::Variant
+                        PlanSlot::Variant(VariantSource::JsonText)
+                    }
+                    // VARIANT from a nested proto message: decode the sub-message
+                    // and serialize it to JSON before the Variant build. Must
+                    // precede the generic Message->Struct arm below, which would
+                    // otherwise treat it as a plain nested struct.
+                    (Kind::Message(inner_desc), DataType::Struct(_), false)
+                        if crate::encoding::format::variant::is_variant_field(arrow_field) =>
+                    {
+                        PlanSlot::Variant(VariantSource::Message(inner_desc.clone()))
                     }
                     // Singular proto enum -> STRING column: render the enum
                     // value *name* rather than its number. Enum + an integer
@@ -422,6 +444,15 @@ impl MessagePlan {
                         )?;
                         PlanSlot::Struct(Arc::new(sub))
                     }
+                    // ARRAY<VARIANT> from repeated nested messages: decode each
+                    // sub-message to JSON before the Variant build. Must precede
+                    // the generic repeated-message List<Struct> arm below, which
+                    // would otherwise treat it as a plain List<Struct>.
+                    (Kind::Message(inner_desc), DataType::List(item_field), true)
+                        if crate::encoding::format::variant::is_variant_field(item_field) =>
+                    {
+                        PlanSlot::RepeatedVariant(VariantSource::Message(inner_desc.clone()))
+                    }
                     // Repeated nested message -> Arrow List<Struct>.
                     (Kind::Message(inner_desc), DataType::List(element_field), true) => {
                         let inner_fields = match element_field.data_type() {
@@ -457,7 +488,7 @@ impl MessagePlan {
                     (Kind::String | Kind::Bytes, DataType::List(item_field), true)
                         if crate::encoding::format::variant::is_variant_field(item_field) =>
                     {
-                        PlanSlot::RepeatedVariant
+                        PlanSlot::RepeatedVariant(VariantSource::JsonText)
                     }
                     // Repeated scalar -> Arrow List<primitive>.
                     (_, DataType::List(item_field), true) => {
@@ -507,7 +538,7 @@ impl MessagePlan {
                     PlanSlot::Scalar(_)
                     | PlanSlot::Struct(_)
                     | PlanSlot::EnumString(_)
-                    | PlanSlot::Variant => {
+                    | PlanSlot::Variant(_) => {
                         return Err(WireToArrowError::NonNullableNotGuaranteed {
                             name: arrow_field.name().to_string(),
                             reason: "proto3 singular fields are omitted at default value, \
@@ -517,7 +548,7 @@ impl MessagePlan {
                     PlanSlot::RepeatedMessage(_)
                     | PlanSlot::RepeatedScalar(_)
                     | PlanSlot::RepeatedEnumString(_)
-                    | PlanSlot::RepeatedVariant
+                    | PlanSlot::RepeatedVariant(_)
                     | PlanSlot::Map(_)
                     | PlanSlot::Absent => {}
                 }

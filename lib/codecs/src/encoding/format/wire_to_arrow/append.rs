@@ -11,7 +11,7 @@ use zeroparser::wire::{WireValue, decode_zigzag32, decode_zigzag64, try_read_var
 
 use super::builders::TypedBuilder;
 use super::errors::{Result, WireToArrowError};
-use super::plan::{ScalarKind, WT_I32, WT_I64, WT_LEN, WT_VARINT};
+use super::plan::{ScalarKind, VariantSource, WT_I32, WT_I64, WT_LEN, WT_VARINT};
 
 /// Extract the inner bytes from a length-delimited `WireValue`, or error.
 #[inline(always)]
@@ -28,11 +28,7 @@ pub(super) fn expect_len<'a>(wv: &'a WireValue<'a>) -> Result<&'a [u8]> {
 /// Decode a length-delimited VARIANT wire value — a proto `string` carrying
 /// UTF-8 JSON text — into the Parquet Variant `(metadata, value)` binary pair.
 ///
-/// Called by [`scan_message`]. The `validate_message` pre-pass runs the cheaper
-/// [`validate_variant_from_wire`] (parse only) so it can drop an unparseable-JSON
-/// row via per-row isolation without paying for the full Variant build twice; a
-/// Variant *build* failure (e.g. exceeding Variant size limits) is rare and fails
-/// the batch here rather than isolating the row.
+/// Called by [`scan_message`].
 ///
 /// [`scan_message`]: super::scan::scan_message
 pub(super) fn encode_variant_from_wire(wv: &WireValue) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -43,16 +39,60 @@ pub(super) fn encode_variant_from_wire(wv: &WireValue) -> Result<(Vec<u8>, Vec<u
         .map_err(|source| WireToArrowError::VariantEncode { source })
 }
 
-/// Parse-check a VARIANT wire value for the `validate_message` pre-pass: confirm
-/// the length-delimited bytes are valid UTF-8 JSON, without building the Variant
-/// binary (that heavyweight step runs once, in [`encode_variant_from_wire`] on
-/// the real scan). Catches the realistic malformed-row case so it drops via
-/// per-row isolation.
-pub(super) fn validate_variant_from_wire(wv: &WireValue) -> Result<()> {
+/// prost-reflect serialize options for a VARIANT backed by a nested proto
+/// message: original proto field names (not lowerCamelCase), 64-bit integers
+/// kept numeric (not stringified), enum values as names, and default-valued
+/// fields skipped (proto3 does not distinguish "unset" from "default", so the
+/// VARIANT carries only present fields). Picked in the spirit of the
+/// arrow_stream encoder's structured values, not for byte-identical parity —
+/// that path serializes vrl values, not proto.
+const VARIANT_MESSAGE_OPTS: prost_reflect::SerializeOptions =
+    prost_reflect::SerializeOptions::new()
+        .use_proto_field_name(true)
+        .stringify_64_bit_integers(false)
+        .skip_default_fields(true);
+
+/// Decode a length-delimited VARIANT wire value that is a **nested proto
+/// message** into the Parquet Variant `(metadata, value)` binary pair: decode
+/// the sub-message with its descriptor, serialize it to a JSON value (see
+/// [`VARIANT_MESSAGE_OPTS`]), then build the Variant. Used for variant-marked
+/// columns whose proto field is a message rather than a JSON-text string.
+pub(super) fn encode_variant_from_message(
+    desc: &prost_reflect::MessageDescriptor,
+    wv: &WireValue,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let bytes = expect_len(wv)?;
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .map(|_| ())
-        .map_err(|source| WireToArrowError::VariantJson { source })
+    let msg = prost_reflect::DynamicMessage::decode(desc.clone(), bytes)
+        .map_err(|source| WireToArrowError::VariantMessageDecode { source })?;
+    let json = msg
+        .serialize_with_options(serde_json::value::Serializer, &VARIANT_MESSAGE_OPTS)
+        .map_err(|source| WireToArrowError::VariantJson { source })?;
+    crate::encoding::format::variant::value_to_variant(&json)
+        .map_err(|source| WireToArrowError::VariantEncode { source })
+}
+
+/// Encode a VARIANT wire value into the Parquet Variant `(metadata, value)`
+/// binary pair, dispatching on the column's [`VariantSource`]. Shared by the
+/// scan hot path and the `validate_message` pre-pass so the variant *build* is
+/// byte-identical in both (the offset-counter overflow check in scan is a
+/// separate, cumulative-across-batch concern, not mirrored here).
+pub(super) fn encode_variant(source: &VariantSource, wv: &WireValue) -> Result<(Vec<u8>, Vec<u8>)> {
+    match source {
+        VariantSource::JsonText => encode_variant_from_wire(wv),
+        VariantSource::Message(desc) => encode_variant_from_message(desc, wv),
+    }
+}
+
+/// Validate a VARIANT wire value for the `validate_message` pre-pass by running
+/// the *full* [`encode_variant`] build and discarding the result. The Parquet
+/// Variant build (which can fail on size/nesting/dictionary limits) must be
+/// exercised here — validating parse-only would let a build-failing row pass the
+/// pre-pass and then error in scan, failing the whole batch instead of dropping
+/// that one row. Building twice (here and in scan) is the price of per-row
+/// isolation: Arrow `*Builder` types expose no rollback, so the offending row
+/// must be rejected before any builder is mutated.
+pub(super) fn validate_variant_from_wire(source: &VariantSource, wv: &WireValue) -> Result<()> {
+    encode_variant(source, wv).map(|_| ())
 }
 
 /// Proto wire type numeric code for a `WireValue`. Used for error reporting.
