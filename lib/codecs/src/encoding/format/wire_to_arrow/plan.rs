@@ -590,22 +590,30 @@ impl MessagePlan {
         // descriptor reflects the current producer schema, it signals
         // "producer emits this field but UC hasn't caught up." Log + count
         // once at plan build so operators notice.
-        let arrow_field_names: std::collections::HashSet<&str> =
-            fields.iter().map(|f| f.name().as_str()).collect();
-        for proto_field in descriptor.fields() {
-            if !arrow_field_names.contains(proto_field.name()) {
-                tracing::warn!(
-                    message = "proto descriptor has a field not declared in the Arrow schema; \
-                               occurrences on the wire will be silently skipped",
-                    field = %proto_field.name(),
-                    descriptor = %descriptor.full_name(),
-                );
-                metrics::counter!(
-                    "wire_to_arrow_extra_proto_field",
-                    "field" => proto_field.name().to_string(),
-                    "descriptor" => descriptor.full_name().to_string(),
-                )
-                .increment(1);
+        //
+        // Skip inside a map entry: entry fields are bound by ordinal position
+        // (see above), not name, so a name-based check would false-positive on
+        // every `keys`/`values` vs proto `key`/`value` map whose fields are in
+        // fact correctly bound — flagging them as "silently skipped" when they
+        // aren't.
+        if !inside_map_entry {
+            let arrow_field_names: std::collections::HashSet<&str> =
+                fields.iter().map(|f| f.name().as_str()).collect();
+            for proto_field in descriptor.fields() {
+                if !arrow_field_names.contains(proto_field.name()) {
+                    tracing::warn!(
+                        message = "proto descriptor has a field not declared in the Arrow schema; \
+                                   occurrences on the wire will be silently skipped",
+                        field = %proto_field.name(),
+                        descriptor = %descriptor.full_name(),
+                    );
+                    metrics::counter!(
+                        "wire_to_arrow_extra_proto_field",
+                        "field" => proto_field.name().to_string(),
+                        "descriptor" => descriptor.full_name().to_string(),
+                    )
+                    .increment(1);
+                }
             }
         }
 
