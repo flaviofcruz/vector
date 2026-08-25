@@ -203,25 +203,26 @@ pub enum WireToArrowError {
         field_number: u32,
     },
 
-    /// Arrow Map's entry struct declares a field name that the proto
-    /// MapEntry descriptor doesn't carry.
+    /// Arrow Map's entry struct declares more fields than the proto MapEntry
+    /// carries, so one has no proto field to bind to at any position.
     ///
     /// Proto `map<K, V>` is generated as a `MapEntry` message with fields
-    /// named `key` (1) and `value` (2). Arrow's Map type doesn't enforce
-    /// these names on its inner Struct, so a user-supplied schema can
-    /// declare `Map<Struct(k, v)>` and have it pass type checking — but
-    /// there is no proto field for the encoder to read into the slot, the
-    /// `MapEntry`'s key non-null contract still applies, and the
-    /// absent-padding path can't honor both. Reject the mismatch at
-    /// plan-build so it surfaces clearly at sink init rather than as a
-    /// runtime panic when the proto3-default helper meets a kind/builder
+    /// `key` (1) and `value` (2). Arrow's Map type doesn't enforce those names
+    /// on its inner Struct, so the encoder binds entry fields by ordinal
+    /// position (slot 0 -> key, slot 1 -> value), tolerating name differences
+    /// like `keys`/`values`. But an entry struct with a third field maps to
+    /// proto field 3, which a `MapEntry` never declares: there is no proto
+    /// field to read into the slot, the `MapEntry`'s key non-null contract
+    /// still applies, and the absent-padding path can't honor both. Reject the
+    /// mismatch at plan-build so it surfaces clearly at sink init rather than
+    /// as a runtime panic when the proto3-default helper meets a kind/builder
     /// pair it can't pad.
     #[snafu(display(
-        "Arrow Map entry has field '{name}' which is not declared in the proto MapEntry; \
-         entry struct field names must match proto MapEntry's 'key' and 'value'"
+        "Arrow Map entry field '{name}' has no corresponding proto MapEntry field; \
+         a proto MapEntry declares only 'key' (1) and 'value' (2)"
     ))]
     MapEntryFieldNotInProto {
-        /// The Arrow Map entry field name that doesn't match proto MapEntry.
+        /// The Arrow Map entry field that has no positional proto MapEntry field.
         name: String,
     },
 

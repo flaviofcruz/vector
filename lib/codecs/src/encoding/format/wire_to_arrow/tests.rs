@@ -675,37 +675,88 @@ fn map_roundtrip() {
 }
 
 #[test]
-fn map_entry_field_name_mismatch_rejected_at_plan_build() {
-    // Arrow's Map type doesn't enforce that the inner Struct's fields are
-    // named `key` and `value`, but proto MapEntry does. Declaring a Map
-    // whose entry struct has a different name ("k" here) leaves no proto
-    // field for the encoder to route bytes from and would force the
-    // absent-padding path to hand `append_proto3_default` a kind/builder
-    // pair it can't satisfy. Plan-build must reject this up front so the
-    // failure surfaces at sink init rather than as a runtime panic.
+fn map_entry_positional_bind_on_name_mismatch() {
+    // Arrow's Map type doesn't constrain the inner Struct's field names, and
+    // Delta/Spark-derived schemas surface proto `map<K, V>` columns with entry
+    // fields named `keys`/`values` rather than proto MapEntry's `key`/`value`.
+    // The encoder binds by ordinal position inside a map entry (slot 0 ->
+    // key(1), slot 1 -> value(2)), so such a schema must build and round-trip
+    // rather than failing serializer build over a cosmetic name difference.
     let desc = rich_descriptor();
     let entry_fields = ArrowFields::from(vec![
-        Field::new("k", DataType::LargeUtf8, false),
-        Field::new("value", DataType::Int32, true),
+        Field::new("keys", DataType::LargeUtf8, false),
+        Field::new("values", DataType::Int32, true),
     ]);
-    let entry_field = Arc::new(Field::new(
-        "key_value",
-        DataType::Struct(entry_fields),
-        false,
-    ));
+    let entry_field = Arc::new(Field::new("entries", DataType::Struct(entry_fields), false));
+    let schema = Schema::new(vec![Field::new(
+        "data",
+        DataType::Map(entry_field, false),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema)
+        .expect("Map entry named keys/values must bind positionally to proto key/value");
+
+    // Populate a row with 2 map entries and confirm each proto key/value
+    // landed in the correspondingly-positioned Arrow column.
+    let mut msg = DynamicMessage::new(desc.clone());
+    let mut entries: std::collections::HashMap<prost_reflect::MapKey, ProtoValue> =
+        std::collections::HashMap::new();
+    entries.insert(
+        prost_reflect::MapKey::String("alpha".into()),
+        ProtoValue::EnumNumber(1),
+    );
+    entries.insert(
+        prost_reflect::MapKey::String("beta".into()),
+        ProtoValue::EnumNumber(2),
+    );
+    msg.set_field_by_name("data", ProtoValue::Map(entries));
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc.encode_batch(&[Bytes::from(buf)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let map = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::MapArray>()
+        .expect("column should be MapArray");
+    assert_eq!(map.value_length(0), 2, "expected 2 map entries");
+    let keys = map.keys().as_string::<i64>();
+    let values = map.values().as_primitive::<arrow::datatypes::Int32Type>();
+    // Map entry iteration order is not guaranteed — collect then compare.
+    let pairs: std::collections::HashMap<String, i32> = (0..2)
+        .map(|i| (keys.value(i).to_string(), values.value(i)))
+        .collect();
+    assert_eq!(pairs.get("alpha").copied(), Some(1));
+    assert_eq!(pairs.get("beta").copied(), Some(2));
+}
+
+#[test]
+fn map_entry_extra_field_rejected_at_plan_build() {
+    // Positional binding recovers `key`/`value` regardless of name, but a proto
+    // MapEntry only declares fields 1 and 2. An entry struct with a third field
+    // has no proto field to bind to at any position, so plan-build must still
+    // reject it up front rather than let the absent-padding path panic.
+    let desc = rich_descriptor();
+    let entry_fields = ArrowFields::from(vec![
+        Field::new("keys", DataType::LargeUtf8, false),
+        Field::new("values", DataType::Int32, true),
+        Field::new("extra", DataType::Int32, true),
+    ]);
+    let entry_field = Arc::new(Field::new("entries", DataType::Struct(entry_fields), false));
     let schema = Schema::new(vec![Field::new(
         "data",
         DataType::Map(entry_field, false),
         true,
     )]);
     let err = WireToArrowEncoder::new(&desc, schema)
-        .expect_err("plan-build must reject Map entry field 'k' (not in proto MapEntry)");
+        .expect_err("plan-build must reject a Map entry with more fields than proto MapEntry");
     assert!(
         matches!(
             err,
-            WireToArrowError::MapEntryFieldNotInProto { ref name } if name == "k"
+            WireToArrowError::MapEntryFieldNotInProto { ref name } if name == "extra"
         ),
-        "expected MapEntryFieldNotInProto, got {err:?}"
+        "expected MapEntryFieldNotInProto for the extra field, got {err:?}"
     );
 }
 
