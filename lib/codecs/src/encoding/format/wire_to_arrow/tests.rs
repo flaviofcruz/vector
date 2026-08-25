@@ -681,8 +681,7 @@ fn map_entry_positional_bind_on_name_mismatch() {
     // fields named `keys`/`values` rather than proto MapEntry's `key`/`value`.
     // The encoder binds by ordinal position inside a map entry (slot 0 ->
     // key(1), slot 1 -> value(2)), so such a schema must build and round-trip
-    // rather than failing serializer build. This is exactly the
-    // query_profile_log schema that broke the Lumberjack Prime zerobus sink.
+    // rather than failing serializer build over a cosmetic name difference.
     let desc = rich_descriptor();
     let entry_fields = ArrowFields::from(vec![
         Field::new("keys", DataType::LargeUtf8, false),
