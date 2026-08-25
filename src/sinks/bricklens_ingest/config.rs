@@ -41,6 +41,25 @@ pub struct BricklensIngestConfig {
     #[configurable(metadata(docs::examples = "BatchCreateLogRecords"))]
     pub method_name: String,
 
+    /// Self-reported caller metadata, stamped onto the outgoing request's `caller_info` field.
+    ///
+    /// Calling application, e.g. `bricklens-agent` (`caller_info.app`).
+    #[configurable(metadata(docs::examples = "bricklens-agent"))]
+    #[serde(default)]
+    pub caller_app: Option<String>,
+
+    /// Specific caller pod, e.g. `bricklens-agent-tfxpp` (`caller_info.pod_name`). Typically
+    /// sourced from the Kubernetes downward API via `${POD_NAME}`.
+    #[configurable(metadata(docs::examples = "bricklens-agent-tfxpp"))]
+    #[serde(default)]
+    pub caller_pod_name: Option<String>,
+
+    /// Fully-qualified Kubernetes cluster URI the caller runs in, encoding its own
+    /// env/cloud/region/cluster in one value (`caller_info.cluster_uri`).
+    #[configurable(metadata(docs::examples = "gcp:us-central1:prod:sydney-s1-0-thke1l"))]
+    #[serde(default)]
+    pub caller_cluster_uri: Option<String>,
+
     /// TLS configuration for the gRPC connection.
     #[configurable(derived)]
     #[serde(default)]

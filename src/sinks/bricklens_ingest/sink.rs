@@ -1,5 +1,5 @@
-use futures::{StreamExt, stream::BoxStream};
-use prost_reflect::{DescriptorPool, prost::Message};
+use futures::{stream::BoxStream, StreamExt};
+use prost_reflect::{prost::Message, DescriptorPool};
 use tower::ServiceBuilder;
 use vector_lib::stream::BatcherSettings;
 
@@ -7,7 +7,7 @@ use crate::{
     codecs::{Encoder, Transformer},
     config::SinkContext,
     event::Event,
-    sinks::util::{Compression, ServiceBuilderExt, StreamSink, builder::SinkBuilderExt},
+    sinks::util::{builder::SinkBuilderExt, Compression, ServiceBuilderExt, StreamSink},
 };
 
 use super::{
@@ -156,12 +156,29 @@ impl BricklensIngestSink {
 
         let request_limits = config.request.into_settings();
 
+        // Self-reported caller metadata (constant for the process lifetime), stamped onto the
+        // request's `caller_info` by the service. Keep only fields set to a non-empty value, so an
+        // env var that interpolates to "" (e.g. `${POD_NAME}` off-k8s) is omitted, not sent blank.
+        let caller_info: Vec<(&'static str, String)> = [
+            ("app", config.caller_app.clone()),
+            ("pod_name", config.caller_pod_name.clone()),
+            ("cluster_uri", config.caller_cluster_uri.clone()),
+        ]
+        .into_iter()
+        .filter_map(|(field, value)| value.filter(|v| !v.is_empty()).map(|v| (field, v)))
+        .collect();
+
         // No field extraction or enum lookups here - the VRL transform shapes the data
         // to match the proto structure. The service just blindly encodes whatever it receives.
         // The per-request timeout is forwarded to the server as a grpc-timeout header so it
         // matches the client-side Tower `Timeout` applied in run_inner().
-        let service =
-            BricklensIngestService::new(client, endpoint, method.clone(), request_limits.timeout);
+        let service = BricklensIngestService::new(
+            client,
+            endpoint,
+            method.clone(),
+            request_limits.timeout,
+            caller_info,
+        );
 
         let batch_settings = config
             .batch

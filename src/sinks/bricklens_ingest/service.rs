@@ -155,8 +155,7 @@ fn format_record_error(record: &prost_reflect::DynamicMessage) -> String {
         .map_or_else(
             || "?".to_string(),
             |number| {
-                enum_value_name(record, "error_code", number)
-                    .unwrap_or_else(|| number.to_string())
+                enum_value_name(record, "error_code", number).unwrap_or_else(|| number.to_string())
             },
         );
     let error_message = record
@@ -286,6 +285,9 @@ pub struct BricklensIngestService {
     /// Per-request deadline, sent to the server as a `grpc-timeout` header. Mirrors the client-side
     /// Tower `Timeout` layer so the server can abandon work the client has already given up on.
     request_timeout: Duration,
+    /// Self-reported caller metadata to stamp into the request's `caller_info` message, as
+    /// (proto field name, value) pairs — a subset of {app, pod_name, cluster_uri}
+    caller_info: Vec<(&'static str, String)>,
 }
 
 impl BricklensIngestService {
@@ -294,12 +296,14 @@ impl BricklensIngestService {
         endpoint: Uri,
         method: MethodDescriptor,
         request_timeout: Duration,
+        caller_info: Vec<(&'static str, String)>,
     ) -> Self {
         Self {
             client,
             endpoint,
             method,
             request_timeout,
+            caller_info,
         }
     }
 
@@ -311,6 +315,26 @@ impl BricklensIngestService {
         // LogEvent internally stores a vrl::value::Value - just clone it
         // No JSON intermediate representation needed
         Ok(log.value().clone())
+    }
+
+    /// Stamps each `(field, value)` pair onto the event value's `caller_info` object, creating it if
+    /// absent (replacing a non-object one) and preserving any other sub-fields. A non-object event
+    /// value is left for `build_grpc_request`'s encoder to reject.
+    fn stamp_caller_info(event_value: &mut vrl::value::Value, fields: &[(&'static str, String)]) {
+        use vrl::value::Value;
+        if let Value::Object(map) = event_value {
+            let caller_info = map
+                .entry("caller_info".into())
+                .or_insert_with(|| Value::Object(Default::default()));
+            if !matches!(caller_info, Value::Object(_)) {
+                *caller_info = Value::Object(Default::default());
+            }
+            if let Value::Object(caller_map) = caller_info {
+                for (field, value) in fields {
+                    caller_map.insert((*field).into(), Value::from(value.as_str()));
+                }
+            }
+        }
     }
 
     /// Validates the service configuration without making a network request.
@@ -395,7 +419,14 @@ impl BricklensIngestService {
                  Use max_events = 1 with a reduce transform for batching."
             );
         }
-        let event_value = event_values.into_iter().next().unwrap();
+        let mut event_value = event_values.into_iter().next().unwrap();
+
+        // Stamp the configured caller metadata into the request's `caller_info` message. Gated on
+        // the request type actually declaring that field, so it is a no-op for types without one
+        // (e.g. `BatchCreateLogRecordsRequest`).
+        if !self.caller_info.is_empty() && input_desc.get_field_by_name("caller_info").is_some() {
+            Self::stamp_caller_info(&mut event_value, &self.caller_info);
+        }
 
         // Encode using VRL's dynamic protobuf encoder
         let dynamic_msg =
@@ -959,6 +990,7 @@ mod tests {
             endpoint: endpoint.parse().unwrap(),
             method,
             request_timeout: Duration::from_secs(60),
+            caller_info: Vec::new(),
         }
     }
 
@@ -1202,6 +1234,83 @@ mod tests {
         .expect("test descriptor pool with WriteMetrics shape")
     }
 
+    /// Builds a descriptor pool whose `WriteMetricsRequest` carries a `caller_info` field of a
+    /// `CallerInfo` message (mirroring universe PR #2477581):
+    ///   message CallerInfo { string app=1; string pod_name=2; string cluster_uri=3; }
+    ///   message WriteMetricsRequest { CallerInfo caller_info = 6; }
+    fn make_test_pool_with_caller_info() -> prost_reflect::DescriptorPool {
+        let string_field = |name: &str, number: i32, json: &str| FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            label: Some(field_descriptor_proto::Label::Optional as i32),
+            r#type: Some(field_descriptor_proto::Type::String as i32),
+            json_name: Some(json.to_string()),
+            ..Default::default()
+        };
+        let file = FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("CallerInfo".to_string()),
+                    field: vec![
+                        string_field("app", 1, "app"),
+                        string_field("pod_name", 2, "podName"),
+                        string_field("cluster_uri", 3, "clusterUri"),
+                    ],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("WriteMetricsRequest".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("caller_info".to_string()),
+                        number: Some(6),
+                        label: Some(field_descriptor_proto::Label::Optional as i32),
+                        r#type: Some(field_descriptor_proto::Type::Message as i32),
+                        type_name: Some(".test.CallerInfo".to_string()),
+                        json_name: Some("callerInfo".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("WriteMetricsResponse".to_string()),
+                    ..Default::default()
+                },
+            ],
+            service: vec![ServiceDescriptorProto {
+                name: Some("TestService".to_string()),
+                method: vec![MethodDescriptorProto {
+                    name: Some("WriteMetrics".to_string()),
+                    input_type: Some(".test.WriteMetricsRequest".to_string()),
+                    output_type: Some(".test.WriteMetricsResponse".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        prost_reflect::DescriptorPool::from_file_descriptor_set(FileDescriptorSet {
+            file: vec![file],
+        })
+        .expect("test descriptor pool with caller_info shape")
+    }
+
+    /// Decodes the single protobuf message out of a built gRPC request body (strips the 5-byte
+    /// framing prefix) against `input_desc`.
+    fn decode_request_body(
+        req: Request<Body>,
+        input_desc: &prost_reflect::MessageDescriptor,
+    ) -> DynamicMessage {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        #[allow(deprecated)]
+        let body = rt.block_on(hyper::body::to_bytes(req.into_body())).unwrap();
+        let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+        let msg_bytes = &body[5..5 + msg_len];
+        DynamicMessage::decode(input_desc.clone(), msg_bytes).unwrap()
+    }
+
     fn make_request(events: Vec<Event>) -> BricklensIngestRequest {
         BricklensIngestRequest {
             events,
@@ -1290,6 +1399,113 @@ mod tests {
             }
             other => panic!("expected list for records field, got {:?}", other),
         }
+    }
+
+    /// Reads a decoded `caller_info` message out of a `WriteMetricsRequest`, or `None` if the field
+    /// is not a message.
+    fn caller_info_msg(decoded: &DynamicMessage) -> Option<DynamicMessage> {
+        match &*decoded.get_field_by_name("caller_info")? {
+            prost_reflect::Value::Message(m) => Some(m.clone()),
+            _ => None,
+        }
+    }
+
+    /// Reads a string sub-field of a decoded `caller_info` message.
+    fn caller_info_str(caller_info: &DynamicMessage, field: &str) -> String {
+        match &*caller_info.get_field_by_name(field).unwrap() {
+            prost_reflect::Value::String(s) => s.clone(),
+            other => panic!("expected {} string, got {:?}", field, other),
+        }
+    }
+
+    #[test]
+    fn test_build_grpc_request_stamps_all_caller_info_fields_when_configured() {
+        // WriteMetrics request message carries a caller_info field; every configured caller field
+        // is encoded even when the event carries no caller_info of its own.
+        let mut svc = make_test_service_with_pool(
+            "https://example.com:443",
+            make_test_pool_with_caller_info(),
+        );
+        svc.caller_info = vec![
+            ("app", "bricklens-agent".to_string()),
+            ("pod_name", "bricklens-agent-tfxpp".to_string()),
+            (
+                "cluster_uri",
+                "gcp:us-central1:prod:sydney-s1-0-thke1l".to_string(),
+            ),
+        ];
+
+        let log = LogEvent::default();
+        let (req, _) = svc
+            .build_grpc_request(make_request(vec![Event::Log(log)]))
+            .unwrap();
+
+        let input_desc = svc.method.input();
+        let decoded = decode_request_body(req, &input_desc);
+        let ci = caller_info_msg(&decoded).expect("caller_info message");
+        assert_eq!(caller_info_str(&ci, "app"), "bricklens-agent");
+        assert_eq!(caller_info_str(&ci, "pod_name"), "bricklens-agent-tfxpp");
+        assert_eq!(
+            caller_info_str(&ci, "cluster_uri"),
+            "gcp:us-central1:prod:sydney-s1-0-thke1l"
+        );
+    }
+
+    #[test]
+    fn test_build_grpc_request_caller_info_preserves_existing_sub_fields() {
+        // Stamping the configured fields must not clobber other caller_info sub-fields already
+        // shaped upstream (here pod_name), while overriding a field it does set (app).
+        let mut svc = make_test_service_with_pool(
+            "https://example.com:443",
+            make_test_pool_with_caller_info(),
+        );
+        svc.caller_info = vec![("app", "bricklens-agent".to_string())];
+
+        let mut log = LogEvent::default();
+        log.insert("caller_info.pod_name", "bricklens-agent-tfxpp");
+        let (req, _) = svc
+            .build_grpc_request(make_request(vec![Event::Log(log)]))
+            .unwrap();
+
+        let input_desc = svc.method.input();
+        let decoded = decode_request_body(req, &input_desc);
+        let ci = caller_info_msg(&decoded).expect("caller_info message");
+        assert_eq!(caller_info_str(&ci, "app"), "bricklens-agent");
+        assert_eq!(caller_info_str(&ci, "pod_name"), "bricklens-agent-tfxpp");
+    }
+
+    #[test]
+    fn test_build_grpc_request_no_caller_info_leaves_field_unset() {
+        // With no caller fields configured, no caller_info is synthesized.
+        let svc = make_test_service_with_pool(
+            "https://example.com:443",
+            make_test_pool_with_caller_info(),
+        );
+
+        let log = LogEvent::default();
+        let (req, _) = svc
+            .build_grpc_request(make_request(vec![Event::Log(log)]))
+            .unwrap();
+
+        let input_desc = svc.method.input();
+        let decoded = decode_request_body(req, &input_desc);
+        // Field is absent on the wire → default (empty) message, app defaults to "".
+        let ci = caller_info_msg(&decoded).expect("caller_info default message");
+        assert_eq!(caller_info_str(&ci, "app"), "");
+    }
+
+    #[test]
+    fn test_build_grpc_request_caller_info_ignored_when_request_lacks_caller_info() {
+        // BatchCreateLogRecordsRequest has no caller_info field; configured caller fields must be a
+        // harmless no-op (the dynamic encoder only serializes declared fields), not an error.
+        let mut svc = make_test_service("https://example.com:443");
+        svc.caller_info = vec![("app", "bricklens-agent".to_string())];
+
+        let mut log = LogEvent::default();
+        log.insert("records[0].message", "hello");
+        // Should encode without error even though caller_info is not part of this request type.
+        svc.build_grpc_request(make_request(vec![Event::Log(log)]))
+            .unwrap();
     }
 
     // ---------------------------------------------------------------------------
