@@ -530,6 +530,19 @@ impl DeliveryEventSingleton {
         .increment(rejected_events as u64);
     }
 
+    /// Matches `files_unwatched_total` (only `reached_eof` is meaningful) but kept
+    /// under `delivery_events_total` to centralize delivery observability. The
+    /// other standard delivery-event labels don't apply and are simply omitted.
+    pub fn emit_file_unwatched(&self, reached_eof: bool) {
+        let reached_eof = if reached_eof { "true" } else { "false" };
+        counter!(
+            "delivery_events_total",
+            "delivery_event_type" => "VECTOR_FILE_UNWATCHED",
+            "reached_eof" => reached_eof,
+        )
+        .increment(1);
+    }
+
     /// Merges one read into the `(source_type, path, time_parity)` accumulator.
     /// Split out from [`accumulate_read`] so the merge/bucketing behavior can be
     /// unit-tested directly, independent of the `VECTOR_BATCH_DELIVERY_EVENT_LOGS`
@@ -1339,6 +1352,43 @@ mod read_accumulation_tests {
         assert_eq!(labels.get("topic"), Some(&"security-log"));
         assert_eq!(labels.get("service_system"), Some(&"money-settings"));
         assert!(!labels.contains_key("time_parity"));
+        assert!(!labels.contains_key("process_generation_id"));
+    }
+
+    // Single counter matching `files_unwatched_total`: only `delivery_event_type`
+    // and `reached_eof`, no other delivery-event labels.
+    #[test]
+    fn file_unwatched_emits_delivery_event_with_reached_eof() {
+        let s = empty_singleton();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            s.emit_file_unwatched(true);
+        });
+
+        let metrics = snapshotter.snapshot().into_vec();
+        // Exact same shape as files_unwatched_total: a single series.
+        assert_eq!(metrics.len(), 1);
+
+        let (key, _, _, value) = &metrics[0];
+        assert_eq!(key.key().name(), "delivery_events_total");
+        assert_eq!(*value, DebugValue::Counter(1));
+
+        let labels = key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<HashMap<_, _>>();
+        // Only the two meaningful labels; the other delivery-event labels are omitted.
+        assert_eq!(labels.len(), 2);
+        assert_eq!(
+            labels.get("delivery_event_type"),
+            Some(&"VECTOR_FILE_UNWATCHED")
+        );
+        assert_eq!(labels.get("reached_eof"), Some(&"true"));
+        assert!(!labels.contains_key("topic"));
+        assert!(!labels.contains_key("source_pod_id"));
         assert!(!labels.contains_key("process_generation_id"));
     }
 

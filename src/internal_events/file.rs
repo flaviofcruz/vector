@@ -345,6 +345,10 @@ mod source {
                 )
             }
             .increment(1);
+
+            // Same as `files_unwatched_total`, but kept under `delivery_events_total`
+            // to centralize delivery observability.
+            vector_lib::internal_event::delivery_singleton().emit_file_unwatched(self.reached_eof);
         }
     }
 
