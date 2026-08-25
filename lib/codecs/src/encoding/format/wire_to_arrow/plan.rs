@@ -277,16 +277,37 @@ impl MessagePlan {
         // by the reverse-index build below.
         let mut slot_proto_numbers: Vec<Option<u32>> = Vec::with_capacity(fields.len());
 
-        for arrow_field in fields.iter() {
-            let Some(proto_field) = descriptor.get_field_by_name(arrow_field.name()) else {
-                // Inside a Map entry sub-plan, a name that doesn't match the
-                // proto MapEntry's `key`/`value` is structurally broken: there's
-                // no proto field to read from, the Map type's non-null key
-                // contract still applies, and the absent-padding path would
-                // hand a kind/builder pair to `append_proto3_default` that it
-                // can't satisfy — which is now a panic (`unreachable!`) rather
-                // than a Result. Reject up front so the failure shows up at
-                // sink init with a clear message.
+        for (entry_slot_idx, arrow_field) in fields.iter().enumerate() {
+            // Bind the Arrow field to its proto field by name. Inside a Map
+            // entry sub-plan, fall back to positional binding when the name
+            // doesn't match: Arrow's Map type fixes the entry struct's two
+            // children in spec order [key, value] but does not constrain their
+            // names, so a proto `map<K, V>` (synthetic `MapEntry` with `key`=1,
+            // `value`=2) can surface as `Map<Struct(keys, values)>` in a
+            // Delta/Spark-derived schema. Ordinal position i -> proto field
+            // number i+1 recovers the correct key/value slot instead of failing
+            // serializer build over a cosmetic name difference.
+            let matched_proto_field =
+                descriptor
+                    .get_field_by_name(arrow_field.name())
+                    .or_else(|| {
+                        if inside_map_entry {
+                            descriptor.get_field((entry_slot_idx as u32) + 1)
+                        } else {
+                            None
+                        }
+                    });
+            let Some(proto_field) = matched_proto_field else {
+                // Inside a Map entry sub-plan, reaching here means neither the
+                // name nor the positional fallback resolved — i.e. the Arrow
+                // entry struct declares more fields than the proto MapEntry's
+                // `key`/`value`. That's structurally broken: there's no proto
+                // field to read from, the Map type's non-null key contract
+                // still applies, and the absent-padding path would hand a
+                // kind/builder pair to `append_proto3_default` that it can't
+                // satisfy — which is now a panic (`unreachable!`) rather than a
+                // Result. Reject up front so the failure shows up at sink init
+                // with a clear message.
                 if inside_map_entry {
                     return Err(WireToArrowError::MapEntryFieldNotInProto {
                         name: arrow_field.name().to_string(),
