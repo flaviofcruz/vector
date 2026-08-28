@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytecheck::CheckBytes;
@@ -15,7 +15,7 @@ use fslock::LockFile;
 use futures::StreamExt;
 use rkyv::{Archive, Serialize, with::Atomic};
 use snafu::{ResultExt, Snafu};
-use tokio::{fs, io::AsyncWriteExt, sync::Notify};
+use tokio::{fs, io::AsyncWriteExt, sync::Notify, time::sleep};
 use vector_common::finalizer::OrderedFinalizer;
 
 use super::{
@@ -28,6 +28,12 @@ use super::{
 use crate::buffer_usage_data::BufferUsageHandle;
 
 pub const LEDGER_LEN: usize = align16(mem::size_of::<ArchivedLedgerState>());
+
+// Reload can briefly overlap the old and replacement buffer owners while fanout senders finish
+// their in-flight writes. Retrying here handles that handoff without weakening the exclusive lock:
+// a persistent lock still fails after this bounded wait.
+const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Error that occurred during calls to [`Ledger`].
 #[derive(Debug, Snafu)]
@@ -578,8 +584,32 @@ where
         // don't know if it's worth it.
         let ledger_lock_path = config.data_dir.join("buffer.lock");
         let mut lock = LockFile::open(&ledger_lock_path).context(IoSnafu)?;
-        if !lock.try_lock().context(IoSnafu)? {
-            return Err(LedgerLoadCreateError::LedgerLockAlreadyHeld);
+        let lock_wait_start = Instant::now();
+        let lock_deadline = lock_wait_start + LOCK_ACQUIRE_TIMEOUT;
+        let mut waiting_for_lock = false;
+        while !lock.try_lock().context(IoSnafu)? {
+            let remaining = lock_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(LedgerLoadCreateError::LedgerLockAlreadyHeld);
+            }
+
+            if !waiting_for_lock {
+                warn!(
+                    path = %ledger_lock_path.display(),
+                    timeout = ?LOCK_ACQUIRE_TIMEOUT,
+                    "Disk buffer lock is already held; waiting for it to be released."
+                );
+                waiting_for_lock = true;
+            }
+
+            sleep(LOCK_RETRY_INTERVAL.min(remaining)).await;
+        }
+        if waiting_for_lock {
+            info!(
+                path = %ledger_lock_path.display(),
+                elapsed = ?lock_wait_start.elapsed(),
+                "Acquired disk buffer lock after waiting for a previous owner."
+            );
         }
 
         // Open the ledger file, which may involve creating it if it doesn't yet exist.

@@ -1,12 +1,52 @@
 use std::time::Duration;
 
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::Instrument;
 
 use crate::{
+    buffer_usage_data::BufferUsageHandle,
     test::{SizedRecord, acknowledge, install_tracing_helpers, with_temp_dir},
-    variants::disk_v2::tests::{create_default_buffer_v2, set_file_length},
+    variants::disk_v2::{
+        DiskBufferConfigBuilder, Ledger,
+        tests::{create_default_buffer_v2, set_file_length},
+    },
 };
+
+#[tokio::test]
+async fn ledger_waits_for_transient_lock_owner() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let config = DiskBufferConfigBuilder::from_path(data_dir)
+                .build()
+                .expect("creating buffer config should not fail");
+            let first_ledger = Ledger::load_or_create(config.clone(), BufferUsageHandle::noop())
+                .await
+                .expect("first ledger should acquire the lock");
+
+            let second_ledger = tokio::spawn(async move {
+                Ledger::load_or_create(config, BufferUsageHandle::noop()).await
+            });
+
+            // Keep the first owner alive across at least one retry. The second load must not fail
+            // immediately merely because a previous topology owner is finishing its handoff.
+            sleep(Duration::from_millis(150)).await;
+            assert!(
+                !second_ledger.is_finished(),
+                "second ledger unexpectedly completed while the lock was still held"
+            );
+            drop(first_ledger);
+
+            timeout(Duration::from_secs(1), second_ledger)
+                .await
+                .expect("second ledger did not acquire the released lock")
+                .expect("second ledger task panicked")
+                .expect("second ledger should acquire the released lock");
+        }
+    })
+    .await;
+}
 
 #[tokio::test]
 async fn reader_doesnt_block_from_partial_write_on_last_record() {

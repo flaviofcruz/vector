@@ -367,8 +367,8 @@ async fn topology_disk_buffer_config_change_does_not_stall() {
         _ = crash_stream.next() => panic!("topology crashed before reload"),
     }
 
-    // Simulate an in-situ config edit: the config watcher would put the changed
-    // sink into components_to_reload, which excludes it from reuse_buffers.
+    // Simulate an in-situ config edit: the config watcher marks the changed sink for a
+    // component-only reload. The changed buffer definition prevents buffer reuse.
     topology.extend_reload_set(HashSet::from_iter(vec![sink_key]));
 
     let reload_result = tokio::time::timeout(
@@ -461,6 +461,69 @@ async fn topology_disk_buffer_config_change_delivers_events_after_reload() {
             .expect("Sink output closed before post-reload event");
         assert_eq!(event.len(), 1);
     }
+
+    topology.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topology_disk_buffer_component_reload_with_unchanged_config_delivers_events() {
+    // A watched credential file forces its sink to reload even though vector.json, including the
+    // disk-buffer configuration, is unchanged. The replacement must reuse the existing on-disk
+    // buffer so it can refresh credentials without reopening buffer.lock or losing its source
+    // connection.
+    test_util::trace_init();
+
+    let data_dir = temp_dir();
+    std::fs::create_dir(&data_dir).unwrap();
+
+    let (mut source_tx, source_config) = basic_source();
+    let (mut sink_rx, sink_config) = basic_sink(10);
+
+    let mut config = Config::builder();
+    config.global.data_dir = Some(data_dir);
+    config.add_source("in", source_config);
+    config.add_sink("out", &["in"], sink_config);
+
+    let sink_key = ComponentKey::from("out");
+    config.sinks[&sink_key].buffer = BufferConfig::Single(BufferType::DiskV2 {
+        max_size: NonZeroU64::new(268435488).unwrap(),
+        when_full: WhenFull::Block,
+    });
+
+    let (mut topology, _crash) = start_topology(config.clone().build().unwrap(), false).await;
+
+    source_tx
+        .send_event(Event::Log(LogEvent::from("before reload")))
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), sink_rx.next())
+        .await
+        .expect("Timed out waiting for pre-reload event")
+        .expect("Sink output closed before pre-reload event");
+    assert_eq!(event.len(), 1);
+
+    topology.extend_reload_set(HashSet::from_iter(vec![sink_key]));
+    let reload_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        topology.reload_config_and_respawn(config.build().unwrap(), Default::default()),
+    )
+    .await;
+
+    assert!(
+        reload_result.is_ok(),
+        "Reload stalled: a watched credential refresh must not stall on an unchanged disk buffer"
+    );
+    reload_result.unwrap().unwrap();
+
+    source_tx
+        .send_event(Event::Log(LogEvent::from("after reload")))
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), sink_rx.next())
+        .await
+        .expect("Timed out waiting for post-reload event")
+        .expect("Sink output closed after reload");
+    assert_eq!(event.len(), 1);
 
     topology.stop().await;
 }

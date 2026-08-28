@@ -18,6 +18,7 @@ use tokio::{
 use tracing::Instrument;
 use vector_common::flush_signal::FlushSignal;
 use vector_lib::{
+    buffers::BufferConfig,
     buffers::topology::channel::BufferSender,
     shutdown::ShutdownSignal,
     tap::topology::{TapOutput, TapResource, WatchRx, WatchTx},
@@ -1243,29 +1244,11 @@ impl RunningTopology {
             .filter(|&(existing_sink, _)| existing_sink)
             .map(|(_, key)| key.clone());
 
-        // For any sink whose buffer configuration didn't change, we can reuse their buffer.
-        let reuse_buffers = diff
-            .sinks
-            .to_change
-            .iter()
-            .filter(|&key| {
-                if diff.components_to_reload.contains(key) {
-                    return false;
-                }
-                self.config.sink(key).map(|s| s.buffer.clone()).or_else(|| {
-                    self.config
-                        .enrichment_table(key)
-                        .and_then(|t| t.as_sink(key))
-                        .map(|(_, s)| s.buffer)
-                }) == new_config.sink(key).map(|s| s.buffer.clone()).or_else(|| {
-                    self.config
-                        .enrichment_table(key)
-                        .and_then(|t| t.as_sink(key))
-                        .map(|(_, s)| s.buffer)
-                })
-            })
-            .cloned()
-            .collect::<HashSet<_>>();
+        // For any sink whose buffer configuration didn't change, we can reuse its buffer. This is
+        // also safe for a component-only reload: the sink itself is still rebuilt (and therefore
+        // re-reads files such as rotated credentials), while the queue and its disk ledger remain
+        // owned by the replacement sink instead of being reopened.
+        let reuse_buffers = reusable_buffers(&self.config, new_config, diff);
 
         // For any existing sink that has a conflicting resource dependency with a changed/added
         // sink, for any sink that we want to reuse their buffer, or for any changed sink with
@@ -2108,12 +2091,40 @@ fn get_changed_outputs(diff: &ConfigDiff, output_ids: Inputs<OutputId>) -> Vec<O
     changed_outputs
 }
 
+fn reusable_buffers(
+    old_config: &Config,
+    new_config: &Config,
+    diff: &ConfigDiff,
+) -> HashSet<ComponentKey> {
+    diff.sinks
+        .to_change
+        .iter()
+        .filter(|key| sink_buffer_config(old_config, key) == sink_buffer_config(new_config, key))
+        .cloned()
+        .collect()
+}
+
+fn sink_buffer_config(config: &Config, key: &ComponentKey) -> Option<BufferConfig> {
+    config.sink(key).map(|sink| sink.buffer.clone()).or_else(|| {
+        config
+            .enrichment_table(key)
+            .and_then(|table| table.as_sink(key))
+            .map(|(_, sink)| sink.buffer)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use vector_common::flush_signal::FlushSignal;
+    use std::{collections::HashSet, num::NonZeroU64};
 
-    use super::signal_sink_flush;
-    use crate::config::ComponentKey;
+    use vector_common::flush_signal::FlushSignal;
+    use vector_lib::buffers::{BufferConfig, BufferType, WhenFull};
+
+    use super::{reusable_buffers, signal_sink_flush};
+    use crate::{
+        config::{ComponentKey, Config, ConfigDiff},
+        test_util::mock::{basic_sink, basic_source},
+    };
 
     #[test]
     fn signal_sink_flush_sets_every_signal() {
@@ -2134,5 +2145,32 @@ mod tests {
     fn signal_sink_flush_handles_empty_slice() {
         // No sinks (e.g. none disk-buffered) must be a no-op, not a panic.
         signal_sink_flush(&[]);
+    }
+
+    #[test]
+    fn component_reload_reuses_an_unchanged_disk_buffer() {
+        let (_source_tx, source) = basic_source();
+        let (_sink_rx, sink) = basic_sink(1);
+        let sink_key = ComponentKey::from("out");
+
+        let mut config = Config::builder();
+        config.add_source("in", source);
+        config.add_sink("out", &["in"], sink);
+        config.sinks[&sink_key].buffer = BufferConfig::Single(BufferType::DiskV2 {
+            max_size: NonZeroU64::new(268435488).unwrap(),
+            when_full: WhenFull::Block,
+        });
+        let config = config.build().unwrap();
+
+        // A changed credential file adds the sink to components_to_reload even though the parsed
+        // Vector config is identical. That selection must not turn an unchanged disk buffer into
+        // a recreate: the replacement sink gets the existing queue and ledger instead.
+        let diff = ConfigDiff::new(
+            &config,
+            &config,
+            HashSet::from_iter([sink_key.clone()]),
+        );
+
+        assert_eq!(reusable_buffers(&config, &config, &diff), HashSet::from([sink_key]));
     }
 }
