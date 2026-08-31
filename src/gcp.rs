@@ -1,19 +1,23 @@
 #![allow(missing_docs)]
 use std::{
+    fs,
+    path::PathBuf,
     sync::{Arc, LazyLock, RwLock},
     time::Duration,
 };
 
 use base64::prelude::{BASE64_URL_SAFE, Engine as _};
+use chrono::{DateTime, Utc};
 pub use goauth::scopes::Scope;
 use goauth::{
     GoErr,
     auth::{JwtClaims, Token, TokenErr},
     credentials::Credentials,
 };
-use http::{Uri, uri::PathAndQuery};
+use http::{StatusCode, Uri, uri::PathAndQuery};
 use http_body::{Body as _, Collected};
-use hyper::header::AUTHORIZATION;
+use hyper::{Body, header::AUTHORIZATION};
+use serde::Deserialize;
 use smpl_jwt::Jwt;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::watch;
@@ -31,6 +35,11 @@ const SERVICE_ACCOUNT_TOKEN_URL: &str =
 const METADATA_TOKEN_EXPIRY_MARGIN_SECS: u64 = 200;
 
 const METADATA_TOKEN_ERROR_RETRY_SECS: u64 = 2;
+
+const EXTERNAL_ACCOUNT_TOKEN_EXCHANGE_GRANT_TYPE: &str =
+    "urn:ietf:params:oauth:grant-type:token-exchange";
+const EXTERNAL_ACCOUNT_REQUESTED_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+const EXTERNAL_ACCOUNT_IMPERSONATED_TOKEN_LIFETIME_SECS: u32 = 3600;
 
 pub const PUBSUB_URL: &str = "https://pubsub.googleapis.com";
 
@@ -63,6 +72,115 @@ pub enum GcpError {
     TokenJsonFromStr { source: serde_json::Error },
     #[snafu(display("Failed to build HTTP client: {}", source))]
     BuildHttpClient { source: HttpError },
+    #[snafu(display("Failed to read external account subject token from {path:?}: {source}"))]
+    ReadExternalAccountSubjectToken {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display("External account subject token file {path:?} was empty"))]
+    EmptyExternalAccountSubjectToken { path: PathBuf },
+    #[snafu(display("Invalid external account credentials: {source}"))]
+    InvalidExternalAccountCredentials { source: serde_json::Error },
+    #[snafu(display("Failed to build external account {operation} request: {source}"))]
+    BuildExternalAccountRequest {
+        operation: &'static str,
+        source: http::Error,
+    },
+    #[snafu(display("Failed to send external account {operation} request: {source}"))]
+    SendExternalAccountRequest {
+        operation: &'static str,
+        source: HttpError,
+    },
+    #[snafu(display("Failed to read external account {operation} response: {source}"))]
+    ReadExternalAccountResponse {
+        operation: &'static str,
+        source: hyper::Error,
+    },
+    #[snafu(display("External account {operation} request failed with HTTP status {status}"))]
+    ExternalAccountResponseStatus {
+        operation: &'static str,
+        status: StatusCode,
+    },
+    #[snafu(display("Invalid external account {operation} response: {source}"))]
+    InvalidExternalAccountResponse {
+        operation: &'static str,
+        source: serde_json::Error,
+    },
+}
+
+/// Credentials in Google's external account format.
+///
+/// This is the format emitted by `gcloud iam workload-identity-pools create-cred-config` and
+/// consumed by Application Default Credentials for workload identity federation. The `file`
+/// credential source covers the Kubernetes projected-token flow while deliberately excluding
+/// executable and URL credential sources, which have materially different security properties.
+#[derive(Clone, Debug, Deserialize)]
+struct ExternalAccountCredentials {
+    audience: String,
+    subject_token_type: String,
+    token_url: String,
+    #[serde(default)]
+    service_account_impersonation_url: Option<String>,
+    #[serde(default)]
+    service_account_impersonation: Option<ExternalAccountServiceAccountImpersonation>,
+    credential_source: ExternalAccountCredentialSource,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ExternalAccountServiceAccountImpersonation {
+    token_lifetime_seconds: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct CredentialFileType {
+    #[serde(rename = "type")]
+    credential_type: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ExternalAccountCredentialSource {
+    file: PathBuf,
+}
+
+#[derive(Clone, Deserialize)]
+struct ExternalAccountToken {
+    access_token: String,
+    token_type: String,
+    expires_in: u32,
+}
+
+impl std::fmt::Debug for ExternalAccountToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalAccountToken")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Deserialize)]
+struct ImpersonatedServiceAccountToken {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+    #[serde(rename = "expireTime")]
+    expires_at: DateTime<Utc>,
+}
+
+pub struct ExternalAccountAuthenticator {
+    credentials: ExternalAccountCredentials,
+    scope: Scope,
+    token: RwLock<ExternalAccountToken>,
+}
+
+impl std::fmt::Debug for ExternalAccountAuthenticator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalAccountAuthenticator")
+            .field("credentials", &self.credentials)
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Configuration of the authentication strategy for interacting with GCP services.
@@ -77,26 +195,30 @@ pub enum GcpError {
 pub struct GcpAuthConfig {
     /// An [API key][gcp_api_key].
     ///
-    /// Either an API key or a path to a service account credentials JSON file can be specified.
+    /// Either an API key or a path to a service-account or external-account credentials JSON file
+    /// can be specified.
     ///
     /// If both are unset, the `GOOGLE_APPLICATION_CREDENTIALS` environment variable is checked for a filename. If no
     /// filename is named, an attempt is made to fetch an instance service account for the compute instance the program is
-    /// running on. If this is not on a GCE instance, then you must define it with an API key or service account
+    /// running on. If this is not on a GCE instance, then you must define it with an API key or
     /// credentials JSON file.
     ///
     /// [gcp_api_key]: https://cloud.google.com/docs/authentication/api-keys
     pub api_key: Option<SensitiveString>,
 
-    /// Path to a [service account][gcp_service_account_credentials] credentials JSON file.
+    /// Path to a [service account][gcp_service_account_credentials] or
+    /// [external account][gcp_external_account_credentials] credentials JSON file.
     ///
-    /// Either an API key or a path to a service account credentials JSON file can be specified.
+    /// Either an API key or a path to a service-account or external-account credentials JSON file
+    /// can be specified.
     ///
     /// If both are unset, the `GOOGLE_APPLICATION_CREDENTIALS` environment variable is checked for a filename. If no
     /// filename is named, an attempt is made to fetch an instance service account for the compute instance the program is
-    /// running on. If this is not on a GCE instance, then you must define it with an API key or service account
+    /// running on. If this is not on a GCE instance, then you must define it with an API key or
     /// credentials JSON file.
     ///
     /// [gcp_service_account_credentials]: https://cloud.google.com/docs/authentication/production#manually
+    /// [gcp_external_account_credentials]: https://cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines#file-sourced-credentials
     pub credentials_path: Option<String>,
 
     /// A short-lived OAuth2 bearer token to use for authentication.
@@ -135,6 +257,7 @@ impl GcpAuthConfig {
 #[derive(Clone, Debug)]
 pub enum GcpAuthenticator {
     Credentials(Arc<InnerCreds>),
+    ExternalAccount(Arc<ExternalAccountAuthenticator>),
     ApiKey(Box<str>),
     /// A static bearer token supplied directly in config (e.g. via a secret backend).
     /// Token refresh is handled externally via Vector's `--watch-config` + `files_to_watch`.
@@ -150,10 +273,36 @@ pub struct InnerCreds {
 
 impl GcpAuthenticator {
     async fn from_file(path: &str, scope: Scope) -> crate::Result<Self> {
+        if let Ok(credential_contents) = fs::read(path) {
+            if matches!(
+                serde_json::from_slice::<CredentialFileType>(&credential_contents),
+                Ok(CredentialFileType { credential_type }) if credential_type == "external_account"
+            ) {
+                let credentials =
+                    serde_json::from_slice::<ExternalAccountCredentials>(&credential_contents)
+                        .context(InvalidExternalAccountCredentialsSnafu)?;
+                return Self::from_external_account(credentials, scope).await;
+            }
+        }
+
         let creds = Credentials::from_file(path).context(InvalidCredentialsSnafu)?;
         let token = RwLock::new(fetch_token(&creds, &scope).await?);
         let creds = Some((creds, scope));
         Ok(Self::Credentials(Arc::new(InnerCreds { creds, token })))
+    }
+
+    async fn from_external_account(
+        credentials: ExternalAccountCredentials,
+        scope: Scope,
+    ) -> crate::Result<Self> {
+        let token = RwLock::new(fetch_external_account_token(&credentials, &scope).await?);
+        Ok(Self::ExternalAccount(Arc::new(
+            ExternalAccountAuthenticator {
+                credentials,
+                scope,
+                token,
+            },
+        )))
     }
 
     async fn new_implicit() -> crate::Result<Self> {
@@ -172,6 +321,7 @@ impl GcpAuthenticator {
     pub fn make_token(&self) -> Option<String> {
         match self {
             Self::Credentials(inner) => Some(inner.make_token()),
+            Self::ExternalAccount(inner) => Some(inner.make_token()),
             Self::StaticToken(token) => Some(format!("Bearer {token}")),
             Self::ApiKey(_) | Self::None => None,
         }
@@ -188,7 +338,9 @@ impl GcpAuthenticator {
 
     pub fn apply_uri(&self, uri: &mut Uri) {
         match self {
-            Self::Credentials(_) | Self::StaticToken(_) | Self::None => (),
+            Self::Credentials(_) | Self::ExternalAccount(_) | Self::StaticToken(_) | Self::None => {
+                ()
+            }
             Self::ApiKey(api_key) => {
                 let mut parts = uri.clone().into_parts();
                 let path = parts
@@ -248,6 +400,31 @@ impl GcpAuthenticator {
                     }
                 }
             }
+            Self::ExternalAccount(inner) => {
+                let mut expires_in = inner.token.read().unwrap().expires_in as u64;
+                loop {
+                    let deadline = Duration::from_secs(
+                        expires_in
+                            .saturating_sub(METADATA_TOKEN_EXPIRY_MARGIN_SECS)
+                            .max(METADATA_TOKEN_ERROR_RETRY_SECS),
+                    );
+                    debug!(
+                        deadline = deadline.as_secs(),
+                        "Sleeping before refreshing GCP external account authentication token.",
+                    );
+                    tokio::time::sleep(deadline).await;
+                    match inner.regenerate_token().await {
+                        Ok(()) => {
+                            sender.send_replace(());
+                            expires_in = inner.token.read().unwrap().expires_in as u64;
+                        }
+                        Err(error) => {
+                            error!(message = "Failed to refresh GCP external account authentication token.", %error);
+                            expires_in = METADATA_TOKEN_ERROR_RETRY_SECS;
+                        }
+                    }
+                }
+            }
             // Static token and API key don't need internal refresh — token rotation is
             // handled externally via Vector's --watch-config + files_to_watch mechanism.
             Self::StaticToken(_) | Self::ApiKey(_) | Self::None => {
@@ -274,6 +451,175 @@ impl InnerCreds {
         let token = self.token.read().unwrap();
         format!("{} {}", token.token_type(), token.access_token())
     }
+}
+
+impl ExternalAccountAuthenticator {
+    async fn regenerate_token(&self) -> crate::Result<()> {
+        let token = fetch_external_account_token(&self.credentials, &self.scope).await?;
+        *self.token.write().unwrap() = token;
+        Ok(())
+    }
+
+    fn make_token(&self) -> String {
+        let token = self.token.read().unwrap();
+        format!("{} {}", token.token_type, token.access_token)
+    }
+}
+
+async fn fetch_external_account_token(
+    credentials: &ExternalAccountCredentials,
+    scope: &Scope,
+) -> Result<ExternalAccountToken, GcpError> {
+    let subject_token_path = &credentials.credential_source.file;
+    let subject_token = fs::read_to_string(subject_token_path).map_err(|source| {
+        GcpError::ReadExternalAccountSubjectToken {
+            path: subject_token_path.clone(),
+            source,
+        }
+    })?;
+    let subject_token = subject_token.trim();
+    if subject_token.is_empty() {
+        return Err(GcpError::EmptyExternalAccountSubjectToken {
+            path: subject_token_path.clone(),
+        });
+    }
+
+    // The federated token must be authorized to invoke IAM Credentials when it is used to
+    // impersonate a service account. Google requires the cloud-platform scope for that call;
+    // the requested, narrower scope belongs on the impersonated token instead.
+    let token_exchange_scope = if credentials.service_account_impersonation_url.is_some() {
+        Scope::CloudPlatform.url()
+    } else {
+        scope.url()
+    };
+
+    let request_body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("audience", &credentials.audience)
+        .append_pair("grant_type", EXTERNAL_ACCOUNT_TOKEN_EXCHANGE_GRANT_TYPE)
+        .append_pair(
+            "requested_token_type",
+            EXTERNAL_ACCOUNT_REQUESTED_TOKEN_TYPE,
+        )
+        .append_pair("scope", &token_exchange_scope)
+        .append_pair("subject_token", subject_token)
+        .append_pair("subject_token_type", &credentials.subject_token_type)
+        .finish();
+    let request = http::Request::post(&credentials.token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(Body::from(request_body))
+        .map_err(|source| GcpError::BuildExternalAccountRequest {
+            operation: "token exchange",
+            source,
+        })?;
+    let response = external_account_http_client()?
+        .send(request)
+        .await
+        .map_err(|source| GcpError::SendExternalAccountRequest {
+            operation: "token exchange",
+            source,
+        })?;
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map(Collected::to_bytes)
+        .map_err(|source| GcpError::ReadExternalAccountResponse {
+            operation: "token exchange",
+            source,
+        })?;
+    if !status.is_success() {
+        return Err(GcpError::ExternalAccountResponseStatus {
+            operation: "token exchange",
+            status,
+        });
+    }
+    let token = serde_json::from_slice::<ExternalAccountToken>(&body).map_err(|source| {
+        GcpError::InvalidExternalAccountResponse {
+            operation: "token exchange",
+            source,
+        }
+    })?;
+
+    match &credentials.service_account_impersonation_url {
+        Some(url) => {
+            let lifetime_secs = credentials
+                .service_account_impersonation
+                .as_ref()
+                .and_then(|config| config.token_lifetime_seconds)
+                .unwrap_or(EXTERNAL_ACCOUNT_IMPERSONATED_TOKEN_LIFETIME_SECS);
+            impersonate_service_account(url, token, scope, lifetime_secs).await
+        }
+        None => Ok(token),
+    }
+}
+
+fn external_account_http_client() -> Result<HttpClient, GcpError> {
+    HttpClient::new(None, &ProxyConfig::from_env())
+        .map_err(|source| GcpError::BuildHttpClient { source })
+}
+
+async fn impersonate_service_account(
+    url: &str,
+    token: ExternalAccountToken,
+    scope: &Scope,
+    lifetime_secs: u32,
+) -> Result<ExternalAccountToken, GcpError> {
+    let request_body = serde_json::json!({
+        "lifetime": format!("{lifetime_secs}s"),
+        "scope": [scope.url()],
+    });
+    let request = http::Request::post(url)
+        .header(
+            "Authorization",
+            format!("{} {}", token.token_type, token.access_token),
+        )
+        .header("Content-Type", "application/json")
+        .body(Body::from(request_body.to_string()))
+        .map_err(|source| GcpError::BuildExternalAccountRequest {
+            operation: "service account impersonation",
+            source,
+        })?;
+    let response = external_account_http_client()?
+        .send(request)
+        .await
+        .map_err(|source| GcpError::SendExternalAccountRequest {
+            operation: "service account impersonation",
+            source,
+        })?;
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map(Collected::to_bytes)
+        .map_err(|source| GcpError::ReadExternalAccountResponse {
+            operation: "service account impersonation",
+            source,
+        })?;
+    if !status.is_success() {
+        return Err(GcpError::ExternalAccountResponseStatus {
+            operation: "service account impersonation",
+            status,
+        });
+    }
+    let token =
+        serde_json::from_slice::<ImpersonatedServiceAccountToken>(&body).map_err(|source| {
+            GcpError::InvalidExternalAccountResponse {
+                operation: "service account impersonation",
+                source,
+            }
+        })?;
+    Ok(ExternalAccountToken {
+        access_token: token.access_token,
+        token_type: "Bearer".to_string(),
+        expires_in: remaining_token_lifetime_secs(token.expires_at, Utc::now()),
+    })
+}
+
+fn remaining_token_lifetime_secs(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> u32 {
+    let remaining_secs = expires_at.signed_duration_since(now).num_seconds().max(0);
+    u32::try_from(remaining_secs).unwrap_or(u32::MAX)
 }
 
 async fn fetch_token(creds: &Credentials, scope: &Scope) -> crate::Result<Token> {
@@ -332,8 +678,15 @@ async fn get_token_implicit() -> Result<Token, GcpError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::assert_downcast_matches;
+    use tempfile::tempdir;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_string_contains, header, method, path},
+    };
 
     #[tokio::test]
     async fn fails_missing_creds() {
@@ -423,6 +776,157 @@ mod tests {
         .await
         .expect("build_auth failed");
         assert!(matches!(auth, GcpAuthenticator::StaticToken(..)));
+    }
+
+    #[tokio::test]
+    async fn external_account_credentials_exchange_and_impersonate() {
+        let server = MockServer::start().await;
+        let granted_token_lifetime_secs = 300;
+        let expires_at =
+            (Utc::now() + chrono::Duration::seconds(granted_token_lifetime_secs)).to_rfc3339();
+        Mock::given(method("POST"))
+            .and(path("/v1/token"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string_contains(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
+            ))
+            .and(body_string_contains(
+                "scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform",
+            ))
+            .and(body_string_contains("subject_token=projected-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "federated-token",
+                "token_type": "Bearer",
+                "expires_in": 600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/projects/-/serviceAccounts/log-collection-sa@example.iam.gserviceaccount.com:generateAccessToken"))
+            .and(header("authorization", "Bearer federated-token"))
+            .and(header("content-type", "application/json"))
+            .and(body_string_contains("https://www.googleapis.com/auth/devstorage.read_write"))
+            .and(body_string_contains(r#""lifetime":"600s""#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "impersonated-token",
+                "expireTime": expires_at,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let directory = tempdir().expect("temporary directory");
+        let subject_token_path = directory.path().join("subject-token");
+        fs::write(&subject_token_path, "projected-token\n").expect("write subject token");
+        let credentials_path = directory.path().join("external-account.json");
+        fs::write(
+            &credentials_path,
+            serde_json::json!({
+                "type": "external_account",
+                "audience": "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/provider",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": format!("{}/v1/token", server.uri()),
+                "service_account_impersonation_url": format!(
+                    "{}/v1/projects/-/serviceAccounts/log-collection-sa@example.iam.gserviceaccount.com:generateAccessToken",
+                    server.uri(),
+                ),
+                "service_account_impersonation": { "token_lifetime_seconds": 600 },
+                "credential_source": { "file": subject_token_path },
+            })
+            .to_string(),
+        )
+        .expect("write external account credentials");
+
+        let auth = GcpAuthenticator::from_file(
+            credentials_path.to_str().expect("UTF-8 path"),
+            Scope::DevStorageReadWrite,
+        )
+        .await
+        .expect("external account authentication should build");
+
+        assert!(matches!(auth, GcpAuthenticator::ExternalAccount(..)));
+        assert_eq!(
+            auth.make_token(),
+            Some("Bearer impersonated-token".to_string())
+        );
+        let GcpAuthenticator::ExternalAccount(inner) = &auth else {
+            panic!("expected external-account authenticator");
+        };
+        assert!(
+            inner.token.read().unwrap().expires_in <= granted_token_lifetime_secs as u32,
+            "the refresh deadline must use Google's returned expireTime, not the requested lifetime"
+        );
+        assert!(
+            inner.token.read().unwrap().expires_in > granted_token_lifetime_secs as u32 - 20,
+            "the granted lifetime should remain close to the returned expiration"
+        );
+        server.verify().await;
+    }
+
+    #[test]
+    fn remaining_token_lifetime_clamps_expired_tokens_to_zero() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T12:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
+        let expires_at = now - chrono::Duration::seconds(1);
+
+        assert_eq!(remaining_token_lifetime_secs(expires_at, now), 0);
+    }
+
+    #[test]
+    fn remaining_token_lifetime_uses_returned_expiration() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T12:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
+        let expires_at = now + chrono::Duration::seconds(300);
+
+        assert_eq!(remaining_token_lifetime_secs(expires_at, now), 300);
+    }
+
+    #[tokio::test]
+    async fn external_account_credentials_without_impersonation_use_sts_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/token"))
+            .and(body_string_contains(
+                "scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdevstorage.read_write",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "sts-token",
+                "token_type": "Bearer",
+                "expires_in": 600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let directory = tempdir().expect("temporary directory");
+        let subject_token_path = directory.path().join("subject-token");
+        fs::write(&subject_token_path, "projected-token").expect("write subject token");
+        let credentials_path = directory.path().join("external-account.json");
+        fs::write(
+            &credentials_path,
+            serde_json::json!({
+                "type": "external_account",
+                "audience": "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/provider",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": format!("{}/v1/token", server.uri()),
+                "credential_source": { "file": subject_token_path },
+            })
+            .to_string(),
+        )
+        .expect("write external account credentials");
+
+        let auth = GcpAuthenticator::from_file(
+            credentials_path.to_str().expect("UTF-8 path"),
+            Scope::DevStorageReadWrite,
+        )
+        .await
+        .expect("external account authentication should build");
+
+        assert_eq!(auth.make_token(), Some("Bearer sts-token".to_string()));
+        server.verify().await;
     }
 
     fn apply_uri(auth: &GcpAuthenticator, uri: &str) -> String {

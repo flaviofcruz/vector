@@ -221,6 +221,7 @@ impl GcpGcsConfig {
         // Build a shared GCP authenticator covering both GCS and Pub/Sub.
         // CloudPlatform scope grants access to both services.
         let auth = self.auth.build(Scope::CloudPlatform).await?;
+        auth.spawn_regenerate_token();
 
         let tls =
             TlsSettings::from_options(self.tls.as_ref()).map_err(|e| format!("TLS error: {e}"))?;
