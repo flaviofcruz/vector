@@ -300,7 +300,10 @@ async fn init_on_truncated_record_in_non_finalized_file_no_writes() {
                 .open(&first_data_file_path)
                 .await
                 .expect("open should not fail");
-            let metadata = data_file.metadata().await.expect("metadata should not fail");
+            let metadata = data_file
+                .metadata()
+                .await
+                .expect("metadata should not fail");
             assert_eq!(expected_first_data_file_len as u64, metadata.len());
             data_file
                 .set_len((first_bytes_written + (second_bytes_written / 2)) as u64)
@@ -390,7 +393,10 @@ async fn live_reader_wedges_on_truncated_record_in_non_finalized_file() {
                 .open(&first_data_file_path)
                 .await
                 .expect("open should not fail");
-            let metadata = data_file.metadata().await.expect("metadata should not fail");
+            let metadata = data_file
+                .metadata()
+                .await
+                .expect("metadata should not fail");
             assert_eq!(expected_first_data_file_len as u64, metadata.len());
             data_file
                 .set_len((first_bytes_written + (second_bytes_written / 2)) as u64)
@@ -591,7 +597,10 @@ async fn init_deadlock_forced_reader_ahead_of_writer() {
             // Write one record so file 0 exists and the ledger is initialized on disk.
             let (mut writer, _, ledger) =
                 create_default_buffer_v2::<_, SizedRecord>(data_dir.clone()).await;
-            writer.write_record(SizedRecord::new(64)).await.expect("write");
+            writer
+                .write_record(SizedRecord::new(64))
+                .await
+                .expect("write");
             writer.flush().await.expect("flush");
             writer.close();
 
@@ -1465,4 +1474,167 @@ async fn writer_and_reader_handle_when_last_record_has_scrambled_archive_data() 
 
     let parent = trace_span!("writer_detects_when_last_record_has_scrambled_archive_data");
     fut.instrument(parent.or_current()).await;
+}
+
+// issue1 regression: when the writer rolls and its next-slot file already exists but is a STALE
+// ORPHAN (all records already acknowledged -- e.g. left behind by a prior file-id wrap cycle), the
+// writer must reclaim it (truncate & reuse) instead of `wait_for_reader`-ing forever. Before the
+// fix this deadlocked the writer (the observed prod hang). We seed a fully-acked file at the next
+// slot and assert the next write completes rather than hanging.
+#[tokio::test]
+async fn writer_reclaims_stale_orphan_at_next_slot_instead_of_deadlocking() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+        async move {
+            // File size chosen so one ~200B record fills a file and each write rolls to a new one.
+            let (mut writer, _reader, ledger) =
+                create_buffer_v2_with_max_data_file_size::<_, SizedRecord>(data_dir.clone(), 256)
+                    .await;
+
+            writer
+                .write_record(SizedRecord::new(200))
+                .await
+                .expect("w0");
+            writer
+                .write_record(SizedRecord::new(200))
+                .await
+                .expect("w1");
+            writer.flush().await.expect("flush");
+
+            // Seed the writer's NEXT slot with a copy of a real (now stale) data file.
+            let current = ledger.get_current_writer_data_file_path();
+            let next = ledger.get_next_writer_data_file_path();
+            std::fs::copy(&current, &next).expect("seed orphan at next slot");
+
+            // Mark everything acknowledged so the orphan's records are all <= the acked frontier
+            // (provably stale, not unread backlog).
+            unsafe {
+                ledger.state().unsafe_set_reader_last_record_id(1_000_000);
+            }
+
+            // This write forces a roll into the seeded next slot. Without the reclaim fix it hangs
+            // in `wait_for_reader` forever; with it, the writer reclaims and the write completes.
+            let res = await_timeout!(writer.write_record(SizedRecord::new(200)), 5);
+            assert!(
+                res.is_ok(),
+                "writer must reclaim the stale next-slot orphan and complete, not deadlock: {res:?}"
+            );
+        }
+    })
+    .await;
+}
+
+// issue1 regression (unreadable variant): the next-slot orphan can be corrupt/unreadable (bit rot,
+// or a torn file that survived a full wrap cycle), so its highest record ID can't be read to prove
+// it fully-acked. The writer cannot see a valid record above the frontier, and under the buffer size
+// cap a non-empty writer-next-slot file cannot be legitimate unread backlog (that needs ~65536 unread
+// files between reader and writer, far past max_buffer_size), so it must still reclaim (default) rather
+// than deadlock. We seed a garbage (unreadable) file at the next slot and assert the write completes.
+#[tokio::test]
+async fn writer_reclaims_unreadable_orphan_at_next_slot_instead_of_deadlocking() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+        async move {
+            let (mut writer, _reader, ledger) =
+                create_buffer_v2_with_max_data_file_size::<_, SizedRecord>(data_dir.clone(), 256)
+                    .await;
+
+            writer
+                .write_record(SizedRecord::new(200))
+                .await
+                .expect("w0");
+            writer
+                .write_record(SizedRecord::new(200))
+                .await
+                .expect("w1");
+            writer.flush().await.expect("flush");
+
+            // Seed the writer's NEXT slot with a file whose contents cannot be parsed as a record.
+            let next = ledger.get_next_writer_data_file_path();
+            std::fs::write(&next, vec![0xabu8; 200]).expect("seed unreadable orphan at next slot");
+
+            // This write forces a roll into the seeded next slot. The orphan is unreadable, so the
+            // writer cannot see a valid record above the frontier; it must reclaim (not wait).
+            let res = await_timeout!(writer.write_record(SizedRecord::new(200)), 5);
+            assert!(
+                res.is_ok(),
+                "writer must reclaim the unreadable next-slot orphan and complete, not deadlock: \
+                 {res:?}"
+            );
+        }
+    })
+    .await;
+}
+
+// issue2 root regression (change #3): if the ledger's `writer_next_record_id` reverts on an unclean
+// shutdown AND the current data file's last record is torn, the writer must forward-scan to the
+// last VALID record and reconcile `writer_next` past it -- otherwise it re-issues an already-written
+// record ID onto a new batch (an ID collision on distinct data). Here we write records, torn the
+// last record, revert `writer_next` to 0, reopen, and assert `writer_next` was reconciled forward
+// (not left at the reverted 0, which would reuse id 0).
+#[tokio::test]
+async fn writer_reconciles_next_id_from_torn_current_file_after_ledger_revert() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+        async move {
+            // Large file so all three records share one data file.
+            let (mut writer, reader, ledger) =
+                create_buffer_v2_with_max_data_file_size::<_, SizedRecord>(data_dir.clone(), 4096)
+                    .await;
+            let data_file_path = ledger.get_current_writer_data_file_path();
+            // Record IDs are 1-based (writer_next starts at 1), so these get ids 1, 2, 3.
+            writer.write_record(SizedRecord::new(64)).await.expect("w1");
+            writer.write_record(SizedRecord::new(64)).await.expect("w2");
+            writer.flush().await.expect("flush12");
+            // Physical length after the first two records; record 3 is written past this point.
+            let len_after_two = tokio::fs::metadata(&data_file_path)
+                .await
+                .expect("meta")
+                .len();
+            writer.write_record(SizedRecord::new(64)).await.expect("w3");
+            writer.flush().await.expect("flush3");
+            writer.close();
+            // Drop the writer and reader so only our `ledger` handle holds the ledger lock (both
+            // hold internal Arc<Ledger> clones); we drop `ledger` too before reopening below.
+            drop(writer);
+            drop(reader);
+
+            // Tear the last record (id 3): truncate a few bytes into its frame, leaving records 1
+            // and 2 intact. This is the real incident's "N valid records then a torn/partial tail"
+            // shape. The fast path reads the rkyv root from the file's END (now mid-record-3) and
+            // fails, so the writer must take the forward-scan slow path (#3) to find record 2.
+            let f = OpenOptions::new()
+                .write(true)
+                .open(&data_file_path)
+                .await
+                .expect("open");
+            f.set_len(len_after_two + 4).await.expect("truncate");
+            f.sync_all().await.expect("sync");
+            drop(f);
+
+            // Simulate the ledger's writer_next reverting to an earlier flushed value on the unclean
+            // crash (here, the initial 1). Without reconciliation the writer would re-issue id 1 and
+            // 2 onto NEW batches -- colliding with the already-written valid records 1 and 2.
+            unsafe {
+                ledger.state().unsafe_set_writer_next_record_id(1);
+            }
+            ledger.flush().expect("ledger flush");
+            drop(ledger);
+
+            // Reopen: the slow-path reconcile must fast-forward writer_next past the last valid
+            // record, NOT leave it at the reverted 0 (which would re-issue an already-written id).
+            let (_w, _r, ledger2) = create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+            let next_id = ledger2.state().get_next_writer_record_id();
+            // Records 1, 2, 3 (event_count 1 each) were written; record 3's tail is torn, so the last
+            // VALID record the slow-path scan can reach is id 2 -> writer_next must be reconciled to
+            // 3 (id 2 + event_count 1), NOT the reverted 1 (which would re-issue ids 1 and 2 onto new
+            // batches, colliding with the valid records already on disk).
+            assert_eq!(
+                next_id, 3,
+                "writer_next must be reconciled via the slow-path scan to just past the last valid \
+                 record (id 2); got {next_id}"
+            );
+        }
+    })
+    .await;
 }

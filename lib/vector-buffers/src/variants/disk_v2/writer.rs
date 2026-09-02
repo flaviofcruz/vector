@@ -950,6 +950,11 @@ where
                 error!(
                     "Last written record did not match the expected checksum. Corruption likely."
                 );
+                // Slow path: the last record is corrupt, but earlier records in this file may be
+                // valid. Forward-scan to the last valid record and reconcile `writer_next` past it
+                // so we cannot re-issue an already-written record ID (an ID collision on distinct
+                // data) if the ledger's `writer_next` reverted on an unclean shutdown.
+                self.reconcile_writer_next_from_last_valid(data_file_mmap.as_ref());
                 true
             }
             // The record itself was corrupted, somehow: it was sufficiently different that `rkyv`
@@ -964,6 +969,8 @@ where
                     ?reason,
                     "Last written record was unable to be deserialized. Corruption likely."
                 );
+                // Slow path (see Corrupted arm): reconcile from the last valid record.
+                self.reconcile_writer_next_from_last_valid(data_file_mmap.as_ref());
                 true
             }
         };
@@ -984,6 +991,33 @@ where
         self.ready_to_write = true;
 
         Ok(())
+    }
+
+    /// Reconcile `writer_next_record_id` against the last VALID record in a torn current file.
+    ///
+    /// Forward-scans `buf` to the last valid record and, if the ledger's `writer_next` is behind
+    /// that record's end, fast-forwards it past that record. This mirrors the `Ordering::Less`
+    /// fast-path reconciliation but recovers the record ID from an earlier record when the file's
+    /// last record is torn -- preventing the writer from re-issuing an already-written record ID
+    /// (an ID collision on distinct data) after an unclean shutdown that reverted the ledger. Only
+    /// ever fast-forwards, never rewinds.
+    fn reconcile_writer_next_from_last_valid(&mut self, buf: &[u8]) {
+        if let Some((last_id, event_count)) = scan_last_valid_record::<T>(buf) {
+            let record_next = last_id.wrapping_add(event_count);
+            let ledger_next = self.ledger.state().get_next_writer_record_id();
+            if ledger_next < record_next {
+                let delta = record_next - ledger_next;
+                let next_record_id = self.ledger.state().increment_next_writer_record_id(delta);
+                self.next_record_id = next_record_id;
+                self.unflushed_events = 0;
+                warn!(
+                    ledger_next,
+                    last_valid_record_id = last_id,
+                    new_ledger_next = record_next,
+                    "Reconciled writer_next past last valid record in torn current file to prevent record ID reuse."
+                );
+            }
+        }
     }
 
     fn is_buffer_full(&self) -> bool {
@@ -1096,11 +1130,79 @@ where
                             // data file we left off writing to.
                             Some((data_file, file_len))
                         } else {
-                            // The file isn't empty, and we're not in initialization anymore, which
-                            // means this data file is one that the reader still hasn't finished
-                            // reading through yet, and so we must wait for the reader to delete it
-                            // before we can proceed.
-                            None
+                            // The next-slot file exists and is non-empty. It is EITHER a genuine
+                            // unread backlog file (reader lagging -> wait for it to be deleted) OR a
+                            // STALE ORPHAN left at this slot by a prior file-id wrap cycle whose
+                            // records are all already acknowledged -- the reader will never delete it
+                            // (it's ahead of the reader's position), so waiting here deadlocks the
+                            // writer (the observed prod hang). Distinguish by the acked reader
+                            // frontier: if every record in this file is at/below `last_reader_record_id`
+                            // it is fully-acked/stale and safe to reclaim (truncate & reuse). Under
+                            // the buffer size cap the writer cannot legitimately wrap into an unread
+                            // file, so a fully-acked file at the next slot is provably an orphan.
+                            let acked_frontier = self.ledger.state().get_last_reader_record_id();
+                            let stale = match self
+                                .ledger
+                                .filesystem()
+                                .open_mmap_readable(&data_file_path)
+                                .await
+                            {
+                                // A non-empty file at the writer's NEXT slot cannot be legitimate
+                                // unread backlog: that would require the reader to be ~65536 data
+                                // files behind the writer (a full file-id wrap cycle -- e.g. 8 TiB
+                                // at 128 MiB/file), far beyond any `max_buffer_size`, so the size cap
+                                // blocks the writer long before it can wrap into unread data. So any
+                                // inability to read or interpret this file (corrupt/torn record,
+                                // undecodable payload, or an unopenable file) means a stale orphan --
+                                // reclaim it rather than deadlocking. The one case we refuse to
+                                // reclaim is a cleanly readable record whose ID is ABOVE the acked
+                                // frontier: that would be genuine unacked data, so we wait for it.
+                                Ok(mmap) => {
+                                    match validate_record_archive(mmap.as_ref(), &Hasher::new()) {
+                                        RecordStatus::Valid { id } => {
+                                            try_as_record_archive(mmap.as_ref())
+                                                .ok()
+                                                .and_then(|r| decode_record_payload::<T>(r).ok())
+                                                .map(|item| {
+                                                    let ec = u64::try_from(item.event_count())
+                                                        .unwrap_or(1);
+                                                    id.wrapping_add(ec.saturating_sub(1))
+                                                        <= acked_frontier
+                                                })
+                                                // Valid checksum but undecodable payload: we still saw a
+                                                // valid record ID, so honor the same rule -- wait only if that
+                                                // ID is above the frontier, otherwise reclaim.
+                                                .unwrap_or_else(|| id <= acked_frontier)
+                                        }
+                                        // Torn/corrupt last record: no ID we can trust, so reclaim.
+                                        _ => true,
+                                    }
+                                }
+                                // Cannot even open/mmap the file: reading issue.
+                                Err(_) => true,
+                            };
+
+                            if stale {
+                                warn!(
+                                    data_file_path = data_file_path.to_string_lossy().as_ref(),
+                                    acked_frontier,
+                                    "Reclaiming stale/orphaned data file at writer's next slot \
+                                     (records already acknowledged, or file unreadable); truncating \
+                                     and reusing."
+                                );
+                                self.ledger
+                                    .filesystem()
+                                    .delete_file(&data_file_path)
+                                    .await?;
+                                let reclaimed = self
+                                    .ledger
+                                    .filesystem()
+                                    .open_file_writable_atomic(&data_file_path)
+                                    .await?;
+                                Some((reclaimed, 0))
+                            } else {
+                                None
+                            }
                         }
                     }
                     // Legitimate I/O error with the operation, bubble this up.
@@ -1367,4 +1469,38 @@ where
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Forward-scan a data file's framed records (`[8-byte big-endian length][archive]`) and return the
+/// `(record_id, event_count)` of the LAST valid record before the first invalid/torn one.
+///
+/// `validate_last_write` normally reads only the last record (via the rkyv root at the file's end).
+/// When that last record is torn/corrupt it cannot recover the record ID, which -- if the ledger's
+/// `writer_next_record_id` also reverted on an unclean shutdown -- lets the writer re-issue an
+/// already-written record ID onto a NEW batch (an ID collision on distinct data). Scanning forward
+/// to the last valid record lets us reconcile `writer_next` past it and avoid that reuse.
+fn scan_last_valid_record<T: Bufferable>(buf: &[u8]) -> Option<(u64, u64)> {
+    let hasher = Hasher::new();
+    let mut offset = 0usize;
+    let mut last: Option<(usize, usize, u64)> = None; // (archive_start, archive_len, record_id)
+
+    while offset + 8 <= buf.len() {
+        let len_bytes: [u8; 8] = buf[offset..offset + 8].try_into().ok()?;
+        let record_len = u64::from_be_bytes(len_bytes) as usize;
+        if record_len == 0 || offset + 8 + record_len > buf.len() {
+            break;
+        }
+        let archive = &buf[offset + 8..offset + 8 + record_len];
+        match validate_record_archive(archive, &hasher) {
+            RecordStatus::Valid { id } => last = Some((offset + 8, record_len, id)),
+            _ => break,
+        }
+        offset += 8 + record_len;
+    }
+
+    let (start, len, last_id) = last?;
+    let record = try_as_record_archive(&buf[start..start + len]).ok()?;
+    let item = decode_record_payload::<T>(record).ok()?;
+    let event_count = u64::try_from(item.event_count()).unwrap_or(1);
+    Some((last_id, event_count))
 }

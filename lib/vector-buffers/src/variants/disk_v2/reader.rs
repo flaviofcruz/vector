@@ -734,7 +734,31 @@ where
 
     /// Switches the reader over to the next data file to read.
     #[cfg_attr(test, instrument(skip(self), level = "debug"))]
-    fn roll_to_next_data_file(&mut self) {
+    async fn roll_to_next_data_file(&mut self) {
+        // Seek-time direct delete: during initialization (`!ready_to_read`) a file being rolled
+        // off is fully consumed (its records are at/below `ledger_last`), so delete it DIRECTLY --
+        // matching the fast-path seek -- instead of leaving a deferred, ack-gated marker that can
+        // be lost on an unclean restart and orphan the file. We only do this for a file that is NOT
+        // the writer's current file (`reader_file_id != writer_file_id`), so the live write file is
+        // never deleted; the writer owns that one. On any delete error we fall through to the
+        // original marker-based roll.
+        if !self.ready_to_read
+            && self.ledger.get_current_reader_file_id() != self.ledger.get_current_writer_file_id()
+        {
+            let data_file_path = self.ledger.get_current_reader_data_file_path();
+            let bytes_read = self.bytes_read;
+            if self
+                .delete_completed_data_file(data_file_path, Some(bytes_read))
+                .await
+                .is_ok()
+            {
+                self.reset();
+                self.data_file_record_count = 0;
+                debug!("Seek-time direct delete of fully-consumed data file; rolling to next.");
+                return;
+            }
+        }
+
         // Add a marker for this data file so we know when it can be safely deleted.  We also need
         // to track the necessary data to do our buffer accounting when it's eligible for deletion.
         //
@@ -1092,7 +1116,7 @@ where
                     // the caller, but they might be expecting a read-after-write behavior, so we
                     // return the error to them after ensuring that we roll to the next file first.
                     if e.is_bad_read() {
-                        self.roll_to_next_data_file();
+                        self.roll_to_next_data_file().await;
                     }
 
                     return Err(e);
@@ -1131,7 +1155,7 @@ where
                         writer_file_id, "Reached the end of current data file."
                     );
 
-                    self.roll_to_next_data_file();
+                    self.roll_to_next_data_file().await;
                     force_check_pending_data_files = true;
                     continue;
                 }
