@@ -142,16 +142,33 @@ pub(super) fn append_scalar_from_wire(
         }
         ScalarKind::UInt32 => {
             let v = expect_varint(kind, wv)?;
-            if let TypedBuilder::UInt32(b) = tb {
-                b.append_value(v as u32);
-                return Ok(());
+            match tb {
+                TypedBuilder::UInt32(b) => {
+                    b.append_value(v as u32);
+                    return Ok(());
+                }
+                // Delta has no unsigned ints; a `uint32` column is declared `Int32`.
+                // Reinterpret the low 32 bits as signed — bit-preserving.
+                TypedBuilder::Int32(b) => {
+                    b.append_value(v as u32 as i32);
+                    return Ok(());
+                }
+                _ => {}
             }
         }
         ScalarKind::UInt64 => {
             let v = expect_varint(kind, wv)?;
-            if let TypedBuilder::UInt64(b) = tb {
-                b.append_value(v);
-                return Ok(());
+            match tb {
+                TypedBuilder::UInt64(b) => {
+                    b.append_value(v);
+                    return Ok(());
+                }
+                // `uint64` column declared `Int64` (no unsigned in Delta) — bit-preserving.
+                TypedBuilder::Int64(b) => {
+                    b.append_value(v as i64);
+                    return Ok(());
+                }
+                _ => {}
             }
         }
         ScalarKind::SInt32 => {
@@ -178,9 +195,18 @@ pub(super) fn append_scalar_from_wire(
         }
         ScalarKind::Fixed32 => {
             let v = expect_i32(kind, wv)?;
-            if let TypedBuilder::UInt32(b) = tb {
-                b.append_value(v);
-                return Ok(());
+            match tb {
+                TypedBuilder::UInt32(b) => {
+                    b.append_value(v);
+                    return Ok(());
+                }
+                // Delta has no unsigned ints; a `fixed32` column (e.g. span `flags`)
+                // is declared `Int32`. Reinterpret the 32 bits as signed.
+                TypedBuilder::Int32(b) => {
+                    b.append_value(v as i32);
+                    return Ok(());
+                }
+                _ => {}
             }
         }
         ScalarKind::SFixed32 => {
@@ -199,9 +225,17 @@ pub(super) fn append_scalar_from_wire(
         }
         ScalarKind::Fixed64 => {
             let v = expect_i64(kind, wv)?;
-            if let TypedBuilder::UInt64(b) = tb {
-                b.append_value(v);
-                return Ok(());
+            match tb {
+                TypedBuilder::UInt64(b) => {
+                    b.append_value(v);
+                    return Ok(());
+                }
+                // `fixed64` column declared `Int64` (no unsigned in Delta) — bit-preserving.
+                TypedBuilder::Int64(b) => {
+                    b.append_value(v as i64);
+                    return Ok(());
+                }
+                _ => {}
             }
         }
         ScalarKind::SFixed64 => {
@@ -325,18 +359,28 @@ pub(super) fn append_proto3_default(kind: ScalarKind, tb: &mut TypedBuilder) {
             }
             _ => {}
         },
-        ScalarKind::UInt32 | ScalarKind::Fixed32 => {
-            if let TypedBuilder::UInt32(b) = tb {
+        ScalarKind::UInt32 | ScalarKind::Fixed32 => match tb {
+            TypedBuilder::UInt32(b) => {
                 b.append_value(0);
                 return;
             }
-        }
-        ScalarKind::UInt64 | ScalarKind::Fixed64 => {
-            if let TypedBuilder::UInt64(b) = tb {
+            TypedBuilder::Int32(b) => {
                 b.append_value(0);
                 return;
             }
-        }
+            _ => {}
+        },
+        ScalarKind::UInt64 | ScalarKind::Fixed64 => match tb {
+            TypedBuilder::UInt64(b) => {
+                b.append_value(0);
+                return;
+            }
+            TypedBuilder::Int64(b) => {
+                b.append_value(0);
+                return;
+            }
+            _ => {}
+        },
         ScalarKind::Float => {
             if let TypedBuilder::Float32(b) = tb {
                 b.append_value(0.0);
