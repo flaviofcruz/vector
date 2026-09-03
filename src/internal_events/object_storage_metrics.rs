@@ -1,5 +1,5 @@
-use metrics::histogram;
-use tracing::debug;
+use metrics::{counter, histogram};
+use tracing::{debug, trace};
 use vector_lib::emit;
 use vector_lib::internal_event::{InternalEvent, NamedInternalEvent};
 
@@ -165,6 +165,64 @@ pub fn emit_object_storage_ack_metrics(
         cloud,
         bucket,
     });
+}
+
+/// Count of messages fetched from the object-storage notification queue in one receive.
+/// Cross-cloud analog of the AWS-specific `sqs_message_received_messages_total`: the azure_blob
+/// (Storage Queue) source emits it today, and any future queue-backed source can too. Pairs with
+/// `QueueMessageDeleteSucceeded` to give the received-vs-deleted drain-health view the AWS SQS panel
+/// has, on non-AWS clouds. The `cloud` label distinguishes provider; `component_id` (added by the
+/// tracing-context metrics layer) distinguishes the source (one per table for Lumberjack Prime).
+#[derive(Debug)]
+pub struct QueueMessageReceived<'a> {
+    pub count: u64,
+    pub cloud: &'a str,
+}
+
+impl NamedInternalEvent for QueueMessageReceived<'_> {
+    fn name(&self) -> &'static str {
+        "QueueMessageReceived"
+    }
+}
+
+impl InternalEvent for QueueMessageReceived<'_> {
+    fn emit(self) {
+        trace!(
+            message = "Received messages from queue.",
+            count = %self.count,
+            cloud = %self.cloud,
+        );
+        counter!("queue_message_received_total", "cloud" => self.cloud.to_string())
+            .increment(self.count);
+    }
+}
+
+/// Count of queue messages deleted after being processed (and acked, when acknowledgements are on).
+/// Cross-cloud analog of the AWS-specific `sqs_message_delete_succeeded_total`. Read together with
+/// `QueueMessageReceived`: the two tracking each other is healthy; sustained received > deleted means
+/// the source is falling behind or messages are being redelivered.
+#[derive(Debug)]
+pub struct QueueMessageDeleteSucceeded<'a> {
+    pub count: u64,
+    pub cloud: &'a str,
+}
+
+impl NamedInternalEvent for QueueMessageDeleteSucceeded<'_> {
+    fn name(&self) -> &'static str {
+        "QueueMessageDeleteSucceeded"
+    }
+}
+
+impl InternalEvent for QueueMessageDeleteSucceeded<'_> {
+    fn emit(self) {
+        trace!(
+            message = "Deleted messages from queue.",
+            count = %self.count,
+            cloud = %self.cloud,
+        );
+        counter!("queue_message_delete_succeeded_total", "cloud" => self.cloud.to_string())
+            .increment(self.count);
+    }
 }
 
 #[cfg(test)]

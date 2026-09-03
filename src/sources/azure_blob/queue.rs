@@ -34,8 +34,8 @@ use vector_lib::source_sender::SendError;
 use crate::codecs::Decoder;
 use crate::event::{Event, LogEvent};
 use crate::internal_events::{
-    EventsReceived, QueueNotificationProcessLag, StreamClosedError,
-    emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
+    EventsReceived, QueueMessageDeleteSucceeded, QueueMessageReceived, QueueNotificationProcessLag,
+    StreamClosedError, emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
 };
 use crate::{
     SourceSender,
@@ -447,6 +447,16 @@ impl IngestorProcess {
                     count = %messages.len(),
                     internal_log_rate_limit = true
                 );
+                // Count messages pulled from the Storage Queue (the received leg of received-vs-deleted
+                // drain health; the delete leg is emitted after the delete loop below). Skip empty
+                // receives so an idle source does not emit a zero-count event every poll interval,
+                // mirroring the delete leg's `deleted_count > 0` guard.
+                if !messages.is_empty() {
+                    emit!(QueueMessageReceived {
+                        count: messages.len() as u64,
+                        cloud: CLOUD_PROVIDER,
+                    });
+                }
             })
             .inspect_err(|err| {
                 error!(
@@ -523,6 +533,7 @@ impl IngestorProcess {
         }
 
         // Delete processed messages
+        let mut deleted_count: u64 = 0;
         for message in delete_messages {
             if let Err(err) = self.delete_message(&message).await {
                 let message_id = message.message_id.clone();
@@ -531,7 +542,16 @@ impl IngestorProcess {
                     message_id = %message_id,
                     error = ?err,
                 );
+            } else {
+                deleted_count += 1;
             }
+        }
+        // Count messages successfully deleted (the deleted leg of received-vs-deleted drain health).
+        if deleted_count > 0 {
+            emit!(QueueMessageDeleteSucceeded {
+                count: deleted_count,
+                cloud: CLOUD_PROVIDER,
+            });
         }
 
         // Wait for next poll interval
