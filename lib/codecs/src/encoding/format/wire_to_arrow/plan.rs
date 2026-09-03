@@ -86,13 +86,30 @@ impl ScalarKind {
     /// [`append_proto3_default`]: super::append::append_proto3_default
     pub(super) fn matches_arrow_type(self, dt: &DataType) -> bool {
         match (self, dt) {
-            (ScalarKind::Int32 | ScalarKind::SInt32 | ScalarKind::SFixed32, DataType::Int32) => {
-                true
-            }
+            // The unsigned/fixed 32-bit kinds join the signed ones here because
+            // Delta/Spark has no unsigned integer type, so `uint32`/`fixed32`
+            // columns are declared as signed `Int32` in the destination table
+            // (the append is bit-preserving; see append.rs). span's `fixed32 flags`
+            // is the motivating case.
+            (
+                ScalarKind::Int32
+                | ScalarKind::SInt32
+                | ScalarKind::SFixed32
+                | ScalarKind::UInt32
+                | ScalarKind::Fixed32,
+                DataType::Int32,
+            ) => true,
             (
                 ScalarKind::Int64 | ScalarKind::SInt64 | ScalarKind::SFixed64,
                 DataType::Int64 | DataType::Timestamp(TimeUnit::Microsecond, _),
             ) => true,
+            // `uint64`/`fixed64` → signed `Int64`, same no-unsigned-in-Delta reason.
+            // Deliberately `Int64` only and NOT `Timestamp(Microsecond)`: span's
+            // `fixed64 start_time_unix_nano`/`end_time_unix_nano` are nanoseconds,
+            // and the `TimestampMicros` path scales ms->us (x1000), not ns->us, so
+            // a fixed64 paired with a micros-timestamp column is rejected here to
+            // fail loudly rather than silently mis-scale.
+            (ScalarKind::UInt64 | ScalarKind::Fixed64, DataType::Int64) => true,
             (ScalarKind::UInt32 | ScalarKind::Fixed32, DataType::UInt32) => true,
             (ScalarKind::UInt64 | ScalarKind::Fixed64, DataType::UInt64) => true,
             (ScalarKind::Float, DataType::Float32) => true,

@@ -127,6 +127,88 @@ fn repeated_int32_descriptor() -> MessageDescriptor {
         .unwrap()
 }
 
+/// Build a `message Fixups { fixed32 f32 = 1; fixed64 f64 = 2; uint32 u32 = 3;
+/// uint64 u64 = 4; }` descriptor. None of the checked-in test protos carry
+/// fixed/unsigned scalar fields, which are the ones that land in *signed* Arrow
+/// columns (Delta has no unsigned integer type — span's `fixed32 flags` and
+/// `fixed64 *_unix_nano` are the real cases).
+fn fixed_and_unsigned_descriptor() -> MessageDescriptor {
+    let field = |name: &str, number: i32, ty: ProtoType| FieldDescriptorProto {
+        name: Some(name.into()),
+        number: Some(number),
+        label: Some(Label::Optional as i32),
+        r#type: Some(ty as i32),
+        ..Default::default()
+    };
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_fixups_test.proto".into()),
+        package: Some("wire_to_arrow_fixups_test".into()),
+        message_type: vec![DescriptorProto {
+            name: Some("Fixups".into()),
+            field: vec![
+                field("f32", 1, ProtoType::Fixed32),
+                field("f64", 2, ProtoType::Fixed64),
+                field("u32", 3, ProtoType::Uint32),
+                field("u64", 4, ProtoType::Uint64),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes).unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_fixups_test.Fixups")
+        .unwrap()
+}
+
+#[test]
+fn fixed_and_unsigned_scalars_encode_into_signed_columns() {
+    // Delta/Spark has no unsigned integer type, so `fixed32`/`uint32` columns are
+    // declared `Int32` and `fixed64`/`uint64` columns `Int64` in the destination
+    // table. The encoder must accept those pairings and write bit-preserving —
+    // values above the signed max reinterpret as negatives. Regression test for
+    // the span WTA build failure on `fixed32 flags` / `arrow type Int32`.
+    let desc = fixed_and_unsigned_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("f32", DataType::Int32, true),
+        Field::new("f64", DataType::Int64, true),
+        Field::new("u32", DataType::Int32, true),
+        Field::new("u64", DataType::Int64, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut msg = DynamicMessage::new(desc.clone());
+    // All chosen above the signed max so the reinterpret is observable.
+    msg.set_field_by_name("f32", ProtoValue::U32(0x8000_0001));
+    msg.set_field_by_name("f64", ProtoValue::U64(0x8000_0000_0000_0001));
+    msg.set_field_by_name("u32", ProtoValue::U32(u32::MAX));
+    msg.set_field_by_name("u64", ProtoValue::U64(u64::MAX));
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+
+    let batch = enc.encode_batch(&[Bytes::from(buf)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let i32_col = |i: usize| {
+        batch
+            .column(i)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(0)
+    };
+    let i64_col = |i: usize| {
+        batch
+            .column(i)
+            .as_primitive::<arrow::datatypes::Int64Type>()
+            .value(0)
+    };
+    assert_eq!(i32_col(0), 0x8000_0001u32 as i32);
+    assert_eq!(i64_col(1), 0x8000_0000_0000_0001u64 as i64);
+    assert_eq!(i32_col(2), -1); // u32::MAX
+    assert_eq!(i64_col(3), -1); // u64::MAX
+}
+
 #[test]
 fn scalar_roundtrip() {
     let desc = scalar_descriptor();
