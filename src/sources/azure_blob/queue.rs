@@ -34,8 +34,9 @@ use vector_lib::source_sender::SendError;
 use crate::codecs::Decoder;
 use crate::event::{Event, LogEvent};
 use crate::internal_events::{
-    EventsReceived, QueueMessageDeleteSucceeded, QueueMessageReceived, QueueNotificationProcessLag,
-    StreamClosedError, emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
+    EventsReceived, QueueMessageCount, QueueMessageDeleteSucceeded, QueueMessageReceived,
+    QueueNotificationProcessLag, StreamClosedError, emit_object_storage_ack_metrics,
+    emit_object_storage_non_ack_metrics,
 };
 use crate::{
     SourceSender,
@@ -77,6 +78,15 @@ pub(super) struct Config {
     #[derivative(Default(value = "default_poll_secs()"))]
     #[configurable(metadata(docs::type_unit = "seconds"))]
     pub(super) poll_secs: u64,
+
+    /// How often to sample the queue's approximate depth (backlog) for the `queue_message_count`
+    /// gauge, in seconds. Sampled on a dedicated timer independent of `poll_secs`, off the message
+    /// receive/delete path, so it never adds latency to draining and its request rate stays fixed
+    /// even if `poll_secs` is lowered. Depth moves slowly; keep this coarse.
+    #[serde(default = "default_depth_poll_secs")]
+    #[derivative(Default(value = "default_depth_poll_secs()"))]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    pub(super) depth_poll_secs: u64,
 
     /// The visibility timeout to use for messages, in seconds.
     /// When a message is received, it becomes invisible to other consumers for this duration.
@@ -142,6 +152,9 @@ pub(super) struct Config {
 const fn default_poll_secs() -> u64 {
     15
 } // 15 seconds between polls when no messages
+const fn default_depth_poll_secs() -> u64 {
+    60
+} // 1 minute between queue-depth (backlog) samples
 const fn default_visibility_timeout_secs() -> u64 {
     300
 } // 5 minutes visibility timeout
@@ -255,6 +268,8 @@ pub struct State {
     queue_name: String,
     /// Seconds to wait between polls when no messages
     poll_secs: u64,
+    /// Seconds between queue-depth (backlog) samples for the `queue_message_count` gauge
+    depth_poll_secs: u64,
     /// Maximum messages to fetch in one batch
     max_number_of_messages: u64,
     /// Number of concurrent polling tasks
@@ -319,6 +334,7 @@ impl Ingestor {
             multiline,
             queue_name: config.queue_name,
             poll_secs: config.poll_secs,
+            depth_poll_secs: config.depth_poll_secs,
             max_number_of_messages: config.max_number_of_messages,
             client_concurrency: config
                 .client_concurrency
@@ -360,6 +376,15 @@ impl Ingestor {
             handles.push(handle);
         }
 
+        // Spawn a single queue-depth sampler, independent of client_concurrency: it polls the queue's
+        // approximate backlog on a coarse timer, off the receive/delete path, and emits the
+        // `queue_message_count` gauge. One metadata call per `depth_poll_secs` per queue regardless of
+        // how many worker tasks drain it.
+        let depth_handle = tokio::spawn(
+            Self::run_depth_poller(Arc::clone(&self.state), cx.shutdown.clone()).in_current_span(),
+        );
+        handles.push(depth_handle);
+
         // Wait for all tasks to complete, propagating any panics
         for handle in handles.drain(..) {
             if let Err(e) = handle.await {
@@ -370,6 +395,58 @@ impl Ingestor {
         }
 
         Ok(())
+    }
+
+    /// Periodically samples the queue's approximate depth (backlog) and emits the
+    /// `queue_message_count` gauge. Runs on its own timer, decoupled from message polling, so it adds
+    /// no latency to draining and its request rate is independent of `poll_secs`. Each sample is a
+    /// single cheap Get-Queue-Metadata call bounded by a timeout, so a slow or hung call can neither
+    /// stall this loop nor pile up; on error or timeout it skips the sample and retries next tick.
+    async fn run_depth_poller(state: Arc<State>, shutdown: ShutdownSignal) {
+        // A depth sample must never wedge the loop; keep this well under the tick interval.
+        const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let shutdown = shutdown.fuse();
+        pin!(shutdown);
+
+        let mut ticker = tokio::time::interval(Duration::from_secs(state.depth_poll_secs));
+        // On a missed tick (e.g. a slow metadata call), skip it rather than firing a catch-up burst.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            select! {
+                _ = &mut shutdown => break,
+                _ = ticker.tick() => {
+                    let queue_client = state.queue_client.queue_client(&state.queue_name);
+                    match tokio::time::timeout(
+                        METADATA_TIMEOUT,
+                        queue_client.get_metadata().into_future(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(response)) => {
+                            emit!(QueueMessageCount {
+                                count: response.approximate_messages_count as u64,
+                                cloud: CLOUD_PROVIDER,
+                            });
+                        }
+                        Ok(Err(err)) => {
+                            warn!(
+                                message = "Failed to fetch queue metadata for depth metric.",
+                                error = ?err,
+                                internal_log_rate_limit = true,
+                            );
+                        }
+                        Err(_) => {
+                            warn!(
+                                message = "Timed out fetching queue metadata for depth metric.",
+                                internal_log_rate_limit = true,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

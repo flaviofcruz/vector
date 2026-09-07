@@ -1,4 +1,4 @@
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use tracing::{debug, trace};
 use vector_lib::emit;
 use vector_lib::internal_event::{InternalEvent, NamedInternalEvent};
@@ -222,6 +222,36 @@ impl InternalEvent for QueueMessageDeleteSucceeded<'_> {
         );
         counter!("queue_message_delete_succeeded_total", "cloud" => self.cloud.to_string())
             .increment(self.count);
+    }
+}
+
+/// Approximate number of messages currently in the notification queue (its backlog / depth).
+/// A gauge, not a rate: pairs with `QueueMessageReceived` / `QueueMessageDeleteSucceeded` (the drain
+/// rates) to answer "is the backlog growing?" directly, which the rates only imply. Sourced from the
+/// provider's cheap metadata call (Azure's `x-ms-approximate-messages-count`), sampled on a coarse
+/// timer off the receive path. Azure Monitor only exposes this per storage account, not per queue, so
+/// this source-side gauge is the only per-queue backlog signal; `component_id` (added by the
+/// tracing-context metrics layer) distinguishes the queue (one source per table for Lumberjack Prime).
+#[derive(Debug)]
+pub struct QueueMessageCount<'a> {
+    pub count: u64,
+    pub cloud: &'a str,
+}
+
+impl NamedInternalEvent for QueueMessageCount<'_> {
+    fn name(&self) -> &'static str {
+        "QueueMessageCount"
+    }
+}
+
+impl InternalEvent for QueueMessageCount<'_> {
+    fn emit(self) {
+        trace!(
+            message = "Measured queue depth.",
+            count = %self.count,
+            cloud = %self.cloud,
+        );
+        gauge!("queue_message_count", "cloud" => self.cloud.to_string()).set(self.count as f64);
     }
 }
 
