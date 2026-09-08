@@ -1,5 +1,7 @@
 //! Configuration for the Zerobus sink.
 
+use std::collections::BTreeMap;
+
 use vector_lib::configurable::configurable_component;
 use vector_lib::sensitive_string::SensitiveString;
 
@@ -185,6 +187,16 @@ pub struct ZerobusSinkConfig {
     #[configurable(metadata(docs::examples = "my-service/1.2"))]
     pub user_agent: Option<String>,
 
+    /// Extra static headers attached to every Zerobus gRPC request.
+    ///
+    /// Applied on both auth strategies. Names must be lowercase (gRPC metadata
+    /// keys are). Reserved auth headers (`authorization`,
+    /// `x-databricks-zerobus-table-name`, `x-databricks-app-instance-name`,
+    /// `user-agent` — controlled via `user_agent`) and gRPC transport headers
+    /// (`content-type`, `te`, any `grpc-*`) cannot be set here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_headers: BTreeMap<String, String>,
+
     /// Schema definition for the table.
     ///
     /// Defaults to fetching the schema dynamically from Unity Catalog.
@@ -243,6 +255,7 @@ impl GenerateConfig for ZerobusSinkConfig {
                 client_secret: SensitiveString::from("${DATABRICKS_CLIENT_SECRET}".to_string()),
             },
             user_agent: None,
+            custom_headers: BTreeMap::new(),
             schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
             batch_encoding: default_batch_encoding(),
@@ -348,6 +361,38 @@ impl ZerobusSinkConfig {
             }
         }
 
+        // Custom headers: gRPC metadata keys must be lowercase, so require it
+        // here — the gRPC layer would otherwise reject an uppercase name at the
+        // first stream create rather than at config load. Reject reserved auth
+        // headers and gRPC transport headers that would corrupt the exchange.
+        const RESERVED: [&str; 5] = [
+            "authorization",
+            "x-databricks-zerobus-table-name",
+            "x-databricks-app-instance-name",
+            "user-agent",
+            "content-type",
+        ];
+        for (name, value) in &self.custom_headers {
+            if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                return Err(ZerobusSinkError::ConfigError {
+                    message: format!("custom_headers header name '{name}' must be lowercase"),
+                });
+            }
+            if RESERVED.contains(&name.as_str()) || name.starts_with("grpc-") || name == "te" {
+                return Err(ZerobusSinkError::ConfigError {
+                    message: format!("custom_headers cannot set reserved header '{name}'"),
+                });
+            }
+            http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                ZerobusSinkError::ConfigError {
+                    message: format!("invalid custom_headers header name '{name}'"),
+                }
+            })?;
+            http::HeaderValue::from_str(value).map_err(|_| ZerobusSinkError::ConfigError {
+                message: format!("invalid custom_headers value for header '{name}'"),
+            })?;
+        }
+
         if let Some(max_bytes) = self.batch.max_bytes {
             // Zerobus SDK limits max bytes to 10MB.
             // NOTE: The size of the batch in Vector is not exactly the same as the size of the
@@ -404,6 +449,7 @@ mod tests {
                 client_secret: SensitiveString::from("test-client-secret".to_string()),
             },
             user_agent: None,
+            custom_headers: BTreeMap::new(),
             schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
             batch_encoding: default_batch_encoding(),
@@ -699,6 +745,69 @@ mod tests {
             batch.column(2).as_string::<i64>().value(0),
             "alice@example.com"
         );
+    }
+
+    #[test]
+    fn custom_headers_reserved_name_rejected() {
+        let mut config = create_test_config();
+        config
+            .custom_headers
+            .insert("authorization".into(), "Bearer x".into());
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ZerobusSinkError::ConfigError { message } if message.contains("reserved")),
+            "expected reserved-header rejection"
+        );
+    }
+
+    #[test]
+    fn custom_headers_uppercase_name_rejected() {
+        // gRPC metadata keys must be lowercase; catch it at load, not at first
+        // stream create (arrow-flight's add_header would reject it there).
+        let mut config = create_test_config();
+        config
+            .custom_headers
+            .insert("X-My-Tenant".into(), "acme".into());
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ZerobusSinkError::ConfigError { message } if message.contains("must be lowercase")),
+            "expected uppercase-name rejection"
+        );
+    }
+
+    #[test]
+    fn custom_headers_transport_name_rejected() {
+        for bad in ["content-type", "te", "grpc-timeout"] {
+            let mut config = create_test_config();
+            config.custom_headers.insert(bad.into(), "v".into());
+            let err = config.validate().unwrap_err();
+            assert!(
+                matches!(err, ZerobusSinkError::ConfigError { message } if message.contains("reserved")),
+                "expected reserved rejection for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_headers_invalid_name_rejected() {
+        let mut config = create_test_config();
+        config
+            .custom_headers
+            .insert("bad header".into(), "v".into());
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ZerobusSinkError::ConfigError { message } if message.contains("invalid custom_headers header name")),
+            "expected invalid-name rejection"
+        );
+    }
+
+    #[test]
+    fn custom_headers_valid_accepted() {
+        let mut config = create_test_config();
+        config
+            .custom_headers
+            .insert("x-my-tenant".into(), "acme".into());
+        assert!(config.validate().is_ok());
     }
 
     #[test]

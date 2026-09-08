@@ -5,6 +5,7 @@
 
 mod config;
 mod error;
+mod headers;
 mod service;
 mod sink;
 mod unity_catalog_schema;

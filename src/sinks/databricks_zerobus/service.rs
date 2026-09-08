@@ -13,6 +13,7 @@ use databricks_zerobus_ingest_sdk::{
     ConnectorFactory, HeadersProvider, ProxyConnector, ZerobusArrowStream, ZerobusSdk,
 };
 use futures::future::BoxFuture;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower::{Layer, Service};
@@ -22,7 +23,7 @@ use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 
-use super::{config::ZerobusSinkConfig, error::ZerobusSinkError, unity_catalog_schema};
+use super::{config::ZerobusSinkConfig, error::ZerobusSinkError, headers, unity_catalog_schema};
 
 /// Build a connector factory that routes Zerobus gRPC traffic through
 /// Vector's configured proxy, honoring `no_proxy` rules.
@@ -327,6 +328,14 @@ pub struct ZerobusService {
     schema_resolve: Arc<Mutex<()>>,
     /// Optional token manager for Login service auth.
     token_manager: Option<Arc<TokenManager>>,
+    /// OAuth headers provider wrapping the SDK's, built once when `custom_headers`
+    /// is set on the OAuth strategy. `None` otherwise, in which case `build_stream`
+    /// uses the SDK's own `builder.oauth(...)` unchanged.
+    oauth_provider: Option<Arc<dyn HeadersProvider>>,
+    /// Configured static headers, leaked once (`&'static`) so both auth
+    /// strategies' providers can hold a `Copy` reference with no clone. Merged
+    /// into every request. Empty when none set.
+    custom_headers: &'static HashMap<&'static str, String>,
     /// Test-only stand-in for the Unity Catalog fetch, which unit tests cannot
     /// perform. When set, `resolve_schema` pops the next schema from this queue
     /// instead of calling out to UC, letting a test script the sequence of
@@ -377,6 +386,9 @@ impl ZerobusService {
             _ => None,
         };
 
+        let custom_headers = headers::leak_custom_headers(&config);
+        let oauth_provider = headers::build_oauth_provider(&config, custom_headers);
+
         Ok(Self {
             sdk: Arc::new(sdk),
             config: Arc::new(config),
@@ -385,6 +397,8 @@ impl ZerobusService {
             schema: Arc::new(RwLock::new(None)),
             schema_resolve: Arc::new(Mutex::new(())),
             token_manager,
+            oauth_provider,
+            custom_headers,
             #[cfg(test)]
             schema_fetch_results: Arc::new(std::sync::Mutex::new(Default::default())),
         })
@@ -679,16 +693,17 @@ impl ZerobusService {
                     Arc::new(LoginServiceHeadersProvider::new(
                         Arc::clone(tm),
                         self.config.table_name.clone(),
+                        self.custom_headers,
                     ));
                 builder.headers_provider(headers_provider)
             }
-            super::config::DatabricksAuthentication::OAuth {
-                client_id,
-                client_secret,
-            } => builder.oauth(
-                client_id.inner().to_string(),
-                client_secret.inner().to_string(),
-            ),
+            super::config::DatabricksAuthentication::OAuth { .. } => {
+                let provider = self
+                    .oauth_provider
+                    .as_ref()
+                    .expect("oauth_provider initialized for OAuth auth");
+                builder.headers_provider(Arc::clone(provider))
+            }
         };
 
         builder
@@ -915,6 +930,8 @@ impl Clone for ZerobusService {
             schema: Arc::clone(&self.schema),
             schema_resolve: Arc::clone(&self.schema_resolve),
             token_manager: self.token_manager.clone(),
+            oauth_provider: self.oauth_provider.clone(),
+            custom_headers: self.custom_headers,
             #[cfg(test)]
             schema_fetch_results: Arc::clone(&self.schema_fetch_results),
         }
@@ -955,6 +972,9 @@ impl ZerobusService {
                 message: format!("Failed to create HTTP client: {}", e),
             })?;
 
+        let custom_headers = headers::leak_custom_headers(&config);
+        let oauth_provider = headers::build_oauth_provider(&config, custom_headers);
+
         let config = Arc::new(config);
         let pinned = PinnedStream {
             schema: Self::build_test_schema(&config, arrow::datatypes::Schema::empty()),
@@ -969,6 +989,8 @@ impl ZerobusService {
             schema: Arc::new(RwLock::new(None)),
             schema_resolve: Arc::new(Mutex::new(())),
             token_manager: None,
+            oauth_provider,
+            custom_headers,
             schema_fetch_results: Arc::new(std::sync::Mutex::new(Default::default())),
         })
     }
@@ -1139,6 +1161,25 @@ mod tests {
     use vector_lib::event_test_util::{clear_recorded_events, contains_name_once};
     use vector_lib::sensitive_string::SensitiveString;
 
+    #[tokio::test]
+    async fn oauth_always_builds_wrapped_provider() {
+        // OAuth always routes through our wrapper (which merges custom headers,
+        // empty or not), never the SDK's plain oauth path.
+        let service = ZerobusService::new(test_config(), &ProxyConfig::default())
+            .await
+            .unwrap();
+        assert!(service.oauth_provider.is_some());
+
+        let mut config = test_config();
+        config
+            .custom_headers
+            .insert("x-my-tenant".into(), "acme".into());
+        let service = ZerobusService::new(config, &ProxyConfig::default())
+            .await
+            .unwrap();
+        assert!(service.oauth_provider.is_some());
+    }
+
     fn test_config() -> ZerobusSinkConfig {
         ZerobusSinkConfig {
             ingestion_endpoint: "https://127.0.0.1:1".to_string(),
@@ -1149,6 +1190,7 @@ mod tests {
                 client_secret: SensitiveString::from("secret".to_string()),
             },
             user_agent: None,
+            custom_headers: std::collections::BTreeMap::new(),
             schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
             batch_encoding: vector_lib::codecs::encoding::BatchSerializerConfig::ArrowStream(

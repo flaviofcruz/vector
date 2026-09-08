@@ -11,14 +11,23 @@ use super::TokenManager;
 pub struct LoginServiceHeadersProvider {
     token_manager: Arc<TokenManager>,
     table_name: String,
+    /// User-configured static headers merged into every request. Leaked once at
+    /// service construction (`&'static`). Reserved names are rejected at config
+    /// validation, so these never clobber auth headers.
+    custom_headers: &'static HashMap<&'static str, String>,
 }
 
 impl LoginServiceHeadersProvider {
     /// Create a new LoginServiceHeadersProvider.
-    pub fn new(token_manager: Arc<TokenManager>, table_name: String) -> Self {
+    pub fn new(
+        token_manager: Arc<TokenManager>,
+        table_name: String,
+        custom_headers: &'static HashMap<&'static str, String>,
+    ) -> Self {
         Self {
             token_manager,
             table_name,
+            custom_headers,
         }
     }
 }
@@ -41,6 +50,7 @@ impl HeadersProvider for LoginServiceHeadersProvider {
                 headers.insert("x-databricks-app-instance-name", app_instance);
             }
         }
+        headers.extend(self.custom_headers.iter().map(|(k, v)| (*k, v.clone())));
         Ok(headers)
     }
 }
