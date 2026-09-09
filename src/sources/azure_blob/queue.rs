@@ -6,6 +6,7 @@ use std::{future::ready, num::NonZeroUsize, panic, sync::Arc};
 // Azure SDK imports for blob and queue operations
 // Note: Using azure_core_for_storage (v0.21) to match azure_storage_* crate versions
 use azure_core_for_storage::error::ErrorKind;
+use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::*;
 use azure_storage_queues::operations::Message;
 use azure_storage_queues::prelude::*;
@@ -225,6 +226,20 @@ pub enum ProcessingError {
         blob: String,
     },
 
+    /// A direct-ingest message named a storage account not permitted by the source's
+    /// `allowed_storage_accounts` allowlist (or a cross-account read under account-bound auth).
+    #[snafu(display(
+        "Direct ingest for {}/{} names storage account {} which is not in the allowlist",
+        container,
+        blob,
+        account
+    ))]
+    DisallowedStorageAccount {
+        account: String,
+        container: String,
+        blob: String,
+    },
+
     /// Received an unsupported Event Grid version
     #[snafu(display("Unsupported Event Grid version: {}.", version,))]
     UnsupportedEventGridVersion { version: semver::Version },
@@ -289,6 +304,22 @@ pub struct State {
     process_custom_message: bool,
     /// Optional callback client for notifying upstream on processing completion
     callback_client: Option<IngestionCallbackClient>,
+
+    /// Blob clients for allowlisted cross-account read targets, keyed by account and built
+    /// eagerly at startup. The configured account is served by `blob_client`, not listed here.
+    extra_blob_clients: HashMap<String, BlobServiceClient>,
+}
+
+impl State {
+    /// Returns the blob service client to read `account`: the configured account's own client, or
+    /// an allowlisted cross-account client built at startup. `None` if `account` is not permitted.
+    fn blob_client_for(&self, account: &str) -> Option<BlobServiceClient> {
+        if account == self.storage_account_name {
+            Some(self.blob_client.clone())
+        } else {
+            self.extra_blob_clients.get(account).cloned()
+        }
+    }
 }
 
 /// Main ingestor implementation that handles Azure Queue message processing
@@ -307,6 +338,8 @@ impl Ingestor {
         multiline: Option<line_agg::Config>,
         decoder: Decoder,
         callback_client: Option<IngestionCallbackClient>,
+        cross_account_credentials: Option<StorageCredentials>,
+        allowed_storage_accounts: Vec<String>,
     ) -> Result<Ingestor, IngestorNewError> {
         // Validate message batch size
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 32 {
@@ -325,6 +358,24 @@ impl Ingestor {
                     .to_string()
             })
             .unwrap_or_else(|_| "unknown".to_string());
+
+        // Build a blob client for each allowlisted cross-account target up front, so any transport
+        // setup failure surfaces here rather than on the first cross-account message. Cross-account
+        // reads reuse the account-agnostic token, so this is empty under connection-string auth.
+        // The configured account is served by `blob_client`.
+        let extra_blob_clients: HashMap<String, BlobServiceClient> = match cross_account_credentials
+        {
+            Some(credentials) => allowed_storage_accounts
+                .into_iter()
+                .filter(|account| !account.is_empty() && account != &storage_account_name)
+                .map(|account| {
+                    let client =
+                        super::build_blob_service_client(account.clone(), credentials.clone());
+                    (account, client)
+                })
+                .collect(),
+            None => HashMap::new(),
+        };
 
         // Create shared state
         let state = Arc::new(State {
@@ -347,6 +398,7 @@ impl Ingestor {
             storage_account_name,
             process_custom_message: config.process_custom_message,
             callback_client,
+            extra_blob_clients,
         });
 
         Ok(Ingestor { state })
@@ -597,6 +649,19 @@ impl IngestorProcess {
                                 delete_messages.push(message.clone());
                             }
                         }
+                        ProcessingError::DisallowedStorageAccount { ref account, .. }
+                        | ProcessingError::WrongStorageAccount { ref account, .. } => {
+                            warn!(
+                                message = "Message names a storage account this source cannot read, discarding.",
+                                message_id = &message_id,
+                                account = %account,
+                            );
+                            // Permanent: the allowlist is static config, so a retry can never
+                            // succeed. Delete to avoid redelivery until queue TTL.
+                            if self.state.delete_message {
+                                delete_messages.push(message.clone());
+                            }
+                        }
                         _ => {
                             error!(
                                 message = "Failed to process queue message.",
@@ -741,17 +806,12 @@ impl IngestorProcess {
                 blob: msg.blob,
             });
         }
-        // The blob client is bound to the source's configured storage account, so we
-        // reject cross-account requests — consistent with the Event Grid notification path.
-        if let Some(ref account) = msg.account {
-            if self.state.storage_account_name != *account {
-                return Err(ProcessingError::WrongStorageAccount {
-                    account: account.clone(),
-                    container: msg.container,
-                    blob: msg.blob,
-                });
-            }
-        }
+        // Resolve the storage account this message targets: its explicit `account` override,
+        // else the source's configured account. The allowlist is enforced when the per-account
+        // blob client is resolved during processing (State::blob_client_for).
+        let target_account = msg
+            .account
+            .unwrap_or_else(|| self.state.storage_account_name.clone());
 
         // Emit queue processing lag metric (insertion time → now).
         // This measures how long the message sat in the queue before being picked up.
@@ -770,14 +830,19 @@ impl IngestorProcess {
             message = "Processing direct ingest message.",
             container = %msg.container,
             blob = %msg.blob,
-            account = %self.state.storage_account_name,
+            account = %target_account,
             file_id = %msg.file_id,
             message_id = %message_id,
         );
 
         let processing_start = std::time::Instant::now();
         let result = self
-            .process_blob_object(&msg.container, &msg.blob, msg.log_type.as_deref())
+            .process_blob_object(
+                &target_account,
+                &msg.container,
+                &msg.blob,
+                msg.log_type.as_deref(),
+            )
             .await;
 
         // Fire ingestion callback if configured (non-blocking).
@@ -786,10 +851,7 @@ impl IngestorProcess {
                 ("file_id".to_string(), msg.file_id.clone()),
                 ("container".to_string(), msg.container.clone()),
                 ("blob".to_string(), msg.blob.clone()),
-                (
-                    "account".to_string(),
-                    self.state.storage_account_name.clone(),
-                ),
+                ("account".to_string(), target_account),
             ]);
             let _ = cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
         }
@@ -855,8 +917,11 @@ impl IngestorProcess {
             });
         }
 
-        // Event Grid notifications carry no log type; only direct-ingest messages do.
-        self.process_blob_object(container, blob, None).await
+        // Event Grid notifications are always for the source's configured account.
+        // They carry no log type, unlike direct-ingest messages.
+        let account = self.state.storage_account_name.clone();
+        self.process_blob_object(&account, container, blob, None)
+            .await
     }
 
     /// Downloads a blob, decompresses, frames, deserializes, enriches, and sends
@@ -865,6 +930,7 @@ impl IngestorProcess {
     ///
     async fn process_blob_object(
         &mut self,
+        account: &str,
         container: &str,
         blob: &str,
         log_type: Option<&str>,
@@ -877,10 +943,16 @@ impl IngestorProcess {
         let blob = blob.to_owned();
         let log_type = log_type.map(|s| s.to_owned());
 
-        // Get blob client and download content
+        // Resolve the blob client for the target account (allowlist enforced here), then
+        // address the specific container and blob.
         let blob_client = self
             .state
-            .blob_client
+            .blob_client_for(account)
+            .ok_or_else(|| ProcessingError::DisallowedStorageAccount {
+                account: account.to_owned(),
+                container: container.clone(),
+                blob: blob.clone(),
+            })?
             .container_client(&container)
             .blob_client(&blob);
 

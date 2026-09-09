@@ -72,6 +72,13 @@ pub struct AzureBlobConfig {
     #[configurable(derived)]
     pub client_certificate: Option<PemCertificateCredential>,
 
+    /// Extra storage accounts a direct-ingest message may read from, via its `account` field.
+    ///
+    /// Reads reuse the account-agnostic AAD token, so each account must grant this source's
+    /// identity read access. Requires client-certificate auth. Empty (default) is single-account.
+    #[serde(default)]
+    pub allowed_storage_accounts: Vec<String>,
+
     /// The compression scheme used for decompressing blobs.
     ///
     /// This can be set to a specific compression type or set to `auto` to
@@ -290,23 +297,29 @@ impl AzureBlobConfig {
         log_namespace: LogNamespace,
         proxy: &ProxyConfig,
     ) -> crate::Result<queue::Ingestor> {
-        let (blob_client, queue_client) = match (&self.connection_string, &self.client_certificate)
-        {
-            (Some(connection_string), None) => {
-                self.create_clients_from_connection_string(connection_string)?
-            }
-            (None, Some(client_cert_config)) => {
-                self.create_clients_from_certificate(client_cert_config)?
-            }
-            (None, None) => {
-                return Err(CreateQueueIngestorError::MissingCredentials.into());
-            }
-            (Some(_), Some(_)) => {
-                // We should error out here, as this is an example of incorrect configuration and
-                // the user should only specify one of the two.
-                return Err(CreateQueueIngestorError::ConflictingCredentials.into());
-            }
-        };
+        // Reject an invalid config: allowed_storage_accounts needs the account-agnostic token
+        // credential that only client-certificate auth provides.
+        if !self.allowed_storage_accounts.is_empty() && self.client_certificate.is_none() {
+            return Err(CreateQueueIngestorError::AllowedAccountsRequireCertAuth.into());
+        }
+
+        let (blob_client, queue_client, cross_account_credentials) =
+            match (&self.connection_string, &self.client_certificate) {
+                (Some(connection_string), None) => {
+                    self.create_clients_from_connection_string(connection_string)?
+                }
+                (None, Some(client_cert_config)) => {
+                    self.create_clients_from_certificate(client_cert_config)?
+                }
+                (None, None) => {
+                    return Err(CreateQueueIngestorError::MissingCredentials.into());
+                }
+                (Some(_), Some(_)) => {
+                    // We should error out here, as this is an example of incorrect configuration and
+                    // the user should only specify one of the two.
+                    return Err(CreateQueueIngestorError::ConflictingCredentials.into());
+                }
+            };
 
         // Build decoder
         let decoder =
@@ -332,6 +345,8 @@ impl AzureBlobConfig {
             multiline,
             decoder,
             callback_client,
+            cross_account_credentials,
+            self.allowed_storage_accounts.clone(),
         )
         .await?;
 
@@ -348,7 +363,14 @@ impl AzureBlobConfig {
     fn create_clients_from_connection_string(
         &self,
         connection_string: &str,
-    ) -> Result<(BlobServiceClient, QueueServiceClient), CreateQueueIngestorError> {
+    ) -> Result<
+        (
+            BlobServiceClient,
+            QueueServiceClient,
+            Option<StorageCredentials>,
+        ),
+        CreateQueueIngestorError,
+    > {
         // Connection string authentication
         warn!(
             message = "Using Azure connection string for authentication. This method of authentication is NOT recommended, and should be used only for local testing. Please consider using Service Principal based SNI authentication instead."
@@ -410,7 +432,9 @@ impl AzureBlobConfig {
             None => QueueServiceClient::new(account, creds),
         };
 
-        Ok((blob_client, queue_client))
+        // Connection-string credentials are account-bound (account key or SAS), so
+        // cross-account direct-ingest reads are not supported under this auth mode.
+        Ok((blob_client, queue_client, None))
     }
 
     /// Creates Azure clients using client certificate authentication.
@@ -423,7 +447,14 @@ impl AzureBlobConfig {
     fn create_clients_from_certificate(
         &self,
         client_cert_config: &PemCertificateCredential,
-    ) -> Result<(BlobServiceClient, QueueServiceClient), CreateQueueIngestorError> {
+    ) -> Result<
+        (
+            BlobServiceClient,
+            QueueServiceClient,
+            Option<StorageCredentials>,
+        ),
+        CreateQueueIngestorError,
+    > {
         info!(message = "Using client certificate for Azure authentication.",);
 
         let client_credential = client_cert_config
@@ -443,13 +474,24 @@ impl AzureBlobConfig {
         // Disable transport-level gzip decompression so `Content-Length` survives: see
         // `no_decompression_transport`. The queue client is left as-is (queue responses are
         // never gzip-encoded).
-        let blob_client = ClientBuilder::new(account.clone(), storage_credentials.clone())
-            .transport(no_decompression_transport())
-            .blob_service_client();
-        let queue_client = QueueServiceClient::new(account, storage_credentials);
+        let blob_client = build_blob_service_client(account.clone(), storage_credentials.clone());
+        let queue_client = QueueServiceClient::new(account, storage_credentials.clone());
 
-        Ok((blob_client, queue_client))
+        // The token credential authenticates to any account this identity can read, so
+        // surface it to enable cross-account direct-ingest reads for allowlisted accounts.
+        Ok((blob_client, queue_client, Some(storage_credentials)))
     }
+}
+
+/// Builds a blob service client for `account` with response decompression disabled
+/// (see [`no_decompression_transport`]).
+fn build_blob_service_client(
+    account: String,
+    credentials: StorageCredentials,
+) -> BlobServiceClient {
+    ClientBuilder::new(account, credentials)
+        .transport(no_decompression_transport())
+        .blob_service_client()
 }
 
 /// Builds the Azure Storage HTTP transport with response decompression disabled.
@@ -509,6 +551,14 @@ enum CreateQueueIngestorError {
         "connection_string and client_certificate cannot be provided at the same time"
     ))]
     ConflictingCredentials,
+
+    /// `allowed_storage_accounts` was set without client-certificate auth. Cross-account reads
+    /// need the account-agnostic token credential, which only that auth mode provides.
+    #[snafu(display(
+        "allowed_storage_accounts requires client_certificate auth (connection-string \
+         credentials are account-bound)"
+    ))]
+    AllowedAccountsRequireCertAuth,
 }
 
 #[cfg(test)]
@@ -598,6 +648,31 @@ mod test {
         fetch(ClientBuilder::with_location(loc(), creds).transport(no_decompression_transport()))
             .await
             .expect("no_decompression_transport must fetch the gzip blob");
+    }
+
+    /// allowed_storage_accounts is only valid with client-certificate auth, so pairing it with
+    /// connection-string auth is rejected at build.
+    #[tokio::test]
+    async fn allowed_storage_accounts_requires_certificate_auth() {
+        let config: AzureBlobConfig = toml::from_str(
+            r#"
+            connection_string = "DefaultEndpointsProtocol=https;AccountName=a;AccountKey=k;EndpointSuffix=core.windows.net"
+            allowed_storage_accounts = ["other-account"]
+            [queue]
+            queue_name = "my-queue"
+            "#,
+        )
+        .expect("config should parse");
+        let err = config
+            .create_queue_ingestor(None, LogNamespace::Legacy, &ProxyConfig::default())
+            .await
+            .err()
+            .expect("cross-account without certificate auth must be rejected");
+        assert!(
+            err.to_string()
+                .contains("allowed_storage_accounts requires client_certificate"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Tests valid configuration parsing
@@ -902,7 +977,7 @@ mod test {
 
         let config = AzureBlobConfig::default();
         for case in cases {
-            let (blob, queue) = config
+            let (blob, queue, _) = config
                 .create_clients_from_connection_string(&case.connection_string)
                 .unwrap_or_else(|_| panic!("clients must build: {}", case.name));
 
