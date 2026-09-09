@@ -1,6 +1,7 @@
 use std::convert::TryInto;
 
 use aws_smithy_types::byte_stream::ByteStream;
+use aws_types::region::Region;
 use snafu::Snafu;
 use vector_lib::{
     codecs::{
@@ -55,6 +56,11 @@ enum Strategy {
 pub struct AwsS3Config {
     #[serde(flatten)]
     region: RegionOrEndpoint,
+
+    /// Overrides the region used for S3 `GetObject`, independent of `region` (which
+    /// selects the SQS queue). Set this when the SQS queue and the buckets it references
+    /// live in different regions. Defaults to `region`.
+    s3_region: Option<String>,
 
     /// The compression scheme used for decompressing objects retrieved from S3.
     compression: Compression,
@@ -215,6 +221,16 @@ impl SourceConfig for AwsS3Config {
 }
 
 impl AwsS3Config {
+    /// Region for the S3 client: the `s3_region` override when set, else the source region.
+    /// Separate from the SQS/source region so a queue and the buckets it references can live
+    /// in different regions.
+    fn s3_client_region(&self) -> Option<Region> {
+        self.s3_region
+            .clone()
+            .map(Region::new)
+            .or_else(|| self.region.region())
+    }
+
     async fn create_sqs_ingestor(
         &self,
         multiline: Option<line_agg::Config>,
@@ -229,7 +245,7 @@ impl AwsS3Config {
                 force_path_style: Some(self.force_path_style),
             },
             &self.auth,
-            region.clone(),
+            self.s3_client_region(),
             endpoint.clone(),
             proxy,
             self.tls_options.as_ref(),
@@ -309,6 +325,65 @@ async fn s3_object_decoder(
         .resolve(content_encoding, content_type, key)
         .build_decoder(body_stream)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s3_client_region_prefers_override_then_source() {
+        struct Case {
+            name: &'static str,
+            s3_region: Option<&'static str>,
+            source_region: Option<&'static str>,
+            expected: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                name: "override wins over source region",
+                s3_region: Some("peer-region"),
+                source_region: Some("home-region"),
+                expected: Some("peer-region"),
+            },
+            Case {
+                name: "override applies with no source region",
+                s3_region: Some("peer-region"),
+                source_region: None,
+                expected: Some("peer-region"),
+            },
+            Case {
+                name: "no override falls back to source region",
+                s3_region: None,
+                source_region: Some("home-region"),
+                expected: Some("home-region"),
+            },
+            Case {
+                name: "neither set resolves to none",
+                s3_region: None,
+                source_region: None,
+                expected: None,
+            },
+        ];
+
+        for case in cases {
+            let config = AwsS3Config {
+                s3_region: case.s3_region.map(str::to_owned),
+                region: RegionOrEndpoint {
+                    region: case.source_region.map(str::to_owned),
+                    endpoint: None,
+                },
+                ..Default::default()
+            };
+            assert_eq!(
+                config.s3_client_region().as_ref().map(|r| r.as_ref()),
+                case.expected,
+                "{}",
+                case.name,
+            );
+        }
+    }
 }
 
 #[cfg(feature = "aws-s3-integration-tests")]
