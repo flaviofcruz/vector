@@ -191,9 +191,13 @@ pub struct ZerobusSinkConfig {
     ///
     /// Applied on both auth strategies. Names must be lowercase (gRPC metadata
     /// keys are). Reserved auth headers (`authorization`,
-    /// `x-databricks-zerobus-table-name`, `x-databricks-app-instance-name`,
-    /// `user-agent` — controlled via `user_agent`) and gRPC transport headers
-    /// (`content-type`, `te`, any `grpc-*`) cannot be set here.
+    /// `x-databricks-zerobus-table-name`, `user-agent` — controlled via
+    /// `user_agent`) and gRPC transport headers (`content-type`, `te`, any
+    /// `grpc-*`) cannot be set here.
+    ///
+    /// `x-databricks-app-instance-name` may be set here to route traffic to a
+    /// personal pod deployment (dev/staging). On `login_service` auth a value
+    /// set here takes precedence over the `ZEROBUS_APP_INSTANCE_NAME` env var.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_headers: BTreeMap<String, String>,
 
@@ -365,10 +369,9 @@ impl ZerobusSinkConfig {
         // here — the gRPC layer would otherwise reject an uppercase name at the
         // first stream create rather than at config load. Reject reserved auth
         // headers and gRPC transport headers that would corrupt the exchange.
-        const RESERVED: [&str; 5] = [
+        const RESERVED: [&str; 4] = [
             "authorization",
             "x-databricks-zerobus-table-name",
-            "x-databricks-app-instance-name",
             "user-agent",
             "content-type",
         ];
@@ -807,6 +810,18 @@ mod tests {
         config
             .custom_headers
             .insert("x-my-tenant".into(), "acme".into());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn custom_headers_app_instance_name_accepted() {
+        // Pod-routing header for personal deployments is not reserved: it is
+        // safe to set and is the only way to route OAuth-auth traffic to a
+        // personal pod.
+        let mut config = create_test_config();
+        config
+            .custom_headers
+            .insert("x-databricks-app-instance-name".into(), "shinkansen-dev".into());
         assert!(config.validate().is_ok());
     }
 
