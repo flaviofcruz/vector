@@ -14201,11 +14201,9 @@ dependencies = [
 name = "vector-redaction-executor"
 version = "0.1.0"
 dependencies = [
- "hmac",
+ "bytes 1.11.1",
  "prost 0.12.6",
  "prost-build 0.12.6",
- "serde_json",
- "sha2",
 ]
 
 [[package]]

@@ -10,7 +10,7 @@ license = "MPL-2.0"
 indoc.workspace = true
 vrl.workspace = true
 enrichment = { path = "../../enrichment" }
-vector-redaction-executor = { path = "../../vector-redaction-executor" }
+vector-redaction-executor = { path = "../../vector-redaction-executor", optional = true }
 dnstap-parser = { path = "../../dnstap-parser", optional = true }
 vector-vrl-metrics = { path = "../../vector-vrl-metrics", optional = true }
 
@@ -20,5 +20,6 @@ prost = { workspace = true, features = ["derive"] }
 
 [features]
 default = []
+databricks-redaction = ["dep:vector-redaction-executor", "vector-redaction-executor/static-executor"]
 dnstap = ["dep:dnstap-parser"]
 vrl-metrics = ["dep:vector-vrl-metrics"]

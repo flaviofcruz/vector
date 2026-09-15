@@ -1,2324 +1,393 @@
-//! Native (Rust) executor for the streaming proto redactor.
+//! Safe Rust wrapper around the prebuilt canonical redaction executor C ABI.
 //!
-//! Consumes the language-neutral [`RedactionPlanSet`] contract
-//! (`.../redaction/proto/redaction_plan.proto`), redacting a serialized log record per the
-//! serialized plan.
+//! # Safety model
 //!
-//! Plans are registered once via [`register_plan`] (which does the decode + validation) and
-//! referenced by a `u64` handle from then on, so the per-record [`redact`] path skips re-parsing
-//! the plan on every call. Callers must release the handle via [`release_plan`] when done with it.
-//!
-//! The engine walks the record's proto wire bytes tag-by-tag, looks up each field's [`FieldAction`]
-//! in the plan, and copies, drops, recurses into, or rewrites the field accordingly, emitting
-//! redacted wire bytes. It handles the structural opcodes (PassThrough / PassThroughString / Remove
-//! / EmptyString / TodoRemove / Recurse / MapEntry / MapStripValue / RedactTag) plus the `RedactFrom`
-//! derivation (Phase 1: HMAC_HASH). Derivation needs the fleet HMAC key, so it is only reachable via
-//! [`register_plan_with_key`]; the keyless [`register_plan`] entry point rejects any plan carrying a
-//! `RedactFrom` (so that path stays fail-closed until the key is provisioned). GenericAny never
-//! appears in a serialized plan. The executor also fails closed on any `FieldAction` whose `oneof`
-//! is unset — never emitting the input unredacted.
-//!
-//! Vendored copy; kept in sync with its upstream source. The only difference is the plan-proto
-//! binding below: `build.rs` (prost-build) emits it into `OUT_DIR` and it is `include!`d as the
-//! `plan_proto` module.
-//!
-//! Note: `handle_recurse` recurses on the native call stack via `process_message`, and a `Recurse`
-//! action may reference an ancestor plan, so a deeply-nested record could otherwise recurse without
-//! bound. [`MAX_RECURSION_DEPTH`] caps this: past the limit `redact` returns
-//! [`RedactError::RecursionLimitExceeded`] (fail-closed, per-record) instead of overflowing the
-//! native stack (which would abort the whole process).
-//!
-//! DATABRICKS DIVERGENCE (see `README.databricks.md`): the depth cap is a vector-fork-only change;
-//! universe's canonical executor does NOT yet have it. See the `TODO(vendored)` on
-//! [`MAX_RECURSION_DEPTH`] — the fix must be ported upstream and re-vendored to converge.
+//! Unsafe code is confined to the FFI calls and the zero-copy view of buffers allocated by the
+//! canonical library. Rust slices passed to the ABI remain live for each call, output pointers are
+//! distinct initialized locals, and every returned allocation has one owner that invokes the
+//! library's matching deallocator on drop.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+#![deny(unsafe_op_in_unsafe_fn)]
 
-use hmac::{Hmac, Mac};
-use plan_proto::field_action::Action;
-use prost::Message;
-use sha2::Sha512;
+#[cfg(feature = "static-executor")]
+use std::{ptr, slice, sync::OnceLock};
 
-mod shape;
-mod metadata_shape;
+#[cfg(feature = "static-executor")]
+use bytes::Bytes;
 
-/// prost-generated bindings for `proto/redaction_plan.proto`. `build.rs` emits `_bindings.rs`, which
-/// wires each proto package into a nested module tree; the plan proto references `compliance.DataLabel`
-/// across packages, so the nested layout is required.
-///
-/// TODO(vendored): this prost-build binding (`OUT_DIR` -> `include!`) is the one intended divergence
-/// from universe's executor, which resolves the same proto through a Bazel crate name. Everything
-/// else in this file is meant to stay byte-identical to
-/// log-sync/structured-logs/common/src/redaction/streaming/executor/src/lib.rs; converge at vendor time.
 mod proto_bindings {
     include!(concat!(env!("OUT_DIR"), "/_bindings.rs"));
 }
 
-/// The generated `RedactionPlanSet` contract types. Public so callers can construct or inspect plans.
+pub use proto_bindings::compliance::DataShape;
 pub use proto_bindings::databricks::logstructuredredactionplan as plan_proto;
 
-/// Log-metadata shape-enforcement policy (the LP port of Scala `LogMetadataShapeEnforcer`). The
-/// `enforce_metadata_shape` VRL function walks the `_log_metadata` object and applies these maps.
-pub use metadata_shape::{
-    field_value_conforms, DATA_PLANE_METADATA_SHAPES, LOG_DAEMON_METADATA_SHAPES,
-    SERVICE_METADATA_SHAPES,
-};
+#[cfg(feature = "static-executor")]
+const EXPECTED_ABI_VERSION: u32 = 1;
 
-/// Protobuf wire types (the low 3 bits of a field tag). Groups (start/end, wire types 3 and 4) are
-/// unsupported — the redactor rejects them as malformed.
-mod wire_type {
-    pub const VARINT: u32 = 0;
-    pub const FIXED64: u32 = 1;
-    pub const LENGTH_DELIMITED: u32 = 2;
-    pub const FIXED32: u32 = 5;
+#[cfg(feature = "static-executor")]
+#[repr(C)]
+struct ForeignBuffer {
+    data: *mut u8,
+    len: usize,
+    _capacity: usize,
 }
 
-/// `logging.Field` field numbers read during REDACT_TAG. `key` (1) and `label` (4) are the two
-/// fields kept when a tag's value oneof is stripped; `label` is the varint enum the keep decision
-/// gates on.
-mod tag_field {
-    pub const KEY: u32 = 1;
-    pub const LABEL: u32 = 4;
+#[cfg(feature = "static-executor")]
+impl ForeignBuffer {
+    const EMPTY: Self = Self {
+        data: ptr::null_mut(),
+        len: 0,
+        _capacity: 0,
+    };
+
+    fn into_bytes(self) -> Bytes {
+        if self.data.is_null() || self.len == 0 {
+            return Bytes::new();
+        }
+        Bytes::from_owner(self)
+    }
+
+    fn diagnostic(&self) -> String {
+        String::from_utf8_lossy(self.as_ref()).into_owned()
+    }
 }
 
-/// Maximum submessage nesting the redactor will recurse through before failing closed.
-///
-/// The engine recurses on the native call stack (`process_message` -> `handle_recurse` ->
-/// `process_message`), and a `Recurse` action may point back at an ancestor plan, so without a cap a
-/// crafted deeply-nested record could exhaust the stack and abort the process. 100 is chosen to
-/// match the protobuf ecosystem's universal default recursion limit (`CodedInputStream` /
-/// `google::protobuf` default), while sitting far above any legitimate log record: the deepest
-/// `ai-products-event-log` message chain nests ~8 levels, structured-log protos are CI-enforced
-/// acyclic ("All log protos are finite"), and the framework's own guidance is that protos "typically
-/// nest 3-5 levels". So the cap never rejects a valid record, but bounds the one unbounded-in-
-/// principle path (`google.protobuf.Any` payloads, whose nesting follows attacker-influenced input).
-///
-/// TODO(vendored): DATABRICKS-ONLY divergence from universe's canonical executor
-/// (log-sync/structured-logs/common/src/redaction/streaming/executor/src/lib.rs), which has NO depth
-/// cap. Port this cap upstream (both the Java `StreamingProtoRedactor` and the Rust executor
-/// hand-recurse and are equally exposed), then re-vendor so the copies converge. Until then this file
-/// is intentionally NOT byte-identical to universe on this point.
-const MAX_RECURSION_DEPTH: usize = 100;
+#[cfg(feature = "static-executor")]
+impl AsRef<[u8]> for ForeignBuffer {
+    fn as_ref(&self) -> &[u8] {
+        if self.data.is_null() || self.len == 0 {
+            return &[];
+        }
+        // SAFETY: Successful ABI calls return a non-null, immutable allocation containing at least
+        // len initialized bytes. This wrapper owns it exclusively until Drop invokes the matching
+        // deallocator, so the slice cannot outlive or alias a mutation of the allocation.
+        unsafe { slice::from_raw_parts(self.data, self.len) }
+    }
+}
 
-/// Reasons the executor can refuse to redact. Every variant fails closed: the caller must drop the
-/// record rather than emit un-redacted bytes.
+// SAFETY: ForeignBuffer uniquely owns an immutable allocation and exposes no mutation API. The
+// allocator used by the linked Rust static library supports deallocation from any thread.
+#[cfg(feature = "static-executor")]
+unsafe impl Send for ForeignBuffer {}
+
+#[cfg(feature = "static-executor")]
+impl Drop for ForeignBuffer {
+    fn drop(&mut self) {
+        // SAFETY: This is empty or the sole owner of an unmodified live buffer returned by this ABI;
+        // Drop runs once and the ABI resets the buffer while freeing it.
+        unsafe { db_redactor_buffer_free(self) };
+    }
+}
+
+#[cfg(feature = "static-executor")]
+// SAFETY: These declarations exactly mirror vector_redactor.h from the archive that the build script
+// links. The safe wrappers below uphold each function's pointer and ownership contract.
+unsafe extern "C" {
+    fn db_redactor_abi_version() -> u32;
+    fn db_redactor_register_plan(
+        plan: *const u8,
+        plan_len: usize,
+        hmac_key: *const u8,
+        hmac_key_len: usize,
+        out_handle: *mut u64,
+        out_error: *mut ForeignBuffer,
+    ) -> i32;
+    fn db_redactor_redact(
+        handle: u64,
+        record: *const u8,
+        record_len: usize,
+        enforce_shapes: u8,
+        keep_original: u8,
+        out_record: *mut ForeignBuffer,
+        out_error: *mut ForeignBuffer,
+    ) -> i32;
+    fn db_redactor_field_value_conforms(
+        shapes: *const i32,
+        shapes_len: usize,
+        value: *const u8,
+        value_len: usize,
+        out_conforms: *mut u8,
+    ) -> i32;
+    fn db_redactor_release_plan(handle: u64);
+    fn db_redactor_buffer_free(buffer: *mut ForeignBuffer);
+}
+
+/// Reasons the canonical executor or its ABI refused an operation.
+#[cfg(feature = "static-executor")]
 #[derive(Debug)]
 pub enum RedactError {
-    /// The plan bytes did not decode as a `RedactionPlanSet`.
-    BadPlan(prost::DecodeError),
-    /// A well-formed plan that is structurally invalid (e.g. empty plan table).
+    AbiVersion { expected: u32, actual: u32 },
     InvalidPlan(String),
-    /// `redact` was called with a handle that `register_plan` never returned, or that has already
-    /// been released.
-    UnknownHandle(u64),
-    /// The record bytes were not valid protobuf wire format (truncated, bad varint, or an
-    /// unsupported group wire type). We fail closed so the caller drops the record rather than
-    /// emitting it unredacted.
-    MalformedRecord(String),
-    /// The record nested deeper than [`MAX_RECURSION_DEPTH`] while recursing into submessages. We
-    /// fail closed (drop the record) rather than recurse further, since unbounded native-stack
-    /// recursion on a crafted record would abort the whole process instead of erroring per-record.
-    RecursionLimitExceeded(usize),
+    UnknownHandle(String),
+    RedactionFailed(String),
+    InvalidArgument(String),
+    ExecutorPanic(String),
+    UnknownStatus(i32, String),
 }
 
+#[cfg(feature = "static-executor")]
 impl std::fmt::Display for RedactError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RedactError::BadPlan(e) => write!(f, "failed to decode RedactionPlanSet: {e}"),
-            RedactError::InvalidPlan(msg) => write!(f, "invalid RedactionPlanSet: {msg}"),
-            RedactError::UnknownHandle(handle) => write!(f, "unknown plan handle: {handle}"),
-            RedactError::MalformedRecord(msg) => write!(f, "malformed record: {msg}"),
-            RedactError::RecursionLimitExceeded(limit) => {
-                write!(f, "record nesting exceeded recursion limit of {limit}")
+            Self::AbiVersion { expected, actual } => {
+                write!(
+                    f,
+                    "redactor ABI version mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::InvalidPlan(message) => write!(f, "invalid redaction plan: {message}"),
+            Self::UnknownHandle(message) => write!(f, "unknown redaction plan handle: {message}"),
+            Self::RedactionFailed(message) => write!(f, "redaction failed: {message}"),
+            Self::InvalidArgument(message) => write!(f, "invalid redactor argument: {message}"),
+            Self::ExecutorPanic(message) => write!(f, "redactor panic: {message}"),
+            Self::UnknownStatus(status, message) => {
+                write!(f, "redactor returned unknown status {status}: {message}")
             }
         }
     }
 }
 
+#[cfg(feature = "static-executor")]
 impl std::error::Error for RedactError {}
 
-/// Per-record data-shape enforcement verdict, resolved upstream (the VRL gate in prod) and threaded
-/// through the walk. Governs the `PassThroughString` arm only: `Off` copies each such field
-/// verbatim; `On` enforces its declared `allowed_shapes`. Every other opcode ignores it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "static-executor")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeEnforcement {
-    /// Copy `PassThroughString` fields verbatim, ignoring their declared shapes.
     Off,
-    /// Enforce declared shapes: keep a `PassThroughString` field iff a shape matches, else drop
-    /// (empty shapes drop everything).
     On,
 }
 
-// ===== The plan model (recap) =====
-//
-// A *planset* ([`plan_proto::RedactionPlanSet`]) is a flat table of *plans*. `plans[0]` is the root
-// plan for the log-type proto being redacted; nested message types are reached from it via a
-// `Recurse` action carrying a `child_plan_index` into the same table (which may point back at an
-// ancestor, so cyclic message types are expressed without inlining).
-//
-// A *plan* ([`plan_proto::MessageRedactionPlan`]) redacts one message type. It is a list of
-// *action-entries*, one per proto field: each maps a proto *field number* (the field's tag on the
-// wire, i.e. its "column") to a `FieldAction` opcode — PassThrough (copy verbatim), Remove (drop),
-// Recurse (redact a nested message with another plan), MapEntry / MapStripValue (json_map handling),
-// or RedactTag (keep a tagged value only if its runtime label is centralizable). A field number
-// absent from the plan is dropped (allowlist default).
-//
-// `action_index` below is the prebuilt `field_number -> action-entry index` map (one per plan) so
-// the per-record walk is an O(1) lookup instead of a scan. The proto contract in
-// `proto/redaction_plan.proto` is the exhaustive definition; this is the reader's-digest at the
-// point the runtime model is first used.
-type PlanRegistry = HashMap<u64, Arc<RegisteredPlan>>;
-
-/// A decoded plan set plus its prebuilt `field_number -> action-entry index` map (one map per
-/// plan). Because the map depends only on the plan — which is fixed for a handle's lifetime — it is
-/// built once at [`register_plan`] time and reused by every [`redact`] call on that handle, rather
-/// than rebuilt per record.
-struct RegisteredPlan {
-    plan_set: plan_proto::RedactionPlanSet,
-    action_index: Vec<HashMap<u32, usize>>,
-    /// Per-plan `RedactFrom` actions, sorted ascending by target field number. The Java redactor
-    /// emits derived fields in field-number order, so matching it keeps output byte-identical.
-    redact_from: Vec<Vec<PreparedRedactFrom>>,
-    /// Per-plan set of source field numbers referenced by any `RedactFrom` — the fields Pass 1
-    /// collects the cleartext of before Pass 2 emits the derived values.
-    source_fields: Vec<HashSet<u32>>,
-    /// Fleet HMAC key for HMAC_HASH derivation. Required (and non-empty) iff any plan carries a
-    /// `RedactFrom`; `None` on the keyless path, which rejects such plans.
-    hmac_key: Option<Vec<u8>>,
+#[cfg(feature = "static-executor")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepMode {
+    Wipe,
+    Keep,
 }
 
-/// Shape-enforcement state of a `RedactFrom`'s derived value, mirroring the Java planner's
-/// `@Nullable DataShapeValidator[]` tri-state (the `derived_shapes` wrapper's message presence):
-/// `Absent` = no enforcement (a non-centralizable self-hash), always emitted; `Empty` = a
-/// centralizable target that declares no shape, wiped when enforcement is `On`; `Shapes` = kept when
-/// enforcement is `On` iff the derived value matches one of the shapes.
-enum DerivedShapesState {
-    Absent,
-    Empty,
-    Shapes(Vec<i32>),
-}
-
-/// A `RedactFrom` action prepared once at registration: the derived (target) field to emit, the
-/// sibling source field whose cleartext is hashed, whether the target is repeated, and how to
-/// shape-enforce the derived value.
-struct PreparedRedactFrom {
-    target_field_number: u32,
-    source_field_number: u32,
-    is_repeated: bool,
-    derived_shapes: DerivedShapesState,
-}
-
-impl RegisteredPlan {
-    /// Decodes the per-plan action index, the `RedactFrom` derivation index, and the source-field
-    /// collect sets from `plan_set`, validating the derivation contract. Proto field numbers are
-    /// >= 1; an absent/invalid field number is ignored.
-    ///
-    /// Fails closed at registration when a `RedactFrom` is malformed (unset/unsupported transform,
-    /// missing source/target field number, missing `is_repeated`), when a source field is not
-    /// dropped (would leak cleartext), or when any plan carries a `RedactFrom` but no non-empty
-    /// `hmac_key` was supplied — so a keyless registration can never execute a derivation.
-    fn new(
-        plan_set: plan_proto::RedactionPlanSet,
-        hmac_key: Option<Vec<u8>>,
-    ) -> Result<Self, RedactError> {
-        let action_index: Vec<HashMap<u32, usize>> = plan_set
-            .plans
-            .iter()
-            .map(|plan| {
-                let mut map = HashMap::with_capacity(plan.actions.len());
-                for (i, entry) in plan.actions.iter().enumerate() {
-                    if let Some(field_number) = entry.field_number {
-                        if field_number > 0 {
-                            map.insert(field_number as u32, i);
-                        }
-                    }
-                }
-                map
-            })
-            .collect();
-
-        let mut redact_from: Vec<Vec<PreparedRedactFrom>> =
-            Vec::with_capacity(plan_set.plans.len());
-        let mut source_fields: Vec<HashSet<u32>> = Vec::with_capacity(plan_set.plans.len());
-        let mut any_redact_from = false;
-        for (plan_index, plan) in plan_set.plans.iter().enumerate() {
-            // A key-shape gate must name a real, positive field the plan handles (the planner sets a
-            // map entry's key field to PassThrough). Reject a malformed/stale gate here so a bad plan
-            // fails loudly at registration instead of silently dropping every entry under enforcement
-            // (an unreadable/unknown key field fails the runtime gate for every entry).
-            if let Some(key_field) = plan.key_shape_field_number {
-                if key_field <= 0 || !action_index[plan_index].contains_key(&(key_field as u32)) {
-                    return Err(RedactError::InvalidPlan(format!(
-                        "plan {plan_index} has a key-shape gate on field {key_field} that is not a \
-                         positive field the plan handles"
-                    )));
-                }
-            }
-            let mut prepared = Vec::new();
-            let mut sources = HashSet::new();
-            for entry in &plan.actions {
-                let Some(Action::RedactFrom(rf)) =
-                    entry.action.as_ref().and_then(|a| a.action.as_ref())
-                else {
-                    continue;
-                };
-                let target_field_number = match entry.field_number {
-                    Some(n) if n > 0 => n as u32,
-                    _ => {
-                        return Err(RedactError::InvalidPlan(format!(
-                            "RedactFrom in plan {plan_index} has no target field number"
-                        )));
-                    }
-                };
-                // Phase 1 executes only HMAC_HASH; any other/unset transform is a coverage gap.
-                if rf.transform != Some(plan_proto::RedactFromTransform::HmacHash as i32) {
-                    return Err(RedactError::InvalidPlan(format!(
-                        "RedactFrom on field {target_field_number} in plan {plan_index} has an \
-                         unsupported transform {:?} (only HMAC_HASH is implemented)",
-                        rf.transform
-                    )));
-                }
-                let source_field_number = match rf.source_field_number {
-                    Some(n) if n > 0 => n as u32,
-                    _ => {
-                        return Err(RedactError::InvalidPlan(format!(
-                            "RedactFrom on field {target_field_number} in plan {plan_index} has no \
-                             source field number"
-                        )));
-                    }
-                };
-                // The serializer always sets is_repeated; absent → malformed plan (the JVM
-                // deserializer rejects it too). Fail closed rather than default to scalar.
-                let Some(is_repeated) = rf.is_repeated else {
-                    return Err(RedactError::InvalidPlan(format!(
-                        "RedactFrom on field {target_field_number} in plan {plan_index} has no \
-                         is_repeated set"
-                    )));
-                };
-                // Source-drop invariant: the cleartext source must not be emitted, so its action in
-                // this plan must be Remove/TodoRemove or absent (dropped by the allowlist default).
-                // A self-hash (source == target) is fine — the target's own RedactFrom arm drops the
-                // incoming value in dispatch. Anything else would leave cleartext next to the hash.
-                let source_dropped = source_field_number == target_field_number
-                    || match action_index[plan_index].get(&source_field_number) {
-                        None => true,
-                        Some(&entry_index) => matches!(
-                            plan.actions[entry_index]
-                                .action
-                                .as_ref()
-                                .and_then(|a| a.action.as_ref()),
-                            Some(Action::Remove(_) | Action::TodoRemove(_))
-                        ),
-                    };
-                if !source_dropped {
-                    return Err(RedactError::InvalidPlan(format!(
-                        "RedactFrom on field {target_field_number} in plan {plan_index}: source \
-                         field {source_field_number} must be dropped (Remove) to preserve the \
-                         source-drop invariant, but its plan action would emit it"
-                    )));
-                }
-                let derived_shapes = match &rf.derived_shapes {
-                    None => DerivedShapesState::Absent,
-                    Some(ds) if ds.shapes.is_empty() => DerivedShapesState::Empty,
-                    Some(ds) => DerivedShapesState::Shapes(ds.shapes.clone()),
-                };
-                sources.insert(source_field_number);
-                prepared.push(PreparedRedactFrom {
-                    target_field_number,
-                    source_field_number,
-                    is_repeated,
-                    derived_shapes,
-                });
-            }
-            any_redact_from |= !prepared.is_empty();
-            prepared.sort_by_key(|p| p.target_field_number);
-            redact_from.push(prepared);
-            source_fields.push(sources);
-        }
-
-        // A RedactFrom needs a non-empty HMAC key (the JVM HashingUtils rejects an empty key, so
-        // matching keeps the Rust output authoritative). Enforced only when a RedactFrom is present.
-        if any_redact_from && !matches!(hmac_key.as_deref(), Some(key) if !key.is_empty()) {
-            return Err(RedactError::InvalidPlan(
-                "plan carries a RedactFrom (HMAC_HASH) action but no non-empty HMAC key was \
-                 provided; register via register_plan_with_key with the fleet key"
-                    .to_string(),
-            ));
-        }
-
-        Ok(RegisteredPlan {
-            plan_set,
-            action_index,
-            redact_from,
-            source_fields,
-            hmac_key,
-        })
-    }
-}
-
-/// Registered plans, keyed by the handle returned from [`register_plan`]. Values are `Arc`-wrapped
-/// so [`redact`] can clone a reference out under a short lock and keep using it even if
-/// [`release_plan`] races it from another thread.
-///
-/// The registry is multi-tenant: it holds one entry per [`register_plan`] call, so many plansets
-/// can be registered concurrently (each under its own handle). The M2 `apply_redaction` function
-/// happens to register a single planset today, but that is a caller-side choice — the registry
-/// itself is not limited to one, which is what lets a caller register per-`(log_type, group)` plans
-/// later.
-static REGISTRY: LazyLock<Mutex<PlanRegistry>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Source of fresh handles for [`register_plan`]. Starts at 1 so 0 is never a valid handle.
-///
-/// A handle is an opaque, monotonically increasing `u64` — the key under which one decoded planset
-/// lives in [`REGISTRY`], nothing more. It is NOT an index into `plans`: `handle 1` means "the first
-/// planset registered in this process," not "`plans[0]`". The `plans[0] == root log-type plan`
-/// convention (checked in [`register_plan`]) is a separate, within-planset contract unrelated to the
-/// handle value.
-static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
-
-/// Decodes and validates `plan_bytes` once, caching it under a fresh handle so repeated [`redact`]
-/// calls for the same plan skip re-parsing it. Callers must eventually pass the handle to
-/// [`release_plan`].
-/// This keyless entry point cannot execute a `RedactFrom` derivation: [`RegisteredPlan::new`] fails
-/// closed when a plan carries one but no HMAC key was supplied. To run derivations, register via
-/// [`register_plan_with_key`] with the fleet HMAC key.
+#[cfg(feature = "static-executor")]
 pub fn register_plan(plan_bytes: &[u8]) -> Result<u64, RedactError> {
     register_plan_with_key(plan_bytes, None)
 }
 
-/// Like [`register_plan`], but supplies the fleet HMAC key used by HMAC_HASH `RedactFrom`
-/// derivations. Registering a plan that carries a `RedactFrom` requires a non-empty key; the keyless
-/// [`register_plan`] rejects such plans.
+#[cfg(feature = "static-executor")]
 pub fn register_plan_with_key(
     plan_bytes: &[u8],
     hmac_key: Option<&[u8]>,
 ) -> Result<u64, RedactError> {
-    // Decode here so a malformed contract fails at the boundary rather than silently mis-redacting
-    // (also exercises the prost binding).
-    let plan_set =
-        plan_proto::RedactionPlanSet::decode(plan_bytes).map_err(RedactError::BadPlan)?;
-
-    // plans[0] is the root log-type plan by contract; a plan table without it cannot be executed.
-    if plan_set.plans.is_empty() {
-        return Err(RedactError::InvalidPlan("plans table is empty".to_string()));
+    ensure_abi_version()?;
+    let (key_ptr, key_len) = hmac_key
+        .map(|key| (key.as_ptr(), key.len()))
+        .unwrap_or((ptr::null(), 0));
+    let mut handle = 0;
+    let mut error = ForeignBuffer::EMPTY;
+    // SAFETY: Both input slices remain live for the call. The output pointers reference distinct,
+    // aligned, initialized locals and do not alias either input.
+    let status = unsafe {
+        db_redactor_register_plan(
+            plan_bytes.as_ptr(),
+            plan_bytes.len(),
+            key_ptr,
+            key_len,
+            &mut handle,
+            &mut error,
+        )
+    };
+    status_result(status, &error)?;
+    if handle == 0 {
+        return Err(RedactError::InvalidPlan(
+            "executor returned an empty handle".to_owned(),
+        ));
     }
-
-    // Build the per-plan action / derivation indexes once here (validating the RedactFrom contract)
-    // so repeated `redact` calls on this handle reuse them rather than rebuilding per record.
-    let registered = RegisteredPlan::new(plan_set, hmac_key.map(<[u8]>::to_vec))?;
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    registry_guard().insert(handle, Arc::new(registered));
     Ok(handle)
 }
 
-/// Redact `record_bytes` per the plan registered under `handle` ([`register_plan`]). On error
-/// returns [`RedactError`], which the caller must treat as "drop the record", never "emit the
-/// input".
-///
-/// `enforcement` is the per-record verdict resolved upstream (driven by the VRL gate in prod). It
-/// governs the `PassThroughString` arm only (see [`ShapeEnforcement`]); every other opcode is
-/// independent of it. Threaded through the walk so nested `PassThroughString` fields see the same
-/// verdict.
+#[cfg(feature = "static-executor")]
 pub fn redact(
     handle: u64,
-    record_bytes: &[u8],
+    record: &[u8],
     enforcement: ShapeEnforcement,
-) -> Result<Vec<u8>, RedactError> {
-    // Clone the Arc out under a short lock so a concurrent `release_plan` can't drop the plan
-    // mid-walk: the plan outlives the registry entry.
-    let registered = registry_guard()
-        .get(&handle)
-        .map(Arc::clone)
-        .ok_or(RedactError::UnknownHandle(handle))?;
-
-    // plans[0] is the root log-type plan by contract (checked at register time). The action index
-    // was prebuilt at register time; `PlanTable` just borrows it.
-    let table = PlanTable::new(&registered);
-    let mut reader = WireReader::new(record_bytes);
-    let mut out = Vec::with_capacity(record_bytes.len());
-    process_message(&mut reader, &mut out, &table, 0, 0, enforcement)?;
-    Ok(out)
+) -> Result<Bytes, RedactError> {
+    redact_with_mode(handle, record, enforcement, KeepMode::Wipe)
 }
 
-/// Drops the plan registered under `handle`. Idempotent: releasing an already-released or unknown
-/// handle is a no-op, since the caller side (`NativeRustProtoTransformer.close()`) has no way to
-/// recover from a double-release.
+#[cfg(feature = "static-executor")]
+pub fn redact_with_mode(
+    handle: u64,
+    record: &[u8],
+    enforcement: ShapeEnforcement,
+    keep_mode: KeepMode,
+) -> Result<Bytes, RedactError> {
+    let mut output = ForeignBuffer::EMPTY;
+    let mut error = ForeignBuffer::EMPTY;
+    // SAFETY: The record remains live for the call. The output pointers reference distinct,
+    // aligned, initialized locals and do not alias the input.
+    let status = unsafe {
+        db_redactor_redact(
+            handle,
+            record.as_ptr(),
+            record.len(),
+            u8::from(enforcement == ShapeEnforcement::On),
+            u8::from(keep_mode == KeepMode::Keep),
+            &mut output,
+            &mut error,
+        )
+    };
+    status_result(status, &error)?;
+    Ok(output.into_bytes())
+}
+
+#[cfg(feature = "static-executor")]
 pub fn release_plan(handle: u64) {
-    registry_guard().remove(&handle);
+    // SAFETY: Handles are opaque integers and release accepts unknown handles.
+    unsafe { db_redactor_release_plan(handle) };
 }
 
-/// Locks [`REGISTRY`], recovering the guard on poison rather than panicking — none of the
-/// operations performed while holding it can panic, so poisoning can't reflect real corruption.
-fn registry_guard() -> MutexGuard<'static, PlanRegistry> {
-    REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-// ===== Wire reader =====
-
-/// A cursor over serialized proto bytes. Tracks an absolute offset so kept fields can be sliced
-/// verbatim from the input rather than decoded and re-encoded.
-struct WireReader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> WireReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        WireReader { buf, pos: 0 }
-    }
-
-    /// A second cursor over the same buffer at this reader's current position, for the `RedactFrom`
-    /// Pass-1 source scan (which reads the whole message ahead without disturbing the Pass-2 walk).
-    fn fork(&self) -> WireReader<'a> {
-        WireReader {
-            buf: self.buf,
-            pos: self.pos,
-        }
-    }
-
-    fn position(&self) -> usize {
-        self.pos
-    }
-
-    fn remaining(&self) -> usize {
-        self.buf.len() - self.pos
-    }
-
-    /// Reads the next field key. Returns `Ok(None)` only at end of buffer (message terminates);
-    /// otherwise decodes a tag and rejects a field number of 0 as malformed.
-    ///
-    /// Rejecting field 0 is stricter than a bare `tag == 0` break — e.g. wire bytes `0x03` decode to
-    /// field 0 / wire type 3, which is invalid protobuf rather than a clean end-of-message. Failing
-    /// closed here keeps a malformed record from emitting as a partial one.
-    fn read_tag(&mut self) -> Result<Option<(u32, u32)>, RedactError> {
-        if self.remaining() == 0 {
-            return Ok(None);
-        }
-        let tag = self.read_varint32()?;
-        let field_number = tag >> 3;
-        if field_number == 0 {
-            return Err(RedactError::MalformedRecord(format!(
-                "invalid tag with field number 0 (raw tag {tag})"
-            )));
-        }
-        Ok(Some((field_number, tag & 0x07)))
-    }
-
-    /// Reads a base-128 varint (up to 10 bytes).
-    fn read_varint64(&mut self) -> Result<u64, RedactError> {
-        let mut result: u64 = 0;
-        let mut shift: u32 = 0;
-        loop {
-            if self.remaining() == 0 {
-                return Err(RedactError::MalformedRecord("truncated varint".to_string()));
-            }
-            let byte = self.buf[self.pos];
-            self.pos += 1;
-            result |= u64::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(result);
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(RedactError::MalformedRecord(
-                    "varint exceeds 64 bits".to_string(),
-                ));
-            }
-        }
-    }
-
-    /// Reads a varint and truncates to 32 bits. Used for tags and length prefixes, which the proto
-    /// wire format limits to at most 29-bit field numbers and 32-bit lengths — values exceeding
-    /// `u32::MAX` would indicate a malformed record.
-    fn read_varint32(&mut self) -> Result<u32, RedactError> {
-        let v = self.read_varint64()?;
-        debug_assert!(
-            v <= u32::MAX as u64,
-            "varint exceeded u32 range — malformed tag or length prefix"
-        );
-        Ok(v as u32)
-    }
-
-    /// Advances past `n` bytes, bounds-checked. `remaining()` avoids overflow (pos <= len always).
-    fn skip_bytes(&mut self, n: usize) -> Result<(), RedactError> {
-        if n > self.remaining() {
-            return Err(RedactError::MalformedRecord("truncated field".to_string()));
-        }
-        self.pos += n;
-        Ok(())
-    }
-
-    /// Appends the next `n` bytes to `out` and advances, bounds-checked.
-    fn copy_bytes(&mut self, out: &mut Vec<u8>, n: usize) -> Result<(), RedactError> {
-        if n > self.remaining() {
-            return Err(RedactError::MalformedRecord("truncated field".to_string()));
-        }
-        out.extend_from_slice(&self.buf[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(())
-    }
-
-    /// Borrows the next `n` bytes and advances, bounds-checked. Used to window a length-delimited
-    /// submessage for recursion / sub-field scanning.
-    fn take_slice(&mut self, n: usize) -> Result<&'a [u8], RedactError> {
-        if n > self.remaining() {
-            return Err(RedactError::MalformedRecord(
-                "truncated length-delimited field".to_string(),
-            ));
-        }
-        let slice = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(slice)
-    }
-}
-
-// ===== Wire writer helpers =====
-//
-// Free functions over `Vec<u8>`. A fresh `Vec` is allocated per nested message.
-
-/// Writes a base-128 varint. A `u32` value zero-extends to `u64`, so the same function encodes both
-/// unsigned widths identically.
-fn write_varint(out: &mut Vec<u8>, mut value: u64) {
-    while value & !0x7F != 0 {
-        out.push(((value & 0x7F) as u8) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-/// Writes a field key (`(field_number << 3) | wire_type`).
-fn write_tag(out: &mut Vec<u8>, field_number: u32, wire_type: u32) {
-    write_varint(out, u64::from((field_number << 3) | wire_type));
-}
-
-/// Byte length of the varint encoding of `value`.
-fn varint_size(value: u32) -> usize {
-    if value & (!0u32 << 7) == 0 {
-        1
-    } else if value & (!0u32 << 14) == 0 {
-        2
-    } else if value & (!0u32 << 21) == 0 {
-        3
-    } else if value & (!0u32 << 28) == 0 {
-        4
-    } else {
-        5
-    }
-}
-
-/// Byte length of the tag for `field_number`. The wire-type nibble never changes the varint length
-/// (it occupies the low 3 bits that `field_number << 3` leaves zero), so this matches the emitted
-/// tag size regardless of wire type.
-fn tag_size(field_number: u32) -> usize {
-    varint_size(field_number << 3)
-}
-
-// ===== Plan table =====
-
-/// A borrowed view over a [`RegisteredPlan`], giving the walk an O(1) `field_number -> action`
-/// lookup. Cheap to construct (holds two references), so building it per [`redact`] call is fine;
-/// the underlying action index is built once at register time. Threaded (with a plan index) through
-/// recursion.
-struct PlanTable<'a> {
-    plans: &'a [plan_proto::MessageRedactionPlan],
-    action_index: &'a [HashMap<u32, usize>],
-    redact_from: &'a [Vec<PreparedRedactFrom>],
-    source_fields: &'a [HashSet<u32>],
-    hmac_key: Option<&'a [u8]>,
-}
-
-impl<'a> PlanTable<'a> {
-    fn new(registered: &'a RegisteredPlan) -> Self {
-        PlanTable {
-            plans: &registered.plan_set.plans,
-            action_index: &registered.action_index,
-            redact_from: &registered.redact_from,
-            source_fields: &registered.source_fields,
-            hmac_key: registered.hmac_key.as_deref(),
-        }
-    }
-
-    /// The `RedactFrom` actions at `plan_index`, sorted ascending by target field number. Empty for
-    /// a plan (or out-of-range index) with no derivations.
-    fn redact_from(&self, plan_index: usize) -> &'a [PreparedRedactFrom] {
-        self.redact_from.get(plan_index).map_or(&[], Vec::as_slice)
-    }
-
-    /// Whether `field_number` at `plan_index` is a source field some `RedactFrom` derives from.
-    fn is_source(&self, plan_index: usize, field_number: u32) -> bool {
-        self.source_fields
-            .get(plan_index)
-            .is_some_and(|s| s.contains(&field_number))
-    }
-
-    /// Looks up the action for `field_number` in the plan at `plan_index`.
-    ///
-    /// - `Ok(None)`: no entry — an unknown field, dropped by the allowlist default.
-    /// - `Ok(Some(action))`: the field's structural opcode.
-    /// - `Err(InvalidPlan)`: an entry exists but its action `oneof` is unset — a deferred/unknown
-    ///   opcode. Fail closed rather than emit the field unredacted.
-    fn action(&self, plan_index: usize, field_number: u32) -> Result<Option<&Action>, RedactError> {
-        let Some(entry_index) = self
-            .action_index
-            .get(plan_index)
-            .and_then(|map| map.get(&field_number))
-        else {
-            return Ok(None);
-        };
-        match self.plans[plan_index].actions[*entry_index]
-            .action
-            .as_ref()
-            .and_then(|field_action| field_action.action.as_ref())
-        {
-            Some(action) => Ok(Some(action)),
-            None => Err(RedactError::InvalidPlan(format!(
-                "field {field_number} in plan {plan_index} has no action set \
-                 (deferred or unknown opcode)"
-            ))),
-        }
-    }
-}
-
-// ===== Redaction engine =====
-
-/// Walks one message from `reader` into `out` per the plan at `plan_index`. Reads each field's tag,
-/// looks up its action, and copies / drops / recurses / rewrites accordingly. Unknown fields are
-/// dropped (allowlist default). Does not read or write an outer length prefix — the caller owns
-/// that (see [`handle_recurse`]).
-///
-/// `depth` is the current submessage-nesting level (0 at the top-level record); it increments on each
-/// recursion into a nested message and is capped at [`MAX_RECURSION_DEPTH`] to fail closed rather
-/// than overflow the native stack (see [`handle_recurse`]).
-///
-/// `enforcement` is the per-record shape-enforcement verdict (see [`ShapeEnforcement`]); it governs
-/// the `PassThroughString` arm only and is threaded through recursion.
-fn process_message(
-    reader: &mut WireReader,
-    out: &mut Vec<u8>,
-    table: &PlanTable,
-    plan_index: usize,
-    depth: usize,
-    enforcement: ShapeEnforcement,
-) -> Result<(), RedactError> {
-    if depth > MAX_RECURSION_DEPTH {
-        return Err(RedactError::RecursionLimitExceeded(MAX_RECURSION_DEPTH));
-    }
-
-    let redact_from = table.redact_from(plan_index);
-
-    // Fast path: no derivations at this level — a single pass, unchanged.
-    if redact_from.is_empty() {
-        while let Some((field_number, wire_type)) = reader.read_tag()? {
-            match table.action(plan_index, field_number)? {
-                None => drop_field(reader, wire_type)?,
-                Some(action) => dispatch(
-                    reader,
-                    out,
-                    table,
-                    field_number,
-                    wire_type,
-                    action,
-                    depth,
-                    enforcement,
-                )?,
-            }
-        }
-        return Ok(());
-    }
-
-    // Derivation levels are two-pass (mirrors the Java redactor): a derived (target) field is
-    // computed from a sibling source field that may appear after it in wire order, so Pass 1 scans
-    // ahead to collect the source cleartext, then Pass 2 walks the record and emits derived fields
-    // interleaved in ascending target-field order.
-    let collected = collect_sources(&mut reader.fork(), table, plan_index)?;
-
-    let mut next_derived = 0usize;
-    while let Some((field_number, wire_type)) = reader.read_tag()? {
-        // Emit derived fields ordered strictly before this input field (a target equal to the
-        // current field waits — that field is the target's own RedactFrom entry, dropped below).
-        while next_derived < redact_from.len()
-            && redact_from[next_derived].target_field_number < field_number
-        {
-            emit_redact_from(
-                out,
-                &redact_from[next_derived],
-                &collected,
-                table.hmac_key,
-                enforcement,
-            )?;
-            next_derived += 1;
-        }
-        match table.action(plan_index, field_number)? {
-            None => drop_field(reader, wire_type)?,
-            Some(action) => dispatch(
-                reader,
-                out,
-                table,
-                field_number,
-                wire_type,
-                action,
-                depth,
-                enforcement,
-            )?,
-        }
-    }
-    // Derived fields whose target is greater than every input field: emit at the end.
-    while next_derived < redact_from.len() {
-        emit_redact_from(
-            out,
-            &redact_from[next_derived],
-            &collected,
-            table.hmac_key,
-            enforcement,
-        )?;
-        next_derived += 1;
-    }
-    Ok(())
-}
-
-/// Applies one field's `action`. The `oneof` is exhaustive over the structural opcodes; there is no
-/// wildcard, so adding a deferred opcode to the proto forces a decision here rather than silently
-/// passing through.
-fn dispatch(
-    reader: &mut WireReader,
-    out: &mut Vec<u8>,
-    table: &PlanTable,
-    field_number: u32,
-    wire_type: u32,
-    action: &Action,
-    depth: usize,
-    enforcement: ShapeEnforcement,
-) -> Result<(), RedactError> {
-    match action {
-        Action::PassThrough(_) => {
-            write_tag(out, field_number, wire_type);
-            copy_field_value(reader, out, wire_type)
-        }
-        // Enforce the field's declared data shapes, but only when `enforcement` is `On` (the
-        // per-record verdict resolved upstream). Three-way branch:
-        //   enforcement off         → copy verbatim
-        //   on + no shapes declared → drop
-        //   on + shapes declared    → keep the string iff any allowed shape matches, else drop
-        // Enforcement off is distinct from "shapes declared empty": a plan built before shape
-        // enforcement existed simply runs with enforcement off and copies verbatim.
-        Action::PassThroughString(pts) => {
-            if enforcement == ShapeEnforcement::Off {
-                // Enforcement off → copy verbatim.
-                write_tag(out, field_number, wire_type);
-                copy_field_value(reader, out, wire_type)
-            } else if pts.allowed_shapes.is_empty() {
-                // Enforcement on + no shapes declared → drop.
-                drop_field(reader, wire_type)
-            } else {
-                // allowed_shapes is serialized as Vec<i32> (the DataShape enum numbers), and the
-                // shape crate validates them via the crate-agnostic is_allowed_shape(&[i32], &str).
-                handle_shape_enforce(reader, out, field_number, wire_type, &pts.allowed_shapes)
-            }
-        }
-        Action::Remove(_) => drop_field(reader, wire_type),
-        Action::Recurse(recurse) => handle_recurse(
-            reader,
-            out,
-            table,
-            field_number,
-            wire_type,
-            recurse,
-            depth,
-            enforcement,
-        ),
-        Action::MapEntry(map_entry) => {
-            handle_map_entry(reader, out, field_number, wire_type, map_entry)
-        }
-        Action::MapStripValue(_) => handle_map_strip_value(reader, out, field_number, wire_type),
-        Action::RedactTag(redact_tag) => {
-            handle_redact_tag(reader, out, field_number, wire_type, redact_tag)
-        }
-        // Drop the input value, re-emit the field as an empty string (tag + zero-length prefix),
-        // preserving presence while blanking content (custom_redactor = EMPTY).
-        Action::EmptyString(_) => handle_empty_string(reader, out, field_number, wire_type),
-        // Drop the field, exactly like Remove — the planner's fail-safe fallback for an unresolvable
-        // redaction. The carried `description` is debug-only and ignored here.
-        Action::TodoRemove(_) => drop_field(reader, wire_type),
-        // The derived value is emitted by `process_message` (interleaved in target-field order from
-        // the Pass-1 source scan), not here. An incoming target field on the wire — rare, since the
-        // emitter normally does not populate the derived field — is dropped so a caller-supplied
-        // value can neither leak nor double-emit alongside the derived one.
-        Action::RedactFrom(_) => drop_field(reader, wire_type),
-    }
-}
-
-/// Copies a field value verbatim (tag already written by the caller). Varints are decoded and
-/// re-encoded in canonical (minimal) form — so a non-canonically-encoded input varint is
-/// normalized, NOT byte-copied; the executor is not a pure passthrough for pathologically-encoded
-/// varints. Fixed-width and length-delimited payloads are copied byte-for-byte.
-fn copy_field_value(
-    reader: &mut WireReader,
-    out: &mut Vec<u8>,
-    wire_type: u32,
-) -> Result<(), RedactError> {
-    match wire_type {
-        wire_type::VARINT => {
-            let value = reader.read_varint64()?;
-            write_varint(out, value);
-            Ok(())
-        }
-        wire_type::FIXED64 => reader.copy_bytes(out, 8),
-        wire_type::LENGTH_DELIMITED => {
-            let length = reader.read_varint32()?;
-            write_varint(out, u64::from(length));
-            reader.copy_bytes(out, length as usize)
-        }
-        wire_type::FIXED32 => reader.copy_bytes(out, 4),
-        other => Err(RedactError::MalformedRecord(format!(
-            "unsupported wire type {other}"
+#[cfg(feature = "static-executor")]
+pub fn field_value_conforms(shapes: &[i32], value: &str) -> Result<bool, RedactError> {
+    ensure_abi_version()?;
+    let mut conforms = 0;
+    // SAFETY: Both input slices remain live for the call, and out_conforms points to a distinct,
+    // aligned, initialized local.
+    let status = unsafe {
+        db_redactor_field_value_conforms(
+            shapes.as_ptr(),
+            shapes.len(),
+            value.as_ptr(),
+            value.len(),
+            &mut conforms,
+        )
+    };
+    status_result(status, &ForeignBuffer::EMPTY)?;
+    match conforms {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(RedactError::InvalidArgument(format!(
+            "executor returned invalid conformance flag {value}"
         ))),
     }
 }
 
-/// Reads and discards a field value, emitting nothing to the output. Used to drop fields that
-/// should be redacted. Groups (wire types 3/4) and unknown types are rejected as malformed.
-fn drop_field(reader: &mut WireReader, wire_type: u32) -> Result<(), RedactError> {
-    match wire_type {
-        wire_type::VARINT => {
-            reader.read_varint64()?;
-            Ok(())
-        }
-        wire_type::FIXED64 => reader.skip_bytes(8),
-        wire_type::LENGTH_DELIMITED => {
-            let length = reader.read_varint32()? as usize;
-            reader.skip_bytes(length)
-        }
-        wire_type::FIXED32 => reader.skip_bytes(4),
-        other => Err(RedactError::MalformedRecord(format!(
-            "cannot drop wire type {other}"
-        ))),
-    }
-}
-
-/// EMPTY_STRING: drop the input value and re-emit the field as a zero-length string (tag + 0-length
-/// prefix), preserving presence while blanking content. Only a length-delimited field can be blanked
-/// to a zero-length value; for any other wire type the field is simply dropped.
-fn handle_empty_string(
-    reader: &mut WireReader,
-    out: &mut Vec<u8>,
-    field_number: u32,
-    wire_type: u32,
-) -> Result<(), RedactError> {
-    drop_field(reader, wire_type)?;
-    if wire_type == wire_type::LENGTH_DELIMITED {
-        write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
-        write_varint(out, 0);
-    }
-    Ok(())
-}
-
-/// Pass 1 of a derivation level: scans the whole message (via a forked reader) and collects each
-/// `RedactFrom` source field's value as the string it will be hashed as, keyed by field number and
-/// preserving wire-encounter order (so a repeated target emits one derived value per occurrence in
-/// order). Mirrors the JVM `StreamingProtoRedactor.collectField` / `CollectedValues.valueAsString`:
-///
-/// - VARINT / FIXED64 / FIXED32 sources render as the signed-decimal `Long.toString` of the value
-///   (FIXED32 sign-extended to 64 bits).
-/// - A length-delimited source is read as a UTF-8 string; invalid UTF-8 aborts the whole record
-///   (fail closed), matching the JVM `readString()` throw.
-/// - A length-delimited source whose plan action is `Recurse` is a nested message, not a string; the
-///   JVM recurses instead of reading it as a string, so it is never a hash source. Skip it (the
-///   derived field is then treated as absent).
-fn collect_sources(
-    reader: &mut WireReader,
-    table: &PlanTable,
-    plan_index: usize,
-) -> Result<HashMap<u32, Vec<String>>, RedactError> {
-    let mut collected: HashMap<u32, Vec<String>> = HashMap::new();
-    while let Some((field_number, wire_type)) = reader.read_tag()? {
-        if !table.is_source(plan_index, field_number) {
-            drop_field(reader, wire_type)?;
-            continue;
-        }
-        let rendered: Option<String> = match wire_type {
-            wire_type::VARINT => Some((reader.read_varint64()? as i64).to_string()),
-            wire_type::FIXED64 => {
-                let bytes = reader.take_slice(8)?;
-                let v = i64::from_le_bytes(bytes.try_into().expect("take_slice(8) yields 8 bytes"));
-                Some(v.to_string())
-            }
-            wire_type::FIXED32 => {
-                let bytes = reader.take_slice(4)?;
-                let v = i32::from_le_bytes(bytes.try_into().expect("take_slice(4) yields 4 bytes"));
-                Some(i64::from(v).to_string())
-            }
-            wire_type::LENGTH_DELIMITED => {
-                let length = reader.read_varint32()? as usize;
-                let bytes = reader.take_slice(length)?;
-                if matches!(
-                    table.action(plan_index, field_number)?,
-                    Some(Action::Recurse(_))
-                ) {
-                    None
-                } else {
-                    let value = std::str::from_utf8(bytes).map_err(|_| {
-                        RedactError::MalformedRecord(format!(
-                            "RedactFrom source field {field_number} is not valid UTF-8"
-                        ))
-                    })?;
-                    Some(value.to_string())
-                }
-            }
-            other => {
-                return Err(RedactError::MalformedRecord(format!(
-                    "unsupported wire type {other} for RedactFrom source field {field_number}"
-                )));
-            }
-        };
-        if let Some(value) = rendered {
-            collected.entry(field_number).or_default().push(value);
-        }
-    }
-    Ok(collected)
-}
-
-/// Emits the derived field(s) for one `RedactFrom` action from the Pass-1 `collected` source values.
-/// A repeated target emits one derived value per collected source occurrence (in order); a scalar
-/// target emits a single value from the last occurrence (matching the JVM `CollectedValues`). If the
-/// source field was absent from the record, nothing is emitted.
-fn emit_redact_from(
-    out: &mut Vec<u8>,
-    prepared: &PreparedRedactFrom,
-    collected: &HashMap<u32, Vec<String>>,
-    hmac_key: Option<&[u8]>,
-    enforcement: ShapeEnforcement,
-) -> Result<(), RedactError> {
-    let Some(values) = collected.get(&prepared.source_field_number) else {
-        return Ok(());
-    };
-    // The key is validated present + non-empty at registration whenever a plan carries a RedactFrom;
-    // this guard keeps the invariant explicit and fails closed rather than emitting an unkeyed hash.
-    let key = hmac_key.ok_or_else(|| {
-        RedactError::InvalidPlan("RedactFrom reached execution without an HMAC key".to_string())
-    })?;
-    if prepared.is_repeated {
-        for value in values {
-            emit_one_derived(out, prepared, value, key, enforcement);
-        }
-    } else if let Some(last) = values.last() {
-        emit_one_derived(out, prepared, last, key, enforcement);
-    }
-    Ok(())
-}
-
-/// Hashes one already-rendered source string and, subject to `derived_shapes` enforcement, emits it
-/// as the target field (a length-delimited string). The `derived_shapes` tri-state mirrors the
-/// `PassThroughString` gate: `Absent` → always emit; `Empty` → emit only when enforcement is off
-/// (wiped under the gate); `Shapes` → emit when enforcement is off, or when a declared shape matches.
-fn emit_one_derived(
-    out: &mut Vec<u8>,
-    prepared: &PreparedRedactFrom,
-    source: &str,
-    key: &[u8],
-    enforcement: ShapeEnforcement,
-) {
-    let hashed = hmac_hash(key, source);
-    let keep = match &prepared.derived_shapes {
-        DerivedShapesState::Absent => true,
-        DerivedShapesState::Empty => enforcement == ShapeEnforcement::Off,
-        DerivedShapesState::Shapes(shapes) => {
-            enforcement == ShapeEnforcement::Off || shape::is_allowed_shape(shapes, &hashed)
-        }
-    };
-    if keep {
-        write_tag(
-            out,
-            prepared.target_field_number,
-            wire_type::LENGTH_DELIMITED,
-        );
-        write_varint(out, hashed.len() as u64);
-        out.extend_from_slice(hashed.as_bytes());
-    }
-}
-
-/// HMAC-SHA-512 of `value` under `key`, rendered in the legacy signed-decimal "mkString" encoding:
-/// the 64 MAC bytes each rendered as a signed decimal (`i8`, -128..=127) and concatenated with no
-/// separator. This is the wire format classic Lumberjack has written for years and downstream joins
-/// depend on byte-for-byte (Scala `HashingUtils(key).hash(value).mkString`), so it must not be
-/// "fixed" to hex. Both `value` and `key` are hashed as their UTF-8 bytes.
-fn hmac_hash(key: &[u8], value: &str) -> String {
-    // `Hmac::new_from_slice` accepts a key of any length, so this construction never errors.
-    let mut mac =
-        Hmac::<Sha512>::new_from_slice(key).expect("HMAC-SHA-512 accepts a key of any length");
-    mac.update(value.as_bytes());
-    let bytes = mac.finalize().into_bytes(); // 64 bytes
-    let mut encoded = String::with_capacity(bytes.len() * 4);
-    for byte in bytes.iter() {
-        encoded.push_str(&(*byte as i8).to_string());
-    }
-    encoded
-}
-
-/// Enforces a `PassThroughString` field's declared data shapes: keep the string iff at least one
-/// `allowed_shape` matches, else drop it (no emit).
-///
-/// Only length-delimited (string) wire is meaningful; the plan builder applies PassThroughString to
-/// declared string fields, so any other wire type is defensive — skip the field without emitting.
-///
-/// `shape_numbers` is non-empty (the caller routes empty shapes to the verbatim copy branch). It
-/// carries the i32 enum numbers of the plan's `DataShape` values, so the shape crate (a distinct
-/// prost crate with its own `DataShape` type) validates them via the crate-agnostic
-/// `is_allowed_shape(&[i32], &str)`.
-fn handle_shape_enforce(
-    reader: &mut WireReader,
-    out: &mut Vec<u8>,
-    field_number: u32,
-    wire_type: u32,
-    shape_numbers: &[i32],
-) -> Result<(), RedactError> {
-    if wire_type != wire_type::LENGTH_DELIMITED {
-        // Defensive: PassThroughString is only applied to declared string fields by the plan
-        // builder, so a non-length-delimited wire type is unexpected — skip without emitting.
-        return drop_field(reader, wire_type);
-    }
-    let length = reader.read_varint32()? as usize;
-    let value_bytes = reader.take_slice(length)?;
-    // Shapes validate `&str`, so a field whose bytes are not valid UTF-8 cannot match any shape
-    // and is dropped (fail-closed) — a non-UTF-8 value is not a centralizable string. from_utf8
-    // does not allocate on the success path.
-    let value = match std::str::from_utf8(value_bytes) {
-        Ok(s) => s,
-        Err(_) => return Ok(()), // no shape matches a non-string → drop (no emit)
-    };
-    if shape::is_allowed_shape(shape_numbers, value) {
-        write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
-        write_varint(out, length as u64);
-        out.extend_from_slice(value_bytes); // re-emit the original bytes verbatim
-    }
-    // else: no shape matched → drop the field (no emit)
-    Ok(())
-}
-
-/// RECURSE: redact a nested length-delimited message with the referenced child plan, then emit
-/// tag + new length + redacted bytes.
-fn handle_recurse(
-    reader: &mut WireReader,
-    out: &mut Vec<u8>,
-    table: &PlanTable,
-    field_number: u32,
-    wire_type: u32,
-    recurse: &plan_proto::Recurse,
-    depth: usize,
-    enforcement: ShapeEnforcement,
-) -> Result<(), RedactError> {
-    if wire_type != wire_type::LENGTH_DELIMITED {
-        // TODO(vendored): DATABRICKS-ONLY divergence — universe passes through verbatim, but
-        // RECURSE fields contain content that must be redacted; if we can't recurse, drop instead.
-        // Port upstream and re-vendor.
-        return drop_field(reader, wire_type);
-    }
-
-    let child_index = recurse
-        .child_plan_index
-        .ok_or_else(|| RedactError::InvalidPlan("Recurse missing child_plan_index".to_string()))?;
-    if child_index < 0 || child_index as usize >= table.plans.len() {
-        return Err(RedactError::InvalidPlan(format!(
-            "Recurse child_plan_index {child_index} out of range"
-        )));
-    }
-
-    let length = reader.read_varint32()? as usize;
-    let content = reader.take_slice(length)?;
-
-    // Map-entry key-shape gate: under enforcement, drop the whole entry when its key matches no
-    // allowed shape (a bad key can't be wiped to "" without colliding entries onto one key). Mirrors
-    // StreamingProtoRedactor; enforcement off never fires the gate.
-    let child_plan = &table.plans[child_index as usize];
-    if enforcement == ShapeEnforcement::On {
-        if let Some(key_field) = child_plan.key_shape_field_number {
-            let key = read_string_field(content, key_field as u32)?;
-            if !key_passes_shape_gate(key.as_deref(), &child_plan.key_shapes) {
-                return Ok(());
-            }
-        }
-    }
-
-    // Recurse into a fresh child buffer since the redacted length isn't known up front. `depth + 1`
-    // is checked at the top of `process_message`, bounding native-stack recursion.
-    let mut child_reader = WireReader::new(content);
-    let mut child_out = Vec::new();
-    process_message(
-        &mut child_reader,
-        &mut child_out,
-        table,
-        child_index as usize,
-        depth + 1,
-        enforcement,
-    )?;
-
-    // Emit even when the child redacts to empty (tag + 0).
-    write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
-    write_varint(out, child_out.len() as u64);
-    out.extend_from_slice(&child_out);
-    Ok(())
-}
-
-/// MAP_ENTRY: keep or drop a whole `json_map` entry by its key's centralizability.
-fn handle_map_entry(
-    reader: &mut WireReader,
-    out: &mut Vec<u8>,
-    field_number: u32,
-    wire_type: u32,
-    map_entry: &plan_proto::MapEntry,
-) -> Result<(), RedactError> {
-    if wire_type != wire_type::LENGTH_DELIMITED {
-        // Map entries are always length-delimited messages; anything else is malformed → drop.
-        return drop_field(reader, wire_type);
-    }
-
-    let length = reader.read_varint32()? as usize;
-    let entry = reader.take_slice(length)?;
-
-    let key_field = map_entry.key_field_number.unwrap_or(0);
-    let key = read_string_field(entry, key_field as u32)?;
-    if should_keep_key(map_entry, key.as_deref()) {
-        write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
-        write_varint(out, length as u64);
-        out.extend_from_slice(entry);
-    }
-    Ok(())
-}
-
-/// Whether a MAP_ENTRY with the given (raw, not-yet-lowercased) key is kept: a per-key override
-/// wins, else the default; an absent key takes the default.
-///
-/// Operates on proto3 map fields, where each entry is a `{key: string, value: ...}` submessage.
-/// The keep decision is per string key. Contrast with [`should_keep_label`], which operates on
-/// structured tag fields and gates on a numeric enum label rather than a string key.
-fn should_keep_key(map_entry: &plan_proto::MapEntry, key: Option<&str>) -> bool {
-    let default = map_entry.default_is_centralizable.unwrap_or(false);
-    let Some(key) = key else {
-        return default;
-    };
-    // Decision keys are pre-lowercased by the serializer; lower-case the runtime key to match.
-    let lowered = key.to_lowercase();
-    map_entry
-        .key_decisions
-        .iter()
-        .find(|decision| decision.key.as_deref() == Some(lowered.as_str()))
-        .and_then(|decision| decision.is_centralizable)
-        .unwrap_or(default)
-}
-
-/// MAP_STRIP_VALUE: keep a proto3 map entry's key (field 1), drop its value (field 2).
-fn handle_map_strip_value(
-    reader: &mut WireReader,
-    out: &mut Vec<u8>,
-    field_number: u32,
-    wire_type: u32,
-) -> Result<(), RedactError> {
-    if wire_type != wire_type::LENGTH_DELIMITED {
-        return drop_field(reader, wire_type);
-    }
-    let length = reader.read_varint32()? as usize;
-    let entry = reader.take_slice(length)?;
-    reemit_selected_fields(out, field_number, entry, |field| field == 1)
-}
-
-/// REDACT_TAG: for a `logging.Field` tag, keep the whole value if its label (field 4) is
-/// centralizable, else emit only key (1) and label (4).
-fn handle_redact_tag(
-    reader: &mut WireReader,
-    out: &mut Vec<u8>,
-    field_number: u32,
-    wire_type: u32,
-    redact_tag: &plan_proto::RedactTag,
-) -> Result<(), RedactError> {
-    if wire_type != wire_type::LENGTH_DELIMITED {
-        return drop_field(reader, wire_type);
-    }
-    let length = reader.read_varint32()? as usize;
-    let entry = reader.take_slice(length)?;
-
-    let label = read_tag_label(entry)?;
-    if should_keep_label(redact_tag, label) {
-        write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
-        write_varint(out, length as u64);
-        out.extend_from_slice(entry);
+#[cfg(feature = "static-executor")]
+fn ensure_abi_version() -> Result<(), RedactError> {
+    static ACTUAL_ABI_VERSION: OnceLock<u32> = OnceLock::new();
+    let actual = *ACTUAL_ABI_VERSION.get_or_init(|| {
+        // SAFETY: This function has no preconditions.
+        unsafe { db_redactor_abi_version() }
+    });
+    if actual == EXPECTED_ABI_VERSION {
         Ok(())
     } else {
-        reemit_selected_fields(out, field_number, entry, |field| {
-            field == tag_field::KEY || field == tag_field::LABEL
+        Err(RedactError::AbiVersion {
+            expected: EXPECTED_ABI_VERSION,
+            actual,
         })
     }
 }
 
-/// Whether a tag's label is kept: non-negative and in the keepable set. `keepable_labels` is the
-/// enum numbers (prost lowers `repeated DataLabel` to `Vec<i32>`), so the comparison is numeric.
-///
-/// Operates on structured tag fields (e.g. `logging.Field`), where the keep decision is based on
-/// a numeric `DataLabel` enum value embedded in the tag. Contrast with [`should_keep_key`], which
-/// operates on proto3 map fields and gates on a string key rather than a numeric label.
-fn should_keep_label(redact_tag: &plan_proto::RedactTag, label: i32) -> bool {
-    label >= 0 && redact_tag.keepable_labels.contains(&label)
-}
-
-/// Re-emits a length-delimited submessage keeping only fields matching `keep`. Two passes over the
-/// same bytes — measure the kept length for the prefix, then emit. Drops the entry (emits nothing)
-/// when no field is kept. `bytes` is the already-windowed submessage, so field spans index it
-/// directly (no window offset to add).
-fn reemit_selected_fields(
-    out: &mut Vec<u8>,
-    field_number: u32,
-    bytes: &[u8],
-    keep: impl Fn(u32) -> bool,
-) -> Result<(), RedactError> {
-    let mut kept_len = 0usize;
-    let mut scan = WireReader::new(bytes);
-    while let Some((field, wire_type)) = scan.read_tag()? {
-        let value_start = scan.position();
-        drop_field(&mut scan, wire_type)?;
-        let value_end = scan.position();
-        if keep(field) {
-            kept_len += tag_size(field) + (value_end - value_start);
-        }
-    }
-
-    if kept_len == 0 {
-        return Ok(());
-    }
-
-    write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
-    write_varint(out, kept_len as u64);
-
-    let mut emit = WireReader::new(bytes);
-    while let Some((field, wire_type)) = emit.read_tag()? {
-        let value_start = emit.position();
-        drop_field(&mut emit, wire_type)?;
-        let value_end = emit.position();
-        if keep(field) {
-            write_tag(out, field, wire_type);
-            out.extend_from_slice(&bytes[value_start..value_end]);
-        }
-    }
-    Ok(())
-}
-
-/// Scans a submessage for the first length-delimited field matching `target_field` and returns its
-/// UTF-8 string value (lossy decode).
-fn read_string_field(bytes: &[u8], target_field: u32) -> Result<Option<String>, RedactError> {
-    let mut reader = WireReader::new(bytes);
-    while let Some((field, wire_type)) = reader.read_tag()? {
-        if field == target_field && wire_type == wire_type::LENGTH_DELIMITED {
-            let length = reader.read_varint32()? as usize;
-            let value = reader.take_slice(length)?;
-            return Ok(Some(String::from_utf8_lossy(value).into_owned()));
-        }
-        drop_field(&mut reader, wire_type)?;
-    }
-    Ok(None)
-}
-
-/// True iff `key` matches at least one of `key_shapes`. Mirrors
-/// `StreamingProtoRedactor.keyPassesShapeGate`: a missing key or empty `key_shapes` fails every key
-/// (empty => drop all under enforcement, unlike `PassThroughString` where empty = no constraint).
-fn key_passes_shape_gate(key: Option<&str>, key_shapes: &[i32]) -> bool {
-    match key {
-        Some(k) if !key_shapes.is_empty() => shape::is_allowed_shape(key_shapes, k),
-        _ => false,
+#[cfg(feature = "static-executor")]
+fn status_result(status: i32, error: &ForeignBuffer) -> Result<(), RedactError> {
+    let message = error.diagnostic();
+    match status {
+        0 => Ok(()),
+        1 => Err(RedactError::InvalidArgument(message)),
+        2 => Err(RedactError::InvalidPlan(message)),
+        3 => Err(RedactError::UnknownHandle(message)),
+        4 => Err(RedactError::RedactionFailed(message)),
+        5 => Err(RedactError::ExecutorPanic(message)),
+        status => Err(RedactError::UnknownStatus(status, message)),
     }
 }
 
-/// Scans a `logging.Field` tag for its `label` varint (field 4) and returns the enum number, or 0
-/// (the enum default) if absent.
-fn read_tag_label(bytes: &[u8]) -> Result<i32, RedactError> {
-    let mut reader = WireReader::new(bytes);
-    while let Some((field, wire_type)) = reader.read_tag()? {
-        if field == tag_field::LABEL && wire_type == wire_type::VARINT {
-            return Ok(reader.read_varint64()? as i32);
-        }
-        drop_field(&mut reader, wire_type)?;
-    }
-    Ok(0)
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "static-executor"))]
 mod tests {
+    use prost::Message;
+
     use super::*;
 
-    // ===== Wire-byte fixture helpers =====
-
-    /// Appends a `field_number << 3 | wire_type` tag then a varint value.
-    fn push_varint_field(out: &mut Vec<u8>, field_number: u32, value: u64) {
-        write_tag(out, field_number, wire_type::VARINT);
-        write_varint(out, value);
-    }
-
-    /// Appends a length-delimited field (tag + length + bytes).
-    fn push_len_field(out: &mut Vec<u8>, field_number: u32, value: &[u8]) {
-        write_tag(out, field_number, wire_type::LENGTH_DELIMITED);
-        write_varint(out, value.len() as u64);
-        out.extend_from_slice(value);
-    }
-
-    fn field_entry(field_number: i32, action: Action) -> plan_proto::FieldActionEntry {
-        plan_proto::FieldActionEntry {
-            field_number: Some(field_number),
-            action: Some(plan_proto::FieldAction {
-                action: Some(action),
-            }),
-        }
-    }
-
-    /// Runs the engine directly against a plan set (bypassing the handle registry) at the given
-    /// `enforcement` verdict, returning the raw result so tests can assert either success bytes or a
-    /// fail-closed error.
-    fn try_run_with(
-        plan_set: &plan_proto::RedactionPlanSet,
-        record: &[u8],
-        enforcement: ShapeEnforcement,
-    ) -> Result<Vec<u8>, RedactError> {
-        try_run_keyed(plan_set, record, None, enforcement)
-    }
-
-    /// Like [`try_run_with`] but supplies an HMAC key, so `RedactFrom` (HMAC_HASH) plans register and
-    /// execute. Surfaces a registration error too, so fail-closed derivation tests can assert it.
-    fn try_run_keyed(
-        plan_set: &plan_proto::RedactionPlanSet,
-        record: &[u8],
-        hmac_key: Option<&[u8]>,
-        enforcement: ShapeEnforcement,
-    ) -> Result<Vec<u8>, RedactError> {
-        let registered = RegisteredPlan::new(plan_set.clone(), hmac_key.map(<[u8]>::to_vec))?;
-        let table = PlanTable::new(&registered);
-        let mut reader = WireReader::new(record);
-        let mut out = Vec::new();
-        process_message(&mut reader, &mut out, &table, 0, 0, enforcement)?;
-        Ok(out)
-    }
-
-    /// Builds a `RedactFrom` (HMAC_HASH) entry on `target`, deriving from field `source`.
-    fn redact_from_entry(
-        target: i32,
-        source: i32,
-        is_repeated: bool,
-        derived_shapes: Option<Vec<i32>>,
-    ) -> plan_proto::FieldActionEntry {
-        field_entry(
-            target,
-            Action::RedactFrom(plan_proto::RedactFrom {
-                source_field_number: Some(source),
-                transform: Some(plan_proto::RedactFromTransform::HmacHash as i32),
-                is_repeated: Some(is_repeated),
-                derived_shapes: derived_shapes
-                    .map(|shapes| plan_proto::redact_from::DerivedShapes { shapes }),
-            }),
-        )
-    }
-
-    fn plan_of(actions: Vec<plan_proto::FieldActionEntry>) -> plan_proto::RedactionPlanSet {
-        plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions,
-                ..Default::default()
-            }],
-        }
-    }
-
-    /// [`try_run_with`] with shape enforcement off — the default for structural-opcode tests, which
-    /// carry no `PassThroughString` and are therefore independent of the verdict.
-    fn try_run(
-        plan_set: &plan_proto::RedactionPlanSet,
-        record: &[u8],
-    ) -> Result<Vec<u8>, RedactError> {
-        try_run_with(plan_set, record, ShapeEnforcement::Off)
-    }
-
-    /// Runs the engine (enforcement off) and unwraps, for the common success-path assertions.
-    fn run(plan_set: &plan_proto::RedactionPlanSet, record: &[u8]) -> Vec<u8> {
-        try_run(plan_set, record).expect("redaction failed")
-    }
-
-    /// Runs the engine with shape enforcement on and unwraps — for the `PassThroughString` tests.
-    fn run_enforced(plan_set: &plan_proto::RedactionPlanSet, record: &[u8]) -> Vec<u8> {
-        try_run_with(plan_set, record, ShapeEnforcement::On).expect("redaction failed")
-    }
-
-    /// A single-plan set keeping `field_number` as PASS_THROUGH — enough to reach the wire walk so
-    /// the malformed-input tests exercise the reader, not plan lookup.
-    fn pass_through_plan(field_number: i32) -> plan_proto::RedactionPlanSet {
-        plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(
-                    field_number,
-                    Action::PassThrough(plan_proto::PassThrough {}),
-                )],
-                ..Default::default()
-            }],
-        }
-    }
-
-    // ===== Registry / handle lifecycle =====
-
     #[test]
-    fn register_plan_rejects_garbage_bytes() {
-        // 0xFF is not a valid protobuf tag/length prefix, so decode must fail closed.
-        let err = register_plan(&[0xFF, 0xFF, 0xFF]).unwrap_err();
-        assert!(matches!(err, RedactError::BadPlan(_)));
+    fn rejects_invalid_plan_through_real_static_library() {
+        assert!(matches!(
+            register_plan(b"not a plan"),
+            Err(RedactError::InvalidPlan(_))
+        ));
     }
 
     #[test]
-    fn register_plan_rejects_empty_plan_table() {
-        let empty = plan_proto::RedactionPlanSet::default().encode_to_vec();
-        let err = register_plan(&empty).unwrap_err();
-        assert!(matches!(err, RedactError::InvalidPlan(_)));
+    fn unknown_handle_fails_closed() {
+        assert!(matches!(
+            redact(0, b"record", ShapeEnforcement::Off),
+            Err(RedactError::UnknownHandle(_))
+        ));
     }
 
     #[test]
-    fn redact_rejects_unknown_handle() {
-        // 0 is never returned by register_plan, so it is unknown regardless of test execution order.
-        let err = redact(0, b"record", ShapeEnforcement::Off).unwrap_err();
-        assert!(matches!(err, RedactError::UnknownHandle(0)));
-    }
-
-    #[test]
-    fn redact_fails_after_release() {
-        // The handle lookup fails before the record is ever parsed, so any bytes are fine here.
-        let plan = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan::default()],
-        };
-        let handle = register_plan(&plan.encode_to_vec()).unwrap();
+    fn registers_redacts_and_releases_through_real_static_library() {
+        // RedactionPlanSet { plans: [MessageRedactionPlan {}] }.
+        let handle = register_plan_with_key(&[0x0a, 0x00], Some(b"test-key"))
+            .expect("minimal plan should register");
+        assert_eq!(
+            redact(handle, &[], ShapeEnforcement::Off).expect("empty record should redact"),
+            Bytes::new()
+        );
         release_plan(handle);
-        let err = redact(handle, b"anything", ShapeEnforcement::Off).unwrap_err();
-        assert!(matches!(err, RedactError::UnknownHandle(_)));
+        assert!(matches!(
+            redact(handle, &[], ShapeEnforcement::Off),
+            Err(RedactError::UnknownHandle(_))
+        ));
     }
 
     #[test]
-    fn release_plan_is_idempotent() {
-        release_plan(u64::MAX); // never registered — must not panic
-    }
-
-    // ===== Per-opcode engine tests (hand-built plans + wire bytes) =====
-
-    #[test]
-    fn pass_through_keeps_field_verbatim() {
-        // Plan: field 1 PASS_THROUGH (varint), field 2 PASS_THROUGH (length-delimited).
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![
-                    field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
-                    field_entry(
-                        2,
-                        Action::PassThroughString(plan_proto::PassThroughString {
-                            allowed_shapes: vec![], // Empty list means no shape constraint
-                        }),
-                    ),
-                ],
-                ..Default::default()
-            }],
-        };
-        let mut record = Vec::new();
-        push_varint_field(&mut record, 1, 7);
-        push_len_field(&mut record, 2, b"keep me");
-        // Both fields kept → output is byte-identical to the (canonical) input.
-        assert_eq!(run(&plan_set, &record), record);
-    }
-
-    #[test]
-    fn pass_through_string_enforces_shape_when_enabled() {
-        // enforcement=On (LP pipeline plans): field 1 is a PassThroughString gated to
-        // DATA_SHAPE_UUID. A non-UUID value is dropped; a valid UUID is kept verbatim.
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(
-                    1,
-                    Action::PassThroughString(plan_proto::PassThroughString {
-                        allowed_shapes: vec![1], // DATA_SHAPE_UUID
-                    }),
-                )],
-                ..Default::default()
-            }],
-        };
-        let mut bad = Vec::new();
-        push_len_field(&mut bad, 1, b"not-a-uuid");
-        assert!(
-            run_enforced(&plan_set, &bad).is_empty(),
-            "non-UUID must be dropped under enforcement"
-        );
-        let mut good = Vec::new();
-        push_len_field(&mut good, 1, b"550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(
-            run_enforced(&plan_set, &good),
-            good,
-            "valid UUID must be kept"
-        );
-    }
-
-    #[test]
-    fn pass_through_string_skips_shape_enforcement_when_disabled() {
-        // enforcement=Off (compliance/Governator plan): the same UUID-gated field passes a
-        // non-UUID value through VERBATIM — shapes are not enforced.
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(
-                    1,
-                    Action::PassThroughString(plan_proto::PassThroughString {
-                        allowed_shapes: vec![1], // DATA_SHAPE_UUID
-                    }),
-                )],
-                ..Default::default()
-            }],
-        };
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, b"not-a-uuid");
-        assert_eq!(
-            run(&plan_set, &record),
-            record,
-            "enforcement off → kept verbatim despite shape mismatch"
-        );
-    }
-
-    #[test]
-    fn remove_drops_field_but_keeps_others() {
-        // Plan: field 1 PASS_THROUGH, field 2 REMOVE.
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![
-                    field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
-                    field_entry(2, Action::Remove(plan_proto::Remove {})),
-                ],
-                ..Default::default()
-            }],
-        };
-        let mut record = Vec::new();
-        push_varint_field(&mut record, 1, 7);
-        push_len_field(&mut record, 2, b"secret");
-        let mut expected = Vec::new();
-        push_varint_field(&mut expected, 1, 7);
-        assert_eq!(run(&plan_set, &record), expected);
-    }
-
-    #[test]
-    fn unknown_field_is_dropped() {
-        // Plan only mentions field 1; field 2 has no entry → allowlist default drops it.
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(
-                    1,
-                    Action::PassThrough(plan_proto::PassThrough {}),
-                )],
-                ..Default::default()
-            }],
-        };
-        let mut record = Vec::new();
-        push_varint_field(&mut record, 1, 7);
-        push_len_field(&mut record, 2, b"unmapped");
-        let mut expected = Vec::new();
-        push_varint_field(&mut expected, 1, 7);
-        assert_eq!(run(&plan_set, &record), expected);
-    }
-
-    #[test]
-    fn recurse_redacts_nested_message_by_child_plan() {
-        // plans[0]: field 1 RECURSE -> plans[1]. plans[1]: field 1 PASS_THROUGH, field 2 REMOVE.
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![
-                plan_proto::MessageRedactionPlan {
-                    actions: vec![field_entry(
-                        1,
-                        Action::Recurse(plan_proto::Recurse {
-                            child_plan_index: Some(1),
-                        }),
-                    )],
-                    ..Default::default()
-                },
-                plan_proto::MessageRedactionPlan {
-                    actions: vec![
-                        field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
-                        field_entry(2, Action::Remove(plan_proto::Remove {})),
-                    ],
-                    ..Default::default()
-                },
-            ],
-        };
-        let mut nested = Vec::new();
-        push_varint_field(&mut nested, 1, 42);
-        push_len_field(&mut nested, 2, b"drop");
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, &nested);
-
-        let mut expected_nested = Vec::new();
-        push_varint_field(&mut expected_nested, 1, 42);
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 1, &expected_nested);
-        assert_eq!(run(&plan_set, &record), expected);
-    }
-
-    #[test]
-    fn recurse_out_of_range_child_fails_closed() {
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(
-                    1,
-                    Action::Recurse(plan_proto::Recurse {
-                        child_plan_index: Some(9),
-                    }),
-                )],
-                ..Default::default()
-            }],
-        };
-        let mut nested = Vec::new();
-        push_varint_field(&mut nested, 1, 1);
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, &nested);
-
-        let registered = RegisteredPlan::new(plan_set, None).unwrap();
-        let table = PlanTable::new(&registered);
-        let mut reader = WireReader::new(&record);
-        let mut out = Vec::new();
-        let err = process_message(&mut reader, &mut out, &table, 0, 0, ShapeEnforcement::Off)
-            .unwrap_err();
-        assert!(matches!(err, RedactError::InvalidPlan(_)));
-    }
-
-    /// Builds `levels` nested length-delimited messages, each wrapping the next in field 1, with a
-    /// terminal varint at the innermost level. Depth `levels` = `levels` recursions of field 1.
-    fn nested_record(levels: usize) -> Vec<u8> {
-        let mut buf = Vec::new();
-        push_varint_field(&mut buf, 1, 1);
-        for _ in 0..levels {
-            let mut outer = Vec::new();
-            push_len_field(&mut outer, 1, &buf);
-            buf = outer;
-        }
-        buf
-    }
-
-    // A self-referential plan (field 1 recurses back into plan 0) applied to a record nested past
-    // MAX_RECURSION_DEPTH fails closed with RecursionLimitExceeded, rather than overflowing the
-    // native stack (which would abort the process instead of dropping the one record).
-    #[test]
-    fn recursion_deeper_than_limit_fails_closed() {
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(
-                    1,
-                    Action::Recurse(plan_proto::Recurse {
-                        child_plan_index: Some(0),
-                    }),
-                )],
-                ..Default::default()
-            }],
-        };
-
-        let err = try_run(&plan_set, &nested_record(MAX_RECURSION_DEPTH + 5))
-            .expect_err("record nested past the limit should fail closed");
-        assert!(
-            matches!(err, RedactError::RecursionLimitExceeded(limit) if limit == MAX_RECURSION_DEPTH),
-            "unexpected error: {err:?}"
-        );
-
-        // A record within the limit still redacts successfully through the same cyclic plan.
-        try_run(&plan_set, &nested_record(3)).expect("shallow record should redact fine");
-    }
-
-    #[test]
-    fn map_entry_keeps_centralizable_key_drops_others() {
-        // json_map field 5; entry key field 1. Default drop; "keep_this" kept (case-insensitively).
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(
-                    5,
-                    Action::MapEntry(plan_proto::MapEntry {
-                        key_field_number: Some(1),
-                        default_is_centralizable: Some(false),
-                        key_decisions: vec![plan_proto::MapKeyDecision {
-                            key: Some("keep_this".to_string()),
-                            is_centralizable: Some(true),
-                        }],
-                    }),
-                )],
-                ..Default::default()
-            }],
-        };
-        // Build two entries: {key:"KEEP_THIS", value:"v1"} and {key:"other", value:"v2"}.
-        let mut keep_entry = Vec::new();
-        push_len_field(&mut keep_entry, 1, b"KEEP_THIS");
-        push_len_field(&mut keep_entry, 2, b"v1");
-        let mut drop_entry = Vec::new();
-        push_len_field(&mut drop_entry, 1, b"other");
-        push_len_field(&mut drop_entry, 2, b"v2");
-        let mut record = Vec::new();
-        push_len_field(&mut record, 5, &keep_entry);
-        push_len_field(&mut record, 5, &drop_entry);
-
-        // Only the (case-insensitively matched) keep entry survives, verbatim.
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 5, &keep_entry);
-        assert_eq!(run(&plan_set, &record), expected);
-    }
-
-    #[test]
-    fn map_strip_value_keeps_key_drops_value() {
-        // proto3 map<string,string> entry: field 1 = key, field 2 = value. Strip the value.
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(
-                    3,
-                    Action::MapStripValue(plan_proto::MapStripValue {}),
-                )],
-                ..Default::default()
-            }],
-        };
-        let mut entry = Vec::new();
-        push_len_field(&mut entry, 1, b"k");
-        push_len_field(&mut entry, 2, b"secret");
-        let mut record = Vec::new();
-        push_len_field(&mut record, 3, &entry);
-
-        let mut expected_entry = Vec::new();
-        push_len_field(&mut expected_entry, 1, b"k");
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 3, &expected_entry);
-        assert_eq!(run(&plan_set, &record), expected);
-    }
-
-    #[test]
-    fn redact_tag_keeps_value_for_centralizable_label() {
-        // logging.Field tag: key(1), value(2), label(4). Keepable label 3 → whole tag kept.
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(
-                    7,
-                    Action::RedactTag(plan_proto::RedactTag {
-                        keepable_labels: vec![3],
-                    }),
-                )],
-                ..Default::default()
-            }],
-        };
-        let mut tag = Vec::new();
-        push_len_field(&mut tag, 1, b"key");
-        push_len_field(&mut tag, 2, b"val");
-        push_varint_field(&mut tag, 4, 3); // centralizable label
-        let mut record = Vec::new();
-        push_len_field(&mut record, 7, &tag);
-        // Label kept → tag re-emitted verbatim.
-        assert_eq!(run(&plan_set, &record), record);
-    }
-
-    #[test]
-    fn redact_tag_strips_value_for_noncentralizable_label() {
-        // Label 9 not in keepable set → keep only key(1) and label(4), drop value(2).
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(
-                    7,
-                    Action::RedactTag(plan_proto::RedactTag {
-                        keepable_labels: vec![3],
-                    }),
-                )],
-                ..Default::default()
-            }],
-        };
-        let mut tag = Vec::new();
-        push_len_field(&mut tag, 1, b"key");
-        push_len_field(&mut tag, 2, b"val");
-        push_varint_field(&mut tag, 4, 9); // non-centralizable label
-        let mut record = Vec::new();
-        push_len_field(&mut record, 7, &tag);
-
-        let mut expected_tag = Vec::new();
-        push_len_field(&mut expected_tag, 1, b"key");
-        push_varint_field(&mut expected_tag, 4, 9);
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 7, &expected_tag);
-        assert_eq!(run(&plan_set, &record), expected);
-    }
-
-    #[test]
-    fn field_with_unset_action_fails_closed() {
-        // An entry present but with no action oneof set → deferred/unknown opcode → fail closed.
-        let plan_set = plan_proto::RedactionPlanSet {
+    fn transfers_redacted_output_without_copying() {
+        let plan = plan_proto::RedactionPlanSet {
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![plan_proto::FieldActionEntry {
                     field_number: Some(1),
-                    action: Some(plan_proto::FieldAction { action: None }),
+                    action: Some(plan_proto::FieldAction {
+                        action: Some(plan_proto::field_action::Action::PassThrough(
+                            plan_proto::PassThrough {},
+                        )),
+                    }),
                 }],
                 ..Default::default()
             }],
         };
-        let mut record = Vec::new();
-        push_varint_field(&mut record, 1, 7);
-        let registered = RegisteredPlan::new(plan_set, None).unwrap();
-        let table = PlanTable::new(&registered);
-        let mut reader = WireReader::new(&record);
-        let mut out = Vec::new();
-        let err = process_message(&mut reader, &mut out, &table, 0, 0, ShapeEnforcement::Off)
-            .unwrap_err();
-        assert!(matches!(err, RedactError::InvalidPlan(_)));
-    }
+        let handle = register_plan(&plan.encode_to_vec()).expect("plan should register");
+        let record = [0x08, 0x07];
+        let mut output = ForeignBuffer::EMPTY;
+        let mut error = ForeignBuffer::EMPTY;
 
-    // ===== Malformed wire input (fails closed) =====
-
-    #[test]
-    fn field_number_zero_tag_fails_closed() {
-        // 0x03 = field number 0, wire type 3. Field number 0 is invalid protobuf, not an
-        // end-of-message marker, so we must fail closed rather than silently skip it and emit a
-        // partial record.
-        let err = try_run(&pass_through_plan(1), &[0x03]).unwrap_err();
-        assert!(matches!(err, RedactError::MalformedRecord(_)));
-    }
-
-    #[test]
-    fn literal_zero_byte_tag_fails_closed() {
-        // A literal 0 byte is field number 0 too (the whole tag varint is 0) — invalid, not a clean
-        // terminator. Only running out of bytes ends a message.
-        let err = try_run(&pass_through_plan(1), &[0x00]).unwrap_err();
-        assert!(matches!(err, RedactError::MalformedRecord(_)));
-    }
-
-    #[test]
-    fn truncated_varint_value_fails_closed() {
-        // Field 1 varint whose value bytes all set the continuation bit and then the buffer ends:
-        // the varint never terminates → truncated, must fail closed.
-        let mut record = Vec::new();
-        write_tag(&mut record, 1, wire_type::VARINT);
-        record.extend_from_slice(&[0x80, 0x80, 0x80]); // continuation set, no final byte
-        let err = try_run(&pass_through_plan(1), &record).unwrap_err();
-        assert!(matches!(err, RedactError::MalformedRecord(_)));
-    }
-
-    #[test]
-    fn overlong_varint_exceeding_64_bits_fails_closed() {
-        // 11 continuation bytes: exceeds the 64-bit varint width, must fail closed rather than wrap.
-        let mut record = Vec::new();
-        write_tag(&mut record, 1, wire_type::VARINT);
-        record.extend_from_slice(&[0x80; 10]);
-        record.push(0x01);
-        let err = try_run(&pass_through_plan(1), &record).unwrap_err();
-        assert!(matches!(err, RedactError::MalformedRecord(_)));
-    }
-
-    #[test]
-    fn length_prefix_past_end_of_buffer_fails_closed() {
-        // Field 1 length-delimited claiming 50 bytes but only 3 follow → the length overruns the
-        // buffer, must fail closed (the take_slice / skip bounds check).
-        let mut record = Vec::new();
-        write_tag(&mut record, 1, wire_type::LENGTH_DELIMITED);
-        write_varint(&mut record, 50);
-        record.extend_from_slice(b"abc");
-        let err = try_run(&pass_through_plan(1), &record).unwrap_err();
-        assert!(matches!(err, RedactError::MalformedRecord(_)));
-    }
-
-    #[test]
-    fn group_wire_type_fails_closed() {
-        // Wire type 3 (start-group) on a mapped field is unsupported (deprecated group encoding);
-        // copy_field_value rejects it as malformed.
-        let mut record = Vec::new();
-        write_tag(&mut record, 1, 3); // field 1, wire type 3 = start group
-        let err = try_run(&pass_through_plan(1), &record).unwrap_err();
-        assert!(matches!(err, RedactError::MalformedRecord(_)));
-    }
-
-    #[test]
-    fn group_wire_type_on_dropped_field_fails_closed() {
-        // Same group wire type but on an unmapped field, so drop_field (not copy_field_value) sees
-        // it — still unsupported, still fails closed.
-        let mut record = Vec::new();
-        write_tag(&mut record, 2, 3); // field 2 (no plan entry), wire type 3
-        let err = try_run(&pass_through_plan(1), &record).unwrap_err();
-        assert!(matches!(err, RedactError::MalformedRecord(_)));
-    }
-
-    // ===== EmptyString / TodoRemove =====
-
-    #[test]
-    fn empty_string_blanks_length_delimited_field() {
-        let plan = plan_of(vec![
-            field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
-            field_entry(2, Action::EmptyString(plan_proto::EmptyString {})),
-        ]);
-        let mut record = Vec::new();
-        push_varint_field(&mut record, 1, 7);
-        push_len_field(&mut record, 2, b"user@example.com");
-        let mut expected = Vec::new();
-        push_varint_field(&mut expected, 1, 7);
-        push_len_field(&mut expected, 2, b""); // present, blanked
-        assert_eq!(run(&plan, &record), expected);
-    }
-
-    #[test]
-    fn todo_remove_drops_field_like_remove() {
-        let plan = plan_of(vec![
-            field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
-            field_entry(
-                2,
-                Action::TodoRemove(plan_proto::TodoRemove {
-                    description: Some("unresolved".to_string()),
-                }),
-            ),
-        ]);
-        let mut record = Vec::new();
-        push_varint_field(&mut record, 1, 7);
-        push_len_field(&mut record, 2, b"gone");
-        let mut expected = Vec::new();
-        push_varint_field(&mut expected, 1, 7); // field 2 dropped entirely
-        assert_eq!(run(&plan, &record), expected);
-    }
-
-    // ===== RedactFrom (HMAC_HASH) derivation =====
-
-    // Parity fixture: HMAC-SHA-512(key, value) in the legacy signed-decimal mkString encoding.
-    const PARITY_KEY: &[u8] = b"fleet-hmac-key";
-    const PARITY_SOURCE: &str = "cleartext-table-name";
-    const PARITY_HASH: &str = "-722276-11-49-419425-115-31-40-652732-125-61104-231-7332-106-96-720-327-35-83-101-30-110-104-98112-1181131-8750-68-127823227-1461-4642572-9576-7712379-43556992-47909147";
-
-    #[test]
-    fn hmac_hash_matches_java_signed_decimal_encoding() {
-        // Byte-for-byte with Scala HashingUtils(key).hash(value).mkString.
-        assert_eq!(hmac_hash(PARITY_KEY, PARITY_SOURCE), PARITY_HASH);
-    }
-
-    #[test]
-    fn keyless_registration_rejects_redact_from() {
-        let plan = plan_of(vec![
-            field_entry(1, Action::Remove(plan_proto::Remove {})),
-            redact_from_entry(2, 1, false, None),
-        ]);
-        assert!(matches!(
-            register_plan(&plan.encode_to_vec()).unwrap_err(),
-            RedactError::InvalidPlan(_)
-        ));
-    }
-
-    #[test]
-    fn redact_from_derives_hash_and_drops_source() {
-        // Source-drop invariant: source (field 1, Remove) dropped; target (field 2) carries the hash.
-        let plan = plan_of(vec![
-            field_entry(1, Action::Remove(plan_proto::Remove {})),
-            redact_from_entry(2, 1, false, None),
-        ]);
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, PARITY_SOURCE.as_bytes());
-        let out = try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 2, PARITY_HASH.as_bytes());
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn redact_from_scalar_last_and_repeated_each() {
-        let scalar = plan_of(vec![
-            field_entry(1, Action::Remove(plan_proto::Remove {})),
-            redact_from_entry(2, 1, false, None),
-        ]);
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, b"first");
-        push_len_field(&mut record, 1, PARITY_SOURCE.as_bytes());
-        let out = try_run_keyed(&scalar, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 2, PARITY_HASH.as_bytes()); // scalar → last occurrence
-        assert_eq!(out, expected);
-
-        let repeated = plan_of(vec![
-            field_entry(1, Action::Remove(plan_proto::Remove {})),
-            redact_from_entry(2, 1, true, None),
-        ]);
-        let out =
-            try_run_keyed(&repeated, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 2, hmac_hash(PARITY_KEY, "first").as_bytes());
-        push_len_field(&mut expected, 2, PARITY_HASH.as_bytes()); // one per occurrence, in order
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn redact_from_absent_source_emits_nothing() {
-        let plan = plan_of(vec![
-            field_entry(1, Action::Remove(plan_proto::Remove {})),
-            redact_from_entry(2, 1, false, None),
-        ]);
-        let out = try_run_keyed(&plan, &[], Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn redact_from_self_hash_hashes_in_place() {
-        let plan = plan_of(vec![redact_from_entry(1, 1, false, None)]);
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, PARITY_SOURCE.as_bytes());
-        let out = try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 1, PARITY_HASH.as_bytes());
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn redact_from_numeric_source_renders_signed_decimal() {
-        let plan = plan_of(vec![
-            field_entry(1, Action::Remove(plan_proto::Remove {})),
-            redact_from_entry(2, 1, false, None),
-        ]);
-        let mut record = Vec::new();
-        push_varint_field(&mut record, 1, 12345);
-        let out = try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 2, hmac_hash(PARITY_KEY, "12345").as_bytes());
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn redact_from_malformed_utf8_source_fails_closed() {
-        let plan = plan_of(vec![
-            field_entry(1, Action::Remove(plan_proto::Remove {})),
-            redact_from_entry(2, 1, false, None),
-        ]);
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, &[0xFF, 0xFE, 0x00]);
-        assert!(matches!(
-            try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap_err(),
-            RedactError::MalformedRecord(_)
-        ));
-    }
-
-    #[test]
-    fn redact_from_empty_shapes_wiped_under_enforcement() {
-        // derived_shapes present-but-empty: emitted with enforcement off, wiped with enforcement on.
-        let plan = plan_of(vec![
-            field_entry(1, Action::Remove(plan_proto::Remove {})),
-            redact_from_entry(2, 1, false, Some(vec![])),
-        ]);
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, PARITY_SOURCE.as_bytes());
-
-        let off = try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 2, PARITY_HASH.as_bytes());
-        assert_eq!(off, expected);
-
-        let on = try_run_keyed(&plan, &record, Some(PARITY_KEY), ShapeEnforcement::On).unwrap();
-        assert!(
-            on.is_empty(),
-            "empty derived_shapes must be wiped under enforcement"
-        );
-    }
-
-    #[test]
-    fn redact_from_grows_nested_message() {
-        // A RedactFrom inside a nested message replaces a short source with a long hash; the child
-        // grows past the 1-byte varint length boundary. handle_recurse must length-prefix it right.
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![
-                plan_proto::MessageRedactionPlan {
-                    actions: vec![field_entry(
-                        1,
-                        Action::Recurse(plan_proto::Recurse {
-                            child_plan_index: Some(1),
-                        }),
-                    )],
-                    ..Default::default()
-                },
-                plan_proto::MessageRedactionPlan {
-                    actions: vec![
-                        field_entry(1, Action::Remove(plan_proto::Remove {})),
-                        redact_from_entry(2, 1, false, None),
-                    ],
-                    ..Default::default()
-                },
-            ],
+        // SAFETY: The record remains live and outputs point to initialized locals.
+        let status = unsafe {
+            db_redactor_redact(
+                handle,
+                record.as_ptr(),
+                record.len(),
+                0,
+                0,
+                &mut output,
+                &mut error,
+            )
         };
-        let mut child = Vec::new();
-        push_len_field(&mut child, 1, b"x");
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, &child);
+        status_result(status, &error).expect("record should redact");
+        let foreign_data = output.data;
+        let redacted = output.into_bytes();
 
-        let out =
-            try_run_keyed(&plan_set, &record, Some(PARITY_KEY), ShapeEnforcement::Off).unwrap();
-
-        let mut expected_child = Vec::new();
-        push_len_field(
-            &mut expected_child,
-            2,
-            hmac_hash(PARITY_KEY, "x").as_bytes(),
-        );
-        assert!(
-            expected_child.len() > 127,
-            "child must cross the 1-byte varint boundary"
-        );
-        let mut expected = Vec::new();
-        push_len_field(&mut expected, 1, &expected_child);
-        assert_eq!(out, expected);
+        assert_eq!(redacted.as_ref(), record);
+        assert_eq!(redacted.as_ptr(), foreign_data);
+        release_plan(handle);
     }
 
     #[test]
-    fn redact_from_malformed_plans_fail_closed() {
-        // Missing transform, missing source, missing is_repeated, undropped source, empty key.
-        let missing_transform = plan_of(vec![field_entry(
-            2,
-            Action::RedactFrom(plan_proto::RedactFrom {
-                source_field_number: Some(1),
-                transform: None,
-                is_repeated: Some(false),
-                derived_shapes: None,
-            }),
-        )]);
+    fn validates_shapes_through_real_static_library() {
+        assert!(field_value_conforms(
+            &[DataShape::Uuid as i32],
+            "01ef1742-bfef-1d54-8e8f-0d79b856b0f3"
+        )
+        .expect("shape validation should succeed"));
         assert!(
-            register_plan_with_key(&missing_transform.encode_to_vec(), Some(PARITY_KEY)).is_err()
+            !field_value_conforms(&[DataShape::Uuid as i32], "not-a-uuid")
+                .expect("shape validation should succeed")
         );
-
-        let missing_source = plan_of(vec![field_entry(
-            2,
-            Action::RedactFrom(plan_proto::RedactFrom {
-                source_field_number: None,
-                transform: Some(plan_proto::RedactFromTransform::HmacHash as i32),
-                is_repeated: Some(false),
-                derived_shapes: None,
-            }),
-        )]);
-        assert!(register_plan_with_key(&missing_source.encode_to_vec(), Some(PARITY_KEY)).is_err());
-
-        let missing_is_repeated = plan_of(vec![
-            field_entry(1, Action::Remove(plan_proto::Remove {})),
-            field_entry(
-                2,
-                Action::RedactFrom(plan_proto::RedactFrom {
-                    source_field_number: Some(1),
-                    transform: Some(plan_proto::RedactFromTransform::HmacHash as i32),
-                    is_repeated: None,
-                    derived_shapes: None,
-                }),
-            ),
-        ]);
-        assert!(
-            register_plan_with_key(&missing_is_repeated.encode_to_vec(), Some(PARITY_KEY)).is_err()
-        );
-
-        let undropped_source = plan_of(vec![
-            field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
-            redact_from_entry(2, 1, false, None),
-        ]);
-        assert!(
-            register_plan_with_key(&undropped_source.encode_to_vec(), Some(PARITY_KEY)).is_err()
-        );
-
-        let ok_plan = plan_of(vec![
-            field_entry(1, Action::Remove(plan_proto::Remove {})),
-            redact_from_entry(2, 1, false, None),
-        ]);
-        assert!(register_plan_with_key(&ok_plan.encode_to_vec(), Some(b"")).is_err());
-    }
-
-    // ===== Key-shape gate (map entry) =====
-
-    /// Root field 1 recurses into a synthetic map-entry plan (plans[1]) whose key (field 1) is gated
-    /// to `key_shapes`; the value (field 2) is a plain PassThrough to isolate the KEY gate.
-    fn key_shape_gate_plan(key_shapes: Vec<i32>) -> plan_proto::RedactionPlanSet {
-        plan_proto::RedactionPlanSet {
-            plans: vec![
-                plan_proto::MessageRedactionPlan {
-                    actions: vec![field_entry(
-                        1,
-                        Action::Recurse(plan_proto::Recurse {
-                            child_plan_index: Some(1),
-                        }),
-                    )],
-                    ..Default::default()
-                },
-                plan_proto::MessageRedactionPlan {
-                    actions: vec![
-                        field_entry(1, Action::PassThrough(plan_proto::PassThrough {})),
-                        field_entry(2, Action::PassThrough(plan_proto::PassThrough {})),
-                    ],
-                    key_shape_field_number: Some(1),
-                    key_shapes,
-                    ..Default::default()
-                },
-            ],
-        }
-    }
-
-    /// A record with one map entry (root field 1) holding a string key (entry field 1) + value.
-    fn string_key_map_record(key: &[u8], value: &[u8]) -> Vec<u8> {
-        let mut entry = Vec::new();
-        push_len_field(&mut entry, 1, key);
-        push_len_field(&mut entry, 2, value);
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, &entry);
-        record
-    }
-
-    #[test]
-    fn key_shape_gate_keeps_entry_with_conforming_key_under_enforcement() {
-        let plan = key_shape_gate_plan(vec![1]); // DATA_SHAPE_UUID
-        let record = string_key_map_record(b"550e8400-e29b-41d4-a716-446655440000", b"v");
-        assert_eq!(
-            run_enforced(&plan, &record),
-            record,
-            "a UUID key passes the gate — the entry is kept verbatim"
-        );
-    }
-
-    #[test]
-    fn key_shape_gate_drops_entry_with_nonconforming_key_under_enforcement() {
-        let plan = key_shape_gate_plan(vec![1]); // DATA_SHAPE_UUID
-        let record = string_key_map_record(b"not-a-uuid", b"v");
-        assert!(
-            run_enforced(&plan, &record).is_empty(),
-            "a non-UUID key fails the gate — the whole entry is dropped, not wiped to \"\""
-        );
-    }
-
-    #[test]
-    fn key_shape_gate_copies_verbatim_when_enforcement_off() {
-        let plan = key_shape_gate_plan(vec![1]); // DATA_SHAPE_UUID
-        let record = string_key_map_record(b"not-a-uuid", b"v");
-        assert_eq!(
-            try_run_with(&plan, &record, ShapeEnforcement::Off).unwrap(),
-            record,
-            "enforcement off copies the entry verbatim regardless of key shape"
-        );
-    }
-
-    #[test]
-    fn key_shape_gate_empty_shapes_drops_every_entry_under_enforcement() {
-        // Empty key_shapes = "centralizable key, no shape annotation": every key fails under
-        // enforcement, so every entry is dropped (distinct from PassThroughString's empty = keep).
-        let plan = key_shape_gate_plan(vec![]);
-        let record = string_key_map_record(b"550e8400-e29b-41d4-a716-446655440000", b"v");
-        assert!(
-            run_enforced(&plan, &record).is_empty(),
-            "an empty key-shape gate drops every entry under enforcement"
-        );
-    }
-
-    #[test]
-    fn key_shape_gate_drops_non_string_key_under_enforcement() {
-        // A varint key can't be read as a string to shape-check, so it fails the gate (defensive —
-        // the planner only gates string keys). Mirrors StreamingProtoRedactor.readKeyFromEntry.
-        let plan = key_shape_gate_plan(vec![1]); // DATA_SHAPE_UUID
-        let mut entry = Vec::new();
-        push_varint_field(&mut entry, 1, 123); // numeric key, not length-delimited
-        push_len_field(&mut entry, 2, b"v");
-        let mut record = Vec::new();
-        push_len_field(&mut record, 1, &entry);
-        assert!(
-            run_enforced(&plan, &record).is_empty(),
-            "a non-string key can't be shape-checked, so the entry is dropped under enforcement"
-        );
-    }
-
-    #[test]
-    fn register_rejects_key_shape_gate_on_unhandled_field() {
-        // A key-shape gate whose field the plan carries no action for is malformed (the planner
-        // always sets a map entry's key field to PassThrough). Registration must reject it rather
-        // than let the runtime silently drop every entry under enforcement.
-        let plan_set = plan_proto::RedactionPlanSet {
-            plans: vec![plan_proto::MessageRedactionPlan {
-                actions: vec![field_entry(1, Action::PassThrough(plan_proto::PassThrough {}))],
-                key_shape_field_number: Some(2), // no action for field 2 in this plan
-                ..Default::default()
-            }],
-        };
-        let err = register_plan(&plan_set.encode_to_vec()).unwrap_err();
-        assert!(matches!(err, RedactError::InvalidPlan(_)));
     }
 }

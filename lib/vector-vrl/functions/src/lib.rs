@@ -5,16 +5,19 @@
 //! - Standard VRL library functions (`vrl::stdlib::all`)
 //! - Vector-specific functions (`vector_vrl::secret_functions`)
 //! - Enrichment table functions (`enrichment::vrl_functions`)
-//! - Redaction functions (`redaction_functions`)
+//! - Databricks redaction functions (`redaction_functions`, optional)
 //! - DNS tap parsing functions (optional, with `dnstap` feature)
 
 #![deny(warnings)]
 
 use vrl::{compiler::Function, path::OwnedTargetPath};
 
+#[cfg(feature = "databricks-redaction")]
 pub mod apply_redaction;
+#[cfg(feature = "databricks-redaction")]
 pub mod enforce_metadata_shape;
 pub mod get_secret;
+#[cfg(feature = "databricks-redaction")]
 pub mod redaction;
 pub mod remove_secret;
 pub mod set_secret;
@@ -40,11 +43,18 @@ pub fn secret_functions() -> Vec<Box<dyn Function>> {
 }
 
 /// Returns Vector-specific redaction functions.
+#[cfg(feature = "databricks-redaction")]
 pub fn redaction_functions() -> Vec<Box<dyn Function>> {
     vec![
         Box::new(apply_redaction::ApplyRedaction) as _,
         Box::new(enforce_metadata_shape::EnforceMetadataShape) as _,
     ]
+}
+
+/// Returns no Databricks-only functions in standalone builds.
+#[cfg(not(feature = "databricks-redaction"))]
+pub fn redaction_functions() -> Vec<Box<dyn Function>> {
+    Vec::new()
 }
 
 /// Returns all VRL functions available in Vector.
@@ -63,4 +73,12 @@ pub fn all() -> Vec<Box<dyn Function>> {
     let functions = functions.chain(vector_vrl_metrics::all());
 
     functions.collect()
+}
+
+#[cfg(all(test, not(feature = "databricks-redaction")))]
+mod tests {
+    #[test]
+    fn standalone_build_omits_databricks_redaction_functions() {
+        assert!(super::redaction_functions().is_empty());
+    }
 }

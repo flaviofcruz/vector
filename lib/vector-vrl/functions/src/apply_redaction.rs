@@ -151,10 +151,13 @@ impl FunctionExpression for ApplyRedactionFn {
             .handle_for(&PlanKey::default())
             .ok_or("apply_redaction: no redaction plan registered")?;
 
+        // TODO: When the canonical executor implements GENERATE_PUID, capture Vector's TableSearch
+        // at VRL compile time and pass a lookup callback plus context through the static ABI here.
+        // The callback resolves (user_id, org_id, shard_name) from the PUID enrichment table.
         let redacted = executor::redact(handle, &bytes, self.enforcement)
             .map_err(|e| format!("apply_redaction: {e}"))?;
 
-        Ok(Value::Bytes(Bytes::from(redacted)))
+        Ok(Value::Bytes(redacted))
     }
 
     fn type_def(&self, _: &state::TypeState) -> TypeDef {
@@ -173,9 +176,9 @@ mod tests {
     use vector_redaction_executor::plan_proto;
 
     use super::*;
+    use vrl::compiler::CompileConfig;
     use vrl::compiler::function::FunctionCompileContext;
     use vrl::compiler::state::{self, TypeState};
-    use vrl::compiler::CompileConfig;
     use vrl::diagnostic::Span;
 
     /// Encodes a two-field proto record on the wire: field 1 and field 2, both varints.

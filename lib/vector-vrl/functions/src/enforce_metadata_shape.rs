@@ -1,7 +1,7 @@
 //! The `enforce_metadata_shape` VRL function: shape-enforces the Lumberjack `_log_metadata` envelope
 //! on the Lumberjack Prime write path. It is the LP port of Scala `LogMetadataShapeEnforcer`, which
 //! classic Lumberjack applies as a Spark UDF in `CentralizationBase`; the field -> shape policy lives
-//! in `vector_redaction_executor::metadata_shape`, and this function owns only the VRL `Value` walk.
+//! in this module, while the canonical validators are called through `vector_redaction_executor`.
 //!
 //! Given the `_log_metadata` object, each declared string field is kept iff it is empty, the literal
 //! `"unknown"`, or matches one of its declared `DataShape`s; otherwise it is set to `null`. Absent
@@ -9,7 +9,91 @@
 //! nulled), so the stage cannot reduce completeness. Fallible: errors if `metadata` is not an object.
 
 use vector_redaction_executor as executor;
+use vector_redaction_executor::DataShape;
 use vrl::prelude::*;
+
+const SERVICE_METADATA_SHAPES: &[(&str, &[i32])] = &[
+    ("branch_name", &[DataShape::BranchName as i32]),
+    ("system_uri", &[DataShape::SystemUri as i32]),
+    (
+        "shard_name",
+        &[
+            DataShape::ShardName as i32,
+            DataShape::KubeContext as i32,
+            DataShape::CloudRegion as i32,
+        ],
+    ),
+    (
+        "request_id",
+        &[DataShape::Uuid as i32, DataShape::Ulid as i32],
+    ),
+    (
+        "traceparent",
+        &[DataShape::W3cTraceparent as i32, DataShape::Hex32 as i32],
+    ),
+    ("trace_id", &[DataShape::Hex32 as i32]),
+    ("account_id", &[DataShape::Uuid as i32]),
+    ("pod_uid", &[DataShape::Uuid as i32]),
+];
+
+const DATA_PLANE_METADATA_SHAPES: &[(&str, &[i32])] = &[
+    ("cluster_id", &[DataShape::DbrClusterId as i32]),
+    ("cluster_creator", &[DataShape::ClusterCreator as i32]),
+    ("spark_image_label", &[DataShape::DbrImageLabel as i32]),
+    (
+        "spark_version",
+        &[
+            DataShape::DbrImageLabel as i32,
+            DataShape::VersionNumber as i32,
+        ],
+    ),
+    ("cluster_size_type", &[DataShape::ClusterSizeType as i32]),
+    (
+        "cluster_node_type",
+        &[
+            DataShape::CloudInstanceType as i32,
+            DataShape::ServerlessNodeTypeId as i32,
+        ],
+    ),
+    (
+        "cluster_unity_catalog_mode",
+        &[DataShape::ClusterUnityCatalogMode as i32],
+    ),
+    ("dbsql_channel", &[DataShape::PlatformChannel as i32]),
+    (
+        "internal_cluster_id",
+        &[DataShape::InternalClusterId as i32],
+    ),
+];
+
+const LOG_DAEMON_METADATA_SHAPES: &[(&str, &[i32])] = &[
+    (
+        "shard_name",
+        &[DataShape::ShardName as i32, DataShape::KubeContext as i32],
+    ),
+    (
+        "stream_guid",
+        &[
+            DataShape::Uuid as i32,
+            DataShape::LoggingFileId as i32,
+            DataShape::Hex32 as i32,
+        ],
+    ),
+    ("plane", &[DataShape::Plane as i32]),
+    ("cluster_type", &[DataShape::ClusterType as i32]),
+    ("spark_image_label", &[DataShape::DbrImageLabel as i32]),
+    ("org_id", &[DataShape::Numeric as i32]),
+    ("region", &[DataShape::CloudRegion as i32]),
+    (
+        "unp_node_id",
+        &[
+            DataShape::Uuid as i32,
+            DataShape::AwsEc2InstanceId as i32,
+            DataShape::GcpComputeInstanceId as i32,
+            DataShape::GoogleCloudHex32Id as i32,
+        ],
+    ),
+];
 
 #[derive(Clone, Copy, Debug)]
 pub struct EnforceMetadataShape;
@@ -68,16 +152,18 @@ struct EnforceMetadataShapeFn {
 /// Nulls every field of `value` (when it is an object) whose present string value does not conform to
 /// its declared shapes. Two passes to satisfy the borrow checker: collect the non-conforming keys,
 /// then null them.
-fn enforce_fields(value: &mut Value, fields: &[(&str, &[i32])]) {
+fn enforce_fields(value: &mut Value, fields: &[(&str, &[i32])]) -> Result<(), ExpressionError> {
     let obj = match value {
         Value::Object(obj) => obj,
-        _ => return,
+        _ => return Ok(()),
     };
     let mut to_null: Vec<&str> = Vec::new();
     for &(field, shapes) in fields {
         if let Some(Value::Bytes(bytes)) = obj.get(field) {
             let string = String::from_utf8_lossy(bytes);
-            if !executor::field_value_conforms(shapes, &string) {
+            if !executor::field_value_conforms(shapes, &string)
+                .map_err(|error| format!("enforce_metadata_shape: {error}"))?
+            {
                 to_null.push(field);
             }
         }
@@ -85,6 +171,7 @@ fn enforce_fields(value: &mut Value, fields: &[(&str, &[i32])]) {
     for field in to_null {
         obj.insert(field.into(), Value::Null);
     }
+    Ok(())
 }
 
 impl FunctionExpression for EnforceMetadataShapeFn {
@@ -96,16 +183,16 @@ impl FunctionExpression for EnforceMetadataShapeFn {
         };
 
         if let Some(service) = root.get_mut("service_metadata") {
-            enforce_fields(service, executor::SERVICE_METADATA_SHAPES);
+            enforce_fields(service, SERVICE_METADATA_SHAPES)?;
             // data_plane_metadata is nested inside service_metadata (matches the Scala tree).
-            if let Value::Object(service_obj) = service {
-                if let Some(data_plane) = service_obj.get_mut("data_plane_metadata") {
-                    enforce_fields(data_plane, executor::DATA_PLANE_METADATA_SHAPES);
-                }
+            if let Value::Object(service_obj) = service
+                && let Some(data_plane) = service_obj.get_mut("data_plane_metadata")
+            {
+                enforce_fields(data_plane, DATA_PLANE_METADATA_SHAPES)?;
             }
         }
         if let Some(daemon) = root.get_mut("log_daemon_metadata") {
-            enforce_fields(daemon, executor::LOG_DAEMON_METADATA_SHAPES);
+            enforce_fields(daemon, LOG_DAEMON_METADATA_SHAPES)?;
         }
 
         Ok(value)
@@ -122,14 +209,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use vrl::compiler::CompileConfig;
     use vrl::compiler::function::FunctionCompileContext;
     use vrl::compiler::state::{self, TypeState};
-    use vrl::compiler::CompileConfig;
     use vrl::diagnostic::Span;
 
     const A_UUID: &str = "01ef1742-bfef-1d54-8e8f-0d79b856b0f3";
-    const DBR_IMAGE_LABEL: &str =
-        "release__18.2.x-photon-scala2.13__dbr__18.2.2__8020d77__099e4fa__jenkins__sdp-20260524-rc0-fbcacd4__format-4";
+    const DBR_IMAGE_LABEL: &str = "release__18.2.x-photon-scala2.13__dbr__18.2.2__8020d77__099e4fa__jenkins__sdp-20260524-rc0-fbcacd4__format-4";
 
     fn object(pairs: Vec<(&str, Value)>) -> Value {
         let mut map = BTreeMap::new();
@@ -178,7 +264,10 @@ mod tests {
             ("cluster_size_type", Value::from("VM_CONTAINER")),
             ("cluster_unity_catalog_mode", Value::from("SINGLE_USER")),
             ("dbsql_channel", Value::from("CHANNEL_NAME_CURRENT")),
-            ("internal_cluster_id", Value::from("qeaj2n--i0508122019-c6vlrq5a")),
+            (
+                "internal_cluster_id",
+                Value::from("qeaj2n--i0508122019-c6vlrq5a"),
+            ),
         ]);
         let service = object(vec![
             ("branch_name", Value::from("master")),
@@ -234,9 +323,15 @@ mod tests {
         let out = enforce(input);
 
         // The three corrupted fields are nulled.
-        assert_eq!(at(&out, &["service_metadata", "request_id"]), Some(&Value::Null));
         assert_eq!(
-            at(&out, &["service_metadata", "data_plane_metadata", "cluster_id"]),
+            at(&out, &["service_metadata", "request_id"]),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            at(
+                &out,
+                &["service_metadata", "data_plane_metadata", "cluster_id"]
+            ),
             Some(&Value::Null)
         );
         assert_eq!(
@@ -278,7 +373,10 @@ mod tests {
         )]);
         let out = enforce(input);
         // service_metadata still enforced, and the absent log_daemon_metadata causes no error.
-        assert_eq!(at(&out, &["service_metadata", "request_id"]), Some(&Value::Null));
+        assert_eq!(
+            at(&out, &["service_metadata", "request_id"]),
+            Some(&Value::Null)
+        );
         assert_eq!(at(&out, &["log_daemon_metadata"]), None);
     }
 }
