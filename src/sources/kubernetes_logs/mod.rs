@@ -300,6 +300,14 @@ pub struct Config {
     #[configurable(metadata(docs::human_name = "Glob Minimum Cooldown"))]
     glob_minimum_cooldown_ms: Duration,
 
+    /// The interval at which a file that has stopped producing data is checked for new content.
+    ///
+    /// Lower values reduce the delay before reading new content appended to an idle file, but
+    /// increase filesystem polling overhead.
+    #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
+    #[configurable(metadata(docs::human_name = "Idle Read Interval"))]
+    idle_read_interval_ms: Duration,
+
     /// Overrides the name of the log field used to add the ingestion timestamp to each event.
     ///
     /// This is useful to compute the latency between important event processing
@@ -507,6 +515,7 @@ impl Default for Config {
             max_merged_line_bytes: None,
             fingerprint_lines: default_fingerprint_lines(),
             glob_minimum_cooldown_ms: default_glob_minimum_cooldown_ms(),
+            idle_read_interval_ms: default_idle_read_interval_ms(),
             ingestion_timestamp_field: None,
             timezone: None,
             kube_config_file: None,
@@ -803,6 +812,7 @@ struct Source {
     max_merged_line_bytes: Option<usize>,
     fingerprint_lines: usize,
     glob_minimum_cooldown: Duration,
+    idle_read_interval: Duration,
     ingestion_timestamp_field: Option<OwnedTargetPath>,
     include_file_metric_tag: bool,
     rotate_wait: Duration,
@@ -1039,6 +1049,7 @@ impl Source {
         let exclude_paths = prepare_exclude_paths(config)?;
 
         let glob_minimum_cooldown = config.glob_minimum_cooldown_ms;
+        let idle_read_interval = config.idle_read_interval_ms;
 
         let ingestion_timestamp_field = config
             .ingestion_timestamp_field
@@ -1080,6 +1091,7 @@ impl Source {
             max_merged_line_bytes: config.max_merged_line_bytes,
             fingerprint_lines: config.fingerprint_lines,
             glob_minimum_cooldown,
+            idle_read_interval,
             ingestion_timestamp_field,
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
@@ -1132,6 +1144,7 @@ impl Source {
             max_merged_line_bytes,
             fingerprint_lines,
             glob_minimum_cooldown,
+            idle_read_interval,
             ingestion_timestamp_field,
             include_file_metric_tag,
             rotate_wait,
@@ -1236,6 +1249,7 @@ impl Source {
             // This value specifies not exactly the globbing, but interval
             // between the polling the files to watch from the `paths_provider`.
             glob_minimum_cooldown,
+            idle_read_interval,
             // The shape of the log files is well-known in the Kubernetes
             // environment, so we pick the a specially crafted fingerprinter
             // for the log files.
@@ -1597,6 +1611,10 @@ const fn default_max_line_bytes() -> usize {
 
 const fn default_glob_minimum_cooldown_ms() -> Duration {
     Duration::from_millis(60_000)
+}
+
+const fn default_idle_read_interval_ms() -> Duration {
+    Duration::from_secs(10)
 }
 
 const fn default_fingerprint_lines() -> usize {

@@ -194,6 +194,16 @@ pub struct FileConfig {
     #[configurable(metadata(docs::human_name = "Glob Minimum Cooldown"))]
     pub glob_minimum_cooldown_ms: Duration,
 
+    /// The interval at which a file that has stopped producing data is checked for new content.
+    ///
+    /// Lower values reduce the delay before reading new content appended to an idle file, but
+    /// increase filesystem polling overhead.
+    #[serde(default = "default_idle_read_interval_ms")]
+    #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
+    #[configurable(metadata(docs::type_unit = "milliseconds"))]
+    #[configurable(metadata(docs::human_name = "Idle Read Interval"))]
+    pub idle_read_interval_ms: Duration,
+
     #[configurable(derived)]
     #[serde(alias = "fingerprinting", default)]
     fingerprint: FingerprintConfig,
@@ -334,6 +344,10 @@ const fn default_glob_minimum_cooldown_ms() -> Duration {
     Duration::from_millis(1000)
 }
 
+const fn default_idle_read_interval_ms() -> Duration {
+    Duration::from_secs(10)
+}
+
 const fn default_multi_line_timeout() -> u64 {
     1000
 } // deprecated
@@ -451,6 +465,7 @@ impl Default for FileConfig {
             offset_key: None,
             data_dir: None,
             glob_minimum_cooldown_ms: default_glob_minimum_cooldown_ms(),
+            idle_read_interval_ms: default_idle_read_interval_ms(),
             message_start_indicator: None,
             multi_line_timeout: default_multi_line_timeout(), // millis
             multiline: None,
@@ -595,6 +610,7 @@ pub fn file_source(
     let ignore_before = calculate_ignore_before(config.ignore_older_secs);
     let start_reading_at = parse_start_reading_at(config.start_reading_at.clone());
     let glob_minimum_cooldown = config.glob_minimum_cooldown_ms;
+    let idle_read_interval = config.idle_read_interval_ms;
     let (ignore_checkpoints, read_from) = reconcile_position_options(
         config.start_at_beginning,
         config.ignore_checkpoints,
@@ -648,6 +664,7 @@ pub fn file_source(
         line_delimiter: line_delimiter_as_bytes,
         data_dir,
         glob_minimum_cooldown,
+        idle_read_interval,
         fingerprinter: Fingerprinter::new(strategy, config.max_line_bytes, config.ignore_not_found),
         oldest_first: config.oldest_first,
         remove_after: config.remove_after_secs.map(Duration::from_secs),

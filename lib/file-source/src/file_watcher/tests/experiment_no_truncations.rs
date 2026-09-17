@@ -1,4 +1,4 @@
-use std::{fs, io::Write};
+use std::{fs, io::Write, time::Duration};
 
 use bytes::Bytes;
 use file_source_common::ReadFrom;
@@ -23,6 +23,7 @@ async fn experiment_no_truncations(actions: Vec<FileWatcherAction>) {
         None,
         100_000,
         Bytes::from("\n"),
+        Duration::from_secs(10),
     )
     .await
     .expect("must be able to create");

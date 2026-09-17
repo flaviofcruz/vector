@@ -2,7 +2,7 @@
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
-use std::{fs, io::Write};
+use std::{fs, io::Write, time::Duration};
 
 use bytes::Bytes;
 use file_source_common::ReadFrom;
@@ -35,6 +35,7 @@ async fn experiment(actions: Vec<FileWatcherAction>) {
         None,
         100_000,
         Bytes::from("\n"),
+        Duration::from_secs(10),
     )
     .await
     .expect("must be able to create");
