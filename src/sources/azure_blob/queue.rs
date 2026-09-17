@@ -1,5 +1,6 @@
 // Standard library imports for core functionality
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::{future::ready, num::NonZeroUsize, panic, sync::Arc};
 
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use smallvec::SmallVec;
 use snafu::{ResultExt, Snafu};
+use tokio::io::AsyncRead;
 use tokio::{pin, select};
 use tokio_util::codec::FramedRead;
 use tracing::Instrument;
@@ -35,9 +37,9 @@ use vector_lib::source_sender::SendError;
 use crate::codecs::Decoder;
 use crate::event::{Event, LogEvent};
 use crate::internal_events::{
-    EventsReceived, QueueMessageCount, QueueMessageDeleteSucceeded, QueueMessageReceived,
-    QueueNotificationProcessLag, StreamClosedError, emit_object_storage_ack_metrics,
-    emit_object_storage_non_ack_metrics,
+    EventsReceived, ObjectStorageBlobTruncated, QueueMessageCount, QueueMessageDeleteSucceeded,
+    QueueMessageReceived, QueueNotificationProcessLag, StreamClosedError,
+    emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
 };
 use crate::{
     SourceSender,
@@ -47,6 +49,7 @@ use crate::{
     shutdown::ShutdownSignal,
     sources::azure_blob::AzureBlobConfig,
     sources::ingestion_callback::IngestionCallbackClient,
+    sources::util::TolerateTrailingEof,
     tls::TlsConfig,
 };
 use vector_lib::config::{LegacyKey, LogNamespace, log_schema};
@@ -147,6 +150,23 @@ pub(super) struct Config {
     #[serde(default)]
     #[derivative(Default)]
     pub(super) process_custom_message: bool,
+
+    /// Whether to ingest the decodable prefix of a truncated compressed blob and ack it, instead
+    /// of failing the read and redelivering the message forever.
+    ///
+    /// A gzip/zstd archive whose committed bytes end mid-member (a torn upload) decodes fine up to
+    /// the tear, then errors with `UnexpectedEof`. The blob is immutable, so leaving the read to
+    /// error redelivers the same un-decodable blob indefinitely, re-ingesting the decodable prefix
+    /// as duplicates each cycle. When enabled, the source ingests the records that did decode, acks
+    /// the message, and emits `ObjectStorageBlobTruncated` for the dropped tail.
+    ///
+    /// Defaults to `false`: tolerating truncation drops the torn tail (data loss), so it is
+    /// opt-in per source. It only ever applies to a fully-downloaded but truncated archive — a
+    /// short *transfer* (fewer bytes than `Content-Length`) still redelivers regardless of this
+    /// setting.
+    #[serde(default)]
+    #[derivative(Default)]
+    pub(super) tolerate_truncated_archives: bool,
 }
 
 // Default configuration values
@@ -302,6 +322,9 @@ pub struct State {
     storage_account_name: String,
     /// Whether to process custom direct ingest messages
     process_custom_message: bool,
+    /// Whether to tolerate a truncated trailing gzip/zstd member (ingest the decodable prefix and
+    /// ack) rather than redelivering an un-decodable blob forever. See `Config`.
+    tolerate_truncated_archives: bool,
     /// Optional callback client for notifying upstream on processing completion
     callback_client: Option<IngestionCallbackClient>,
 
@@ -397,6 +420,7 @@ impl Ingestor {
             decoder,
             storage_account_name,
             process_custom_message: config.process_custom_message,
+            tolerate_truncated_archives: config.tolerate_truncated_archives,
             callback_client,
             extra_blob_clients,
         });
@@ -1004,16 +1028,27 @@ impl IngestorProcess {
         let content_type = Some(properties.content_type.as_str());
         let content_encoding = properties.content_encoding.as_deref();
         let last_modified = properties.last_modified;
+        // Advertised size of the committed blob; used to distinguish a truncated committed blob
+        // (compressed bytes pulled == content_length) from a short download (fewer bytes) below.
+        let content_length = properties.content_length;
 
         let timestamp = last_modified;
 
         // Create batch for event processing
         let (batch, receiver) = BatchNotifier::maybe_new_with_receiver(self.acknowledgements);
 
-        // Prepare blob content stream
-        let body_stream = blob_response
-            .data
-            .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+        // Prepare blob content stream, counting the compressed bytes actually pulled so we can
+        // later confirm the whole committed blob was read before tolerating a trailing EOF.
+        let compressed_bytes = Arc::new(AtomicU64::new(0));
+        let byte_counter = Arc::clone(&compressed_bytes);
+        let body_stream = blob_response.data.map(move |result| {
+            result
+                .map(|chunk| {
+                    byte_counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    chunk
+                })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        });
 
         // Decode blob content based on compression settings
         let blob_reader = super::blob_object_decoder(
@@ -1024,6 +1059,22 @@ impl IngestorProcess {
             Box::new(body_stream),
         )
         .await;
+
+        // Optionally tolerate a truncated trailing gzip/zstd member: ingest the decodable prefix
+        // and ack rather than redelivering an immutable, un-fully-decodable archive forever. Gated
+        // by `tolerate_truncated_archives` (default off) because the dropped tail is data loss;
+        // when off, the raw decoder is used and a truncated blob errors and redelivers as before.
+        // See TolerateTrailingEof.
+        let truncated_tail = Arc::new(AtomicBool::new(false));
+        let blob_reader: Box<dyn AsyncRead + Send + Unpin> =
+            if self.state.tolerate_truncated_archives {
+                Box::new(TolerateTrailingEof::new(
+                    blob_reader,
+                    Arc::clone(&truncated_tail),
+                ))
+            } else {
+                blob_reader
+            };
 
         // Set up error tracking and metrics
         let mut read_error = None;
@@ -1112,7 +1163,29 @@ impl IngestorProcess {
         drop(stream);
         drop(batch);
 
+        // A framer error surfaced only at end-of-stream — `decode_eof` on the residual bytes —
+        // after we tolerated a trailing archive truncation is the truncated tail's incomplete
+        // final frame, not a real read failure: `length_delimited`/`octet_counting` framers
+        // return `Err` on a partial trailing frame (newline/bytes framers instead emit the
+        // residual as a final frame, so there is no error to clear). Left as an error it would
+        // set `read_error` -> `ReadBlob`, so `truncated_tail` is set but `delivered` is not and
+        // the whole committed blob was read, and neither reconcile branch below runs: the message
+        // never acks and the immutable blob redelivers forever — the exact loop this feature
+        // prevents. Drop that residual error so we take the normal ack path (and record the
+        // tolerated drop). Gated on having read the whole committed blob, so a short transfer
+        // still surfaces as a real error and redelivers rather than acking a partial download.
+        if read_error.is_some()
+            && tolerated_trailing_frame_error(
+                truncated_tail.load(Ordering::Relaxed),
+                content_length,
+                compressed_bytes.load(Ordering::Relaxed),
+            )
+        {
+            read_error = None;
+        }
+
         // Handle any errors that occurred
+        let mut delivered = false;
         let processing_result = if let Some(error) = read_error {
             Err(ProcessingError::ReadBlob {
                 source: error,
@@ -1128,7 +1201,11 @@ impl IngestorProcess {
         } else {
             // Handle batch acknowledgement
             match receiver {
-                None => Ok(()),
+                // Acknowledgements disabled: best-effort send, treat as delivered.
+                None => {
+                    delivered = true;
+                    Ok(())
+                }
                 Some(receiver) => {
                     let result = receiver.await;
                     // Emit the acknowledgement metrics
@@ -1147,6 +1224,7 @@ impl IngestorProcess {
                                 internal_log_rate_limit = true
                             );
 
+                            delivered = true;
                             Ok(())
                         }
                         BatchStatus::Errored => {
@@ -1183,6 +1261,42 @@ impl IngestorProcess {
                 }
             }
         };
+
+        // Reconcile a tolerated trailing EOF with how much we actually read.
+        let mut processing_result = processing_result;
+        if truncated_tail.load(Ordering::Relaxed) {
+            let pulled = compressed_bytes.load(Ordering::Relaxed);
+            if content_length > 0 && pulled < content_length {
+                // Saw a trailing UnexpectedEof but did NOT read the whole committed blob: the
+                // download was cut short (transient), not a truncated archive. Force redelivery
+                // rather than acking a partial read as if it were the whole blob.
+                warn!(
+                    message = "Incomplete blob download (short transfer); will redeliver.",
+                    container = %container,
+                    blob = %blob,
+                    bytes_read = %pulled,
+                    content_length = %content_length,
+                );
+                processing_result = Err(ProcessingError::ReadBlob {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "incomplete blob download: read {pulled} of {content_length} bytes"
+                        ),
+                    )),
+                    container: container.clone(),
+                    blob: blob.clone(),
+                });
+            } else if delivered {
+                // Whole committed blob read but its trailing member was truncated: we ingested the
+                // decodable prefix and the batch was delivered. Record the tolerated data-drop.
+                emit!(ObjectStorageBlobTruncated {
+                    cloud: CLOUD_PROVIDER,
+                    container: &container,
+                    blob: &blob,
+                });
+            }
+        }
 
         processing_result
     }
@@ -1326,6 +1440,24 @@ fn parse_blob_subject(subject: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Whether a framer error raised at end-of-stream should be tolerated as the truncated tail's
+/// incomplete final frame rather than treated as a read failure.
+///
+/// Only meaningful once `tolerate_truncated_archives` turned a trailing decoder `UnexpectedEof`
+/// into a clean EOF (`truncated_tail`). At that point the whole compressed body was consumed by
+/// the decoder, so any framer error can only come from `decode_eof` on the leftover partial
+/// frame — the truncated tail. It is tolerated only when the whole committed blob was read
+/// (`content_length` unknown, or `pulled >= content_length`); a short transfer
+/// (`pulled < content_length`) is a cut-short download and must still surface as an error so the
+/// message redelivers instead of acking a partial read.
+const fn tolerated_trailing_frame_error(
+    truncated_tail: bool,
+    content_length: u64,
+    pulled: u64,
+) -> bool {
+    truncated_tail && !(content_length > 0 && pulled < content_length)
+}
+
 /// The expected value of the `kind` field in a direct ingest message.
 const DIRECT_INGEST_KIND: &str = "INGEST";
 
@@ -1446,6 +1578,170 @@ pub struct StorageDiagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt as _;
+
+    /// End-to-end through the REAL gzip decoder (not a mock): a multi-member gzip whose final
+    /// member is truncated must yield the fully-decoded prefix and set `tolerated`; a fully valid
+    /// gzip must decode completely with `tolerated` unset. This guards the load-bearing assumption
+    /// that async-compression reports mid-member truncation as `UnexpectedEof` — if a dependency
+    /// bump changes that, this test fails instead of the tolerance silently no-opping.
+    #[tokio::test]
+    async fn real_truncated_gzip_yields_prefix_and_is_tolerated() {
+        use std::io::Write as _;
+
+        fn gz(bytes: &[u8]) -> Vec<u8> {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(bytes).unwrap();
+            e.finish().unwrap()
+        }
+
+        async fn decode(bytes: Vec<u8>) -> (String, bool) {
+            let tolerated = Arc::new(AtomicBool::new(false));
+            let inner = super::super::Compression::Gzip
+                .build_decoder(futures::stream::iter(vec![Ok::<_, std::io::Error>(
+                    Bytes::from(bytes),
+                )]))
+                .await;
+            let mut reader = TolerateTrailingEof::new(inner, Arc::clone(&tolerated));
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await.unwrap();
+            (
+                String::from_utf8(out).unwrap(),
+                tolerated.load(Ordering::Relaxed),
+            )
+        }
+
+        let m1 = gz(b"span1\nspan2\n");
+        let m2 = gz(b"span3\nspan4\nspan5\n");
+
+        // Full, valid two-member gzip: decodes completely, not tolerated.
+        let mut full = m1.clone();
+        full.extend_from_slice(&m2);
+        let (out, tolerated) = decode(full).await;
+        assert_eq!(out, "span1\nspan2\nspan3\nspan4\nspan5\n");
+        assert!(!tolerated);
+
+        // Second member truncated inside its DEFLATE payload: member 1 decodes (the prefix), then
+        // the decoder hits a mid-member EOF -> tolerated.
+        let mut truncated = m1.clone();
+        truncated.extend_from_slice(&m2[..12]);
+        let (out, tolerated) = decode(truncated).await;
+        assert!(out.starts_with("span1\nspan2\n"), "got: {out:?}");
+        assert!(out.len() < "span1\nspan2\nspan3\nspan4\nspan5\n".len());
+        assert!(tolerated);
+    }
+
+    #[test]
+    fn tolerated_trailing_frame_error_gates_on_whole_blob_read() {
+        // No tolerated truncation: a framer error is a genuine read failure, never suppressed.
+        assert!(!tolerated_trailing_frame_error(false, 100, 100));
+        assert!(!tolerated_trailing_frame_error(false, 0, 0));
+        // Trailing truncation tolerated AND the whole committed blob was read: the framer error is
+        // the truncated tail's partial final frame -> tolerate so we ack the decodable prefix.
+        assert!(tolerated_trailing_frame_error(true, 100, 100));
+        assert!(tolerated_trailing_frame_error(true, 100, 120));
+        // Unknown length (content_length == 0): treated as whole-blob-read, matching the reconcile
+        // block's short-transfer guard which also keys off `content_length > 0`.
+        assert!(tolerated_trailing_frame_error(true, 0, 0));
+        // Short transfer (cut-short download): keep the error so the message redelivers rather than
+        // acking a partial read as if it were a truncated archive.
+        assert!(!tolerated_trailing_frame_error(true, 100, 50));
+    }
+
+    /// Regression guard for the interaction between `tolerate_truncated_archives` and a framer
+    /// whose `decode_eof` errors on a partial trailing frame (`length_delimited`/`octet_counting`).
+    /// The tolerance turns the decoder's trailing `UnexpectedEof` into a clean EOF, but `FramedRead`
+    /// then runs the framer's `decode_eof` on the residual bytes; for a length-delimited stream the
+    /// truncated tail is an incomplete frame, so `decode_eof` returns `Err`. This reproduces that
+    /// exact shape and asserts the decodable prefix frames still come through, a framer error is
+    /// recorded, the truncation was tolerated, and `tolerated_trailing_frame_error` therefore
+    /// clears that error (so `process_blob` acks instead of redelivering forever).
+    #[tokio::test]
+    async fn length_delimited_truncated_tail_frame_error_is_tolerated() {
+        use std::io;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::ReadBuf;
+        use vector_lib::codecs::LengthDelimitedDecoder;
+
+        /// Yields `data` then a single `UnexpectedEof`, mimicking a truncated gzip decoder.
+        struct MockRead {
+            data: Vec<u8>,
+            pos: usize,
+            errored: bool,
+        }
+
+        impl AsyncRead for MockRead {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if self.pos < self.data.len() {
+                    let n = std::cmp::min(buf.remaining(), self.data.len() - self.pos);
+                    let start = self.pos;
+                    buf.put_slice(&self.data[start..start + n]);
+                    self.pos += n;
+                    return Poll::Ready(Ok(()));
+                }
+                if !self.errored {
+                    self.errored = true;
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "mock")));
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // Two complete 4-byte-length-prefixed frames ("foo", "bar") followed by a frame whose
+        // header declares 5 bytes but supplies only 2 — the truncated tail.
+        let mut decoded = Vec::new();
+        decoded.extend_from_slice(b"\x00\x00\x00\x03foo");
+        decoded.extend_from_slice(b"\x00\x00\x00\x03bar");
+        decoded.extend_from_slice(b"\x00\x00\x00\x05qu");
+
+        let truncated_tail = Arc::new(AtomicBool::new(false));
+        let reader = TolerateTrailingEof::new(
+            MockRead {
+                data: decoded,
+                pos: 0,
+                errored: false,
+            },
+            Arc::clone(&truncated_tail),
+        );
+
+        // Drive the framer exactly as `process_blob` does: capture the framer error, stop on it.
+        let mut read_error = None;
+        let mut frames = Vec::new();
+        let mut framed = FramedRead::new(reader, LengthDelimitedDecoder::default());
+        while let Some(res) = framed.next().await {
+            match res {
+                Ok(bytes) => frames.push(bytes),
+                Err(err) => {
+                    read_error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        // The decodable prefix is delivered, the truncation was tolerated, and the partial tail
+        // surfaced as a framer error at EOF.
+        assert_eq!(frames, vec![Bytes::from("foo"), Bytes::from("bar")]);
+        assert!(truncated_tail.load(Ordering::Relaxed));
+        assert!(read_error.is_some());
+
+        // With the whole committed blob read, that residual error is tolerated (cleared), so the
+        // message is acked rather than looping. A short transfer would keep it.
+        assert!(tolerated_trailing_frame_error(
+            truncated_tail.load(Ordering::Relaxed),
+            10,
+            10,
+        ));
+        assert!(!tolerated_trailing_frame_error(
+            truncated_tail.load(Ordering::Relaxed),
+            10,
+            4,
+        ));
+    }
 
     /// Tests the blob subject parser with various input formats
     #[test]
@@ -1766,6 +2062,28 @@ mod tests {
         )
         .unwrap();
         assert!(!config.process_custom_message);
+    }
+
+    #[test]
+    fn test_tolerate_truncated_archives_config_parsing() {
+        // Default: off — tolerating truncation drops the torn tail, so it must be opt-in.
+        let config: Config = toml::from_str(
+            r#"
+            queue_name = "my-storage-queue"
+            "#,
+        )
+        .unwrap();
+        assert!(!config.tolerate_truncated_archives);
+
+        // Explicitly enabled
+        let config: Config = toml::from_str(
+            r#"
+            queue_name = "my-storage-queue"
+            tolerate_truncated_archives = true
+            "#,
+        )
+        .unwrap();
+        assert!(config.tolerate_truncated_archives);
     }
 
     #[test]
