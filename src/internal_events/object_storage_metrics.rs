@@ -1,5 +1,5 @@
 use metrics::{counter, gauge, histogram};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use vector_lib::emit;
 use vector_lib::internal_event::{InternalEvent, NamedInternalEvent};
 
@@ -252,6 +252,40 @@ impl InternalEvent for QueueMessageCount<'_> {
             cloud = %self.cloud,
         );
         gauge!("queue_message_count", "cloud" => self.cloud.to_string()).set(self.count as f64);
+    }
+}
+
+/// A blob's gzip/zstd stream ended part-way through a member (`UnexpectedEof`) on a fully-read
+/// (Content-Length-verified) committed blob: the archive is truncated. The source ingested the
+/// records that did decode and acked the message rather than redelivering an immutable blob that
+/// can never fully decode; the truncated tail is dropped. This is a tolerated data-drop, not a
+/// component error, so it is counted on its own metric (`object_storage_blob_truncated_total`)
+/// rather than `component_errors_total` — it must not inflate error-rate alerting. Per-blob
+/// granularity: how many records were in the dropped tail is unknown (they never decoded).
+#[derive(Debug)]
+pub struct ObjectStorageBlobTruncated<'a> {
+    pub cloud: &'a str,
+    pub container: &'a str,
+    pub blob: &'a str,
+}
+
+impl NamedInternalEvent for ObjectStorageBlobTruncated<'_> {
+    fn name(&self) -> &'static str {
+        "ObjectStorageBlobTruncated"
+    }
+}
+
+impl InternalEvent for ObjectStorageBlobTruncated<'_> {
+    fn emit(self) {
+        warn!(
+            message = "Blob stream truncated (UnexpectedEof); ingested the decodable prefix and \
+                       acked the message to stop infinite redelivery. The truncated tail is dropped.",
+            container = %self.container,
+            blob = %self.blob,
+            cloud = %self.cloud,
+        );
+        counter!("object_storage_blob_truncated_total", "cloud" => self.cloud.to_string())
+            .increment(1);
     }
 }
 
