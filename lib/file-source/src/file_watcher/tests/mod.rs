@@ -1,7 +1,7 @@
 mod experiment;
 mod experiment_no_truncations;
 
-use std::{path::PathBuf, str, thread};
+use std::{path::PathBuf, str, thread, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use quickcheck::{Arbitrary, Gen};
@@ -191,6 +191,7 @@ fn watcher_for_timing() -> FileWatcher {
         last_read_attempt: now,
         last_read_success: now,
         read_retry_delay: EOF_READ_BACKOFF_MIN,
+        idle_read_interval: Duration::from_secs(10),
         last_seen: now,
         max_line_bytes: 1024,
         line_delimiter: Bytes::from_static(b"\n"),
@@ -236,6 +237,22 @@ fn caps_and_resets_eof_backoff() {
 
     assert_eq!(watcher.read_retry_delay, EOF_READ_BACKOFF_MIN);
     assert!(!watcher.reached_eof());
+}
+
+#[tokio::test(start_paused = true)]
+async fn uses_configured_idle_read_interval() {
+    let mut watcher = watcher_for_timing();
+    watcher.idle_read_interval = Duration::from_secs(1);
+
+    tokio::time::advance(watcher.idle_read_interval).await;
+    assert!(!watcher.should_read());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(watcher.should_read());
+
+    watcher.track_read_attempt();
+    tokio::time::advance(watcher.idle_read_interval).await;
+    assert!(!watcher.should_read());
 }
 
 // read_line no longer decides watcher death: reaching EOF while not findable

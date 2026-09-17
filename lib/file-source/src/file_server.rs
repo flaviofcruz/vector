@@ -62,6 +62,7 @@ where
     pub line_delimiter: Bytes,
     pub data_dir: PathBuf,
     pub glob_minimum_cooldown: Duration,
+    pub idle_read_interval: Duration,
     pub fingerprinter: Fingerprinter,
     pub oldest_first: bool,
     pub remove_after: Option<Duration>,
@@ -949,6 +950,7 @@ where
             self.start_reading_at,
             self.max_line_bytes,
             self.line_delimiter.clone(),
+            self.idle_read_interval,
         )
         .await
         {
@@ -1242,6 +1244,7 @@ mod tests {
             line_delimiter: Bytes::from("\n"),
             data_dir,
             glob_minimum_cooldown: Duration::from_millis(100),
+            idle_read_interval: Duration::from_secs(10),
             fingerprinter: Fingerprinter::new(
                 FingerprintStrategy::FirstLinesChecksum {
                     ignored_header_bytes: 0,
@@ -2105,6 +2108,7 @@ mod tests {
             line_delimiter: Bytes::from("\n"),
             data_dir: data_dir.clone(),
             glob_minimum_cooldown: Duration::from_secs(1),
+            idle_read_interval: Duration::from_secs(10),
             fingerprinter: Fingerprinter::new(
                 FingerprintStrategy::FirstLinesChecksum {
                     ignored_header_bytes: 0,
@@ -2351,6 +2355,7 @@ mod tests {
             line_delimiter: Bytes::from("\n"),
             data_dir: data_dir.clone(),
             glob_minimum_cooldown: Duration::from_secs(1),
+            idle_read_interval: Duration::from_secs(10),
             fingerprinter: Fingerprinter::new(
                 FingerprintStrategy::FirstLinesChecksum {
                     ignored_header_bytes: 0,

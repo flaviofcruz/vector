@@ -62,6 +62,7 @@ pub struct FileWatcher {
     last_read_attempt: Instant,
     last_read_success: Instant,
     read_retry_delay: Duration,
+    idle_read_interval: Duration,
     last_seen: Instant,
     max_line_bytes: usize,
     line_delimiter: Bytes,
@@ -81,6 +82,7 @@ impl FileWatcher {
         start_reading_at: Option<DateTime<Utc>>,
         max_line_bytes: usize,
         line_delimiter: Bytes,
+        idle_read_interval: Duration,
     ) -> Result<FileWatcher, std::io::Error> {
         let f = File::open(&path).await?;
         let file_info = f.file_info().await?;
@@ -196,6 +198,7 @@ impl FileWatcher {
             last_read_attempt: ts,
             last_read_success: ts,
             read_retry_delay: EOF_READ_BACKOFF_MIN,
+            idle_read_interval,
             last_seen: ts,
             max_line_bytes,
             line_delimiter,
@@ -365,8 +368,8 @@ impl FileWatcher {
             return false;
         }
 
-        self.last_read_success.elapsed() < Duration::from_secs(10)
-            || self.last_read_attempt.elapsed() > Duration::from_secs(10)
+        self.last_read_success.elapsed() < self.idle_read_interval
+            || self.last_read_attempt.elapsed() > self.idle_read_interval
     }
 
     #[inline]
