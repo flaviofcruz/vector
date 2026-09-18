@@ -689,6 +689,8 @@ impl IngestorProcess {
     /// The message body is first unwrapped from an SNS envelope if present, then
     /// deserialized as one of:
     /// - `S3Event` — standard S3 bucket notification (ObjectCreated, etc.)
+    /// - `EventBridgeS3Event` — S3 "Object Created" delivered via EventBridge (S3 -> default
+    ///   event bus -> SQS); converted to an `S3Event` and handled on the same path
     /// - `S3TestEvent` — S3 test connectivity event (silently acknowledged)
     /// - `DirectIngestMessage` — custom message requesting ingestion of a specific S3 object
     ///   (only processed when `process_custom_message` is enabled in the SQS config)
@@ -720,6 +722,12 @@ impl IngestorProcess {
             }
             SqsEvent::Event(s3_event) => {
                 self.handle_s3_event(s3_event, queue_notification_create_timestamp)
+                    .await
+            }
+            SqsEvent::EventBridge(eb_event) => {
+                // Reshape into the S3Event path so the version/region/ObjectCreated/metrics
+                // handling stays identical to the S3-notification path.
+                self.handle_s3_event(eb_event.into(), queue_notification_create_timestamp)
                     .await
             }
             SqsEvent::DirectIngest(msg) => {
@@ -1363,6 +1371,9 @@ pub struct DirectIngestMessage {
 enum SqsEvent {
     DirectIngest(DirectIngestMessage),
     Event(S3Event),
+    /// S3 "Object Created" delivered via EventBridge (S3 -> default event bus -> SQS). A
+    /// completely different envelope than `Event` (no `Records`); see [`EventBridgeS3Event`].
+    EventBridge(EventBridgeS3Event),
     TestEvent(S3TestEvent),
 }
 
@@ -1515,6 +1526,76 @@ pub struct S3Object {
 
     // The object size in bytes
     pub size: u64,
+}
+
+// An S3 "Object Created" notification delivered through EventBridge (S3 -> default event bus ->
+// SQS), as opposed to the classic S3 -> SNS/SQS notification modeled by `S3Event`. EventBridge wraps
+// the event in its own envelope with a flat `detail`, so the JSON shape is entirely different from an
+// S3 bucket notification (no `Records` array), and this is a distinct untagged `SqsEvent` variant.
+// https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventBridge.html
+//
+// Only the fields we need are modeled; the real envelope also carries version/id/account/resources/etc.,
+// which are ignored (no `deny_unknown_fields`). Its five required fields (detail-type/source/region/time
+// /detail) make the untagged match unambiguous -- an S3Event or DirectIngestMessage lacks `detail`, and
+// this lacks their `Records` / `kind`, so neither can be mistaken for the other.
+#[derive(Clone, Debug, Deserialize)]
+pub struct EventBridgeS3Event {
+    #[serde(rename = "detail-type")]
+    pub detail_type: String,
+    pub source: String,
+    pub region: String,
+    pub time: String,
+    pub detail: EventBridgeS3Detail,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct EventBridgeS3Detail {
+    pub bucket: S3Bucket,
+    pub object: EventBridgeS3Object,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct EventBridgeS3Object {
+    // Unlike S3 notifications (whose keys are URL-encoded, hence S3Object's `urlencoded_string`),
+    // EventBridge delivers the key un-encoded. It is used verbatim -- no decode.
+    pub key: String,
+    // Object size in bytes. Unused downstream (the object is re-fetched); defaulted so an event
+    // that omits it still parses rather than dead-lettering.
+    #[serde(default)]
+    pub size: u64,
+}
+
+impl From<EventBridgeS3Event> for S3Event {
+    fn from(eb: EventBridgeS3Event) -> Self {
+        // EventBridge detail-type is space-delimited ("Object Created"); the classic S3 event_name
+        // kind is not ("ObjectCreated"). Collapsing spaces lets the shared handle_s3_event_record
+        // ObjectCreated filter treat EventBridge and S3-notification creates identically (and still
+        // ignore an "Object Deleted"/etc. that a broader rule might deliver).
+        let kind = eb.detail_type.replace(' ', "");
+        S3Event {
+            records: vec![S3EventRecord {
+                // EventBridge carries no S3-notification schema version; stamp a supported one
+                // (SUPPORTED_S3_EVENT_VERSION is ~2) so the downstream version gate passes.
+                event_version: S3EventVersion { major: 2, minor: 1 },
+                event_source: "aws:s3".to_string(),
+                aws_region: eb.region,
+                event_name: S3EventName {
+                    kind,
+                    name: "EventBridge".to_string(),
+                },
+                event_time: eb.time,
+                s3: S3Message {
+                    bucket: eb.detail.bucket,
+                    // Direct construction bypasses S3Object's urlencoded_string decode, which is
+                    // correct: the EventBridge key is already un-encoded.
+                    object: S3Object {
+                        key: eb.detail.object.key,
+                        size: eb.detail.object.size,
+                    },
+                },
+            }],
+        }
+    }
 }
 
 mod urlencoded_string {
@@ -1675,6 +1756,101 @@ fn test_direct_ingest_message() {
     }"#;
     let value: SqsEvent = serde_json::from_str(s3_notification).unwrap();
     assert!(matches!(value, SqsEvent::Event(_)));
+}
+
+#[test]
+fn test_eventbridge_object_created() {
+    // S3 -> EventBridge -> SQS delivers this envelope: no SNS wrap, no `Records` array.
+    let body = r#"{
+        "version": "0",
+        "id": "17793124-05d4-b198-2fde-7ededc63b103",
+        "detail-type": "Object Created",
+        "source": "aws.s3",
+        "account": "123456789012",
+        "time": "2024-01-15T18:19:03Z",
+        "region": "us-east-1",
+        "resources": ["arn:aws:s3:::databricks-dev-storage-virginia"],
+        "detail": {
+            "version": "0",
+            "bucket": {"name": "databricks-dev-storage-virginia"},
+            "object": {
+                "key": "databricks-logs/archived-log/log-sync-internal/structured-logs/query-profile-log-low-delay/f.log.gz",
+                "size": 1024,
+                "etag": "b1946ac92492d2347c6235b4d2611184",
+                "sequencer": "0062E99A88DC407460"
+            },
+            "request-id": "N4N7GDK58NMKJ12R",
+            "requester": "123456789012",
+            "reason": "PutObject"
+        }
+    }"#;
+    let value: SqsEvent = serde_json::from_str(body).unwrap();
+    let eb = match value {
+        SqsEvent::EventBridge(eb) => eb,
+        _ => panic!("Expected EventBridge variant"),
+    };
+    assert_eq!(eb.detail_type, "Object Created");
+    assert_eq!(eb.source, "aws.s3");
+    assert_eq!(eb.region, "us-east-1");
+    assert_eq!(eb.detail.bucket.name, "databricks-dev-storage-virginia");
+    assert_eq!(eb.detail.object.size, 1024);
+
+    // Converting to the shared S3Event shape maps the create through with a supported version.
+    let s3: S3Event = eb.into();
+    assert_eq!(s3.records.len(), 1);
+    let rec = &s3.records[0];
+    assert_eq!(rec.event_name.kind, "ObjectCreated");
+    assert_eq!(rec.aws_region, "us-east-1");
+    assert_eq!(rec.s3.bucket.name, "databricks-dev-storage-virginia");
+    assert_eq!(
+        rec.s3.object.key,
+        "databricks-logs/archived-log/log-sync-internal/structured-logs/query-profile-log-low-delay/f.log.gz"
+    );
+    assert_eq!(rec.s3.object.size, 1024);
+    let version: semver::Version = rec.event_version.clone().into();
+    assert!(SUPPORTED_S3_EVENT_VERSION.matches(&version));
+}
+
+#[test]
+fn test_eventbridge_key_not_urldecoded() {
+    // EventBridge delivers keys un-encoded (the S3-notification path URL-decodes; this must not),
+    // so a literal '+' and a '%2B' are both preserved verbatim through the conversion.
+    let body = r#"{
+        "detail-type": "Object Created",
+        "source": "aws.s3",
+        "time": "2024-01-15T18:19:03Z",
+        "region": "us-east-1",
+        "detail": {
+            "bucket": {"name": "b"},
+            "object": {"key": "structured-logs/span/a+b%2Bc.log", "size": 1}
+        }
+    }"#;
+    let value: SqsEvent = serde_json::from_str(body).unwrap();
+    let eb = match value {
+        SqsEvent::EventBridge(eb) => eb,
+        _ => panic!("Expected EventBridge variant"),
+    };
+    let s3: S3Event = eb.into();
+    assert_eq!(s3.records[0].s3.object.key, "structured-logs/span/a+b%2Bc.log");
+}
+
+#[test]
+fn test_eventbridge_object_deleted_ignored_downstream() {
+    // A broader rule could deliver "Object Deleted"; it parses as EventBridge but its collapsed
+    // kind ("ObjectDeleted") is not "ObjectCreated", so handle_s3_event_record ignores it.
+    let body = r#"{
+        "detail-type": "Object Deleted",
+        "source": "aws.s3",
+        "time": "2024-01-15T18:19:03Z",
+        "region": "us-east-1",
+        "detail": {"bucket": {"name": "b"}, "object": {"key": "k", "size": 0}}
+    }"#;
+    let eb = match serde_json::from_str::<SqsEvent>(body).unwrap() {
+        SqsEvent::EventBridge(eb) => eb,
+        _ => panic!("Expected EventBridge variant"),
+    };
+    let s3: S3Event = eb.into();
+    assert_ne!(s3.records[0].event_name.kind, "ObjectCreated");
 }
 
 #[test]
