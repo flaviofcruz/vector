@@ -1854,6 +1854,25 @@ fn test_eventbridge_object_deleted_ignored_downstream() {
 }
 
 #[test]
+fn test_s3_testevent_still_resolves_through_sqsevent() {
+    // Guards the untagged SqsEvent declaration order: `EventBridge` now precedes `TestEvent`, and
+    // serde untagged tries variants top-down. An S3 test event has no `detail`, so it can't match
+    // `EventBridgeS3Event` and must still fall through to `TestEvent` (never `process_s3_object`).
+    let body = r#"{
+        "Service":"Amazon S3",
+        "Event":"s3:TestEvent",
+        "Time":"2014-10-13T15:57:02.089Z",
+        "Bucket":"bucketname",
+        "RequestId":"5582815E1AEA5ADF",
+        "HostId":"8cLeGAmw098X5cv4Zkwcmo8vvZa3eH3eKxsPzbB9wrR+YstdA6Knx4Ip8EXAMPLE"
+    }"#;
+    assert!(matches!(
+        serde_json::from_str::<SqsEvent>(body).unwrap(),
+        SqsEvent::TestEvent(_)
+    ));
+}
+
+#[test]
 fn test_direct_ingest_message_with_log_type() {
     // log_type set by the upstream Log Access service is carried through so the
     // ingestion path can segregate CP / DP-spark / DP-service logs.
