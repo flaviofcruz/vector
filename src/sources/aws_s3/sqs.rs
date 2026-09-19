@@ -1366,6 +1366,14 @@ pub struct DirectIngestMessage {
 }
 
 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/how-to-enable-disable-notification-intro.html
+//
+// `untagged`: serde tries the variants top-down and keeps the first that deserializes, so they are
+// disambiguated purely by JSON *shape*. A variant struct must therefore model only the fields it reads
+// and let serde ignore the rest -- e.g. `EventBridgeS3Event` omits the envelope's
+// version/id/account/resources/... So do NOT add `#[serde(deny_unknown_fields)]` to `EventBridgeS3Event`
+// or `S3Event`: a real envelope carries extra fields and would then fail to match. (`DirectIngestMessage`
+// is the deliberate exception -- it sets `deny_unknown_fields` so its small, fully-known shape can't
+// accidentally absorb another variant's payload.)
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 enum SqsEvent {
@@ -1760,7 +1768,8 @@ fn test_direct_ingest_message() {
 
 #[test]
 fn test_eventbridge_object_created() {
-    // S3 -> EventBridge -> SQS delivers this envelope: no SNS wrap, no `Records` array.
+    // S3 -> EventBridge -> SQS delivers this envelope: no SNS wrap, no `Records` array, and the extra
+    // envelope fields (version/id/account/resources/request-id/...) must be ignored, not rejected.
     let body = r#"{
         "version": "0",
         "id": "17793124-05d4-b198-2fde-7ededc63b103",
@@ -1769,12 +1778,12 @@ fn test_eventbridge_object_created() {
         "account": "123456789012",
         "time": "2024-01-15T18:19:03Z",
         "region": "us-east-1",
-        "resources": ["arn:aws:s3:::databricks-dev-storage-virginia"],
+        "resources": ["arn:aws:s3:::example-bucket"],
         "detail": {
             "version": "0",
-            "bucket": {"name": "databricks-dev-storage-virginia"},
+            "bucket": {"name": "example-bucket"},
             "object": {
-                "key": "databricks-logs/archived-log/log-sync-internal/structured-logs/query-profile-log-low-delay/f.log.gz",
+                "key": "some/prefix/f.log.gz",
                 "size": 1024,
                 "etag": "b1946ac92492d2347c6235b4d2611184",
                 "sequencer": "0062E99A88DC407460"
@@ -1784,28 +1793,21 @@ fn test_eventbridge_object_created() {
             "reason": "PutObject"
         }
     }"#;
-    let value: SqsEvent = serde_json::from_str(body).unwrap();
-    let eb = match value {
+    let eb = match serde_json::from_str::<SqsEvent>(body).unwrap() {
         SqsEvent::EventBridge(eb) => eb,
-        _ => panic!("Expected EventBridge variant"),
+        other => panic!("expected EventBridge variant, got {other:?}"),
     };
-    assert_eq!(eb.detail_type, "Object Created");
-    assert_eq!(eb.source, "aws.s3");
-    assert_eq!(eb.region, "us-east-1");
-    assert_eq!(eb.detail.bucket.name, "databricks-dev-storage-virginia");
-    assert_eq!(eb.detail.object.size, 1024);
 
-    // Converting to the shared S3Event shape maps the create through with a supported version.
+    // The behavior under test is the From<EventBridgeS3Event> conversion (our logic), not serde field
+    // mapping: "Object Created" collapses to the ObjectCreated kind the shared filter keys on, the key
+    // passes through verbatim, and a supported event version is stamped.
     let s3: S3Event = eb.into();
     assert_eq!(s3.records.len(), 1);
     let rec = &s3.records[0];
     assert_eq!(rec.event_name.kind, "ObjectCreated");
     assert_eq!(rec.aws_region, "us-east-1");
-    assert_eq!(rec.s3.bucket.name, "databricks-dev-storage-virginia");
-    assert_eq!(
-        rec.s3.object.key,
-        "databricks-logs/archived-log/log-sync-internal/structured-logs/query-profile-log-low-delay/f.log.gz"
-    );
+    assert_eq!(rec.s3.bucket.name, "example-bucket");
+    assert_eq!(rec.s3.object.key, "some/prefix/f.log.gz");
     assert_eq!(rec.s3.object.size, 1024);
     let version: semver::Version = rec.event_version.clone().into();
     assert!(SUPPORTED_S3_EVENT_VERSION.matches(&version));
