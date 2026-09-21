@@ -711,6 +711,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kubernetes_atomic_writer_rotations_trigger_component_update() {
+        use std::os::unix::fs::symlink;
+
+        trace_init();
+
+        let delay = Duration::from_millis(500);
+        let volume_dir = temp_dir().join("secret-volume");
+        let credential_path = volume_dir.join("credential.json");
+        let http_component = ComponentKey::from("http");
+
+        std::fs::create_dir_all(&volume_dir).unwrap();
+
+        let mut old_payload_dir = volume_dir.join("..2026_09_21_00_00_01");
+        std::fs::create_dir(&old_payload_dir).unwrap();
+        std::fs::write(old_payload_dir.join("credential.json"), b"{\"version\":1}").unwrap();
+        symlink(
+            old_payload_dir.file_name().unwrap(),
+            volume_dir.join("..data"),
+        )
+        .unwrap();
+        symlink("..data/credential.json", &credential_path).unwrap();
+
+        let component_config = ComponentConfig::new(
+            vec![credential_path.clone()],
+            http_component.clone(),
+            ComponentType::Sink,
+        );
+
+        let (signal_tx, mut signal_rx) = broadcast::channel(128);
+        spawn_thread(
+            WatcherConfig::RecommendedWatcher,
+            signal_tx,
+            &[],
+            vec![component_config],
+            delay,
+        )
+        .unwrap();
+
+        drain_initial_reload(&mut signal_rx, Duration::from_secs(5)).await;
+
+        for version in 2..=3 {
+            let new_payload_dir = volume_dir.join(format!("..2026_09_21_00_00_0{version}"));
+            std::fs::create_dir(&new_payload_dir).unwrap();
+            std::fs::write(
+                new_payload_dir.join("credential.json"),
+                format!("{{\"version\":{version}}}"),
+            )
+            .unwrap();
+
+            let temporary_data_link = volume_dir.join("..data_tmp");
+            symlink(new_payload_dir.file_name().unwrap(), &temporary_data_link).unwrap();
+            std::fs::rename(&temporary_data_link, volume_dir.join("..data")).unwrap();
+
+            // AtomicWriter removes the previous timestamped payload after publishing ..data.
+            std::fs::remove_dir_all(&old_payload_dir).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(&credential_path).unwrap(),
+                format!("{{\"version\":{version}}}")
+            );
+            assert!(
+                recv_signal_ref(
+                    crate::signal::SignalTo::ReloadComponents(HashSet::from_iter(vec![
+                        http_component.clone(),
+                    ])),
+                    Duration::from_secs(5),
+                    &mut signal_rx,
+                )
+                .await,
+                "Timed out after AtomicWriter rotation {version}"
+            );
+
+            old_payload_dir = new_payload_dir;
+        }
+    }
+
+    #[tokio::test]
     async fn atomic_enrichment_table_file_replacement_triggers_enrichment_reload() {
         trace_init();
 
