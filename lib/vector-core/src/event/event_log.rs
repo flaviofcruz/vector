@@ -177,6 +177,12 @@ pub fn generate_count_map(
                 for_delivery_events,
             );
             let message_bytes = get_message_bytes(log_event, log_metadata_field);
+            let accounting = log_event.metadata().delivery_path_accounting();
+            let metric_count = if for_delivery_events && accounting.is_some() {
+                0
+            } else {
+                message_count
+            };
             count_map
                 .entry(build_key(
                     log_event,
@@ -186,6 +192,7 @@ pub fn generate_count_map(
                 ))
                 .and_modify(|x: &mut MetadataValuesCount| {
                     x.count += message_count;
+                    x.metric_count += metric_count;
                     x.size += message_bytes;
                 })
                 .or_insert(MetadataValuesCount {
@@ -196,8 +203,43 @@ pub fn generate_count_map(
                         for_delivery_events,
                     ),
                     count: message_count,
+                    metric_count,
                     size: message_bytes,
+                    delivery_path_count: None,
                 });
+
+            if for_delivery_events {
+                if let Some(accounting) = accounting {
+                    for path_count in accounting.counts.iter().filter(|count| count.selected) {
+                        let key = format!(
+                            "delivery-path:{}",
+                            serde_json::to_string(&(
+                                &path_count.path,
+                                &path_count.source,
+                                path_count.selected,
+                            ))
+                            .expect("delivery path count keys must serialize")
+                        );
+                        count_map
+                            .entry(key)
+                            .and_modify(|value: &mut MetadataValuesCount| {
+                                value.count = value.count.saturating_add(path_count.count as usize);
+                                value.metric_count = value.count;
+                                if let Some(existing) = &mut value.delivery_path_count {
+                                    existing.count =
+                                        existing.count.saturating_add(path_count.count);
+                                }
+                            })
+                            .or_insert_with(|| MetadataValuesCount {
+                                value_map: HashMap::new(),
+                                count: path_count.count as usize,
+                                metric_count: path_count.count as usize,
+                                size: 0,
+                                delivery_path_count: Some(path_count.clone()),
+                            });
+                    }
+                }
+            }
         }
     }
     count_map
@@ -271,6 +313,14 @@ impl EventWithEventLog for Event {
 
 #[cfg(test)]
 mod tests {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use vector_common::internal_event::vector_event::delivery_event::{
+        DeliveryEventStage, combine_sink_delivery_events, emit_delivery_counters,
+    };
+    use vector_common::internal_event::vector_event::delivery_path::{
+        DeliveryPathAccounting, DeliverySourceLabels,
+    };
+
     use super::*;
 
     fn event_with_delivery_count(count: usize) -> Event {
@@ -302,6 +352,129 @@ mod tests {
             get_message_count(&event, "log_metadata", "message_count", true),
             9
         );
+    }
+
+    #[test]
+    fn mixed_batches_keep_vel_totals_but_emit_each_event_in_only_one_counter_form() {
+        let mut event = event_with_delivery_count(7);
+        let accounting = DeliveryPathAccounting::at_read(
+            DeliverySourceLabels {
+                process_generation_id: "source-process".to_owned(),
+                time_parity: 3_600_000,
+                topic: "service-log".to_owned(),
+                delivery_method: "file".to_owned(),
+                service_system: "service".to_owned(),
+                source_pod_id: "pod".to_owned(),
+            },
+            ["blob".to_owned(), "online".to_owned()],
+        );
+        let mut selected = accounting.clone();
+        selected.select_path("online");
+        for accounting in [accounting, selected, DeliveryPathAccounting::default()] {
+            let selected = accounting.counts.iter().any(|count| count.selected);
+            event
+                .metadata_mut()
+                .set_delivery_path_accounting(Some(accounting));
+            let enrolled_map = generate_count_map(&[event.clone()], true);
+            assert_eq!(enrolled_map.len(), if selected { 2 } else { 1 });
+            let unscoped = enrolled_map
+                .values()
+                .find(|v| v.delivery_path_count.is_none())
+                .unwrap();
+            assert_eq!(unscoped.count, 7);
+            assert_eq!(unscoped.metric_count, 0);
+            assert!(unscoped.size > 0);
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                emit_delivery_counters(enrolled_map.values(), DeliveryEventStage::Delivered);
+            });
+            let metrics = snapshotter.snapshot().into_vec();
+            assert_eq!(metrics.len(), if selected { 4 } else { 2 });
+            let mut byte_series = 0;
+            for (key, _, _, value) in metrics {
+                if key.key().name() == "delivery_event_bytes_total" {
+                    byte_series += 1;
+                    assert!(
+                        key.key()
+                            .labels()
+                            .all(|label| label.key() != "delivery_path")
+                    );
+                    assert_eq!(value, DebugValue::Counter(unscoped.size as u64));
+                } else {
+                    assert_eq!(key.key().name(), "delivery_events_total");
+                    assert!(selected);
+                    assert_eq!(value, DebugValue::Counter(1));
+                }
+            }
+            assert_eq!(byte_series, 2);
+
+            // Exercise both count-map aggregation and merging across sink requests.
+            let first = VectorSinkDeliveryEvent::with_count_map(generate_count_map(
+                &[event.clone(), event_with_delivery_count(2)],
+                true,
+            ));
+            let second = VectorSinkDeliveryEvent::with_count_map(generate_count_map(
+                &[event.clone(), event_with_delivery_count(3)],
+                true,
+            ));
+            let combined = combine_sink_delivery_events(vec![first.clone(), second.clone()]);
+            let mut merged = first;
+            merged.merge(second);
+            for batch in [combined, merged] {
+                let unscoped = batch
+                    .count_map
+                    .values()
+                    .find(|v| v.delivery_path_count.is_none())
+                    .unwrap();
+                assert_eq!(unscoped.count, 19);
+                assert_eq!(unscoped.metric_count, 5);
+                for (stage, expected_label) in [
+                    (DeliveryEventStage::Staged, "VECTOR_SINK_UPLOAD_STAGED"),
+                    (
+                        DeliveryEventStage::Delivered,
+                        "VECTOR_SINK_UPLOAD_DELIVERED",
+                    ),
+                    (
+                        DeliveryEventStage::SinkInputAccepted,
+                        "VECTOR_SINK_INPUT_ACCEPTED",
+                    ),
+                ] {
+                    let accepted = matches!(stage, DeliveryEventStage::SinkInputAccepted);
+                    let recorder = DebuggingRecorder::new();
+                    let snapshotter = recorder.snapshotter();
+                    metrics::with_local_recorder(&recorder, || {
+                        emit_delivery_counters(batch.count_map.values(), stage);
+                    });
+                    let metrics = snapshotter.snapshot().into_vec();
+                    assert_eq!(metrics.len(), if selected && !accepted { 6 } else { 4 });
+                    let mut byte_series = 0;
+                    for (key, _, _, value) in metrics {
+                        let labels = key
+                            .key()
+                            .labels()
+                            .map(|l| (l.key(), l.value()))
+                            .collect::<HashMap<_, _>>();
+                        assert_eq!(labels["delivery_event_type"], expected_label);
+                        if key.key().name() == "delivery_event_bytes_total" {
+                            byte_series += 1;
+                            assert!(!labels.contains_key("delivery_path"));
+                            assert_eq!(value, DebugValue::Counter(unscoped.size as u64));
+                            continue;
+                        }
+                        assert_eq!(key.key().name(), "delivery_events_total");
+                        if let Some(path) = labels.get("delivery_path") {
+                            assert_eq!(*path, "online");
+                            assert_eq!(labels["source_process_generation_id"], "source-process");
+                            assert_eq!(value, DebugValue::Counter(2));
+                        } else {
+                            assert_eq!(value, DebugValue::Counter(if accepted { 19 } else { 5 }));
+                        }
+                    }
+                    assert_eq!(byte_series, 2);
+                }
+            }
+        }
     }
 
     fn event_with_service_system(service_system: &str) -> LogEvent {

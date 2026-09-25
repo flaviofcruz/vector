@@ -760,6 +760,7 @@ transforms-logs = [
   "transforms-aws_ec2_metadata",
   "transforms-bricklens_config_enricher",
   "transforms-dedupe",
+  "transforms-delivery_path_accounting",
   "transforms-delivery_event_counter",
   "transforms-dynamic_rls_throttle",
   "transforms-filter",
@@ -796,6 +797,7 @@ transforms-aggregate = []
 transforms-aws_ec2_metadata = ["dep:arc-swap"]
 transforms-bricklens_config_enricher = ["dep:prost-reflect", "dep:prost"]
 transforms-dedupe = ["transforms-impl-dedupe"]
+transforms-delivery_path_accounting = []
 transforms-delivery_event_counter = []
 transforms-dynamic_rls_throttle = ["dep:arc-swap", "dep:prost-reflect", "dep:prost"]
 transforms-filter = []

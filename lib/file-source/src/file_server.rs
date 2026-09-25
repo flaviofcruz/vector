@@ -552,6 +552,7 @@ where
                         self.source_type,
                         vector_common::internal_event::vector_event::delivery_event::current_hour_time_parity_ms_value(),
                         false,
+                        None,
                     );
                 }
                 if watcher.reached_eof() && self.is_archive(&watcher.path) {

@@ -6,6 +6,7 @@ use governor::{Quota, clock};
 use metrics::Counter;
 use snafu::Snafu;
 use vector_common::finalization::EventStatus;
+use vector_common::internal_event::vector_event::delivery_event::DeliveryEventStage;
 
 use super::{
     config::{ThrottleConfig, ThrottleInternalMetricsConfig},
@@ -29,6 +30,7 @@ pub struct Throttle<C: clock::Clock<Instant = I>, I: clock::Reference> {
     pub clock: C,
     internal_metrics: ThrottleInternalMetricsConfig,
     throttled_event_status: EventStatus,
+    delivery_path_intentional_drop: Option<(Vec<String>, String)>,
     pub cpu_ns: Option<Counter>,
 }
 
@@ -69,6 +71,23 @@ where
                 return Err(Box::new(ConfigError::NonZero));
             }
         };
+        let delivery_path_intentional_drop = config
+            .delivery_path_intentional_drop
+            .as_ref()
+            .map(|intentional_drop| {
+                if intentional_drop.paths.is_empty()
+                    || intentional_drop.paths.iter().any(String::is_empty)
+                    || intentional_drop.reason.is_empty()
+                {
+                    Err(Box::new(ConfigError::InvalidDeliveryPathIntentionalDrop))
+                } else {
+                    Ok((
+                        intentional_drop.paths.clone(),
+                        intentional_drop.reason.clone(),
+                    ))
+                }
+            })
+            .transpose()?;
 
         Ok(Self {
             quota,
@@ -78,6 +97,7 @@ where
             exclude,
             internal_metrics: config.internal_metrics.clone(),
             throttled_event_status,
+            delivery_path_intentional_drop,
             cpu_ns: context.cpu_ns.clone(),
         })
     }
@@ -95,6 +115,19 @@ where
             key,
             emit_events_discarded_per_key: self.internal_metrics.emit_events_discarded_per_key
         });
+    }
+
+    fn emit_delivery_path_intentional_drop(&self, event: &mut Event) {
+        let Some((paths, reason)) = &self.delivery_path_intentional_drop else {
+            return;
+        };
+        if let Some(accounting) = event.metadata_mut().delivery_path_accounting_mut() {
+            for path in paths {
+                for count in accounting.take_path(path) {
+                    count.emit(DeliveryEventStage::IntentionalDrop { reason });
+                }
+            }
+        }
     }
 }
 
@@ -114,7 +147,7 @@ where
 
         Box::pin(stream! {
             while let Some(event) = input_rx.next().await {
-                let (throttle, event) = match self.exclude.as_ref() {
+                let (throttle, mut event) = match self.exclude.as_ref() {
                     Some(condition) => {
                         let (result, event) = condition.check(event);
                         (!result, event)
@@ -138,6 +171,7 @@ where
                         Some(event)
                     } else {
                         self.emit_event_discarded(key.unwrap_or_else(|| "None".to_string()));
+                        self.emit_delivery_path_intentional_drop(&mut event);
                         event.metadata().update_status(self.throttled_event_status);
                         None
                     }
@@ -156,23 +190,123 @@ where
 pub enum ConfigError {
     #[snafu(display("`threshold`, and `window_secs` must be non-zero"))]
     NonZero,
+    #[snafu(display("`delivery_path_intentional_drop` requires non-empty paths and reason"))]
+    InvalidDeliveryPathIntentionalDrop,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::task::Poll;
+    use std::{collections::HashMap, task::Poll};
 
     use futures::SinkExt;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use vector_common::internal_event::vector_event::delivery_path::{
+        DeliveryPathAccounting, DeliverySourceLabels,
+    };
 
     use super::*;
     use crate::transforms::Transform;
     use crate::{
-        event::LogEvent, test_util::components::assert_transform_compliance,
+        event::{Event, LogEvent},
+        test_util::components::assert_transform_compliance,
         transforms::test::create_topology,
-        transforms::throttle::config::default_throttled_event_status,
+        transforms::throttle::config::{
+            ThrottleDeliveryPathIntentionalDropConfig, default_throttled_event_status,
+        },
     };
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
+
+    #[tokio::test]
+    async fn delivery_path_intentional_drop_counts_only_actual_throttle_drops() {
+        for paths in [
+            vec!["online"],
+            vec!["blob", "online", "online", "not-required"],
+            vec![],
+        ] {
+            assert_throttle_delivery_paths(paths);
+        }
+    }
+
+    fn assert_throttle_delivery_paths(paths: Vec<&str>) {
+        let config = ThrottleConfig {
+            threshold: 1,
+            window_secs: Duration::from_secs(60),
+            throttled_event_status: default_throttled_event_status(),
+            delivery_path_intentional_drop: (!paths.is_empty()).then(|| {
+                ThrottleDeliveryPathIntentionalDropConfig {
+                    paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+                    reason: "policy_rate_limit".to_owned(),
+                }
+            }),
+            ..Default::default()
+        };
+        let throttle = Throttle::new(
+            &config,
+            &TransformContext::default(),
+            clock::FakeRelativeClock::default(),
+        )
+        .expect("valid throttle");
+        let mut event = Event::Log(LogEvent::from("message"));
+        event
+            .metadata_mut()
+            .set_delivery_path_accounting(Some(DeliveryPathAccounting::at_read(
+                DeliverySourceLabels {
+                    process_generation_id: "source-process".to_owned(),
+                    time_parity: 3_600_000,
+                    topic: "service-log".to_owned(),
+                    delivery_method: "file".to_owned(),
+                    service_system: "service".to_owned(),
+                    source_pod_id: "pod".to_owned(),
+                },
+                ["blob".to_owned(), "online".to_owned()],
+            )));
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let expected_metadata = event.metadata().delivery_path_accounting().cloned();
+        let output = metrics::with_local_recorder(&recorder, || {
+            futures::executor::block_on(
+                Box::new(throttle)
+                    .transform(Box::pin(futures::stream::iter(vec![event.clone(), event])))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert_eq!(
+            output.len(),
+            1,
+            "the second event must actually be throttled"
+        );
+        assert_eq!(
+            output[0].metadata().delivery_path_accounting(),
+            expected_metadata.as_ref()
+        );
+        let counters = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "delivery_events_total")
+            .collect::<Vec<_>>();
+        let expected_paths = ["blob", "online"]
+            .into_iter()
+            .filter(|path| paths.contains(path))
+            .collect::<Vec<_>>();
+        assert_eq!(counters.len(), 2 * expected_paths.len());
+        for (key, _, _, value) in counters {
+            let labels = key
+                .key()
+                .labels()
+                .map(|label| (label.key(), label.value()))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(value, DebugValue::Counter(1));
+            assert!(expected_paths.contains(&labels["delivery_path"]));
+            assert_eq!(
+                labels["delivery_event_type"],
+                "VECTOR_DELIVERY_INTENTIONAL_DROP"
+            );
+            assert_eq!(labels["reason"], "policy_rate_limit");
+        }
+    }
 
     #[tokio::test]
     async fn throttle_events() {
@@ -388,6 +522,7 @@ key_field = "{{ bucket }}"
                 exclude: None,
                 internal_metrics: Default::default(),
                 throttled_event_status: default_throttled_event_status(),
+                delivery_path_intentional_drop: None,
             };
             let (tx, rx) = mpsc::channel(1);
             let (topology, mut out) = create_topology(ReceiverStream::new(rx), config).await;

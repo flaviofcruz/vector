@@ -1,4 +1,6 @@
-use vector_common::internal_event::vector_event::delivery_event::emit_delivery_counters;
+use vector_common::internal_event::vector_event::delivery_event::{
+    DeliveryEventStage, emit_delivery_counters,
+};
 use vector_lib::{
     config::clone_input_definitions, configurable::configurable_component,
     event::event_log::generate_count_map,
@@ -13,8 +15,6 @@ use crate::{
     schema::Definition,
     transforms::{FunctionTransform, OutputBuffer, Transform},
 };
-
-const SINK_INPUT_ACCEPTED: &str = "VECTOR_SINK_INPUT_ACCEPTED";
 
 /// Configuration for the `delivery_event_counter` transform.
 #[configurable_component(transform(
@@ -64,7 +64,7 @@ struct DeliveryEventCounter;
 impl FunctionTransform for DeliveryEventCounter {
     fn transform(&mut self, output: &mut OutputBuffer, event: Event) {
         let count_map = generate_count_map(std::slice::from_ref(&event), true);
-        emit_delivery_counters(count_map.values(), SINK_INPUT_ACCEPTED);
+        emit_delivery_counters(count_map.values(), DeliveryEventStage::SinkInputAccepted);
         output.push(event);
     }
 }
@@ -104,7 +104,8 @@ mod tests {
             .filter(|(key, _, _, _)| {
                 key.key().name() == "delivery_events_total"
                     && key.key().labels().any(|label| {
-                        label.key() == "delivery_event_type" && label.value() == SINK_INPUT_ACCEPTED
+                        label.key() == "delivery_event_type"
+                            && label.value() == "VECTOR_SINK_INPUT_ACCEPTED"
                     })
             })
             .collect::<Vec<_>>();
@@ -118,7 +119,7 @@ mod tests {
                 .collect::<HashMap<_, _>>();
             assert_eq!(
                 labels.get("delivery_event_type"),
-                Some(&SINK_INPUT_ACCEPTED)
+                Some(&"VECTOR_SINK_INPUT_ACCEPTED")
             );
         }
     }

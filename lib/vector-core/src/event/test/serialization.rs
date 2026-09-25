@@ -107,6 +107,86 @@ fn delivery_event_service_system_round_trips_through_bytes() {
 }
 
 #[test]
+fn delivery_path_accounting_preserves_source_labels_and_selection_through_disk_encoding() {
+    use vector_common::internal_event::vector_event::delivery_path::{
+        DeliveryPathAccounting, DeliverySourceLabels,
+    };
+
+    let source_labels = DeliverySourceLabels {
+        process_generation_id: "original-process".to_owned(),
+        time_parity: 3_600_000,
+        topic: "service-log".to_owned(),
+        delivery_method: "VECTOR_WOODCHUCK_V2_FILE".to_owned(),
+        service_system: "money-settings".to_owned(),
+        source_pod_id: "source-pod".to_owned(),
+    };
+    let mut first = LogEvent::from("first record");
+    first
+        .metadata_mut()
+        .set_delivery_path_accounting(Some(DeliveryPathAccounting::at_read(
+            source_labels.clone(),
+            ["archive".to_owned(), "online".to_owned()],
+        )));
+    let mut selected = first.clone();
+    selected
+        .metadata_mut()
+        .delivery_path_accounting_mut()
+        .unwrap()
+        .select_path("archive");
+    selected.metadata_mut().merge(first.clone().into_parts().1);
+    let mut later_source_labels = source_labels;
+    later_source_labels.process_generation_id = "later-process".to_owned();
+    later_source_labels.time_parity += 3_600_000;
+    let mut later = LogEvent::from("later record");
+    later
+        .metadata_mut()
+        .set_delivery_path_accounting(Some(DeliveryPathAccounting::at_read(
+            later_source_labels,
+            ["archive".to_owned()],
+        )));
+    selected.metadata_mut().merge(later.into_parts().1);
+    selected.insert("message", "first record\nfirst record\nlater record");
+    let expected = selected
+        .metadata()
+        .delivery_path_accounting()
+        .unwrap()
+        .clone();
+    assert_eq!(expected.counts.len(), 4);
+    let mut buffer = BytesMut::new();
+    encode_value(EventArray::from(Event::from(selected)), &mut buffer);
+    let decoded = decode_value::<EventArray, _>(buffer)
+        .into_events()
+        .next()
+        .unwrap();
+    assert_eq!(
+        decoded.as_log().metadata().delivery_path_accounting(),
+        Some(&expected)
+    );
+}
+
+#[test]
+fn uninstrumented_and_explicitly_empty_path_accounting_remain_distinct() {
+    use vector_common::internal_event::vector_event::delivery_path::DeliveryPathAccounting;
+
+    for accounting in [None, Some(DeliveryPathAccounting::default())] {
+        let mut event = LogEvent::from("record");
+        event
+            .metadata_mut()
+            .set_delivery_path_accounting(accounting.clone());
+        let mut buffer = BytesMut::new();
+        encode_value(EventArray::from(Event::from(event)), &mut buffer);
+        let decoded = decode_value::<EventArray, _>(buffer)
+            .into_events()
+            .next()
+            .unwrap();
+        assert_eq!(
+            decoded.as_log().metadata().delivery_path_accounting(),
+            accounting.as_ref()
+        );
+    }
+}
+
+#[test]
 fn serialization() {
     let mut event = LogEvent::from("raw log line");
     event.insert("foo", "bar");

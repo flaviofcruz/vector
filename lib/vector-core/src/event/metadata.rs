@@ -6,6 +6,7 @@ use derivative::Derivative;
 use lookup::OwnedTargetPath;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use vector_common::internal_event::vector_event::delivery_path::DeliveryPathAccounting;
 use vector_common::{EventDataEq, byte_size_of::ByteSizeOf, config::ComponentKey};
 use vrl::{
     compiler::SecretTarget,
@@ -84,6 +85,10 @@ pub(super) struct Inner {
 
     /// Source service identity retained for delivery-event accounting.
     pub(crate) delivery_event_service_system: Option<String>,
+
+    /// Primary-path requirements retained from the original source READ.
+    #[serde(default)]
+    pub(crate) delivery_path_accounting: Option<DeliveryPathAccounting>,
 }
 
 /// Metric Origin metadata for submission to Datadog.
@@ -269,6 +274,21 @@ impl EventMetadata {
     pub fn set_delivery_event_service_system(&mut self, service_system: String) {
         self.get_mut().delivery_event_service_system = Some(service_system);
     }
+
+    /// Returns the source-created primary-path requirements, if this source is instrumented.
+    pub fn delivery_path_accounting(&self) -> Option<&DeliveryPathAccounting> {
+        self.0.delivery_path_accounting.as_ref()
+    }
+
+    /// Returns mutable requirements for explicit branch selection.
+    pub fn delivery_path_accounting_mut(&mut self) -> Option<&mut DeliveryPathAccounting> {
+        self.get_mut().delivery_path_accounting.as_mut()
+    }
+
+    /// Attaches source-created requirements, or clears them at a process input boundary.
+    pub fn set_delivery_path_accounting(&mut self, accounting: Option<DeliveryPathAccounting>) {
+        self.get_mut().delivery_path_accounting = accounting;
+    }
 }
 
 impl Default for Inner {
@@ -286,6 +306,7 @@ impl Default for Inner {
             source_event_id: Some(Uuid::new_v4()),
             delivery_event_count: None,
             delivery_event_service_system: None,
+            delivery_path_accounting: None,
         }
     }
 }
@@ -308,7 +329,7 @@ impl ByteSizeOf for EventMetadata {
         // NOTE we don't count the `str` here because it's allocated somewhere
         // else. We're just moving around the pointer, which is already captured
         // by `ByteSizeOf::size_of`.
-        self.0.finalizers.allocated_bytes()
+        self.0.finalizers.allocated_bytes() + self.0.delivery_path_accounting.allocated_bytes()
     }
 }
 
@@ -385,6 +406,20 @@ impl EventMetadata {
         }
         if inner.delivery_event_service_system.is_none() {
             inner.delivery_event_service_system = other.delivery_event_service_system;
+        }
+        // Reducers start with empty metadata. Preserve the source enrollment view used by
+        // downstream VRL, independently of the selected counts on a particular branch.
+        let enrollment_path = vrl::path!("delivery_path_accounting", "paths");
+        if inner.value.get(enrollment_path).is_none() {
+            if let Some(paths) = other.value.get(enrollment_path) {
+                inner.value.insert(enrollment_path, paths.clone());
+            }
+        }
+        if let Some(other) = other.delivery_path_accounting {
+            inner
+                .delivery_path_accounting
+                .get_or_insert_with(Default::default)
+                .merge(other);
         }
     }
 
@@ -624,6 +659,31 @@ mod test {
         assert_eq!(
             merged.delivery_event_service_system(),
             Some("money-settings")
+        );
+    }
+
+    #[test]
+    fn delivery_path_enrollment_survives_empty_metadata_merge() {
+        let enrollment_path = vrl::path!("delivery_path_accounting", "paths");
+        let paths = vrl::value!(["archive", "online"]);
+        let mut source = EventMetadata::default();
+        source.value_mut().insert(enrollment_path, paths.clone());
+
+        let mut reduced = EventMetadata::default();
+        reduced.merge(source.clone());
+        reduced.merge(source);
+        reduced.merge(EventMetadata::default());
+        assert_eq!(reduced.value().get(enrollment_path), Some(&paths));
+
+        let mut unenrolled = EventMetadata::default();
+        unenrolled
+            .value_mut()
+            .insert(enrollment_path, vrl::value!([]));
+        let mut reduced_unenrolled = EventMetadata::default();
+        reduced_unenrolled.merge(unenrolled);
+        assert_eq!(
+            reduced_unenrolled.value().get(enrollment_path),
+            Some(&vrl::value!([]))
         );
     }
 }

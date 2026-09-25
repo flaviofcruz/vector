@@ -96,6 +96,23 @@ message Metadata {
   bytes source_event_id = 7;
   optional uint64 delivery_event_count = 8;
   optional string delivery_event_service_system = 9;
+  DeliveryPathAccounting delivery_path_accounting = 10;
+}
+
+message DeliveryPathAccounting {
+  repeated DeliveryPathCount counts = 1;
+}
+
+message DeliveryPathCount {
+  string path = 1;
+  string source_process_generation_id = 2;
+  int64 time_parity = 3;
+  string topic = 4;
+  string delivery_method = 5;
+  string service_system = 6;
+  string source_pod_id = 7;
+  uint64 count = 8;
+  bool selected = 9;
 }
 
 message Metric {

@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use chrono::TimeZone;
 use ordered_float::NotNan;
 use uuid::Uuid;
+use vector_common::internal_event::vector_event::delivery_path as path_accounting;
 
 use super::{MetricTags, WithMetadata};
 use crate::{event, metrics::AgentDDSketch};
@@ -71,6 +72,30 @@ impl From<EventArray> for array::EventArray {
 impl From<Event> for EventWrapper {
     fn from(event: Event) -> Self {
         Self { event: Some(event) }
+    }
+}
+
+impl EventWrapper {
+    /// Prevents source-owned LA path requirements from crossing a Vector sink process boundary.
+    #[allow(deprecated)]
+    pub fn clear_delivery_path_accounting(&mut self) {
+        if let Some(Event::Log(log)) = &mut self.event {
+            if let Some(metadata) = &mut log.metadata_full {
+                metadata.delivery_path_accounting = None;
+                if let Some(value::Kind::Map(map)) = metadata
+                    .value
+                    .as_mut()
+                    .and_then(|value| value.kind.as_mut())
+                {
+                    map.fields.remove("delivery_path_accounting");
+                }
+            }
+            if let Some(value::Kind::Map(map)) =
+                log.metadata.as_mut().and_then(|value| value.kind.as_mut())
+            {
+                map.fields.remove("delivery_path_accounting");
+            }
+        }
     }
 }
 
@@ -617,6 +642,56 @@ impl From<OutputId> for crate::config::OutputId {
     }
 }
 
+impl From<path_accounting::DeliveryPathAccounting> for DeliveryPathAccounting {
+    fn from(value: path_accounting::DeliveryPathAccounting) -> Self {
+        Self {
+            counts: value.counts.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<DeliveryPathAccounting> for path_accounting::DeliveryPathAccounting {
+    fn from(value: DeliveryPathAccounting) -> Self {
+        Self {
+            counts: value.counts.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<path_accounting::DeliveryPathCount> for DeliveryPathCount {
+    fn from(value: path_accounting::DeliveryPathCount) -> Self {
+        Self {
+            path: value.path,
+            source_process_generation_id: value.source.process_generation_id,
+            time_parity: value.source.time_parity,
+            topic: value.source.topic,
+            delivery_method: value.source.delivery_method,
+            service_system: value.source.service_system,
+            source_pod_id: value.source.source_pod_id,
+            count: value.count,
+            selected: value.selected,
+        }
+    }
+}
+
+impl From<DeliveryPathCount> for path_accounting::DeliveryPathCount {
+    fn from(value: DeliveryPathCount) -> Self {
+        Self {
+            path: value.path,
+            source: path_accounting::DeliverySourceLabels {
+                process_generation_id: value.source_process_generation_id,
+                time_parity: value.time_parity,
+                topic: value.topic,
+                delivery_method: value.delivery_method,
+                service_system: value.service_system,
+                source_pod_id: value.source_pod_id,
+            },
+            count: value.count,
+            selected: value.selected,
+        }
+    }
+}
+
 impl From<EventMetadata> for Metadata {
     fn from(value: EventMetadata) -> Self {
         let super::metadata::Inner {
@@ -629,6 +704,7 @@ impl From<EventMetadata> for Metadata {
             source_event_id,
             delivery_event_count,
             delivery_event_service_system,
+            delivery_path_accounting,
             ..
         } = value.into_owned();
 
@@ -644,6 +720,7 @@ impl From<EventMetadata> for Metadata {
             source_event_id: source_event_id.map_or(vec![], std::convert::Into::into),
             delivery_event_count: delivery_event_count.map(|count| count as u64),
             delivery_event_service_system,
+            delivery_path_accounting: delivery_path_accounting.map(Into::into),
         }
     }
 }
@@ -660,6 +737,7 @@ impl From<Metadata> for EventMetadata {
             source_event_id,
             delivery_event_count,
             delivery_event_service_system,
+            delivery_path_accounting,
         } = value;
 
         let metadata_value = metadata_value.and_then(decode_value);
@@ -697,6 +775,7 @@ impl From<Metadata> for EventMetadata {
             source_event_id,
             delivery_event_count,
             delivery_event_service_system,
+            delivery_path_accounting: delivery_path_accounting.map(Into::into),
         }))
     }
 }

@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use futures::{future::FutureExt, stream::StreamExt};
 use futures_util::Stream;
 use http_1::{HeaderName, HeaderValue};
+use indexmap::IndexMap;
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
 use k8s_paths_provider::{AnnotationSelector, K8sPathsProvider};
 use kube::{
@@ -24,6 +25,9 @@ use kube::{
 };
 use lifecycle::Lifecycle;
 use serde_with::serde_as;
+use vector_common::internal_event::vector_event::delivery_path::{
+    DeliveryPathAccounting, DeliverySourceLabels,
+};
 use vector_lib::internal_event::delivery_singleton;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf, TimeZone,
@@ -44,12 +48,13 @@ use vector_lib::{
         owned_value_path, path,
     },
 };
-use vrl::value::{Kind, kind::Collection};
+use vrl::value::{Kind, Value, kind::Collection};
 
 use crate::sources::util::{EncodingConfig, MultilineConfig};
 use crate::{
     SourceSender,
     built_info::{PKG_NAME, PKG_VERSION},
+    conditions::{AnyCondition, Condition},
     config::{
         ComponentKey, DataType, GenerateConfig, GlobalOptions, SourceConfig, SourceContext,
         SourceOutput, log_schema,
@@ -405,6 +410,21 @@ pub struct Config {
     ))]
     pub source_context: Option<HashMap<String, String>>,
 
+    /// Primary delivery paths assigned at the existing source READ boundary.
+    ///
+    /// Each map key is an opaque path label and each condition is evaluated after pod annotation.
+    /// Matching paths create independent READ requirements carried with the event.
+    /// An omitted or empty map preserves ordinary unscoped event counters. With a nonempty map,
+    /// an event matching no paths carries explicit empty accounting and emits no READ, STAGED,
+    /// or DELIVERED event counters, including no unscoped fallback. Processing, VEL, and byte
+    /// counters are unchanged. Policies must retain a path for unresolved eligibility; an
+    /// accidentally unmatched event is otherwise outside the completeness measurement.
+    #[serde(default)]
+    #[configurable(metadata(
+        docs::additional_props_description = "A primary delivery path condition."
+    ))]
+    pub delivery_paths: IndexMap<String, AnyCondition>,
+
     /// Multiline aggregation configuration.
     ///
     /// If not specified, multiline aggregation is disabled.
@@ -528,6 +548,7 @@ impl Default for Config {
             checkpoint_dead_retention: default_checkpoint_dead_retention(),
             start_reading_at: None,
             source_context: None,
+            delivery_paths: IndexMap::new(),
             multiline: None,
             remove_after_secs: None,
             drain_on_shutdown: default_drain_on_shutdown(),
@@ -543,8 +564,23 @@ impl Default for Config {
 #[typetag::serde(name = "kubernetes_logs")]
 impl SourceConfig for Config {
     async fn build(&self, cx: SourceContext) -> crate::Result<sources::Source> {
+        if !self.delivery_paths.is_empty()
+            && !vector_common::internal_event::vector_event::delivery_event::emit_read_event_after_multiline_agg()
+        {
+            return Err("delivery_paths requires EMIT_READ_EVENT_AFTER_MULTILINE_AGG=true so path READ matches original READ".into());
+        }
         let log_namespace = cx.log_namespace(self.log_namespace);
-        let source = Source::new(self, &cx.globals, &cx.key).await?;
+        let mut delivery_paths = Vec::with_capacity(self.delivery_paths.len());
+        for (path, condition) in &self.delivery_paths {
+            if path.is_empty() {
+                return Err("delivery path names must not be empty".into());
+            }
+            delivery_paths.push((
+                path.clone(),
+                condition.build(&cx.enrichment_tables, &cx.metrics_storage)?,
+            ));
+        }
+        let source = Source::new(self, &cx.globals, &cx.key, delivery_paths).await?;
 
         // Clippy rule, because async_trait?
         #[allow(clippy::suspicious_else_formatting)]
@@ -771,6 +807,16 @@ impl SourceConfig for Config {
             )
             .with_standard_vector_source_metadata();
 
+        let schema_definition = if self.delivery_paths.is_empty() {
+            schema_definition
+        } else {
+            schema_definition.with_metadata_field(
+                &owned_value_path!("delivery_path_accounting", "paths"),
+                Kind::array(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
+                None,
+            )
+        };
+
         vec![SourceOutput::new_maybe_logs(
             DataType::Log,
             schema_definition,
@@ -820,6 +866,7 @@ struct Source {
     file_to_pod_map: Arc<Mutex<HashMap<PathBuf, LogFileInfo>>>,
     start_reading_at: Option<DateTime<Utc>>,
     source_context: Option<HashMap<String, String>>,
+    delivery_paths: Vec<(String, Condition)>,
     multiline: Option<MultilineConfig>,
     remove_after_secs: Option<u64>,
     drain_on_shutdown: bool,
@@ -831,6 +878,44 @@ struct Source {
     /// legacy `spawn_blocking` wrapper. Sourced from the `async_file_server` global flag; default
     /// off.
     async_file_server: bool,
+}
+
+fn attach_delivery_path_accounting(
+    event: &mut Event,
+    delivery_paths: &[(String, Condition)],
+    source_path: &str,
+    source_context: &Option<HashMap<String, String>>,
+    service_system: Option<&str>,
+    source_pod_id: Option<&str>,
+    time_parity: i64,
+) {
+    if delivery_paths.is_empty() {
+        return;
+    }
+
+    let source = DeliverySourceLabels::at_read(
+        source_path,
+        source_context,
+        service_system,
+        source_pod_id,
+        vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
+        time_parity,
+    );
+    let matching_paths = delivery_paths
+        .iter()
+        .filter_map(|(path, condition)| condition.check(event.clone()).0.then(|| path.clone()));
+    let accounting = DeliveryPathAccounting::at_read(source, matching_paths);
+    let exposed_paths = accounting
+        .counts
+        .iter()
+        .map(|count| Value::from(count.path.clone()))
+        .collect::<Vec<_>>();
+    let metadata = event.metadata_mut();
+    metadata.value_mut().insert(
+        path!("delivery_path_accounting", "paths"),
+        Value::Array(exposed_paths),
+    );
+    metadata.set_delivery_path_accounting(Some(accounting));
 }
 
 /// Wrapper that aborts owned reflector tasks on drop, preventing leaks if the
@@ -851,6 +936,7 @@ impl Source {
         config: &Config,
         globals: &GlobalOptions,
         key: &ComponentKey,
+        delivery_paths: Vec<(String, Condition)>,
     ) -> crate::Result<Self> {
         let self_node_name = if config.self_node_name.is_empty()
             || config.self_node_name == default_self_node_name_env_template()
@@ -1099,6 +1185,7 @@ impl Source {
             file_to_pod_map: Arc::new(Mutex::new(HashMap::new())),
             start_reading_at: parse_start_reading_at(config.start_reading_at.clone()),
             source_context: config.source_context.clone(),
+            delivery_paths,
             multiline: config.multiline.clone(),
             remove_after_secs: config.remove_after_secs,
             drain_on_shutdown: config.drain_on_shutdown,
@@ -1152,6 +1239,7 @@ impl Source {
             file_to_pod_map,
             start_reading_at,
             ref source_context,
+            delivery_paths,
             multiline,
             remove_after_secs,
             drain_on_shutdown,
@@ -1302,6 +1390,7 @@ impl Source {
                 line
             });
         let multiline_config = multiline.clone();
+        let delivery_path_source_context = source_context.clone();
         let messages: Box<dyn Stream<Item = Line> + Send + std::marker::Unpin> =
             if let Some(ref multiline_config) = multiline_config {
                 wrap_with_line_agg(
@@ -1342,6 +1431,16 @@ impl Source {
                     .set_delivery_event_service_system(service_system.clone());
             }
 
+            attach_delivery_path_accounting(
+                &mut event,
+                &delivery_paths,
+                &line.filename,
+                &delivery_path_source_context,
+                service_system.as_deref(),
+                source_pod_id.as_deref(),
+                time_parity,
+            );
+
             // Pod metadata is available only after annotation. Emit the read
             // counter here so it carries the source service identity while
             // preserving the existing post-multiline event count.
@@ -1355,6 +1454,7 @@ impl Source {
                 vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
                 time_parity,
                 true,
+                event.metadata().delivery_path_accounting(),
             );
 
             emit!(KubernetesLogsEventsReceived {
@@ -1722,14 +1822,123 @@ mod tests {
     use similar_asserts::assert_eq;
     use vector_lib::{
         config::LogNamespace,
-        lookup::{OwnedTargetPath, owned_value_path},
+        lookup::{OwnedTargetPath, owned_value_path, path},
         schema::Definition,
     };
     use vrl::value::{Kind, kind::Collection};
 
-    use super::Config;
+    use super::{Config, attach_delivery_path_accounting};
+    use crate::conditions::Condition;
     use crate::config::SourceConfig;
     use crate::encoding_transcode::{Decoder, Encoder};
+    use crate::event::{Event, LogEvent};
+
+    #[test]
+    fn delivery_path_source_schema_exposes_recorded_paths_to_vrl() {
+        let mut config = Config::default();
+        config.delivery_paths.insert(
+            "online".to_owned(),
+            crate::conditions::AnyCondition::String("true".to_owned()),
+        );
+        let path =
+            OwnedTargetPath::metadata(owned_value_path!("delivery_path_accounting", "paths"));
+        for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
+            let definition = config.outputs(namespace)[0]
+                .schema_definition(true)
+                .unwrap();
+            assert_eq!(
+                definition.kind_at(&path),
+                Kind::array(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
+            );
+            #[cfg(feature = "transforms-remap")]
+            {
+                use crate::{
+                    config::TransformContext,
+                    transforms::remap::{Remap, RemapConfig},
+                };
+
+                Remap::new_ast(
+                    RemapConfig {
+                        source: Some(". = {\"enrolled\": includes(array(%delivery_path_accounting.paths) ?? [], \"online\")}".to_owned()),
+                        ..Default::default()
+                    },
+                    &TransformContext { merged_schema_definition: definition, ..Default::default() },
+                ).expect("routing predicates must compile against the declared source schema");
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_path_policy_records_matches_and_configured_empty_results() {
+        let paths = vec![
+            ("blob".to_owned(), Condition::AlwaysPass),
+            ("online".to_owned(), Condition::AlwaysFail),
+        ];
+        let mut event = Event::Log(LogEvent::from("message"));
+        attach_delivery_path_accounting(
+            &mut event,
+            &paths,
+            "/var/log/ServiceLog.pb",
+            &None,
+            Some("service"),
+            Some("pod"),
+            3_600_000,
+        );
+        let accounting = event
+            .metadata()
+            .delivery_path_accounting()
+            .expect("configured source must retain accounting metadata");
+        assert_eq!(accounting.counts.len(), 1);
+        assert_eq!(accounting.counts[0].path, "blob");
+        assert_eq!(
+            event
+                .metadata()
+                .value()
+                .get(path!("delivery_path_accounting", "paths")),
+            Some(&vrl::value::Value::Array(vec!["blob".into()]))
+        );
+
+        let mut unmatched = Event::Log(LogEvent::from("message"));
+        attach_delivery_path_accounting(
+            &mut unmatched,
+            &[("online".to_owned(), Condition::AlwaysFail)],
+            "/var/log/ServiceLog.pb",
+            &None,
+            None,
+            None,
+            3_600_000,
+        );
+        assert_eq!(
+            unmatched
+                .metadata()
+                .delivery_path_accounting()
+                .expect("configured source must be distinguishable")
+                .counts,
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn absent_delivery_path_policy_does_not_change_event_metadata() {
+        let mut event = Event::Log(LogEvent::from("message"));
+        attach_delivery_path_accounting(
+            &mut event,
+            &[],
+            "/var/log/ServiceLog.pb",
+            &None,
+            None,
+            None,
+            3_600_000,
+        );
+        assert!(event.metadata().delivery_path_accounting().is_none());
+        assert!(
+            event
+                .metadata()
+                .value()
+                .get(path!("delivery_path_accounting", "paths"))
+                .is_none()
+        );
+    }
 
     #[test]
     fn generate_config() {

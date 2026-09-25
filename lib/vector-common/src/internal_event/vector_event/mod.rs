@@ -1,4 +1,5 @@
 pub mod delivery_event;
+pub mod delivery_path;
 pub mod file_send_event;
 
 use delivery_event::{VectorSinkDeliveryEvent, combine_sink_delivery_events};

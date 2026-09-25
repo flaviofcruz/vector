@@ -1029,6 +1029,7 @@ fn create_event(
         vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
         time_parity,
         true,
+        None,
     );
 
     emit!(FileEventsReceived {

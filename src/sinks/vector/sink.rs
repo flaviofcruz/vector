@@ -84,7 +84,7 @@ where
                     event_collection.events_json_byte_size += item.json_byte_size;
                 }),
             ))
-            .map(|event_collection| {
+            .map(|mut event_collection| {
                 // This sink is exceptional in that it doesn't use other util classes / functions to build request
                 // So we need to generate the delivery event log needed for the request
                 let delivery_event_log = VectorSinkDeliveryEvent::with_count_map(
@@ -99,6 +99,12 @@ where
                         file_send_event: None,
                     }),
                 );
+
+                // LA accounting ends at this outbound send. Capture it above before stripping
+                // the wire metadata so VA cannot credit these LA requirements again.
+                for event in &mut event_collection.events {
+                    event.clear_delivery_path_accounting();
+                }
 
                 let encoded_events = proto_vector::PushEventsRequest {
                     events: event_collection.events,
@@ -130,5 +136,130 @@ where
 {
     async fn run(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         self.run_inner(input).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, time::Duration};
+
+    use vector_common::internal_event::vector_event::delivery_path::{
+        DeliveryPathAccounting, DeliverySourceLabels,
+    };
+
+    use super::*;
+    use crate::event::{EventStatus, LogEvent};
+
+    struct SentResponse(GroupedCountByteSize);
+
+    impl DriverResponse for SentResponse {
+        fn event_status(&self) -> EventStatus {
+            EventStatus::Delivered
+        }
+
+        fn events_sent(&self) -> &GroupedCountByteSize {
+            &self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_path_counts_stay_in_la_request_metadata_and_are_removed_from_wire() {
+        let events = ["old-process", "new-process"].map(|process| {
+            let mut event = LogEvent::from("service message");
+            let mut accounting = DeliveryPathAccounting::at_read(
+                DeliverySourceLabels {
+                    process_generation_id: process.to_owned(),
+                    time_parity: 3_600_000,
+                    topic: "service-log".to_owned(),
+                    delivery_method: "file".to_owned(),
+                    service_system: "service".to_owned(),
+                    source_pod_id: "pod".to_owned(),
+                },
+                ["archive".to_owned(), "online".to_owned()],
+            );
+            accounting.select_path("online");
+            event
+                .metadata_mut()
+                .set_delivery_path_accounting(Some(accounting));
+            event.metadata_mut().value_mut().insert(
+                vrl::path!("delivery_path_accounting"),
+                vrl::value!({"paths": ["archive", "online"]}),
+            );
+            event
+                .metadata_mut()
+                .value_mut()
+                .insert(vrl::path!("unrelated"), vrl::value!("preserved"));
+            Event::Log(event)
+        });
+        // Only the external receiver is replaced; the real sink builds and sends the request.
+        let (tx, rx) = mpsc::sync_channel(1);
+        let service = tower::service_fn(move |request: VectorRequest| {
+            let response = SentResponse(
+                request
+                    .metadata
+                    .events_estimated_json_encoded_byte_size()
+                    .clone(),
+            );
+            tx.send(request).expect("capture LA request");
+            async move { Ok::<_, crate::Error>(response) }
+        });
+        Box::new(VectorSink {
+            batch_settings: BatcherSettings {
+                timeout: Duration::from_secs(1),
+                size_limit: 1_000_000,
+                item_limit: 2,
+            },
+            service,
+        })
+        .run_inner(futures::stream::iter(events).boxed())
+        .await
+        .expect("successful send");
+
+        let request = rx.try_recv().expect("one batched request");
+        let paths = request
+            .metadata
+            .event_log_metadata()
+            .delivery_event
+            .count_map
+            .values()
+            .filter_map(|value| value.delivery_path_count.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 2);
+        let mut processes = Vec::new();
+        for count in paths {
+            assert_eq!(count.path, "online");
+            assert_eq!(count.count, 1);
+            processes.push(count.source.process_generation_id.as_str());
+        }
+        processes.sort_unstable();
+        assert_eq!(processes, ["new-process", "old-process"]);
+        assert_eq!(request.request.events.len(), 2);
+        for wrapper in request.request.events {
+            #[allow(deprecated)]
+            if let Some(crate::event::proto::Event::Log(log)) = &wrapper.event {
+                let legacy_metadata = log.metadata.as_ref().expect("legacy metadata");
+                let crate::event::proto::value::Kind::Map(map) =
+                    legacy_metadata.kind.as_ref().unwrap()
+                else {
+                    panic!("metadata must be an object")
+                };
+                assert!(!map.fields.contains_key("delivery_path_accounting"));
+                assert!(map.fields.contains_key("unrelated"));
+            }
+            let event = Event::from(wrapper);
+            assert!(event.metadata().delivery_path_accounting().is_none());
+            assert!(
+                event
+                    .metadata()
+                    .value()
+                    .get(vrl::path!("delivery_path_accounting"))
+                    .is_none()
+            );
+            assert_eq!(
+                event.metadata().value().get(vrl::path!("unrelated")),
+                Some(&vrl::value!("preserved"))
+            );
+            assert_eq!(event.as_log()["message"], "service message".into());
+        }
     }
 }

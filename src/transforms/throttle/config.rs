@@ -31,6 +31,17 @@ pub struct ThrottleInternalMetricsConfig {
     pub emit_events_discarded_per_key: bool,
 }
 
+/// Approved intentional-drop accounting emitted only when this throttle rejects an event.
+#[configurable_component]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ThrottleDeliveryPathIntentionalDropConfig {
+    /// Source-configured paths affected by this throttle's policy decision.
+    pub paths: Vec<String>,
+    /// Bounded policy reason attached to the intentional-drop counter.
+    pub reason: String,
+}
+
 /// Configuration for the `throttle` transform.
 #[serde_as]
 #[configurable_component(transform("throttle", "Rate limit logs passing through a topology."))]
@@ -64,6 +75,10 @@ pub struct ThrottleConfig {
     /// The event status to set when dropping event due to throttling. One of (dropped, errored, rejected)
     #[serde(default = "default_throttled_event_status")]
     pub throttled_event_status: String,
+
+    /// Optional approved intentional-drop accounting for source-created delivery paths.
+    /// Does not change throttling behavior or count events that pass through.
+    pub delivery_path_intentional_drop: Option<ThrottleDeliveryPathIntentionalDropConfig>,
 }
 
 impl_generate_config_from_default!(ThrottleConfig);
@@ -103,5 +118,26 @@ mod tests {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<ThrottleConfig>();
+    }
+
+    #[test]
+    fn intentional_drop_config_round_trips() {
+        let intentional_drop = serde_json::json!({
+            "paths": ["online"],
+            "reason": "policy_rate_limit",
+        });
+        let config: ThrottleConfig = serde_json::from_value(serde_json::json!({
+            "threshold": 10,
+            "window_secs": 1,
+            "delivery_path_intentional_drop": intentional_drop,
+        }))
+        .unwrap();
+        let accounting = config.delivery_path_intentional_drop.as_ref().unwrap();
+        assert_eq!(accounting.paths, ["online"]);
+        assert_eq!(accounting.reason, "policy_rate_limit");
+        assert_eq!(
+            serde_json::to_value(config).unwrap()["delivery_path_intentional_drop"],
+            intentional_drop,
+        );
     }
 }
