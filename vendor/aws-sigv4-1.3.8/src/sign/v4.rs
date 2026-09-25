@@ -3,61 +3,62 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::crypto::CryptoError;
 use crate::date_time::format_date;
 use aws_smithy_runtime_api::client::identity::Identity;
-use hmac::{digest::FixedOutput, Hmac, Mac};
-use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 
 /// HashedPayload = Lowercase(HexEncode(Hash(requestPayload)))
-#[allow(dead_code)] // Unused when compiling without certain features
+#[allow(dead_code)] // Retained for the upstream tests and legacy helper API.
 pub(crate) fn sha256_hex_string(bytes: impl AsRef<[u8]>) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize_fixed())
+    try_sha256_hex_string(bytes).expect("SigV4 SHA-256 failed")
 }
 
-/// Calculates a Sigv4 signature
+#[allow(dead_code)] // Unused when compiling without the signing features.
+pub(crate) fn try_sha256_hex_string(bytes: impl AsRef<[u8]>) -> Result<String, CryptoError> {
+    crate::crypto::sha256(bytes.as_ref()).map(hex::encode)
+}
+
+/// Calculates a SigV4 signature.
+///
+/// Panics if the selected crypto backend fails.
 pub fn calculate_signature(signing_key: impl AsRef<[u8]>, string_to_sign: &[u8]) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.as_ref())
-        .expect("HMAC can take key of any size");
-    mac.update(string_to_sign);
-    hex::encode(mac.finalize_fixed())
+    try_calculate_signature(signing_key, string_to_sign).expect("SigV4 HMAC failed")
 }
 
-/// Generates a signing key for Sigv4
+/// Calculates a SigV4 signature, propagating crypto backend failures.
+pub(crate) fn try_calculate_signature(
+    signing_key: impl AsRef<[u8]>,
+    string_to_sign: &[u8],
+) -> Result<String, CryptoError> {
+    crate::crypto::hmac_sha256(signing_key.as_ref(), string_to_sign).map(hex::encode)
+}
+
+/// Generates a signing key for SigV4.
+///
+/// Panics if the selected crypto backend fails.
 pub fn generate_signing_key(
     secret: &str,
     time: SystemTime,
     region: &str,
     service: &str,
 ) -> impl AsRef<[u8]> {
-    // kSecret = your secret access key
-    // kDate = HMAC("AWS4" + kSecret, Date)
-    // kRegion = HMAC(kDate, Region)
-    // kService = HMAC(kRegion, Service)
-    // kSigning = HMAC(kService, "aws4_request")
+    try_generate_signing_key(secret, time, region, service).expect("SigV4 key derivation failed")
+}
 
+/// Generates a signing key for SigV4, propagating crypto backend failures.
+pub(crate) fn try_generate_signing_key(
+    secret: &str,
+    time: SystemTime,
+    region: &str,
+    service: &str,
+) -> Result<[u8; 32], CryptoError> {
+    use crate::crypto::hmac_sha256;
     let secret = format!("AWS4{secret}");
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret.as_ref()).expect("HMAC can take key of any size");
-    mac.update(format_date(time).as_bytes());
-    let tag = mac.finalize_fixed();
-
-    // sign region
-    let mut mac = Hmac::<Sha256>::new_from_slice(&tag).expect("HMAC can take key of any size");
-    mac.update(region.as_bytes());
-    let tag = mac.finalize_fixed();
-
-    // sign service
-    let mut mac = Hmac::<Sha256>::new_from_slice(&tag).expect("HMAC can take key of any size");
-    mac.update(service.as_bytes());
-    let tag = mac.finalize_fixed();
-
-    // sign request
-    let mut mac = Hmac::<Sha256>::new_from_slice(&tag).expect("HMAC can take key of any size");
-    mac.update("aws4_request".as_bytes());
-    mac.finalize_fixed()
+    let date_key = hmac_sha256(secret.as_bytes(), format_date(time).as_bytes())?;
+    let region_key = hmac_sha256(&date_key, region.as_bytes())?;
+    let service_key = hmac_sha256(&region_key, service.as_bytes())?;
+    hmac_sha256(&service_key, b"aws4_request")
 }
 
 /// Parameters to use when signing.

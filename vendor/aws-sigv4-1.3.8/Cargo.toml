@@ -46,6 +46,8 @@ targets = ["x86_64-unknown-linux-gnu"]
 stable = true
 
 [features]
+# Use OpenSSL 3 and its process-wide provider configuration for SigV4.
+openssl = ["dep:foreign-types", "dep:openssl", "dep:openssl-sys"]
 default = [
     "sign-http",
     "http1",
@@ -105,12 +107,26 @@ version = "1.10.0"
 version = "0.5.4"
 optional = true
 
+[dependencies.foreign-types]
+version = "0.3.2"
+optional = true
+
 [dependencies.form_urlencoded]
 version = "1.2.1"
 optional = true
 
 [dependencies.hex]
 version = "0.4.3"
+
+[dependencies.openssl]
+version = "0.10.75"
+default-features = false
+optional = true
+
+[dependencies.openssl-sys]
+version = "0.9.111"
+default-features = false
+optional = true
 
 [dependencies.hmac]
 version = "0.12"

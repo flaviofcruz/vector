@@ -28,6 +28,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 stable = true
 
 [features]
+# Use OpenSSL 3 and its process-wide provider configuration for SigV4.
+openssl = ["dep:foreign-types", "dep:openssl", "dep:openssl-sys"]
 default = ["sign-http", "http1"]
 http0-compat = ["dep:http0"]
 http1 = ["dep:http"]
@@ -36,6 +38,9 @@ sign-eventstream = ["dep:aws-smithy-eventstream"]
 sigv4a = ["dep:p256", "dep:crypto-bigint", "dep:subtle", "dep:zeroize", "dep:ring"]
 
 [dependencies]
+foreign-types = { version = "0.3.2", optional = true }
+openssl = { version = "0.10.75", default-features = false, optional = true }
+openssl-sys = { version = "0.9.111", default-features = false, optional = true }
 bytes = "1.10.0"
 hex = "0.4.3"
 hmac = "0.12"

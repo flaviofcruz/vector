@@ -242,6 +242,7 @@ impl Application {
             opts.log_level(),
             opts.root.internal_log_rate_limit,
         );
+        crate::openssl_provider::log_loaded_providers();
 
         // Set global color preference for downstream modules
         crate::set_global_color(color);
@@ -850,8 +851,8 @@ pub fn watcher_config(
 
 #[cfg(test)]
 mod tests {
-    use super::staged_shutdown_secs;
     use super::FinishedApplication;
+    use super::staged_shutdown_secs;
     use crate::signal::SignalTo;
     use std::time::Duration;
     use tokio::sync::broadcast;

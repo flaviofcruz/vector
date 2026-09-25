@@ -12,7 +12,7 @@ use crate::http_request::uri_path_normalization::normalize_uri_path;
 use crate::http_request::url_escape::percent_encode_path;
 use crate::http_request::{PayloadChecksumKind, SignableBody, SignatureLocation, SigningParams};
 use crate::http_request::{PercentEncodingMode, SigningSettings};
-use crate::sign::v4::sha256_hex_string;
+use crate::sign::v4::try_sha256_hex_string;
 use crate::SignatureVersion;
 use aws_smithy_http::query_writer::QueryWriter;
 use http::header::{AsHeaderName, HeaderName, HOST};
@@ -161,7 +161,7 @@ impl CanonicalRequest<'_> {
             PercentEncodingMode::Double => Cow::Owned(percent_encode_path(&path)),
             PercentEncodingMode::Single => path,
         };
-        let payload_hash = Self::payload_hash(req.body());
+        let payload_hash = Self::payload_hash(req.body())?;
 
         let date_time = format_date_time(*params.time());
         let (signed_headers, canonical_headers) =
@@ -315,7 +315,7 @@ impl CanonicalRequest<'_> {
         Ok((signed_headers, canonical_headers))
     }
 
-    fn payload_hash<'b>(body: &'b SignableBody<'b>) -> Cow<'b, str> {
+    fn payload_hash<'b>(body: &'b SignableBody<'b>) -> Result<Cow<'b, str>, CanonicalRequestError> {
         // Payload hash computation
         //
         // Based on the input body, set the payload_hash of the canonical request:
@@ -325,14 +325,14 @@ impl CanonicalRequest<'_> {
         // - use `UnsignedPayload`
         // - use `UnsignedPayload` for streaming requests
         // - use `StreamingUnsignedPayloadTrailer` for streaming requests with trailers
-        match body {
-            SignableBody::Bytes(data) => Cow::Owned(sha256_hex_string(data)),
+        Ok(match body {
+            SignableBody::Bytes(data) => Cow::Owned(try_sha256_hex_string(data)?),
             SignableBody::Precomputed(digest) => Cow::Borrowed(digest.as_str()),
             SignableBody::UnsignedPayload => Cow::Borrowed(UNSIGNED_PAYLOAD),
             SignableBody::StreamingUnsignedPayloadTrailer => {
                 Cow::Borrowed(STREAMING_UNSIGNED_PAYLOAD_TRAILER)
             }
-        }
+        })
     }
 
     fn params(

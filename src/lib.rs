@@ -100,6 +100,7 @@ pub mod list;
 #[cfg(any(feature = "sources-nats", feature = "sinks-nats"))]
 pub mod nats;
 pub mod net;
+pub(crate) mod openssl_provider;
 #[allow(unreachable_pub)]
 pub(crate) mod proto;
 pub mod providers;

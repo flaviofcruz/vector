@@ -282,20 +282,20 @@ fn calculate_signing_params<'a>(
 ) -> Result<(CalculatedParams, String), SigningError> {
     let creds = params.credentials()?;
     let creq = CanonicalRequest::from(request, params)?;
-    let encoded_creq = &v4::sha256_hex_string(creq.to_string().as_bytes());
+    let encoded_creq = &v4::try_sha256_hex_string(creq.to_string().as_bytes())?;
 
     let (signature, string_to_sign) = match params {
         SigningParams::V4(params) => {
             let string_to_sign =
                 StringToSign::new_v4(params.time, params.region, params.name, encoded_creq)
                     .to_string();
-            let signing_key = v4::generate_signing_key(
+            let signing_key = v4::try_generate_signing_key(
                 creds.secret_access_key(),
                 params.time,
                 params.region,
                 params.name,
-            );
-            let signature = v4::calculate_signature(signing_key, string_to_sign.as_bytes());
+            )?;
+            let signature = v4::try_calculate_signature(signing_key, string_to_sign.as_bytes())?;
             (signature, string_to_sign)
         }
         #[cfg(feature = "sigv4a")]
@@ -363,7 +363,7 @@ fn calculate_signing_headers<'a>(
     // Step 1: https://docs.aws.amazon.com/en_pv/general/latest/gr/sigv4-create-canonical-request.html.
     let creq = CanonicalRequest::from(request, params)?;
     // Step 2: https://docs.aws.amazon.com/en_pv/general/latest/gr/sigv4-create-string-to-sign.html.
-    let encoded_creq = v4::sha256_hex_string(creq.to_string().as_bytes());
+    let encoded_creq = v4::try_sha256_hex_string(creq.to_string().as_bytes())?;
     tracing::trace!(canonical_request = %creq);
     let mut headers = vec![];
 
@@ -377,13 +377,13 @@ fn calculate_signing_headers<'a>(
             );
 
             // Step 3: https://docs.aws.amazon.com/en_pv/general/latest/gr/sigv4-calculate-signature.html
-            let signing_key = v4::generate_signing_key(
+            let signing_key = v4::try_generate_signing_key(
                 creds.secret_access_key(),
                 params.time,
                 params.region,
                 params.name,
-            );
-            let signature = v4::calculate_signature(signing_key, sts.to_string().as_bytes());
+            )?;
+            let signature = v4::try_calculate_signature(signing_key, sts.to_string().as_bytes())?;
 
             // Step 4: https://docs.aws.amazon.com/en_pv/general/latest/gr/sigv4-add-signature-to-request.html
             let values = creq.values.as_headers().expect("signing with headers");

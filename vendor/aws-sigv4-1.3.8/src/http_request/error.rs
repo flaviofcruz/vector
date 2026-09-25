@@ -10,6 +10,7 @@ use std::fmt;
 
 #[derive(Debug)]
 enum SigningErrorKind {
+    Crypto { source: crate::crypto::CryptoError },
     FailedToCreateCanonicalRequest { source: CanonicalRequestError },
     UnsupportedIdentityType,
 }
@@ -31,6 +32,7 @@ impl SigningError {
 impl fmt::Display for SigningError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
+            SigningErrorKind::Crypto { .. } => write!(f, "SigV4 crypto operation failed"),
             SigningErrorKind::FailedToCreateCanonicalRequest { .. } => {
                 write!(f, "failed to create canonical request")
             }
@@ -44,6 +46,7 @@ impl fmt::Display for SigningError {
 impl Error for SigningError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.kind {
+            SigningErrorKind::Crypto { source } => Some(source),
             SigningErrorKind::FailedToCreateCanonicalRequest { source } => Some(source),
             SigningErrorKind::UnsupportedIdentityType => None,
         }
@@ -60,6 +63,7 @@ impl From<CanonicalRequestError> for SigningError {
 
 #[derive(Debug)]
 enum CanonicalRequestErrorKind {
+    Crypto { source: crate::crypto::CryptoError },
     InvalidHeaderName { source: InvalidHeaderName },
     InvalidHeaderValue { source: InvalidHeaderValue },
     InvalidUri { source: InvalidUri },
@@ -75,6 +79,7 @@ impl fmt::Display for CanonicalRequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use CanonicalRequestErrorKind::*;
         match self.kind {
+            Crypto { .. } => write!(f, "SigV4 payload hashing failed"),
             InvalidHeaderName { .. } => write!(f, "invalid header name"),
             InvalidHeaderValue { .. } => write!(f, "invalid header value"),
             InvalidUri { .. } => write!(f, "the uri was invalid"),
@@ -89,6 +94,7 @@ impl Error for CanonicalRequestError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         use CanonicalRequestErrorKind::*;
         match &self.kind {
+            Crypto { source } => Some(source),
             InvalidHeaderName { source } => Some(source),
             InvalidHeaderValue { source } => Some(source),
             InvalidUri { source } => Some(source),
@@ -125,6 +131,22 @@ impl From<InvalidUri> for CanonicalRequestError {
     fn from(source: InvalidUri) -> Self {
         Self {
             kind: CanonicalRequestErrorKind::InvalidUri { source },
+        }
+    }
+}
+
+impl From<crate::crypto::CryptoError> for SigningError {
+    fn from(source: crate::crypto::CryptoError) -> Self {
+        Self {
+            kind: SigningErrorKind::Crypto { source },
+        }
+    }
+}
+
+impl From<crate::crypto::CryptoError> for CanonicalRequestError {
+    fn from(source: crate::crypto::CryptoError) -> Self {
+        Self {
+            kind: CanonicalRequestErrorKind::Crypto { source },
         }
     }
 }

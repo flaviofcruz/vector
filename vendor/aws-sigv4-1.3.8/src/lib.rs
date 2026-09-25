@@ -18,6 +18,11 @@
     unreachable_pub
 )]
 
+#[cfg(all(feature = "openssl", feature = "sigv4a"))]
+compile_error!("the OpenSSL backend does not support SigV4a");
+
+mod crypto;
+
 use std::fmt;
 
 pub mod sign;

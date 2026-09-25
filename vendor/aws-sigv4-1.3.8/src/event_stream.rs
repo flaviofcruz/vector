@@ -48,7 +48,7 @@
 
 use crate::date_time::{format_date, format_date_time, truncate_subsecs};
 use crate::http_request::SigningError;
-use crate::sign::v4::{calculate_signature, generate_signing_key, sha256_hex_string};
+use crate::sign::v4::{try_calculate_signature, try_generate_signing_key, try_sha256_hex_string};
 use crate::SigningOutput;
 use aws_credential_types::Credentials;
 use aws_smithy_eventstream::frame::{write_headers_to, write_message_to};
@@ -66,7 +66,7 @@ fn calculate_string_to_sign(
     last_signature: &str,
     time: SystemTime,
     params: &SigningParams<'_>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, SigningError> {
     // Event Stream string to sign format is documented here:
     // https://docs.aws.amazon.com/transcribe/latest/dg/how-streaming.html
     let date_time_str = format_date_time(time);
@@ -86,9 +86,9 @@ fn calculate_string_to_sign(
     let date_header = Header::new(":date", HeaderValue::Timestamp(time.into()));
     let mut date_buffer = Vec::new();
     write_headers_to(&[date_header], &mut date_buffer).unwrap();
-    writeln!(sts, "{}", sha256_hex_string(&date_buffer)).unwrap();
-    write!(sts, "{}", sha256_hex_string(message_payload)).unwrap();
-    sts
+    writeln!(sts, "{}", try_sha256_hex_string(&date_buffer)?).unwrap();
+    write!(sts, "{}", try_sha256_hex_string(message_payload)?).unwrap();
+    Ok(sts)
 }
 
 /// Signs an Event Stream message with the given `credentials`.
@@ -135,14 +135,14 @@ fn sign_payload<'a>(
         .ok_or_else(SigningError::unsupported_identity_type)?;
 
     let signing_key =
-        generate_signing_key(creds.secret_access_key(), time, params.region, params.name);
+        try_generate_signing_key(creds.secret_access_key(), time, params.region, params.name)?;
     let string_to_sign = calculate_string_to_sign(
         message_payload.as_ref().map(|v| &v[..]).unwrap_or(&[]),
         last_signature,
         time,
         params,
-    );
-    let signature = calculate_signature(signing_key, &string_to_sign);
+    )?;
+    let signature = try_calculate_signature(signing_key, &string_to_sign)?;
     tracing::trace!(canonical_request = ?message_payload, string_to_sign = ?string_to_sign, "calculated signing parameters");
 
     // Generate the signed wrapper event frame
@@ -195,12 +195,10 @@ mod tests {
         let last_signature = sha256_hex_string(b"last message sts");
         assert_eq!(
             expected,
-            std::str::from_utf8(&calculate_string_to_sign(
-                &message_payload,
-                &last_signature,
-                params.time,
-                &params
-            ))
+            std::str::from_utf8(
+                &calculate_string_to_sign(&message_payload, &last_signature, params.time, &params)
+                    .unwrap()
+            )
             .unwrap()
         );
     }
@@ -223,6 +221,11 @@ mod tests {
         let (signed, signature) = sign_message(&message_to_sign, &last_signature, &params)
             .unwrap()
             .into_parts();
+        // Independently checked with Python hashlib/hmac using the string-to-sign fixture.
+        assert_eq!(
+            signature,
+            "08fed460df836999e1c4137962a3d6ad66a9e8c1bf8e8888e3cbeee26bbf774d"
+        );
         assert_eq!(":chunk-signature", signed.headers()[0].name().as_str());
         if let HeaderValue::ByteArray(bytes) = signed.headers()[0].value() {
             assert_eq!(signature, hex::encode(bytes));
@@ -237,5 +240,25 @@ mod tests {
         } else {
             panic!("expected timestamp for :date header");
         }
+    }
+
+    #[test]
+    fn sign_empty_known_answer() {
+        let identity = Credentials::for_tests().into();
+        let params = SigningParams {
+            identity: &identity,
+            region: "us-east-1",
+            name: "testservice",
+            time: UNIX_EPOCH + Duration::new(123_456_789, 1234),
+            settings: (),
+        };
+        let last_signature = "be1f8c7d79ef8e1abc5254a2c70e4da3bfaf4f07328f527444e1fc6ea67273e2";
+        let signed = crate::event_stream::sign_empty_message(last_signature, &params).unwrap();
+        // Same independent reference calculation with SHA256 of an empty payload.
+        assert_eq!(
+            signed.signature(),
+            "d751409ce3396a2f3f5a5108436358a329e5c2f0f72b17165981f5c54dc7a947"
+        );
+        assert!(signed.output().payload().is_empty());
     }
 }
