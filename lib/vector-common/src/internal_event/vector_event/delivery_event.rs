@@ -736,36 +736,50 @@ fn emit_sink_delivery_logs<'a>(
     }
 }
 
-/// Emits the `delivery_events_total` counter per `value_map`. Called inline
-/// (per sink request) so the metric is not affected by the log batching.
+/// Emits the `delivery_events_total` counter and its `delivery_event_bytes_total`
+/// byte sibling per `value_map`. Called inline (per sink request) so the metrics
+/// are not affected by the log batching.
 pub fn emit_delivery_counters<'a>(
     values: impl Iterator<Item = &'a MetadataValuesCount>,
     delivery_event_type: &'static str,
 ) {
     for value in values {
-        counter!(
-            "delivery_events_total",
-            "delivery_event_type" => delivery_event_type.to_string(),
-            "time_parity" => time_parity_from_value_map(&value.value_map),
-            "topic" => topic_from_value_map(&value.value_map),
-            "delivery_method" => delivery_method_from_value_map(&value.value_map),
-            "service_system" => service_system_from_value_map(&value.value_map),
-            "source_pod_id" => source_pod_id_from_value_map(&value.value_map),
-            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
-        )
-        .increment(value.count as u64);
+        // Resolve the shared label values once per entry; both the per-pod and
+        // aggregate series, and the event/byte counter pair, reuse them.
+        let time_parity = time_parity_from_value_map(&value.value_map);
+        let topic = topic_from_value_map(&value.value_map);
+        let delivery_method = delivery_method_from_value_map(&value.value_map);
+        let service_system = service_system_from_value_map(&value.value_map);
+        let source_pod_id = source_pod_id_from_value_map(&value.value_map);
+        let events = value.count as u64;
+        let bytes = value.size as u64;
 
-        counter!(
-            "delivery_events_total",
-            "delivery_event_type" => delivery_event_type.to_string(),
-            "time_parity" => time_parity_from_value_map(&value.value_map),
-            "topic" => topic_from_value_map(&value.value_map),
-            "delivery_method" => delivery_method_from_value_map(&value.value_map),
-            "service_system" => service_system_from_value_map(&value.value_map),
-            "source_pod_id" => ALL_SOURCE_PODS_ID,
-            "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
-        )
-        .increment(value.count as u64);
+        for source_pod_id in [source_pod_id.as_str(), ALL_SOURCE_PODS_ID] {
+            counter!(
+                "delivery_events_total",
+                "delivery_event_type" => delivery_event_type.to_string(),
+                "time_parity" => time_parity.clone(),
+                "topic" => topic.clone(),
+                "delivery_method" => delivery_method.clone(),
+                "service_system" => service_system.clone(),
+                "source_pod_id" => source_pod_id.to_string(),
+                "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
+            )
+            .increment(events);
+
+            // Byte-count sibling of `delivery_events_total` with identical labels.
+            counter!(
+                "delivery_event_bytes_total",
+                "delivery_event_type" => delivery_event_type.to_string(),
+                "time_parity" => time_parity.clone(),
+                "topic" => topic.clone(),
+                "delivery_method" => delivery_method.clone(),
+                "service_system" => service_system.clone(),
+                "source_pod_id" => source_pod_id.to_string(),
+                "process_generation_id" => PROCESS_GENERATION_ID.as_str(),
+            )
+            .increment(bytes);
+        }
     }
 }
 
@@ -1390,6 +1404,65 @@ mod read_accumulation_tests {
         assert!(!labels.contains_key("topic"));
         assert!(!labels.contains_key("source_pod_id"));
         assert!(!labels.contains_key("process_generation_id"));
+    }
+
+    // The sink legs emit a `delivery_event_bytes_total` byte sibling alongside
+    // `delivery_events_total`, carrying `value.size` with identical labels.
+    #[test]
+    fn sink_delivery_counters_emit_event_and_byte_siblings() {
+        let value = MetadataValuesCount {
+            value_map: HashMap::from([
+                ("topic".to_string(), "service-log".to_string()),
+                ("system".to_string(), "money-settings".to_string()),
+                (
+                    "workloadInstanceId".to_string(),
+                    "money-settings-7d9f".to_string(),
+                ),
+            ]),
+            count: 4,
+            size: 512,
+        };
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            emit_delivery_counters(std::iter::once(&value), "VECTOR_SINK_UPLOAD_DELIVERED");
+        });
+
+        let metrics = snapshotter.snapshot().into_vec();
+        // Per-pod and aggregate series for each of the event and byte counters.
+        assert_eq!(metrics.len(), 4);
+
+        let per_pod = |name: &str| {
+            metrics
+                .iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == name
+                        && key.key().labels().any(|label| {
+                            label.key() == "source_pod_id" && label.value() != ALL_SOURCE_PODS_ID
+                        })
+                })
+                .unwrap_or_else(|| panic!("per-pod {name} series"))
+        };
+
+        let (event_key, _, _, event_value) = per_pod("delivery_events_total");
+        assert_eq!(*event_value, DebugValue::Counter(4));
+        let (_, _, _, byte_value) = per_pod("delivery_event_bytes_total");
+        assert_eq!(*byte_value, DebugValue::Counter(512));
+
+        // The byte sibling shares the event counter's labels.
+        let labels = event_key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            labels.get("delivery_event_type"),
+            Some(&"VECTOR_SINK_UPLOAD_DELIVERED")
+        );
+        assert_eq!(labels.get("topic"), Some(&"service-log"));
+        assert_eq!(labels.get("service_system"), Some(&"money-settings"));
+        assert_eq!(labels.get("source_pod_id"), Some(&"money-settings-7d9f"));
     }
 
     // flush() drains the read registry so each bucket is emitted exactly once.
