@@ -18,7 +18,10 @@ use vector_lib::{
 };
 
 use super::{Config, path_helpers::parse_log_file_path};
-use crate::event::{Event, LogEvent};
+use crate::{
+    event::{Event, LogEvent},
+    kubernetes::pod_manager_logic::extract_static_pod_config_hashsum,
+};
 use vector_lib::file_source::paths_provider::LogFileInfo;
 
 const POD_NAME_ANNOTATION_KEY: &str = "dblet.dev/pod-name";
@@ -267,21 +270,35 @@ impl PodMetadataAnnotator {
     }
 }
 
-fn service_system_from_metadata(metadata: &ObjectMeta) -> Option<String> {
-    if let Some(system) = metadata
+/// Resolves the same source identity for read and pre-admission delivery metrics.
+pub(super) fn service_system_from_metadata(metadata: &ObjectMeta) -> Option<String> {
+    metadata
         .labels
         .as_ref()
         .and_then(|labels| labels.get("system"))
-    {
-        return (!system.is_empty()).then(|| system.clone());
-    }
-
-    metadata
-        .annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get("databricks/system_uri"))
-        .and_then(|system_uri| system_uri.strip_prefix("system:"))
-        .filter(|system| !system.is_empty())
+        .map(String::as_str)
+        .filter(|system| !system.is_empty() && *system != "unknown")
+        .or_else(|| {
+            metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("databricks/system_uri"))
+                .and_then(|system_uri| system_uri.strip_prefix("system:"))
+                .filter(|system| !system.is_empty() && *system != "unknown")
+        })
+        .or_else(|| {
+            // Some static-pod manifests omit attribution. Do not infer a system
+            // from arbitrary app labels or pod names outside this known workload.
+            let app = metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("app"))
+                .map(String::as_str);
+            (metadata.namespace.as_deref() == Some("kube-system")
+                && app == Some("kube-apiserver")
+                && extract_static_pod_config_hashsum(metadata).is_some_and(|hash| !hash.is_empty()))
+            .then_some("kube-apiserver")
+        })
         .map(str::to_string)
 }
 
@@ -620,6 +637,94 @@ mod tests {
             ..ObjectMeta::default()
         };
         assert_eq!(service_system_from_metadata(&metadata), None);
+    }
+
+    fn kube_apiserver_metadata() -> ObjectMeta {
+        ObjectMeta {
+            namespace: Some("kube-system".to_string()),
+            labels: Some([("app".to_string(), "kube-apiserver".to_string())].into()),
+            annotations: Some(
+                [(
+                    "kubernetes.io/config.mirror".to_string(),
+                    "config-hash".to_string(),
+                )]
+                .into(),
+            ),
+            ..ObjectMeta::default()
+        }
+    }
+
+    #[test]
+    fn service_system_static_kube_apiserver_fallback_preserves_precedence() {
+        for (label, uri, expected) in [
+            (None, None, "kube-apiserver"),
+            (Some(""), None, "kube-apiserver"),
+            (Some("unknown"), Some("system:unknown"), "kube-apiserver"),
+            (None, Some("invalid-uri"), "kube-apiserver"),
+            (None, Some("system:"), "kube-apiserver"),
+            (
+                Some("label-system"),
+                Some("system:annotation-system"),
+                "label-system",
+            ),
+            (None, Some("system:annotation-system"), "annotation-system"),
+            (
+                Some(""),
+                Some("system:annotation-system"),
+                "annotation-system",
+            ),
+            (
+                Some("unknown"),
+                Some("system:annotation-system"),
+                "annotation-system",
+            ),
+        ] {
+            let mut metadata = kube_apiserver_metadata();
+            if let Some(label) = label {
+                metadata
+                    .labels
+                    .as_mut()
+                    .unwrap()
+                    .insert("system".to_string(), label.to_string());
+            }
+            if let Some(uri) = uri {
+                metadata
+                    .annotations
+                    .as_mut()
+                    .unwrap()
+                    .insert("databricks/system_uri".to_string(), uri.to_string());
+            }
+            assert_eq!(
+                service_system_from_metadata(&metadata).as_deref(),
+                Some(expected),
+                "label={label:?}, uri={uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_system_fallback_does_not_guess_other_workloads() {
+        for (namespace, app, mirror) in [
+            ("default", "kube-apiserver", Some("hash")),
+            ("kube-system", "another-app", Some("hash")),
+            ("kube-system", "kube-apiserver", None),
+            ("kube-system", "kube-apiserver", Some("")),
+        ] {
+            let mut metadata = kube_apiserver_metadata();
+            metadata.namespace = Some(namespace.to_string());
+            metadata
+                .labels
+                .as_mut()
+                .unwrap()
+                .insert("app".to_string(), app.to_string());
+            metadata.annotations = mirror
+                .map(|hash| [("kubernetes.io/config.mirror".to_string(), hash.to_string())].into());
+            assert_eq!(
+                service_system_from_metadata(&metadata),
+                None,
+                "namespace={namespace}, app={app}, mirror={mirror:?}"
+            );
+        }
     }
 
     #[test]

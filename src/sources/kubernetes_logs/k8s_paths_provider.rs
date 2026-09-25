@@ -12,7 +12,10 @@ use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::runtime::reflector::{ObjectRef, store::Store};
 use vector_lib::file_source::paths_provider::{LogFileInfo, PathsProvider};
 
-use super::path_helpers::{build_databricks_k8s_pod_logs_directory, build_pod_logs_directory};
+use super::{
+    path_helpers::{build_databricks_k8s_pod_logs_directory, build_pod_logs_directory},
+    pod_metadata_annotator::service_system_from_metadata,
+};
 use crate::kubernetes::pod_manager_logic::extract_static_pod_config_hashsum;
 
 /// A paths provider implementation that uses the state obtained from the
@@ -51,22 +54,7 @@ fn extract_container_name_from_path(
 }
 
 fn service_system_from_pod(pod: &Pod) -> Option<String> {
-    if let Some(system) = pod
-        .metadata
-        .labels
-        .as_ref()
-        .and_then(|labels| labels.get("system"))
-    {
-        return (!system.is_empty()).then(|| system.clone());
-    }
-
-    pod.metadata
-        .annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get("databricks/system_uri"))
-        .and_then(|system_uri| system_uri.strip_prefix("system:"))
-        .filter(|system| !system.is_empty())
-        .map(str::to_string)
+    service_system_from_metadata(&pod.metadata)
 }
 
 fn source_pod_id_from_pod(pod: &Pod) -> Option<String> {
@@ -120,7 +108,10 @@ impl PathsProvider for K8sPathsProvider {
 
         state
             .into_iter()
-            .filter(|pod| self.annotation_selector.matches(pod.metadata.annotations.as_ref()))
+            .filter(|pod| {
+                self.annotation_selector
+                    .matches(pod.metadata.annotations.as_ref())
+            })
             // filter out pods where we haven't fetched the namespace metadata yet
             // they will be picked up on a later run
             // Only check namespace metadata if insert_namespace_fields is enabled
@@ -310,10 +301,10 @@ fn parse_set_requirement(
 
     let values = values.trim();
     if !values.starts_with('(') || !values.ends_with(')') {
-        return Err(
-            format!("annotation selector set requirement must use parentheses: {requirement}")
-                .into(),
-        );
+        return Err(format!(
+            "annotation selector set requirement must use parentheses: {requirement}"
+        )
+        .into());
     }
 
     let values = values[1..values.len() - 1]
@@ -725,8 +716,7 @@ mod tests {
     use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::ObjectMeta};
 
     use super::{
-        AnnotationSelector,
-        DATABRICKS_HOSTPATH_CUSTOMER_LOGGING_ANNOTATION_KEY,
+        AnnotationSelector, DATABRICKS_HOSTPATH_CUSTOMER_LOGGING_ANNOTATION_KEY,
         DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY, build_container_exclusion_patterns,
         extract_databricks_pod_logs_directory, extract_excluded_containers_for_pod,
         extract_hostpath_logging_annotation_directory, extract_pod_logs_directory, filter_paths,
@@ -777,6 +767,26 @@ mod tests {
         assert_eq!(
             service_system_from_pod(&pod).as_deref(),
             Some("annotation-system")
+        );
+    }
+
+    #[test]
+    fn service_system_falls_back_for_static_kube_apiserver_paths() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                namespace: Some("kube-system".to_string()),
+                labels: Some(annotations(vec![("app", "kube-apiserver")])),
+                annotations: Some(annotations(vec![(
+                    "kubernetes.io/config.mirror",
+                    "config-hash",
+                )])),
+                ..ObjectMeta::default()
+            },
+            ..Pod::default()
+        };
+        assert_eq!(
+            service_system_from_pod(&pod).as_deref(),
+            Some("kube-apiserver")
         );
     }
 
