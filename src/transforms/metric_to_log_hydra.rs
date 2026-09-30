@@ -1,7 +1,13 @@
-use chrono::Utc;
+use std::{collections::HashMap, sync::Arc};
+
+use chrono::{DateTime, Utc};
 use md5::{Digest, Md5};
 use serde::{Serialize, Serializer};
-use vector_lib::{configurable::configurable_component, lookup::event_path};
+use vector_lib::{
+    configurable::configurable_component,
+    lookup::event_path,
+    transform::{SyncTransform, TransformOutputsBuf},
+};
 use vrl::value::{KeyString, Value};
 
 use crate::{
@@ -12,7 +18,7 @@ use crate::{
     event::{Event, LogEvent, Metric, MetricTags, MetricValue},
     internal_events::MetricToLogHydraDropped,
     schema::Definition,
-    transforms::{FunctionTransform, OutputBuffer, Transform},
+    transforms::Transform,
 };
 
 /// Native replacement for the three-transform chain used in the Hydra/VAM
@@ -41,11 +47,34 @@ use crate::{
 ))]
 #[derive(Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub struct MetricToLogHydraConfig {}
+pub struct MetricToLogHydraConfig {
+    /// Optional native pod routing. When set, the transform is multi-output: each event goes to the
+    /// named port(s) of its `system`'s pod(s), replacing the downstream `route` transform.
+    #[serde(default)]
+    pod_routing: Option<PodRoutingConfig>,
+}
+
+/// One pod-routing rule: a `system` (or `"*"` catch-all) → the pod(s) it routes to.
+#[configurable_component]
+#[derive(Clone, Debug)]
+pub struct SystemPodRoute {
+    /// System to match (e.g. `lakebase-storage`), or `"*"` for the catch-all. Exactly one `"*"` required.
+    pub system: String,
+    /// Pods to write to; each is an output port. List several to fan out (e.g. migration). Non-empty.
+    pub pods: Vec<String>,
+}
+
+/// Native pod routing: a `system -> pods` table from `pod_config.jsonnet`'s `system_pod_mapping`.
+#[configurable_component]
+#[derive(Clone, Debug)]
+pub struct PodRoutingConfig {
+    /// Routing rules; exactly one must use `system = "*"` (the catch-all).
+    pub systems: Vec<SystemPodRoute>,
+}
 
 impl GenerateConfig for MetricToLogHydraConfig {
     fn generate_config() -> toml::Value {
-        toml::Value::try_from(Self {}).unwrap()
+        toml::Value::try_from(Self::default()).unwrap()
     }
 }
 
@@ -53,25 +82,47 @@ impl GenerateConfig for MetricToLogHydraConfig {
 #[typetag::serde(name = "metric_to_log_hydra")]
 impl TransformConfig for MetricToLogHydraConfig {
     async fn build(&self, _context: &TransformContext) -> crate::Result<Transform> {
-        Ok(Transform::function(MetricToLogHydra::new()))
+        let routing = match &self.pod_routing {
+            Some(cfg) => Some(Arc::new(PodRouting::compile(cfg)?)),
+            None => None,
+        };
+        Ok(Transform::synchronous(MetricToLogHydra::with_routing(routing)))
     }
 
     fn input(&self) -> Input {
         Input::metric()
     }
 
+    /// Without `pod_routing`: one default output (byte-identical to the legacy single-sink path).
+    /// With `pod_routing`: one named output per distinct pod across all rules (including the `"*"`
+    /// catch-all's pods), so downstream sinks bind to `…hydra_transformed.<pod_id>` and no `route`
+    /// transform is needed.
     fn outputs(
         &self,
         _context: &TransformContext,
         input_definitions: &[(OutputId, Definition)],
     ) -> Vec<TransformOutput> {
-        vec![TransformOutput::new(
-            DataType::Log,
+        let defs = || -> std::collections::HashMap<OutputId, Definition> {
             input_definitions
                 .iter()
                 .map(|(id, _)| (id.clone(), Definition::default_legacy_namespace()))
-                .collect(),
-        )]
+                .collect()
+        };
+        match &self.pod_routing {
+            None => vec![TransformOutput::new(DataType::Log, defs())],
+            Some(cfg) => {
+                let mut pods: Vec<&str> = cfg
+                    .systems
+                    .iter()
+                    .flat_map(|s| s.pods.iter().map(String::as_str))
+                    .collect();
+                pods.sort_unstable();
+                pods.dedup();
+                pods.into_iter()
+                    .map(|p| TransformOutput::new(DataType::Log, defs()).with_port(p))
+                    .collect()
+            }
+        }
     }
 
     fn enable_concurrency(&self) -> bool {
@@ -118,8 +169,72 @@ const SUFFIXES: &[(&str, &str)] = &[
     ("_summary", "summary"),
 ];
 
+/// The reserved `system` value marking the catch-all rule.
+const CATCH_ALL_SYSTEM: &str = "*";
+
+/// Compiled routing table: O(1) exact-match on the event's `system_uri`, with the `"*"` rule lifted
+/// into `default`. Built once at config time, shared across instances via `Arc`. Keys are the
+/// event-side `system:<name>` form, so config `system` values are prefixed at compile time.
+struct PodRouting {
+    /// Pods for any `system_uri` not in `by_system_uri` (the `"*"` rule). Always non-empty.
+    default: Vec<String>,
+    by_system_uri: HashMap<String, Vec<String>>,
+}
+
+impl PodRouting {
+    fn compile(cfg: &PodRoutingConfig) -> crate::Result<Self> {
+        let mut default: Option<Vec<String>> = None;
+        let mut by_system_uri: HashMap<String, Vec<String>> = HashMap::new();
+        for r in &cfg.systems {
+            if r.pods.is_empty() {
+                return Err(format!(
+                    "metric_to_log_hydra pod_routing: rule `{}` lists no pods",
+                    r.system
+                )
+                .into());
+            }
+            if r.system == CATCH_ALL_SYSTEM {
+                if default.replace(r.pods.clone()).is_some() {
+                    return Err("metric_to_log_hydra pod_routing: more than one `*` catch-all rule"
+                        .into());
+                }
+            } else if by_system_uri
+                .insert(format!("system:{}", r.system), r.pods.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "metric_to_log_hydra pod_routing: duplicate rule for `{}`",
+                    r.system
+                )
+                .into());
+            }
+        }
+        let default = default.ok_or(
+            "metric_to_log_hydra pod_routing: a `*` catch-all rule is required",
+        )?;
+        Ok(Self {
+            default,
+            by_system_uri,
+        })
+    }
+
+    /// Resolve the pods for an event's `system_uri`; unmatched (or absent) → the `"*"` default.
+    /// Borrows only into `self`, never the event, so the log's read borrow can end before it moves.
+    /// The returned slice is always non-empty.
+    #[inline]
+    fn decide(&self, system_uri: Option<&str>) -> &[String] {
+        system_uri
+            .and_then(|u| self.by_system_uri.get(u))
+            .unwrap_or(&self.default)
+    }
+}
+
 #[derive(Clone, Default)]
-pub struct MetricToLogHydra;
+pub struct MetricToLogHydra {
+    /// `None` = single default output (legacy; a downstream `route`/sink consumes it). `Some` =
+    /// multi-output: emit each event to its pod's named port.
+    routing: Option<Arc<PodRouting>>,
+}
 
 /// Serializes tags as a sorted JSON object from `iter_single()` (MetricTags is BTreeMap-backed, so
 /// already key-sorted) with no intermediate map. Matches VRL's `encode_json(.tags)`; `None` → `{}`.
@@ -150,7 +265,19 @@ impl std::io::Write for HashWriter<'_> {
 
 impl MetricToLogHydra {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    fn with_routing(routing: Option<Arc<PodRouting>>) -> Self {
+        Self { routing }
+    }
+
+    /// Construct with native pod routing (compiles + validates the config once). Public for
+    /// benchmarks/tests; the topology builds via [`MetricToLogHydraConfig::build`].
+    pub fn with_pod_routing(config: &PodRoutingConfig) -> crate::Result<Self> {
+        Ok(Self::with_routing(Some(Arc::new(PodRouting::compile(
+            config,
+        )?))))
     }
 
     /// Strip a known prometheus suffix from `name`, returning (base, type_str).
@@ -261,7 +388,29 @@ impl MetricToLogHydra {
             .unwrap_or_default(),
         );
 
+        // Delta/zerobus-shaped fields, so the pod_prime → databricks_zerobus path needs no
+        // per-event remap. `_timestamp_hour` is a NEW Timestamp field (not a mutation of the
+        // integer `timestamp_hour_ms`, which S3 consumers still read as-is). `_event_time` derives
+        // from `start_ts`; `_partition_date` is its UTC date; `_system`/`_shard_name` mirror the
+        // promoted `system`/`shardName` tags under the table's column names.
+        let event_time = DateTime::<Utc>::from_timestamp_millis(timestamp_ms).unwrap_or_default();
+        let timestamp_hour = DateTime::<Utc>::from_timestamp_millis(timestamp_hour_ms)
+            .unwrap_or_default();
+        let partition_date = event_time.format("%Y-%m-%d").to_string();
+
         let mut log = LogEvent::new_with_metadata(metadata);
+
+        log.insert(event_path!("_event_time"), Value::Timestamp(event_time));
+        log.insert(event_path!("_timestamp_hour"), Value::Timestamp(timestamp_hour));
+        log.insert(
+            event_path!("_partition_date"),
+            Value::Bytes(partition_date.into()),
+        );
+        log.insert(event_path!("_system"), Value::Bytes(system_label.into()));
+        log.insert(
+            event_path!("_shard_name"),
+            Value::Bytes(shard_name.clone().into()),
+        );
 
         log.insert(event_path!("name"), Value::Bytes(original_name.into()));
         log.insert(event_path!("labels"), labels);
@@ -312,15 +461,41 @@ impl MetricToLogHydra {
     }
 }
 
-impl FunctionTransform for MetricToLogHydra {
-    fn transform(&mut self, output: &mut OutputBuffer, event: Event) {
-        match Self::transform_one(event.into_metric()) {
-            Ok(log) => output.push(log.into()),
+impl SyncTransform for MetricToLogHydra {
+    fn transform(&mut self, event: Event, output: &mut TransformOutputsBuf) {
+        let log = match Self::transform_one(event.into_metric()) {
+            Ok(log) => log,
             // Breakdown metric for every drop; standard discard only for loss reasons.
-            Err(reason) => emit!(MetricToLogHydraDropped {
-                reason: reason.as_str(),
-                counts_as_loss: reason.counts_as_loss(),
-            }),
+            Err(reason) => {
+                emit!(MetricToLogHydraDropped {
+                    reason: reason.as_str(),
+                    counts_as_loss: reason.counts_as_loss(),
+                });
+                return;
+            }
+        };
+
+        let Some(routing) = &self.routing else {
+            // No routing: single default output. Downstream reads it with no port suffix, exactly
+            // as before — a following `route`/`filter` transform (or single sink) consumes it.
+            output.push(None, log.into());
+            return;
+        };
+
+        // Route on `system_uri` (set by `transform_one`). `decide` borrows only into `routing`, not
+        // the log, so the log's read borrow ends with this block — before the log is moved below.
+        let pods = {
+            let system_uri = log.get(event_path!("system_uri")).and_then(|v| v.as_str());
+            routing.decide(system_uri.as_deref())
+        };
+        // A pod's name IS its output port. Fan out by cloning for every target but the last and
+        // MOVING into the last — so the common single-pod case is zero clones and no VRL. `pods` is
+        // guaranteed non-empty by `PodRouting::compile`.
+        if let Some((last, rest)) = pods.split_last() {
+            for pod in rest {
+                output.push(Some(pod), log.clone().into());
+            }
+            output.push(Some(last), log.into());
         }
     }
 }
@@ -413,6 +588,48 @@ mod tests {
             get_i64(&log, "timestamp_hour_ms"),
             now_ms - (now_ms % 3_600_000)
         );
+    }
+
+    #[test]
+    fn emits_delta_shaped_fields() {
+        let now_ms = Utc::now().timestamp_millis();
+        let hour_ms = now_ms - (now_ms % 3_600_000);
+        let log = logof(make_gauge(
+            "m",
+            1.0,
+            &[("system", "lakebase-storage"), ("shardName", "shard-7")],
+            now_ms,
+        ));
+
+        // _system / _shard_name mirror the promoted tags under the Delta column names.
+        assert_eq!(get_str(&log, "_system"), "lakebase-storage");
+        assert_eq!(get_str(&log, "_shard_name"), "shard-7");
+
+        // timestamp_hour_ms stays an integer — the S3 contract is unchanged.
+        assert_eq!(get_i64(&log, "timestamp_hour_ms"), hour_ms);
+
+        // _event_time / _timestamp_hour are Timestamp-typed (for the Delta/zerobus path) and equal
+        // the source millis.
+        match log.get(event_path!("_event_time")) {
+            Some(Value::Timestamp(t)) => assert_eq!(t.timestamp_millis(), now_ms),
+            other => panic!("_event_time must be a Timestamp, got {other:?}"),
+        }
+        match log.get(event_path!("_timestamp_hour")) {
+            Some(Value::Timestamp(t)) => assert_eq!(t.timestamp_millis(), hour_ms),
+            other => panic!("_timestamp_hour must be a Timestamp, got {other:?}"),
+        }
+
+        // _partition_date is the UTC date of start_ts.
+        let expected_date = DateTime::<Utc>::from_timestamp_millis(now_ms)
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(get_str(&log, "_partition_date"), expected_date);
+
+        // Absent system/shard → empty strings (matches the old remap's `?? ""`).
+        let log2 = logof(make_gauge("m", 1.0, &[], now_ms));
+        assert_eq!(get_str(&log2, "_system"), "");
+        assert_eq!(get_str(&log2, "_shard_name"), "");
     }
 
     #[test]
@@ -582,32 +799,34 @@ mod tests {
     }
 
     #[test]
-    fn dropped_metric_emits_to_output_buffer_and_counter() {
-        use vector_lib::transform::FunctionTransform;
+    fn dropped_metric_emits_to_output_and_counter() {
         let mut t = MetricToLogHydra::new();
-        let mut buf = OutputBuffer::with_capacity(1);
-
-        // Valid metric → lands in buffer
         let now_ms = Utc::now().timestamp_millis();
-        let good = make_gauge("good_metric", 1.0, &[], now_ms);
-        t.transform(&mut buf, good.into());
-        assert_eq!(buf.len(), 1, "valid metric should be forwarded");
-        let _ = buf.drain().count();
 
-        // Stale metric → dropped, buffer stays empty
-        let stale = make_gauge("stale_metric", 1.0, &[], now_ms - 700_000);
-        t.transform(&mut buf, stale.into());
-        assert_eq!(buf.len(), 0, "stale metric should be dropped");
-
-        // Non-finite gauge and counter (NaN or ±Inf) → dropped, buffer stays empty.
+        // Valid metric → one event on the default output.
+        assert_eq!(
+            run_default(&mut t, make_gauge("good_metric", 1.0, &[], now_ms)).len(),
+            1,
+            "valid metric should be forwarded"
+        );
+        // Stale metric → dropped.
+        assert_eq!(
+            run_default(&mut t, make_gauge("stale_metric", 1.0, &[], now_ms - 700_000)).len(),
+            0,
+            "stale metric should be dropped"
+        );
+        // Non-finite gauge and counter (NaN or ±Inf) → dropped.
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            t.transform(&mut buf, make_gauge("nf_gauge", value, &[], now_ms).into());
-            assert_eq!(buf.len(), 0, "non-finite gauge {value} should be dropped");
-            t.transform(
-                &mut buf,
-                make_counter("nf_counter", value, &[], now_ms).into(),
+            assert_eq!(
+                run_default(&mut t, make_gauge("nf_gauge", value, &[], now_ms)).len(),
+                0,
+                "non-finite gauge {value} should be dropped"
             );
-            assert_eq!(buf.len(), 0, "non-finite counter {value} should be dropped");
+            assert_eq!(
+                run_default(&mut t, make_counter("nf_counter", value, &[], now_ms)).len(),
+                0,
+                "non-finite counter {value} should be dropped"
+            );
         }
     }
 
@@ -656,5 +875,143 @@ mod tests {
         assert!(is_null(&log, "system_uri"));
         assert_eq!(get_str(&log, "shard_name"), "");
         assert_eq!(get_str(&log, "hydra_cluster_column"), "some_metric||");
+    }
+
+    // ── pod routing (named outputs) ────────────────────────────────────────────
+
+    // Build a router from a `default_pod` (becomes the `"*"` rule) plus `(system_uri, pods)` rules.
+    // Returns the transform and its declared output ports (every distinct pod).
+    fn routing(default_pod: &str, systems: &[(&str, &[&str])]) -> (MetricToLogHydra, Vec<String>) {
+        let cfg = pod_cfg(default_pod, systems);
+        let mut ports: Vec<String> = cfg
+            .systems
+            .iter()
+            .flat_map(|s| s.pods.iter().cloned())
+            .collect();
+        ports.sort();
+        ports.dedup();
+        (MetricToLogHydra::with_pod_routing(&cfg).unwrap(), ports)
+    }
+
+    fn pod_cfg(default_pod: &str, systems: &[(&str, &[&str])]) -> PodRoutingConfig {
+        let mut rules: Vec<SystemPodRoute> = systems
+            .iter()
+            .map(|(system, pods)| SystemPodRoute {
+                system: system.to_string(),
+                pods: pods.iter().map(|p| p.to_string()).collect(),
+            })
+            .collect();
+        rules.push(SystemPodRoute {
+            system: CATCH_ALL_SYSTEM.to_string(),
+            pods: vec![default_pod.to_string()],
+        });
+        PodRoutingConfig { systems: rules }
+    }
+
+    // Drive the SyncTransform; return the per-port emitted-event counts.
+    fn run_ports(
+        t: &mut MetricToLogHydra,
+        ports: &[String],
+        metric: Metric,
+    ) -> std::collections::HashMap<String, usize> {
+        let outputs = ports
+            .iter()
+            .map(|p| TransformOutput::new(DataType::Log, Default::default()).with_port(p.clone()))
+            .collect();
+        let mut buf = TransformOutputsBuf::new_with_capacity(outputs, 8);
+        t.transform(Event::Metric(metric), &mut buf);
+        ports
+            .iter()
+            .map(|p| (p.clone(), buf.drain_named(p).count()))
+            .collect()
+    }
+
+    // Drive the no-routing transform; return the events on the single default output.
+    fn run_default(t: &mut MetricToLogHydra, metric: Metric) -> Vec<LogEvent> {
+        let outputs = vec![TransformOutput::new(DataType::Log, Default::default())];
+        let mut buf = TransformOutputsBuf::new_with_capacity(outputs, 8);
+        t.transform(Event::Metric(metric), &mut buf);
+        buf.drain().map(|e| e.into_log()).collect()
+    }
+
+    #[test]
+    fn no_routing_uses_default_output() {
+        let now = Utc::now().timestamp_millis();
+        let mut t = MetricToLogHydra::new();
+        let out = run_default(&mut t, make_gauge("m", 1.0, &[("system", "obs")], now));
+        assert_eq!(out.len(), 1);
+        assert_eq!(get_str(&out[0], "system_uri"), "system:obs");
+    }
+
+    #[test]
+    fn routes_matched_system_to_pod_port() {
+        let now = Utc::now().timestamp_millis();
+        let (mut t, ports) = routing("pod0", &[("lakebase-storage", &["poda"])]);
+        let counts = run_ports(
+            &mut t,
+            &ports,
+            make_gauge("m", 1.0, &[("system", "lakebase-storage")], now),
+        );
+        assert_eq!(counts["poda"], 1);
+        assert_eq!(counts["pod0"], 0);
+    }
+
+    #[test]
+    fn unmatched_system_falls_back_to_default_port() {
+        let now = Utc::now().timestamp_millis();
+        let (mut t, ports) = routing("pod0", &[("lakebase-storage", &["poda"])]);
+        let counts = run_ports(&mut t, &ports, make_gauge("m", 1.0, &[("system", "obs")], now));
+        assert_eq!(counts["pod0"], 1);
+        assert_eq!(counts["poda"], 0);
+    }
+
+    #[test]
+    fn absent_system_uri_uses_default_port() {
+        let now = Utc::now().timestamp_millis();
+        let (mut t, ports) = routing("pod0", &[("lakebase-storage", &["poda"])]);
+        // No `system` tag → system_uri is null → default pod's port.
+        let counts = run_ports(&mut t, &ports, make_gauge("m", 1.0, &[], now));
+        assert_eq!(counts["pod0"], 1);
+        assert_eq!(counts["poda"], 0);
+    }
+
+    #[test]
+    fn multi_pod_system_fans_out_to_every_pod() {
+        let now = Utc::now().timestamp_millis();
+        // Migration / fan-out: one system → three pods. Each event emitted once per pod.
+        let (mut t, ports) = routing(
+            "pod0",
+            &[("lakebase-storage", &["poda", "podb", "pod0"])],
+        );
+        let counts = run_ports(
+            &mut t,
+            &ports,
+            make_gauge("m", 1.0, &[("system", "lakebase-storage")], now),
+        );
+        assert_eq!(counts["poda"], 1);
+        assert_eq!(counts["podb"], 1);
+        assert_eq!(counts["pod0"], 1);
+    }
+
+    #[test]
+    fn compile_requires_catch_all_rule() {
+        let cfg = PodRoutingConfig {
+            systems: vec![SystemPodRoute {
+                system: "lakebase-storage".to_string(),
+                pods: vec!["poda".to_string()],
+            }],
+        };
+        assert!(MetricToLogHydra::with_pod_routing(&cfg).is_err());
+    }
+
+    #[test]
+    fn compile_rejects_duplicate_and_empty_rules() {
+        // Duplicate exact system_uri.
+        let dup = pod_cfg("pod0", &[("x", &["poda"]), ("x", &["podb"])]);
+        assert!(MetricToLogHydra::with_pod_routing(&dup).is_err());
+
+        // Rule with no pods.
+        let empty = pod_cfg("pod0", &[("x", &[])]);
+        assert!(MetricToLogHydra::with_pod_routing(&empty).is_err());
     }
 }
