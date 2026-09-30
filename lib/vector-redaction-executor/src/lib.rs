@@ -250,6 +250,8 @@ pub fn redact_with_mode(
             record.len(),
             u8::from(enforcement == ShapeEnforcement::On),
             u8::from(keep_mode == KeepMode::Keep),
+            // TODO: Plumb shard_name, workspace_fallback, account_fallback, and
+            // metastore_fallback from the Vector event context.
             ForeignStringView::EMPTY,
             ForeignStringView::EMPTY,
             ForeignStringView::EMPTY,
