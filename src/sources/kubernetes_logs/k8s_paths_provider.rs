@@ -564,7 +564,13 @@ fn build_container_exclusion_patterns<'a>(
 /// The emptyDir volume names a pod may write logs to. Scan roots are built by joining these
 /// onto the pod's emptyDir base rather than by enumerating the base, so a volume the pod does
 /// not mount simply has no scan root.
-const VALID_LOG_VOLUME_NAMES: &[&str] = &["logs", "data", "container-build", "event-logs"];
+const VALID_LOG_VOLUME_NAMES: &[&str] = &[
+    "logs",
+    "data",
+    "container-build",
+    "event-logs",
+    "payload-logs",
+];
 fn get_databricks_pod_logs_directories(
     pod: &Pod,
     empty_dir_pod_logs_directory: Option<PathBuf>,
@@ -1336,6 +1342,8 @@ mod tests {
         std::fs::create_dir_all(&temp_logs_volume_path).unwrap();
         let temp_data_volume_path = temp_dir_path.join("data");
         std::fs::create_dir_all(&temp_data_volume_path).unwrap();
+        let temp_payload_logs_volume_path = temp_dir_path.join("payload-logs");
+        std::fs::create_dir_all(&temp_payload_logs_volume_path).unwrap();
         let temp_invalid_volume_path = temp_dir_path.join("invalid_test_volume");
         std::fs::create_dir_all(&temp_invalid_volume_path).unwrap();
         // `container-build` and `event-logs` are deliberately not created: a whitelisted volume the
@@ -1367,6 +1375,7 @@ mod tests {
                     PathBuf::from("/databricks/host-root/local_disk0/sandbox0-custom-logs-path"),
                     temp_data_volume_path.clone(),
                     temp_logs_volume_path.clone(),
+                    temp_payload_logs_volume_path.clone(),
                 ],
             ),
             (
@@ -1380,7 +1389,11 @@ mod tests {
                     ..Pod::default()
                 },
                 vec![],
-                vec![temp_data_volume_path.clone(), temp_logs_volume_path.clone()],
+                vec![
+                    temp_data_volume_path.clone(),
+                    temp_logs_volume_path.clone(),
+                    temp_payload_logs_volume_path.clone(),
+                ],
             ),
         ];
 
