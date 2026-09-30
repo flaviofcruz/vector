@@ -23,7 +23,7 @@ pub use proto_bindings::compliance::DataShape;
 pub use proto_bindings::databricks::logstructuredredactionplan as plan_proto;
 
 #[cfg(feature = "static-executor")]
-const EXPECTED_ABI_VERSION: u32 = 1;
+const EXPECTED_ABI_VERSION: u32 = 2;
 
 #[cfg(feature = "static-executor")]
 #[repr(C)]
@@ -31,6 +31,22 @@ struct ForeignBuffer {
     data: *mut u8,
     len: usize,
     _capacity: usize,
+}
+
+#[cfg(feature = "static-executor")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ForeignStringView {
+    data: *const u8,
+    len: usize,
+}
+
+#[cfg(feature = "static-executor")]
+impl ForeignStringView {
+    const EMPTY: Self = Self {
+        data: ptr::null(),
+        len: 0,
+    };
 }
 
 #[cfg(feature = "static-executor")]
@@ -97,8 +113,12 @@ unsafe extern "C" {
         handle: u64,
         record: *const u8,
         record_len: usize,
-        enforce_shapes: u8,
+        shape_enforcement_mode: u8,
         keep_original: u8,
+        shard_name: ForeignStringView,
+        workspace_fallback: ForeignStringView,
+        account_fallback: ForeignStringView,
+        metastore_fallback: ForeignStringView,
         out_record: *mut ForeignBuffer,
         out_error: *mut ForeignBuffer,
     ) -> i32;
@@ -218,6 +238,7 @@ pub fn redact_with_mode(
     enforcement: ShapeEnforcement,
     keep_mode: KeepMode,
 ) -> Result<Bytes, RedactError> {
+    ensure_abi_version()?;
     let mut output = ForeignBuffer::EMPTY;
     let mut error = ForeignBuffer::EMPTY;
     // SAFETY: The record remains live for the call. The output pointers reference distinct,
@@ -229,6 +250,12 @@ pub fn redact_with_mode(
             record.len(),
             u8::from(enforcement == ShapeEnforcement::On),
             u8::from(keep_mode == KeepMode::Keep),
+            // TODO: Plumb shard_name, workspace_fallback, account_fallback, and
+            // metastore_fallback from the Vector event context.
+            ForeignStringView::EMPTY,
+            ForeignStringView::EMPTY,
+            ForeignStringView::EMPTY,
+            ForeignStringView::EMPTY,
             &mut output,
             &mut error,
         )
@@ -306,6 +333,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uses_current_abi_version() {
+        assert_eq!(
+            // SAFETY: This function has no preconditions.
+            unsafe { db_redactor_abi_version() },
+            EXPECTED_ABI_VERSION
+        );
+    }
+
+    #[test]
     fn rejects_invalid_plan_through_real_static_library() {
         assert!(matches!(
             register_plan(b"not a plan"),
@@ -365,6 +401,10 @@ mod tests {
                 record.len(),
                 0,
                 0,
+                ForeignStringView::EMPTY,
+                ForeignStringView::EMPTY,
+                ForeignStringView::EMPTY,
+                ForeignStringView::EMPTY,
                 &mut output,
                 &mut error,
             )
