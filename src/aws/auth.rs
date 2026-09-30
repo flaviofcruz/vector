@@ -280,7 +280,7 @@ impl AwsAuthentication {
 
     /// Create the AssumeRoleProviderBuilder, ensuring we create the HTTP client with
     /// the correct proxy and TLS options.
-    fn assume_role_provider_builder(
+    async fn assume_role_provider_builder(
         proxy: &ProxyConfig,
         tls_options: Option<&TlsConfig>,
         region: &Region,
@@ -289,11 +289,7 @@ impl AwsAuthentication {
         session_name: Option<&str>,
     ) -> crate::Result<AssumeRoleProviderBuilder> {
         let connector = super::connector(proxy, tls_options)?;
-        let config = SdkConfig::builder()
-            .http_client(connector)
-            .region(region.clone())
-            .time_source(SystemTimeSource::new())
-            .build();
+        let config = assume_role_sdk_config(region, connector).await;
 
         let mut builder = AssumeRoleProviderBuilder::new(assume_role)
             .region(region.clone())
@@ -341,7 +337,8 @@ impl AwsAuthentication {
                         assume_role,
                         external_id.as_deref(),
                         session_name.as_deref(),
-                    )?;
+                    )
+                    .await?;
 
                     let provider = builder.build_from_provider(provider).await;
 
@@ -414,7 +411,8 @@ impl AwsAuthentication {
                     assume_role,
                     external_id.as_deref(),
                     session_name.as_deref(),
-                )?;
+                )
+                .await?;
 
                 let provider = builder
                     .build_from_provider(
@@ -450,6 +448,21 @@ impl AwsAuthentication {
             session_token: None,
         }
     }
+}
+
+pub(super) async fn assume_role_sdk_config(
+    region: &Region,
+    connector: aws_types::sdk_config::SharedHttpClient,
+) -> SdkConfig {
+    let provider_config = ProviderConfig::empty().with_region(Some(region.clone()));
+    let use_fips =
+        aws_config::default_provider::use_fips::use_fips_provider(&provider_config).await;
+    let mut builder = SdkConfig::builder()
+        .http_client(connector)
+        .region(region.clone())
+        .time_source(SystemTimeSource::new());
+    builder.set_use_fips(use_fips);
+    builder.build()
 }
 
 async fn default_credentials_provider(

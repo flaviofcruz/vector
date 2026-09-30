@@ -3,6 +3,18 @@ pub mod auth;
 pub mod region;
 pub mod timeout;
 
+#[cfg(all(test, feature = "sinks-aws_s3", feature = "sinks-aws_kinesis_streams"))]
+mod endpoint_tests;
+#[cfg(all(
+    test,
+    any(
+        feature = "sources-aws_s3",
+        feature = "sinks-aws_s3",
+        feature = "sinks-aws_kinesis_streams"
+    )
+))]
+pub(crate) mod test_util;
+
 use std::{
     error::Error,
     pin::Pin,
@@ -89,12 +101,8 @@ fn check_response(res: &HttpResponse) -> bool {
     //
     // Now just look for those when it's a client_error
     let re = RETRIABLE_CODES.get_or_init(|| {
-        RegexSet::new([
-            "RequestTimeout",
-            "RequestExpired",
-            "ThrottlingException",
-        ])
-        .expect("invalid regex")
+        RegexSet::new(["RequestTimeout", "RequestExpired", "ThrottlingException"])
+            .expect("invalid regex")
     });
 
     let status = res.status();

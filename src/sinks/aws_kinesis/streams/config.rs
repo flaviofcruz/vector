@@ -43,7 +43,12 @@ impl ClientBuilder for KinesisClientBuilder {
     type Client = KinesisClient;
 
     fn build(&self, config: &aws_types::SdkConfig) -> Self::Client {
-        KinesisClient::new(config)
+        let mut builder = aws_sdk_kinesis::config::Builder::from(config);
+        // The SDK rejects FIPS resolution with a custom endpoint.
+        builder.set_use_fips(Some(
+            config.endpoint_url().is_none() && config.use_fips().unwrap_or(false),
+        ));
+        KinesisClient::from_conf(builder.build())
     }
 }
 
@@ -234,7 +239,8 @@ impl RetryLogic for KinesisRetryLogic {
             if matches!(
                 inner.err(),
                 PutRecordsError::ProvisionedThroughputExceededException(_)
-            ) && self.retry_partial {
+            ) && self.retry_partial
+            {
                 return true;
             }
         }
@@ -272,5 +278,86 @@ mod tests {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<KinesisStreamsSinkConfig>();
+    }
+}
+
+#[cfg(test)]
+mod fips_endpoint_tests {
+    use super::*;
+    use crate::aws::test_util::CaptureClient;
+
+    const LIST_STREAMS_RESPONSE: &str = r#"{"StreamNames":[],"HasMoreStreams":false}"#;
+
+    #[tokio::test]
+    async fn fips_kinesis_requests_use_regional_endpoints() {
+        for region in [
+            "us-east-1",
+            "us-east-2",
+            "us-west-1",
+            "us-west-2",
+            "us-gov-east-1",
+            "us-gov-west-1",
+        ] {
+            for requested in [None, Some(false), Some(true)] {
+                let http = CaptureClient::new(LIST_STREAMS_RESPONSE);
+                let client = KinesisClientBuilder.build(&http.config(region, requested));
+                client.list_streams().send().await.unwrap();
+                let service = if requested == Some(true) && !region.starts_with("us-gov-") {
+                    "kinesis-fips"
+                } else {
+                    "kinesis"
+                };
+                let requests = http.requests.lock().unwrap();
+                assert_eq!(
+                    requests[0].uri(),
+                    format!("https://{service}.{region}.amazonaws.com/")
+                );
+                assert!(
+                    requests[0]
+                        .headers()
+                        .get("authorization")
+                        .unwrap()
+                        .contains(&format!("/{region}/kinesis/aws4_request"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fips_kinesis_preserves_custom_endpoints() {
+        for requested in [None, Some(false), Some(true)] {
+            for region in ["us-east-1", "ca-central-1", "cn-north-1"] {
+                let http = CaptureClient::new(LIST_STREAMS_RESPONSE);
+                let config = http
+                    .config(region, requested)
+                    .into_builder()
+                    .endpoint_url("https://private-kinesis.example.invalid")
+                    .build();
+                let client = KinesisClientBuilder.build(&config);
+                client.list_streams().send().await.unwrap();
+                let requests = http.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(
+                    requests[0].uri(),
+                    "https://private-kinesis.example.invalid/"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fips_kinesis_does_not_fallback_on_endpoint_resolution_failure() {
+        for (region, endpoint) in [(None, None), (Some("us-east-1"), Some("not a URL"))] {
+            let http = CaptureClient::new(LIST_STREAMS_RESPONSE);
+            let mut config = http.config("us-east-1", Some(true)).into_builder();
+            config.set_region(region.map(aws_types::region::Region::new));
+            config.set_endpoint_url(endpoint.map(str::to_owned));
+            let client = KinesisClientBuilder.build(&config.build());
+            let error = client.list_streams().send().await.unwrap_err();
+            if endpoint.is_none() {
+                assert!(format!("{error:?}").contains("Missing Region"), "{error:?}");
+            }
+            assert!(http.requests.lock().unwrap().is_empty());
+        }
     }
 }

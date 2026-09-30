@@ -158,6 +158,7 @@ pub struct S3SinkConfig {
     /// Specifies which addressing style to use.
     ///
     /// This controls if the bucket name is in the hostname or part of the URL.
+    /// SDK-resolved FIPS endpoints require the bucket in the hostname, overriding this setting.
     #[serde(default = "crate::serde::default_true")]
     pub force_path_style: bool,
 
