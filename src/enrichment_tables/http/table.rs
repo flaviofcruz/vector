@@ -19,12 +19,12 @@ use bytes::{Buf, Bytes};
 use http::{Request, Uri};
 use http_body::Body as HttpBody;
 use hyper::Body;
-use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
+use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use vector_lib::{
-    TimeZone,
     conversion::Conversion,
     enrichment::{Case, Condition, IndexHandle, Table},
+    TimeZone,
 };
 use vrl::value::{ObjectMap, Value};
 
@@ -91,46 +91,48 @@ impl HttpTable {
         // endpoint recovers. This mirrors the fail-open behavior of every other path in this
         // table (stale-cache fallback, keep-last-good on refresh failure) and the config-reload
         // path, which already logs and keeps serving rather than aborting.
-        let (rows, from_fresh_cache, started_empty) =
-            match fresh_cache(&config, cache_path.as_ref()) {
-                Some(rows) => (rows, true, false),
-                None => match ctx.fetch_all_pages().await {
-                    Ok(rows) => (rows, false, false),
-                    Err(e) => {
-                        // Fetch failed on first build: fall back to a stale cache if one exists,
-                        // otherwise start empty and let the background refresh recover.
-                        match any_cache(cache_path.as_ref()) {
-                            Some(stale) => {
-                                warn!(
-                                    message = "Initial HTTP enrichment table fetch failed; serving stale cached snapshot.",
-                                    url = %config.url,
-                                    error = %e,
-                                );
-                                (stale.rows, true, false)
-                            }
-                            None if config.require_initial_load => {
-                                // Opt-in fail-fast: the dataset is a hard dependency, so a
-                                // failed initial load with no cache aborts startup (the topology
-                                // builder turns this Err into `exitcode::CONFIG`).
-                                return Err(format!(
-                                    "failed to load HTTP enrichment table from {}: {e}",
-                                    config.url
-                                )
-                                .into());
-                            }
-                            None => {
-                                error!(
-                                    message = "Initial HTTP enrichment table load failed and no cache is available; starting empty and will retry in the background. Lookups match nothing until a refresh succeeds.",
-                                    url = %config.url,
-                                    error = %e,
-                                    internal_log_rate_limit = false,
-                                );
-                                (Vec::new(), false, true)
-                            }
+        let (rows, from_fresh_cache, started_empty) = match fresh_cache(
+            &config,
+            cache_path.as_ref(),
+        ) {
+            Some(rows) => (rows, true, false),
+            None => match ctx.fetch_all_pages().await {
+                Ok(rows) => (rows, false, false),
+                Err(e) => {
+                    // Fetch failed on first build: fall back to a stale cache if one exists,
+                    // otherwise start empty and let the background refresh recover.
+                    match any_cache(cache_path.as_ref()) {
+                        Some(stale) => {
+                            warn!(
+                                message = "Initial HTTP enrichment table fetch failed; serving stale cached snapshot.",
+                                url = %config.url,
+                                error = %e,
+                            );
+                            (stale.rows, true, false)
+                        }
+                        None if config.require_initial_load => {
+                            // Opt-in fail-fast: the dataset is a hard dependency, so a
+                            // failed initial load with no cache aborts startup (the topology
+                            // builder turns this Err into `exitcode::CONFIG`).
+                            return Err(format!(
+                                "failed to load HTTP enrichment table from {}: {e}",
+                                config.url
+                            )
+                            .into());
+                        }
+                        None => {
+                            error!(
+                                message = "Initial HTTP enrichment table load failed and no cache is available; starting empty and will retry in the background. Lookups match nothing until a refresh succeeds.",
+                                url = %config.url,
+                                error = %e,
+                                internal_log_rate_limit = false,
+                            );
+                            (Vec::new(), false, true)
                         }
                     }
-                },
-            };
+                }
+            },
+        };
 
         let indexed = decode_indexed(&rows, &config.schema, timezone);
         let shared = Arc::new(Shared {
@@ -600,8 +602,16 @@ fn decode_indexed(
     schema: &HashMap<String, String>,
     timezone: TimeZone,
 ) -> IndexedData {
-    // Column set is the union of object keys across all rows, in first-seen order.
-    let mut columns: Vec<String> = Vec::new();
+    // Column set is the union of object keys across all rows, in first-seen order. An empty
+    // response has no row keys to discover, so expose the configured schema columns instead;
+    // this lets callers register indexes before a later refresh supplies the first rows.
+    let mut columns = if rows.is_empty() {
+        let mut configured = schema.keys().cloned().collect::<Vec<_>>();
+        configured.sort();
+        configured
+    } else {
+        Vec::new()
+    };
     let mut seen: HashSet<String> = HashSet::new();
     for row in rows {
         if let Some(obj) = row.as_object() {
@@ -892,6 +902,46 @@ mod tests {
     }
 
     #[test]
+    fn empty_response_uses_schema_columns_and_preserves_index_handle_after_refresh() {
+        let schema = HashMap::from([
+            ("puid".to_string(), "integer".to_string()),
+            ("user_id".to_string(), "integer".to_string()),
+        ]);
+        let mut table = table_from(decode_indexed(&[], &schema, TimeZone::default()));
+
+        assert_eq!(table.shared.data.load().headers(), &["puid", "user_id"]);
+        let user_id_index = table
+            .add_index(Case::Sensitive, &["user_id"])
+            .expect("schema column must be indexable before the first populated response");
+
+        let condition = [Condition::Equals {
+            field: "user_id",
+            value: Value::Integer(42),
+        }];
+        assert!(table
+            .find_table_rows(Case::Sensitive, &condition, None, None, Some(user_id_index),)
+            .unwrap()
+            .is_empty());
+
+        {
+            let specs = table.shared.index_specs.lock().unwrap();
+            let mut refreshed = decode_indexed(
+                &rows(r#"[{"user_id": 42, "puid": -7}]"#),
+                &schema,
+                TimeZone::default(),
+            );
+            refreshed.reapply_indexes(&specs);
+            table.shared.data.store(Arc::new(refreshed));
+        }
+
+        let matches = table
+            .find_table_rows(Case::Sensitive, &condition, None, None, Some(user_id_index))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].get("puid"), Some(&Value::Integer(-7)));
+    }
+
+    #[test]
     fn missing_keys_default_to_null() {
         let data = decode_indexed(
             &rows(r#"[{"id": 1, "name": "a"}, {"id": 2}]"#),
@@ -1028,13 +1078,11 @@ mod tests {
     #[test]
     fn none_and_cursor_pagination_seed_no_first_request_params() {
         assert!(initial_page_params(&PaginationConfig::None).is_empty());
-        assert!(
-            initial_page_params(&PaginationConfig::Cursor {
-                token_pointer: "/next".to_string(),
-                token_param: "cursor".to_string(),
-            })
-            .is_empty()
-        );
+        assert!(initial_page_params(&PaginationConfig::Cursor {
+            token_pointer: "/next".to_string(),
+            token_param: "cursor".to_string(),
+        })
+        .is_empty());
     }
 
     #[test]
@@ -1187,7 +1235,8 @@ mod tests {
             .await
             .expect_err("build must fail when require_initial_load is set and the fetch fails");
         assert!(
-            err.to_string().contains("failed to load HTTP enrichment table"),
+            err.to_string()
+                .contains("failed to load HTTP enrichment table"),
             "unexpected error: {err}"
         );
     }
@@ -1248,7 +1297,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(recovered, "table did not recover in the background within the deadline");
+        assert!(
+            recovered,
+            "table did not recover in the background within the deadline"
+        );
         let row = table
             .find_table_row(
                 Case::Sensitive,
