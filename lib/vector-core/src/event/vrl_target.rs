@@ -56,6 +56,7 @@ pub enum TargetEvents {
 pub struct TargetIter<T> {
     iter: std::vec::IntoIter<Value>,
     metadata: EventMetadata,
+    delivery_ranges: Option<std::vec::IntoIter<Option<(u64, u64)>>>,
     _marker: PhantomData<T>,
     log_namespace: LogNamespace,
 }
@@ -71,16 +72,64 @@ impl Iterator for TargetIter<LogEvent> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(|v| {
+            let mut metadata = self.metadata.clone();
+            if let Some(ranges) = &mut self.delivery_ranges
+                && let Some(accounting) = metadata.delivery_path_accounting_mut()
+            {
+                accounting.retain_content(ranges.next().flatten());
+            }
             match self.log_namespace {
                 LogNamespace::Legacy => match v {
-                    value @ Value::Object(_) => LogEvent::from_parts(value, self.metadata.clone()),
-                    value => create_log_event(value, self.metadata.clone()),
+                    value @ Value::Object(_) => LogEvent::from_parts(value, metadata),
+                    value => create_log_event(value, metadata),
                 },
-                LogNamespace::Vector => LogEvent::from_parts(v, self.metadata.clone()),
+                LogNamespace::Vector => LogEvent::from_parts(v, metadata),
             }
             .into()
         })
     }
+}
+
+// A remap that truncates/splits content can declare the retained byte interval of each output.
+// Reject overlapping intervals so cloned output metadata cannot manufacture delivery credit.
+fn take_delivery_ranges(
+    metadata: &mut EventMetadata,
+    outputs: usize,
+) -> Option<Vec<Option<(u64, u64)>>> {
+    let path = vrl::path!("delivery_path_accounting", "output_ranges");
+    metadata.value().get(path)?;
+    let value = metadata.value_mut().remove(path, false)?;
+    let parse = || -> Option<Vec<Option<(u64, u64)>>> {
+        let Value::Array(values) = value else {
+            return None;
+        };
+        if values.len() != outputs {
+            return None;
+        }
+        let mut ranges = Vec::with_capacity(outputs);
+        let mut previous_end = None;
+        for value in values {
+            let Value::Array(pair) = value else {
+                return None;
+            };
+            let [Value::Integer(start), Value::Integer(end)] = pair.as_slice() else {
+                return None;
+            };
+            if *start < 0 || end < start || previous_end.is_some_and(|previous| previous >= *start)
+            {
+                return None;
+            }
+            previous_end = Some(*end);
+            ranges.push(Some((*start as u64, *end as u64)));
+        }
+        Some(ranges)
+    };
+    Some(parse().unwrap_or_else(|| {
+        tracing::warn!(
+            message = "Invalid delivery accounting output ranges; withholding delivery credit."
+        );
+        vec![None; outputs]
+    }))
 }
 
 impl Iterator for TargetIter<TraceEvent> {
@@ -144,25 +193,42 @@ impl VrlTarget {
     /// array to `.` in VRL.
     pub fn into_events(self, log_namespace: LogNamespace) -> TargetEvents {
         match self {
-            VrlTarget::LogEvent(value, metadata) => match value {
-                value @ Value::Object(_) => {
-                    TargetEvents::One(LogEvent::from_parts(value, metadata).into())
+            VrlTarget::LogEvent(value, mut metadata) => {
+                let outputs = match &value {
+                    Value::Array(values) => values.len(),
+                    _ => 1,
+                };
+                let ranges = take_delivery_ranges(&mut metadata, outputs);
+                if outputs == 1
+                    && !matches!(value, Value::Array(_))
+                    && let Some(ranges) = &ranges
+                    && let Some(accounting) = metadata.delivery_path_accounting_mut()
+                {
+                    accounting.retain_content(ranges[0]);
                 }
-
-                Value::Array(values) => TargetEvents::Logs(TargetIter {
-                    iter: values.into_iter(),
-                    metadata,
-                    _marker: PhantomData,
-                    log_namespace,
-                }),
-
-                v => match log_namespace {
-                    LogNamespace::Vector => {
-                        TargetEvents::One(LogEvent::from_parts(v, metadata).into())
+                match value {
+                    value @ Value::Object(_) => {
+                        TargetEvents::One(LogEvent::from_parts(value, metadata).into())
                     }
-                    LogNamespace::Legacy => TargetEvents::One(create_log_event(v, metadata).into()),
-                },
-            },
+
+                    Value::Array(values) => TargetEvents::Logs(TargetIter {
+                        iter: values.into_iter(),
+                        metadata,
+                        delivery_ranges: ranges.map(Vec::into_iter),
+                        _marker: PhantomData,
+                        log_namespace,
+                    }),
+
+                    v => match log_namespace {
+                        LogNamespace::Vector => {
+                            TargetEvents::One(LogEvent::from_parts(v, metadata).into())
+                        }
+                        LogNamespace::Legacy => {
+                            TargetEvents::One(create_log_event(v, metadata).into())
+                        }
+                    },
+                }
+            }
             VrlTarget::Trace(value, metadata) => match value {
                 value @ Value::Object(_) => {
                     let log = LogEvent::from_parts(value, metadata);
@@ -172,6 +238,7 @@ impl VrlTarget {
                 Value::Array(values) => TargetEvents::Traces(TargetIter {
                     iter: values.into_iter(),
                     metadata,
+                    delivery_ranges: None,
                     _marker: PhantomData,
                     log_namespace,
                 }),
@@ -691,6 +758,68 @@ mod test {
 
     use super::{super::MetricValue, *};
     use crate::metric_tags;
+
+    #[test]
+    fn delivery_ranges_reject_truncation_unknown_provenance_and_overlap() {
+        use vector_common::internal_event::vector_event::delivery_path::{
+            DeliveryPathAccounting, DeliverySourceLabels,
+        };
+        let mut accounting = DeliveryPathAccounting::at_read(
+            DeliverySourceLabels {
+                process_generation_id: "process".into(),
+                time_parity: 0,
+                topic: "service-log".into(),
+                delivery_method: "file".into(),
+                service_system: "service".into(),
+                source_pod_id: "pod".into(),
+            },
+            ["online".into()],
+        );
+        accounting.record_content(4);
+        accounting.select_path("online");
+        for (ranges, outputs, expected) in [
+            (vrl::value!([[0, 4]]), 1, 1),
+            (vrl::value!([[0, 3]]), 1, 0),
+            (vrl::value!([[0, 2], [3, 4]]), 2, 0),
+            (vrl::value!([[0, 4], [0, 4]]), 2, 0),
+            (vrl::value!([[0, 4]]), 2, 0),
+            (vrl::value!([[4, 0]]), 1, 0),
+            (vrl::value!([[(-1), 4]]), 1, 0),
+            (vrl::value!("invalid"), 1, 0),
+        ] {
+            for tracked in [true, false] {
+                let mut metadata = EventMetadata::default();
+                let mut accounting = accounting.clone();
+                if !tracked {
+                    accounting.shift_content(None);
+                }
+                metadata.set_delivery_path_accounting(Some(accounting));
+                metadata.value_mut().insert(
+                    vrl::path!("delivery_path_accounting", "output_ranges"),
+                    ranges.clone(),
+                );
+                let value = Value::Array(vec![vrl::value!({"message": "output"}); outputs]);
+                let TargetEvents::Logs(events) =
+                    VrlTarget::LogEvent(value, metadata).into_events(LogNamespace::Legacy)
+                else {
+                    panic!("expected logs");
+                };
+                let delivered: u64 = events
+                    .map(|event| {
+                        event
+                            .metadata()
+                            .delivery_path_accounting()
+                            .unwrap()
+                            .counts
+                            .iter()
+                            .map(|count| count.count)
+                            .sum::<u64>()
+                    })
+                    .sum();
+                assert_eq!(delivered, if tracked { expected } else { 0 }, "{ranges:?}");
+            }
+        }
+    }
 
     #[test]
     fn test_field_definitions_in_message() {

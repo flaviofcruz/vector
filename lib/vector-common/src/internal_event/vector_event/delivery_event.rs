@@ -1027,6 +1027,7 @@ mod topic_inference_tests {
                 },
                 count,
                 selected: true,
+                content_ranges: Vec::new(),
             };
             VectorSinkDeliveryEvent::with_count_map(HashMap::from([(
                 "same-source-path".to_owned(),

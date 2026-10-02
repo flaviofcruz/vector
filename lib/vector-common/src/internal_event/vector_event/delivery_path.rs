@@ -33,12 +33,25 @@ pub struct DeliveryPathCount {
     pub count: u64,
     /// Only an explicitly selected outbound branch can earn delivery credit.
     pub selected: bool,
+    /// Original READ records within the current message. Empty for older/untracked payloads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_ranges: Vec<DeliveryContentRange>,
+}
+
+/// Byte range of an indivisible READ record, with an exclusive end offset.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeliveryContentRange {
+    pub start: u64,
+    pub end: u64,
+    pub count: u64,
 }
 
 #[cfg(feature = "byte_size_of")]
 impl ByteSizeOf for DeliveryPathCount {
     fn allocated_bytes(&self) -> usize {
-        self.path.allocated_bytes() + self.source.allocated_bytes()
+        self.path.allocated_bytes()
+            + self.source.allocated_bytes()
+            + self.content_ranges.capacity() * std::mem::size_of::<DeliveryContentRange>()
     }
 }
 
@@ -60,6 +73,7 @@ impl DeliveryPathAccounting {
                     source: source.clone(),
                     count: 1,
                     selected: false,
+                    content_ranges: Vec::new(),
                 });
             }
         }
@@ -68,6 +82,58 @@ impl DeliveryPathAccounting {
 
     pub fn has_path(&self, path: &str) -> bool {
         self.counts.iter().any(|count| count.path == path)
+    }
+
+    /// Called on each parsed source record, before any payload concatenation.
+    pub fn record_content(&mut self, bytes: usize) {
+        for count in &mut self.counts {
+            count.content_ranges = vec![DeliveryContentRange {
+                start: 0,
+                end: bytes as u64,
+                count: count.count,
+            }];
+        }
+    }
+
+    /// Rebase an appended record's ranges, or invalidate them for unsupported payload mergers.
+    pub fn shift_content(&mut self, offset: Option<usize>) {
+        for count in &mut self.counts {
+            if let Some(offset) = offset {
+                for range in &mut count.content_ranges {
+                    range.start = range.start.saturating_add(offset as u64);
+                    range.end = range.end.saturating_add(offset as u64);
+                }
+            } else {
+                count.content_ranges.clear();
+            }
+        }
+    }
+
+    /// Credit only whole READ records retained by one output. Unknown provenance fails closed.
+    pub fn retain_content(&mut self, retained: Option<(u64, u64)>) {
+        for count in &mut self.counts {
+            let original_len = count.content_ranges.len();
+            count.content_ranges.retain_mut(|range| {
+                if let Some((start, end)) = retained
+                    && start <= range.start
+                    && range.end <= end
+                {
+                    range.start -= start;
+                    range.end -= start;
+                    true
+                } else {
+                    false
+                }
+            });
+            if count.content_ranges.len() < original_len {
+                count.content_ranges.shrink_to_fit();
+            }
+            count.count = count
+                .content_ranges
+                .iter()
+                .map(|range| range.count)
+                .fold(0, u64::saturating_add);
+        }
     }
 
     /// Select existing requirements for this branch without creating new READs.
@@ -111,6 +177,7 @@ impl DeliveryPathAccounting {
                     && existing.selected == count.selected
             }) {
                 existing.count = existing.count.saturating_add(count.count);
+                existing.content_ranges.extend(count.content_ranges);
             } else {
                 self.counts.push(count);
             }
@@ -244,6 +311,7 @@ mod tests {
             source: source_labels("original-process"),
             count: 3,
             selected: false,
+            content_ranges: Vec::new(),
         };
         metrics::with_local_recorder(&recorder, || {
             count.emit(DeliveryEventStage::Staged);
@@ -294,6 +362,7 @@ mod tests {
             source: source_labels("p"),
             count: 1,
             selected: false,
+            content_ranges: Vec::new(),
         };
         metrics::with_local_recorder(&recorder, || {
             count.emit(DeliveryEventStage::Read);

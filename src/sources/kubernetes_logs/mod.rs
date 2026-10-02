@@ -1502,11 +1502,26 @@ impl Source {
         });
 
         let mut parser = Parser::new(log_namespace, extract_databricks_logs);
-        let events = events.flat_map(move |event| {
-            let mut buf = OutputBuffer::with_capacity(1);
-            parser.transform(&mut buf, event);
-            futures::stream::iter(buf.into_events())
-        });
+        let events = events
+            .flat_map(move |event| {
+                let mut buf = OutputBuffer::with_capacity(1);
+                parser.transform(&mut buf, event);
+                futures::stream::iter(buf.into_events())
+            })
+            .map(move |mut event| {
+                // Account payload bytes after removing CRI/Docker framing, without moving READ.
+                let bytes = event
+                    .as_log()
+                    .get(&transform_utils::get_message_path(log_namespace))
+                    .and_then(Value::as_bytes)
+                    .map(|message| message.len());
+                if let Some(bytes) = bytes
+                    && let Some(accounting) = event.metadata_mut().delivery_path_accounting_mut()
+                {
+                    accounting.record_content(bytes);
+                }
+                event
+            });
 
         let (events_count, _) = events.size_hint();
 

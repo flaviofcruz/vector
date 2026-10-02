@@ -11,6 +11,7 @@ use crate::event::{Event, EventArray, LogEvent};
 use vector_common::internal_event::vector_event::{
     EventWithEventLog, VectorSinkEventMetadata,
     delivery_event::{MetadataValuesCount, VectorSinkDeliveryEvent},
+    delivery_path::DeliveryPathCount,
     file_send_event::{FileEventMetadata, VectorFileSendEvent},
 };
 
@@ -235,7 +236,15 @@ pub fn generate_count_map(
                                 count: path_count.count as usize,
                                 metric_count: path_count.count as usize,
                                 size: 0,
-                                delivery_path_count: Some(path_count.clone()),
+                                // Content ranges are needed only while transforming payloads,
+                                // not in the per-request counter projection.
+                                delivery_path_count: Some(DeliveryPathCount {
+                                    path: path_count.path.clone(),
+                                    source: path_count.source.clone(),
+                                    count: path_count.count,
+                                    selected: path_count.selected,
+                                    content_ranges: Vec::new(),
+                                }),
                             });
                     }
                 }
@@ -357,7 +366,7 @@ mod tests {
     #[test]
     fn mixed_batches_keep_vel_totals_but_emit_each_event_in_only_one_counter_form() {
         let mut event = event_with_delivery_count(7);
-        let accounting = DeliveryPathAccounting::at_read(
+        let mut accounting = DeliveryPathAccounting::at_read(
             DeliverySourceLabels {
                 process_generation_id: "source-process".to_owned(),
                 time_parity: 3_600_000,
@@ -368,6 +377,7 @@ mod tests {
             },
             ["blob".to_owned(), "online".to_owned()],
         );
+        accounting.record_content(7);
         let mut selected = accounting.clone();
         selected.select_path("online");
         for accounting in [accounting, selected, DeliveryPathAccounting::default()] {
@@ -377,6 +387,12 @@ mod tests {
                 .set_delivery_path_accounting(Some(accounting));
             let enrolled_map = generate_count_map(&[event.clone()], true);
             assert_eq!(enrolled_map.len(), if selected { 2 } else { 1 });
+            assert!(
+                enrolled_map
+                    .values()
+                    .filter_map(|value| value.delivery_path_count.as_ref())
+                    .all(|count| count.content_ranges.is_empty())
+            );
             let unscoped = enrolled_map
                 .values()
                 .find(|v| v.delivery_path_count.is_none())

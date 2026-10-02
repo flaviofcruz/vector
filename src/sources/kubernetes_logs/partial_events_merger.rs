@@ -34,7 +34,7 @@ struct PartialEventMergeState {
 impl PartialEventMergeState {
     fn add_event(
         &mut self,
-        event: LogEvent,
+        mut event: LogEvent,
         file: &str,
         message_path: &OwnedTargetPath,
         expiration_time: Duration,
@@ -53,6 +53,7 @@ impl PartialEventMergeState {
             {
                 bytes_mut.extend_from_slice(prev_value);
                 bytes_mut.extend_from_slice(new_value);
+                let content_offset = prev_value.len();
 
                 // drop event if it's bigger than max allowed
                 if let Some(max_merged_line_bytes) = self.maybe_max_merged_line_bytes
@@ -68,6 +69,19 @@ impl PartialEventMergeState {
                 }
 
                 *prev_value = bytes_mut.freeze();
+
+                if let Some(accounting) = event.metadata_mut().delivery_path_accounting_mut() {
+                    accounting.shift_content(Some(content_offset));
+                }
+
+                // Each CRI fragment was counted at READ, before partial merging.
+                let count = bucket
+                    .event
+                    .metadata()
+                    .delivery_event_count()
+                    .saturating_add(event.metadata().delivery_event_count());
+                bucket.event.metadata_mut().merge(event.into_parts().1);
+                bucket.event.metadata_mut().set_delivery_event_count(count);
             }
         } else {
             // new event
@@ -214,10 +228,137 @@ fn merge_partial_events_with_custom_expiration(
 
 #[cfg(test)]
 mod test {
+    use vector_common::internal_event::vector_event::delivery_path::{
+        DeliveryPathAccounting, DeliverySourceLabels,
+    };
     use vector_lib::event::LogEvent;
     use vrl::value;
 
     use super::*;
+
+    fn counted_fragments(namespace: LogNamespace, finish: bool) -> Vec<Event> {
+        [2, 3, 5]
+            .into_iter()
+            .enumerate()
+            .map(|(index, count)| {
+                let mut event = match namespace {
+                    LogNamespace::Legacy => LogEvent::from("part"),
+                    LogNamespace::Vector => LogEvent::from(value!("part")),
+                };
+                let partial_path = match namespace {
+                    LogNamespace::Legacy => OwnedTargetPath::event(owned_value_path!("_partial")),
+                    LogNamespace::Vector => OwnedTargetPath::metadata(owned_value_path!(
+                        super::super::Config::NAME,
+                        "_partial"
+                    )),
+                };
+                event.insert(&partial_path, index < 2 || !finish);
+                event.metadata_mut().set_delivery_event_count(count);
+                let mut accounting = DeliveryPathAccounting::at_read(
+                    DeliverySourceLabels {
+                        process_generation_id: "source-process".to_owned(),
+                        time_parity: if index < 2 { 0 } else { 3_600_000 },
+                        topic: "service-log".to_owned(),
+                        delivery_method: "VECTOR_WOODCHUCK_V2_FILE".to_owned(),
+                        service_system: "test-service".to_owned(),
+                        source_pod_id: "source-pod".to_owned(),
+                    },
+                    ["online".to_owned()],
+                );
+                accounting.counts[0].count = count as u64;
+                accounting.record_content(4);
+                event
+                    .metadata_mut()
+                    .set_delivery_path_accounting(Some(accounting));
+                event.into()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn partial_merge_preserves_delivery_counts_and_source_hours() {
+        for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
+            for finish in [true, false] {
+                let inputs = counted_fragments(namespace, finish);
+                let expected_source = inputs[0]
+                    .metadata()
+                    .delivery_path_accounting()
+                    .unwrap()
+                    .counts[0]
+                    .source
+                    .clone();
+                let output: Vec<_> =
+                    merge_partial_events(futures::stream::iter(inputs), namespace, None)
+                        .collect()
+                        .await;
+                assert_eq!(output.len(), 1);
+                let log = output[0].as_log();
+                assert_eq!(
+                    log.get(&get_message_path(namespace)),
+                    Some(&value!("partpartpart"))
+                );
+                assert_eq!(log.metadata().delivery_event_count(), 10);
+                let counts = &log.metadata().delivery_path_accounting().unwrap().counts;
+                assert_eq!(counts.len(), 2);
+                assert_eq!(counts[0].source, expected_source);
+                assert_eq!(counts[0].count, 5);
+                assert_eq!(counts[1].source.time_parity, 3_600_000);
+                assert_eq!(counts[1].count, 5);
+                assert!(
+                    counts
+                        .iter()
+                        .all(|count| count.path == "online" && !count.selected)
+                );
+                assert_eq!(
+                    counts
+                        .iter()
+                        .flat_map(|count| &count.content_ranges)
+                        .map(|range| (range.start, range.end, range.count))
+                        .collect::<Vec<_>>(),
+                    vec![(0, 4, 2), (4, 8, 3), (8, 12, 5)]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_partial_merge_preserves_delivery_counts() {
+        let input = futures::stream::iter(counted_fragments(LogNamespace::Legacy, false))
+            .chain(futures::stream::pending());
+        let output: Vec<_> = merge_partial_events_with_custom_expiration(
+            input,
+            LogNamespace::Legacy,
+            Duration::ZERO,
+            None,
+        )
+        .take(1)
+        .collect()
+        .await;
+        assert_eq!(output[0].metadata().delivery_event_count(), 10);
+        assert_eq!(
+            output[0]
+                .metadata()
+                .delivery_path_accounting()
+                .unwrap()
+                .counts
+                .iter()
+                .map(|count| count.count)
+                .sum::<u64>(),
+            10
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_partial_merge_does_not_produce_delivery_credit() {
+        let output: Vec<_> = merge_partial_events(
+            futures::stream::iter(counted_fragments(LogNamespace::Legacy, true)),
+            LogNamespace::Legacy,
+            Some(8),
+        )
+        .collect()
+        .await;
+        assert!(output.is_empty());
+    }
 
     #[tokio::test]
     async fn merge_single_event_legacy() {

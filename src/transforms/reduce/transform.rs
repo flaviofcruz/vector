@@ -30,6 +30,7 @@ use crate::{
 struct ReduceState {
     events: usize,
     delivery_event_count: usize,
+    message_bytes: Option<usize>,
     fields: HashMap<OwnedTargetPath, Box<dyn ReduceValueMerger>>,
     stale_since: Instant,
     creation: Instant,
@@ -55,6 +56,7 @@ impl ReduceState {
         Self {
             events: 0,
             delivery_event_count: 0,
+            message_bytes: Some(0),
             stale_since: Instant::now(),
             creation: Instant::now(),
             fields: HashMap::new(),
@@ -66,7 +68,34 @@ impl ReduceState {
         self.delivery_event_count = self
             .delivery_event_count
             .saturating_add(e.metadata().delivery_event_count());
-        self.metadata.merge(e.metadata().clone());
+        let mut metadata = e.metadata().clone();
+        let message_path = vector_lib::config::log_schema().message_key_target_path();
+        let separator = match message_path.and_then(|path| strategies.get(path)) {
+            Some(MergeStrategy::ConcatNewline | MergeStrategy::Concat) => Some(1),
+            Some(MergeStrategy::ConcatRaw) => Some(0),
+            _ => None,
+        };
+        let bytes = message_path
+            .and_then(|path| e.get(path))
+            .and_then(crate::event::Value::as_bytes)
+            .map(|v| v.len());
+        let offset = separator.zip(bytes).and_then(|(separator, bytes)| {
+            self.message_bytes.map(|previous| {
+                let offset = previous + if self.events == 0 { 0 } else { separator };
+                self.message_bytes = offset.checked_add(bytes);
+                offset
+            })
+        });
+        if offset.is_none() {
+            self.message_bytes = None;
+            if let Some(accounting) = self.metadata.delivery_path_accounting_mut() {
+                accounting.shift_content(None);
+            }
+        }
+        if let Some(accounting) = metadata.delivery_path_accounting_mut() {
+            accounting.shift_content(offset);
+        }
+        self.metadata.merge(metadata);
 
         for (path, strategy) in strategies {
             if let Some(value) = e.get(path) {
@@ -403,6 +432,109 @@ mod test {
     #[test]
     fn reduce_sums_input_delivery_event_counts() {
         assert_eq!(reduce_delivery_event_count(&[2, 3, 5]), 10);
+    }
+
+    #[test]
+    fn delivery_ranges_follow_multiline_payload_and_survive_buffer_encoding() {
+        use prost::Message;
+        use vector_common::internal_event::vector_event::delivery_path::{
+            DeliveryPathAccounting, DeliverySourceLabels,
+        };
+        use vector_lib::event::{TargetEvents, VrlTarget, proto::EventWrapper};
+
+        for (strategy, joined, ranges) in [
+            (
+                MergeStrategy::ConcatNewline,
+                "aaaa\nbb\ncc",
+                vec![(0, 7), (8, 10)],
+            ),
+            (MergeStrategy::ConcatRaw, "aaaabbcc", vec![(0, 4), (6, 8)]),
+        ] {
+            let mut state = ReduceState::new();
+            let strategies = IndexMap::from([(parse_target_path("message").unwrap(), strategy)]);
+            for (index, message) in ["aaaa", "bb", "cc"].into_iter().enumerate() {
+                let mut event = LogEvent::from(message);
+                let mut accounting = DeliveryPathAccounting::at_read(
+                    DeliverySourceLabels {
+                        process_generation_id: "process".into(),
+                        time_parity: if index < 2 { 0 } else { 3_600_000 },
+                        topic: "service-log".into(),
+                        delivery_method: "file".into(),
+                        service_system: "service".into(),
+                        source_pod_id: "pod".into(),
+                    },
+                    ["online".into()],
+                );
+                accounting.select_path("online");
+                accounting.record_content(message.len());
+                event
+                    .metadata_mut()
+                    .set_delivery_path_accounting(Some(accounting));
+                state.add_event(event, &strategies);
+            }
+            let event = state.flush();
+            assert_eq!(event["message"], joined.into());
+            assert_eq!(event.metadata().delivery_event_count(), 3);
+            let original = event.metadata().delivery_path_accounting().unwrap().clone();
+            assert_eq!(
+                original
+                    .counts
+                    .iter()
+                    .flat_map(|count| &count.content_ranges)
+                    .count(),
+                3,
+                "{original:?}"
+            );
+            let encoded = EventWrapper::from(Event::Log(event)).encode_to_vec();
+            let event = Event::from(EventWrapper::decode(encoded.as_slice()).unwrap()).into_log();
+            assert_eq!(event.metadata().delivery_path_accounting(), Some(&original));
+            let (_, mut metadata) = event.into_parts();
+            metadata.value_mut().insert(
+                vrl::path!("delivery_path_accounting", "output_ranges"),
+                Value::Array(
+                    ranges
+                        .iter()
+                        .map(|(start, end)| {
+                            Value::Array(vec![Value::from(*start), Value::from(*end)])
+                        })
+                        .collect(),
+                ),
+            );
+            let TargetEvents::Logs(events) = VrlTarget::LogEvent(
+                vrl::value!([{"message": "first"}, {"message": "second"}]),
+                metadata,
+            )
+            .into_events(vector_lib::config::LogNamespace::Legacy) else {
+                panic!("expected split logs");
+            };
+            let events: Vec<_> = events.collect();
+            let counts: Vec<_> = events
+                .iter()
+                .map(|event| {
+                    event
+                        .metadata()
+                        .delivery_path_accounting()
+                        .unwrap()
+                        .counts
+                        .iter()
+                        .map(|count| count.count)
+                        .sum::<u64>()
+                })
+                .collect();
+            assert_eq!(
+                counts,
+                if joined.contains('\n') {
+                    vec![2, 1]
+                } else {
+                    vec![1, 1]
+                },
+                "{original:?}; {events:?}"
+            );
+            let last = events[1].metadata().delivery_path_accounting().unwrap();
+            let count = last.counts.iter().find(|count| count.count != 0).unwrap();
+            assert_eq!(count.source.time_parity, 3_600_000);
+            assert_eq!(count.source.source_pod_id, "pod");
+        }
     }
 
     #[test]

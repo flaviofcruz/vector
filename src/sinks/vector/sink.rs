@@ -162,6 +162,128 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(feature = "transforms-remap")]
+    fn split_delivery_credits_only_successful_chunks() {
+        use crate::config::{DataType, TransformContext, TransformOutput};
+        use crate::sinks::util::vector_event_log::EventLoggingService;
+        use crate::transforms::{
+            SyncTransform, TransformOutputsBuf,
+            remap::{Remap, RemapConfig},
+        };
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use vector_common::internal_event::vector_event::delivery_event::DeliveryEventStage;
+
+        for fail_last in [false, true] {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let mut accounting = DeliveryPathAccounting::default();
+                    for offset in [0, 3, 6] {
+                        let mut record = DeliveryPathAccounting::at_read(
+                            DeliverySourceLabels {
+                                process_generation_id: "source-process".into(),
+                                time_parity: 0,
+                                topic: "service-log".into(),
+                                delivery_method: "file".into(),
+                                service_system: "service".into(),
+                                source_pod_id: "pod".into(),
+                            },
+                            ["online".into()],
+                        );
+                        record.counts[0].emit(DeliveryEventStage::Read);
+                        record.select_path("online");
+                        record.record_content(2);
+                        record.shift_content(Some(offset));
+                        accounting.merge(record);
+                    }
+                    let mut event = LogEvent::from("aa\nbb\ncc");
+                    event
+                        .metadata_mut()
+                        .set_delivery_path_accounting(Some(accounting));
+                    let (mut remap, _) = Remap::new_ast(
+                        RemapConfig {
+                            source: Some(
+                                r#"
+                            %delivery_path_accounting = { "output_ranges": [[0, 5], [6, 8]] }
+                            . = [{"message": "aa\nbb"}, {"message": "cc"}]
+                        "#
+                                .to_owned(),
+                            ),
+                            ..Default::default()
+                        },
+                        &TransformContext::default(),
+                    )
+                    .unwrap();
+                    let mut output = TransformOutputsBuf::new_with_capacity(
+                        vec![TransformOutput::new(DataType::Log, Default::default())],
+                        2,
+                    );
+                    remap.transform(event.into(), &mut output);
+                    let events = output.take_primary().into_events();
+                    // Only transport is replaced: the real sink batches/encodes, and its real
+                    // event-logging wrapper decides whether a successful ACK earns credit.
+                    let service = tower::service_fn(move |request: VectorRequest| {
+                        let fail = fail_last
+                            && Event::from(request.request.events[0].clone()).as_log()["message"]
+                                == vrl::value!("cc");
+                        async move {
+                            if fail {
+                                Err::<SentResponse, crate::Error>("failed upload".into())
+                            } else {
+                                Ok(SentResponse(
+                                    request
+                                        .metadata
+                                        .events_estimated_json_encoded_byte_size()
+                                        .clone(),
+                                ))
+                            }
+                        }
+                    });
+                    Box::new(VectorSink {
+                        batch_settings: BatcherSettings {
+                            timeout: Duration::from_secs(1),
+                            size_limit: 10000,
+                            item_limit: 1,
+                        },
+                        service: EventLoggingService {
+                            inner: service,
+                            enable_logs: true,
+                        },
+                    })
+                    .run_inner(futures::stream::iter(events).boxed())
+                    .await
+                    .unwrap();
+                });
+            });
+            let mut totals = std::collections::HashMap::new();
+            for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+                let labels: std::collections::HashMap<_, _> =
+                    key.key().labels().map(|l| (l.key(), l.value())).collect();
+                if key.key().name() == "delivery_events_total"
+                    && labels.get("source_pod_id") == Some(&"pod")
+                {
+                    if let DebugValue::Counter(count) = value {
+                        *totals
+                            .entry(labels["delivery_event_type"].to_owned())
+                            .or_insert(0) += count;
+                    }
+                }
+            }
+            assert_eq!(totals["VECTOR_SOURCE_READ"], 3);
+            assert_eq!(totals["VECTOR_SINK_UPLOAD_STAGED"], 3);
+            assert_eq!(
+                totals["VECTOR_SINK_UPLOAD_DELIVERED"],
+                if fail_last { 2 } else { 3 }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn delivery_path_counts_stay_in_la_request_metadata_and_are_removed_from_wire() {
         let events = ["old-process", "new-process"].map(|process| {

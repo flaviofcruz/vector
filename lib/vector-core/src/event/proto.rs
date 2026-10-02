@@ -670,6 +670,15 @@ impl From<path_accounting::DeliveryPathCount> for DeliveryPathCount {
             source_pod_id: value.source.source_pod_id,
             count: value.count,
             selected: value.selected,
+            content_ranges: value
+                .content_ranges
+                .into_iter()
+                .map(|range| DeliveryContentRange {
+                    start: range.start,
+                    end: range.end,
+                    count: range.count,
+                })
+                .collect(),
         }
     }
 }
@@ -688,6 +697,15 @@ impl From<DeliveryPathCount> for path_accounting::DeliveryPathCount {
             },
             count: value.count,
             selected: value.selected,
+            content_ranges: value
+                .content_ranges
+                .into_iter()
+                .map(|range| path_accounting::DeliveryContentRange {
+                    start: range.start,
+                    end: range.end,
+                    count: range.count,
+                })
+                .collect(),
         }
     }
 }
