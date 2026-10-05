@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::ready,
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     panic,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -12,11 +12,12 @@ use aws_sdk_sqs::{
     Client as SqsClient,
     operation::{
         delete_message_batch::{DeleteMessageBatchError, DeleteMessageBatchOutput},
+        get_queue_attributes::GetQueueAttributesOutput,
         receive_message::ReceiveMessageError,
         send_message_batch::{SendMessageBatchError, SendMessageBatchOutput},
     },
     types::{
-        DeleteMessageBatchRequestEntry, Message, MessageSystemAttributeName,
+        DeleteMessageBatchRequestEntry, Message, MessageSystemAttributeName, QueueAttributeName,
         SendMessageBatchRequestEntry,
     },
 };
@@ -53,7 +54,7 @@ use crate::{
     config::{SourceAcknowledgementsConfig, SourceContext},
     event::{BatchNotifier, BatchStatus, EstimatedJsonEncodedSizeOf},
     internal_events::{
-        EventsReceived, QueueNotificationProcessLag, S3ObjectProcessingFailed,
+        EventsReceived, QueueMessageCount, QueueNotificationProcessLag, S3ObjectProcessingFailed,
         S3ObjectProcessingSucceeded, SqsMessageDeleteBatchError, SqsMessageDeletePartialError,
         SqsMessageDeleteSucceeded, SqsMessageProcessingError, SqsMessageProcessingSucceeded,
         SqsMessageReceiveError, SqsMessageReceiveSucceeded, SqsMessageSendBatchError,
@@ -128,6 +129,16 @@ pub(super) struct Config {
     #[derivative(Default(value = "default_poll_secs()"))]
     #[configurable(metadata(docs::type_unit = "seconds"))]
     pub(super) poll_secs: u32,
+
+    /// How often to sample the queue's approximate depth (backlog) for the `queue_message_count`
+    /// gauge, in seconds. Unset (the default) disables sampling.
+    ///
+    /// Sampled on a dedicated timer independent of `poll_secs` and `client_concurrency`, off the
+    /// message receive/delete path: one `GetQueueAttributes` call per interval per queue. Requires
+    /// `sqs:GetQueueAttributes` on the queue.
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 60))]
+    pub(super) depth_poll_secs: Option<NonZeroU64>,
 
     /// The visibility timeout to use for messages, in seconds.
     ///
@@ -322,6 +333,7 @@ pub struct State {
 
     queue_url: String,
     poll_secs: i32,
+    depth_poll_secs: Option<NonZeroU64>,
     max_number_of_messages: i32,
     client_concurrency: usize,
     visibility_timeout_secs: i32,
@@ -368,6 +380,7 @@ impl Ingestor {
 
             queue_url: config.queue_url,
             poll_secs: config.poll_secs as i32,
+            depth_poll_secs: config.depth_poll_secs,
             max_number_of_messages: config.max_number_of_messages as i32,
             client_concurrency: config
                 .client_concurrency
@@ -408,6 +421,16 @@ impl Ingestor {
             handles.push(handle);
         }
 
+        // When enabled, a single queue-depth sampler per queue, independent of client_concurrency.
+        // Spawned in the source's span so the gauge carries this source's component_id.
+        if let Some(period) = self.state.depth_poll_secs {
+            let depth_handle = tokio::spawn(
+                Self::run_depth_poller(Arc::clone(&self.state), cx.shutdown.clone(), period)
+                    .in_current_span(),
+            );
+            handles.push(depth_handle);
+        }
+
         // Wait for all of the processes to finish.  If any one of them panics, we resume
         // that panic here to properly shutdown Vector.
         for handle in handles.drain(..) {
@@ -420,6 +443,69 @@ impl Ingestor {
 
         Ok(())
     }
+
+    /// Periodically samples the queue's approximate depth (backlog) and emits the
+    /// `queue_message_count` gauge. Runs on its own timer, decoupled from message polling, so it
+    /// adds no latency to draining. Each sample is a single `GetQueueAttributes` call bounded by a
+    /// timeout; on error, timeout, or an unusable response it skips the sample (never reporting a
+    /// false zero) and retries next tick.
+    async fn run_depth_poller(state: Arc<State>, shutdown: ShutdownSignal, period: NonZeroU64) {
+        // A depth sample must never wedge the loop; keep this well under the tick interval.
+        const GET_ATTRIBUTES_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let shutdown = shutdown.fuse();
+        pin!(shutdown);
+
+        let mut ticker = tokio::time::interval(Duration::from_secs(period.get()));
+        // On a missed tick (e.g. a slow call), skip it rather than firing a catch-up burst.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            select! {
+                _ = &mut shutdown => break,
+                _ = ticker.tick() => {
+                    let request = state
+                        .sqs_client
+                        .get_queue_attributes()
+                        .queue_url(state.queue_url.clone())
+                        .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+                        .send();
+                    match tokio::time::timeout(GET_ATTRIBUTES_TIMEOUT, request).await {
+                        Ok(Ok(output)) => match approximate_number_of_messages(&output) {
+                            Some(count) => emit!(QueueMessageCount {
+                                count,
+                                cloud: CLOUD_PROVIDER,
+                            }),
+                            None => warn!(
+                                message = "Queue attributes response has no numeric ApproximateNumberOfMessages for depth metric.",
+                                internal_log_rate_limit = true,
+                            ),
+                        },
+                        Ok(Err(err)) => warn!(
+                            message = "Failed to fetch queue attributes for depth metric.",
+                            error = ?err,
+                            internal_log_rate_limit = true,
+                        ),
+                        Err(_) => warn!(
+                            message = "Timed out fetching queue attributes for depth metric.",
+                            internal_log_rate_limit = true,
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Reads `ApproximateNumberOfMessages` from a `GetQueueAttributes` response. SQS returns attribute
+/// values as strings; `None` when the attribute is absent or not a non-negative integer.
+fn approximate_number_of_messages(output: &GetQueueAttributesOutput) -> Option<u64> {
+    output
+        .attributes
+        .as_ref()?
+        .get(&QueueAttributeName::ApproximateNumberOfMessages)?
+        .parse()
+        .ok()
 }
 
 pub struct IngestorProcess {
@@ -2148,4 +2234,66 @@ fn test_aws_s3_config_with_ingestion_callback() {
     let on_failure = cb.on_failure.unwrap();
     assert_eq!(on_failure.body.len(), 2);
     assert_eq!(on_failure.body["file_id"], "{{message.file_id}}");
+}
+
+#[test]
+fn test_depth_poll_secs_config_parsing() {
+    // Default: depth sampling disabled.
+    let config: Config = toml::from_str(
+        r#"
+            queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.depth_poll_secs, None);
+
+    let config: Config = toml::from_str(
+        r#"
+            queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+            depth_poll_secs = 60
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.depth_poll_secs, NonZeroU64::new(60));
+
+    // Zero would panic the sampler's interval timer, so it must be rejected at parse time.
+    let result: Result<Config, toml::de::Error> = toml::from_str(
+        r#"
+            queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+            depth_poll_secs = 0
+        "#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_approximate_number_of_messages() {
+    let output = GetQueueAttributesOutput::builder()
+        .attributes(QueueAttributeName::ApproximateNumberOfMessages, "42")
+        .build();
+    assert_eq!(approximate_number_of_messages(&output), Some(42));
+
+    let output = GetQueueAttributesOutput::builder()
+        .attributes(QueueAttributeName::ApproximateNumberOfMessages, "0")
+        .build();
+    assert_eq!(approximate_number_of_messages(&output), Some(0));
+
+    // Attribute missing from the map.
+    let output = GetQueueAttributesOutput::builder()
+        .attributes(
+            QueueAttributeName::ApproximateNumberOfMessagesNotVisible,
+            "3",
+        )
+        .build();
+    assert_eq!(approximate_number_of_messages(&output), None);
+
+    // Non-numeric value.
+    let output = GetQueueAttributesOutput::builder()
+        .attributes(QueueAttributeName::ApproximateNumberOfMessages, "abc")
+        .build();
+    assert_eq!(approximate_number_of_messages(&output), None);
+
+    // No attributes map at all.
+    let output = GetQueueAttributesOutput::builder().build();
+    assert_eq!(approximate_number_of_messages(&output), None);
 }

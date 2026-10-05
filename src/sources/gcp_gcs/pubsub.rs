@@ -1,8 +1,14 @@
-use std::{collections::BTreeMap, num::NonZeroUsize, panic, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    num::{NonZeroU64, NonZeroUsize},
+    panic,
+    sync::Arc,
+    time::Duration,
+};
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures::FutureExt;
 use http::Request;
 use hyper::Body;
@@ -26,7 +32,7 @@ use crate::{
     http::{HttpClient, HttpError},
     internal_events::{
         PubSubMessageProcessingError, PubSubMessageProcessingSucceeded, PubSubMessageReceiveError,
-        PubSubMessageReceiveSucceeded, QueueNotificationProcessLag,
+        PubSubMessageReceiveSucceeded, QueueMessageCount, QueueNotificationProcessLag,
     },
     shutdown::ShutdownSignal,
     sources::ingestion_callback::IngestionCallbackClient,
@@ -94,6 +100,24 @@ pub(super) struct Config {
     #[serde(default)]
     #[configurable(metadata(docs::examples = "https://pubsub.googleapis.com"))]
     pub(super) endpoint: Option<String>,
+
+    /// How often to sample the subscription's backlog for the `queue_message_count` gauge, in
+    /// seconds. Unset (the default) disables sampling.
+    ///
+    /// The Pub/Sub API exposes no backlog count, so each sample reads the subscription's
+    /// `num_undelivered_messages` metric from Cloud Monitoring (`timeSeries.list` in `project`),
+    /// which requires `monitoring.timeSeries.list` on that project. Sampled on a dedicated timer,
+    /// off the pull/acknowledge path. Cloud Monitoring publishes the metric with a delay of a few
+    /// minutes, so sampling more often than every 60 seconds adds no freshness.
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 60))]
+    pub(super) depth_poll_secs: Option<NonZeroU64>,
+
+    /// Overrides the Cloud Monitoring API endpoint used to sample the subscription's backlog.
+    /// Defaults to the public Cloud Monitoring endpoint.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "https://monitoring.googleapis.com"))]
+    pub(super) monitoring_endpoint: Option<String>,
 }
 
 // ============================================================================
@@ -355,6 +379,99 @@ struct AcknowledgeRequest<'a> {
 }
 
 // ============================================================================
+// Cloud Monitoring backlog sample (queue_message_count gauge)
+// ============================================================================
+
+/// Public Cloud Monitoring endpoint, used unless `monitoring_endpoint` overrides it.
+const MONITORING_URL: &str = "https://monitoring.googleapis.com";
+
+/// Pub/Sub's per-subscription backlog metric. The Pub/Sub API itself has no backlog count.
+const NUM_UNDELIVERED_MESSAGES_METRIC: &str =
+    "pubsub.googleapis.com/subscription/num_undelivered_messages";
+
+/// How far back each backlog sample looks. Cloud Monitoring publishes Pub/Sub points with a delay
+/// of a few minutes, so the window must reach past that delay to find the latest point; the
+/// newest point in the window is the one reported.
+const BACKLOG_LOOKBACK: Duration = Duration::from_secs(5 * 60);
+
+/// Response from the Cloud Monitoring `timeSeries.list` REST endpoint, limited to the fields the
+/// backlog sample reads.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListTimeSeriesResponse {
+    #[serde(default)]
+    time_series: Vec<TimeSeries>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TimeSeries {
+    #[serde(default)]
+    points: Vec<Point>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Point {
+    interval: TimeInterval,
+    value: TypedValue,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TimeInterval {
+    end_time: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TypedValue {
+    /// Proto3 JSON encodes int64 values as strings.
+    #[serde(default)]
+    int64_value: Option<String>,
+}
+
+/// Builds the `timeSeries.list` request for one subscription's `num_undelivered_messages` over the
+/// lookback window ending at `now`.
+fn backlog_request_url(
+    endpoint: &str,
+    project: &str,
+    subscription: &str,
+    now: DateTime<Utc>,
+) -> Result<url::Url, url::ParseError> {
+    let mut url = url::Url::parse(&format!("{endpoint}/v3/projects/{project}/timeSeries"))?;
+    let filter = format!(
+        r#"metric.type = "{NUM_UNDELIVERED_MESSAGES_METRIC}" AND resource.type = "pubsub_subscription" AND resource.labels.subscription_id = "{subscription}""#
+    );
+    let start = now
+        - chrono::Duration::from_std(BACKLOG_LOOKBACK).expect("lookback fits in chrono::Duration");
+    url.query_pairs_mut()
+        .append_pair("filter", &filter)
+        .append_pair(
+            "interval.startTime",
+            &start.to_rfc3339_opts(SecondsFormat::Secs, true),
+        )
+        .append_pair(
+            "interval.endTime",
+            &now.to_rfc3339_opts(SecondsFormat::Secs, true),
+        );
+    Ok(url)
+}
+
+/// The most recent backlog value in the response; `None` when the window holds no numeric point
+/// (e.g. Cloud Monitoring has not published one yet).
+fn latest_backlog(response: &ListTimeSeriesResponse) -> Option<u64> {
+    response
+        .time_series
+        .iter()
+        .flat_map(|series| series.points.iter())
+        .filter_map(|point| {
+            let value = point.value.int64_value.as_deref()?.parse::<u64>().ok()?;
+            Some((point.interval.end_time, value))
+        })
+        .max_by_key(|(end_time, _)| *end_time)
+        .map(|(_, value)| value)
+}
+
+// ============================================================================
 // Ingestor — owns shared state and spawns per-concurrency IngestorProcesses.
 // ============================================================================
 
@@ -365,7 +482,13 @@ struct State {
     endpoint: String,
     /// Full Pub/Sub resource name: `projects/{project}/subscriptions/{subscription}`.
     subscription_resource_name: String,
+    /// Short subscription ID, as Cloud Monitoring labels it (`resource.labels.subscription_id`).
+    subscription: String,
     project: String,
+    /// Base URL for the Cloud Monitoring REST API (defaults to [`MONITORING_URL`]).
+    monitoring_endpoint: String,
+    /// Seconds between backlog samples for the `queue_message_count` gauge; `None` disables them.
+    depth_poll_secs: Option<NonZeroU64>,
     poll_secs: u64,
     max_number_of_messages: u32,
     client_concurrency: usize,
@@ -375,13 +498,14 @@ struct State {
     message_format: MessageFormat,
 }
 
-/// Resolves the Pub/Sub base endpoint: the configured override with any trailing
-/// slash trimmed, or the public default [`PUBSUB_URL`]. Pub/Sub request URLs are
-/// built with `format!`, so a trailing slash would double the separator. The GCS
-/// side does not need this because it composes URLs with `url::Url`, which normalizes.
-fn resolve_endpoint(configured: Option<&str>) -> String {
+/// Resolves a Google API base endpoint: the configured override with any trailing
+/// slash trimmed, or the public `default` ([`PUBSUB_URL`] / [`MONITORING_URL`]). Pub/Sub
+/// and Cloud Monitoring request URLs are built with `format!`, so a trailing slash would
+/// double the separator. The GCS side does not need this because it composes URLs with
+/// `url::Url`, which normalizes.
+fn resolve_endpoint(configured: Option<&str>, default: &str) -> String {
     configured
-        .unwrap_or(PUBSUB_URL)
+        .unwrap_or(default)
         .trim_end_matches('/')
         .to_string()
 }
@@ -410,14 +534,19 @@ impl Ingestor {
         let subscription_resource_name =
             format!("projects/{project}/subscriptions/{}", config.subscription);
 
-        let endpoint = resolve_endpoint(config.endpoint.as_deref());
+        let endpoint = resolve_endpoint(config.endpoint.as_deref(), PUBSUB_URL);
+        let monitoring_endpoint =
+            resolve_endpoint(config.monitoring_endpoint.as_deref(), MONITORING_URL);
 
         let state = Arc::new(State {
             client,
             auth,
             endpoint,
             subscription_resource_name,
+            subscription: config.subscription,
             project,
+            monitoring_endpoint,
+            depth_poll_secs: config.depth_poll_secs,
             poll_secs: config.poll_secs,
             max_number_of_messages: config.max_number_of_messages,
             client_concurrency: config
@@ -455,6 +584,17 @@ impl Ingestor {
             handles.push(handle);
         }
 
+        // When enabled, a single backlog sampler per subscription, independent of
+        // client_concurrency. Spawned in the source's span so the gauge carries this source's
+        // component_id.
+        if let Some(period) = self.state.depth_poll_secs {
+            let depth_handle = tokio::spawn(
+                Self::run_depth_poller(Arc::clone(&self.state), cx.shutdown.clone(), period)
+                    .in_current_span(),
+            );
+            handles.push(depth_handle);
+        }
+
         for handle in handles.drain(..) {
             if let Err(e) = handle.await {
                 if e.is_panic() {
@@ -465,6 +605,93 @@ impl Ingestor {
 
         Ok(())
     }
+
+    /// Periodically samples the subscription's backlog and emits the `queue_message_count` gauge.
+    /// Runs on its own timer, decoupled from pulling, so it adds no latency to draining. Each
+    /// sample is a single Cloud Monitoring `timeSeries.list` call bounded by a timeout; on error,
+    /// timeout, or no recent point it skips the sample (never reporting a false zero) and retries
+    /// next tick.
+    async fn run_depth_poller(state: Arc<State>, shutdown: ShutdownSignal, period: NonZeroU64) {
+        // A backlog sample must never wedge the loop; keep this well under the tick interval.
+        const LIST_TIME_SERIES_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let shutdown = shutdown.fuse();
+        pin!(shutdown);
+
+        let mut ticker = tokio::time::interval(Duration::from_secs(period.get()));
+        // On a missed tick (e.g. a slow call), skip it rather than firing a catch-up burst.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            select! {
+                _ = &mut shutdown => break,
+                _ = ticker.tick() => {
+                    let sample =
+                        tokio::time::timeout(LIST_TIME_SERIES_TIMEOUT, fetch_backlog(&state)).await;
+                    match sample {
+                        Ok(Ok(Some(count))) => emit!(QueueMessageCount {
+                            count,
+                            cloud: "gcp",
+                        }),
+                        Ok(Ok(None)) => warn!(
+                            message = "No recent subscription backlog point in Cloud Monitoring for depth metric.",
+                            subscription = %state.subscription_resource_name,
+                            internal_log_rate_limit = true,
+                        ),
+                        Ok(Err(error)) => warn!(
+                            message = "Failed to fetch subscription backlog for depth metric.",
+                            %error,
+                            subscription = %state.subscription_resource_name,
+                            internal_log_rate_limit = true,
+                        ),
+                        Err(_) => warn!(
+                            message = "Timed out fetching subscription backlog for depth metric.",
+                            subscription = %state.subscription_resource_name,
+                            internal_log_rate_limit = true,
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Reads the subscription's latest `num_undelivered_messages` from Cloud Monitoring.
+async fn fetch_backlog(state: &State) -> crate::Result<Option<u64>> {
+    let url = backlog_request_url(
+        &state.monitoring_endpoint,
+        &state.project,
+        &state.subscription,
+        Utc::now(),
+    )?;
+
+    let mut request = Request::get(url.as_str())
+        .body(Body::empty())
+        .expect("timeSeries.list request must be valid");
+    state.auth.apply(&mut request);
+
+    let response = state.client.send(request).await?;
+
+    let status = response.status();
+    let body_bytes = http_body::Body::collect(response.into_body())
+        .await
+        .map_err(|source| HttpError::CallRequest { source })?
+        .to_bytes();
+
+    if !status.is_success() {
+        return Err(format!(
+            "Cloud Monitoring timeSeries.list returned HTTP {} — body: {}",
+            status,
+            String::from_utf8_lossy(&body_bytes)
+                .chars()
+                .take(512)
+                .collect::<String>()
+        )
+        .into());
+    }
+
+    let response: ListTimeSeriesResponse = serde_json::from_slice(&body_bytes)?;
+    Ok(latest_backlog(&response))
 }
 
 // ============================================================================
@@ -961,14 +1188,136 @@ mod tests {
     /// the separator.
     #[test]
     fn resolve_endpoint_defaults_and_trims() {
-        let cases: [(Option<&str>, &str); 3] = [
-            (None, PUBSUB_URL),
-            (Some("https://pubsub.example.com"), "https://pubsub.example.com"),
-            (Some("https://pubsub.example.com/"), "https://pubsub.example.com"),
+        let cases: [(Option<&str>, &str, &str); 6] = [
+            (None, PUBSUB_URL, PUBSUB_URL),
+            (
+                Some("https://pubsub.example.com"),
+                PUBSUB_URL,
+                "https://pubsub.example.com",
+            ),
+            (
+                Some("https://pubsub.example.com/"),
+                PUBSUB_URL,
+                "https://pubsub.example.com",
+            ),
+            (None, MONITORING_URL, MONITORING_URL),
+            (
+                Some("https://monitoring.example.com"),
+                MONITORING_URL,
+                "https://monitoring.example.com",
+            ),
+            (
+                Some("https://monitoring.example.com/"),
+                MONITORING_URL,
+                "https://monitoring.example.com",
+            ),
         ];
-        for (configured, expected) in cases {
-            assert_eq!(resolve_endpoint(configured), expected, "configured {configured:?}");
+        for (configured, default, expected) in cases {
+            assert_eq!(
+                resolve_endpoint(configured, default),
+                expected,
+                "configured {configured:?}, default {default}"
+            );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Backlog sample (queue_message_count gauge)
+    // -------------------------------------------------------------------------
+
+    /// Backlog sampling is opt-in: unset by default, so sources that don't ask for it (and lack
+    /// the Cloud Monitoring grant) never call the Monitoring API.
+    #[test]
+    fn config_depth_poll_defaults_and_parses() {
+        let default: Config = toml::from_str(r#"subscription = "s""#).unwrap();
+        assert_eq!(
+            default.depth_poll_secs, None,
+            "sampling must be off by default"
+        );
+        assert_eq!(default.monitoring_endpoint, None);
+
+        let configured: Config = toml::from_str(
+            "subscription = \"s\"\ndepth_poll_secs = 60\nmonitoring_endpoint = \"https://monitoring.example.com\"",
+        )
+        .unwrap();
+        assert_eq!(configured.depth_poll_secs, NonZeroU64::new(60));
+        assert_eq!(
+            configured.monitoring_endpoint.as_deref(),
+            Some("https://monitoring.example.com")
+        );
+    }
+
+    /// Zero would panic the sampler's interval timer, so it must be rejected at parse time.
+    #[test]
+    fn config_depth_poll_rejects_zero() {
+        let result: Result<Config, _> = toml::from_str("subscription = \"s\"\ndepth_poll_secs = 0");
+        assert!(result.is_err(), "depth_poll_secs = 0 must be rejected");
+    }
+
+    #[test]
+    fn backlog_request_url_targets_subscription_metric_over_lookback() {
+        let now = DateTime::parse_from_rfc3339("2026-10-05T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let url = backlog_request_url(MONITORING_URL, "my-project", "my-sub", now).unwrap();
+
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("monitoring.googleapis.com"));
+        assert_eq!(url.path(), "/v3/projects/my-project/timeSeries");
+
+        let query: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            query.get("filter").map(String::as_str),
+            Some(
+                r#"metric.type = "pubsub.googleapis.com/subscription/num_undelivered_messages" AND resource.type = "pubsub_subscription" AND resource.labels.subscription_id = "my-sub""#
+            )
+        );
+        assert_eq!(
+            query.get("interval.startTime").map(String::as_str),
+            Some("2026-10-05T11:55:00Z")
+        );
+        assert_eq!(
+            query.get("interval.endTime").map(String::as_str),
+            Some("2026-10-05T12:00:00Z")
+        );
+    }
+
+    /// The newest point wins regardless of response order; points without a numeric int64Value
+    /// are skipped rather than read as zero.
+    #[test]
+    fn latest_backlog_picks_newest_numeric_point() {
+        let json = r#"{
+            "timeSeries": [{
+                "metric": {"type": "pubsub.googleapis.com/subscription/num_undelivered_messages"},
+                "resource": {"type": "pubsub_subscription", "labels": {"subscription_id": "s"}},
+                "points": [
+                    {"interval": {"startTime": "2026-10-05T11:58:00Z", "endTime": "2026-10-05T11:58:00Z"}, "value": {"int64Value": "7"}},
+                    {"interval": {"startTime": "2026-10-05T11:59:00.5Z", "endTime": "2026-10-05T11:59:00.5Z"}, "value": {"int64Value": "42"}},
+                    {"interval": {"startTime": "2026-10-05T11:57:00Z", "endTime": "2026-10-05T11:57:00Z"}, "value": {"int64Value": "3"}}
+                ]
+            }]
+        }"#;
+        let response: ListTimeSeriesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(latest_backlog(&response), Some(42));
+
+        let json = r#"{
+            "timeSeries": [{
+                "points": [
+                    {"interval": {"endTime": "2026-10-05T11:59:00Z"}, "value": {"doubleValue": 1.0}},
+                    {"interval": {"endTime": "2026-10-05T11:58:00Z"}, "value": {"int64Value": "abc"}},
+                    {"interval": {"endTime": "2026-10-05T11:57:00Z"}, "value": {"int64Value": "5"}}
+                ]
+            }]
+        }"#;
+        let response: ListTimeSeriesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(latest_backlog(&response), Some(5));
+    }
+
+    /// An empty response (no published point in the window) yields no sample, not zero.
+    #[test]
+    fn latest_backlog_empty_response_is_none() {
+        let response: ListTimeSeriesResponse = serde_json::from_str("{}").unwrap();
+        assert_eq!(latest_backlog(&response), None);
     }
 
     // max_number_of_messages bounds are tested via Ingestor::new in mod.rs::tests.
