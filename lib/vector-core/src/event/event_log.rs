@@ -6,7 +6,7 @@ use std::env;
 use std::sync::OnceLock;
 
 use crate::event::proto::EventWrapper;
-use crate::event::{Event, EventArray, LogEvent};
+use crate::event::{Event, EventArray, LogEvent, Value};
 
 use vector_common::internal_event::vector_event::{
     EventWithEventLog, VectorSinkEventMetadata,
@@ -23,6 +23,12 @@ pub static EVENT_LOG_METADATA_FIELD: OnceLock<String> = OnceLock::new();
 pub static EVENT_LOG_GRANULARITY_FIELDS: OnceLock<Vec<String>> = OnceLock::new();
 pub static DELIVERY_EVENT_LOG_GRANULARITY_FIELDS: OnceLock<Vec<String>> = OnceLock::new();
 pub static EVENT_LOG_COUNT_OVERRIDE_FIELD: OnceLock<String> = OnceLock::new();
+// The logMetadata sub-field holding the source-attribute map. Granularity fields control
+// which event is emitted (they form the aggregation key, so each distinct combination is one
+// event). Source identifiers do not: they are populated onto each emitted event from the first
+// record seen in that group, so they never affect event-log fanout no matter their
+// cardinality. Empty (the default) leaves it off.
+pub static EVENT_LOG_SOURCE_ATTRIBUTES_FIELD: OnceLock<String> = OnceLock::new();
 
 // Where we can find the log metadata object
 pub fn get_event_log_metadata_field() -> &'static String {
@@ -36,6 +42,13 @@ pub fn get_event_log_count_override_field() -> &'static String {
     EVENT_LOG_COUNT_OVERRIDE_FIELD.get_or_init(|| {
         env::var("EVENT_LOG_COUNT_OVERRIDE_FIELD").unwrap_or_else(|_| "".to_string())
     })
+}
+
+// The single logMetadata sub-field holding the source-attribute map. Read once and copied
+// verbatim onto file-send events, never used as a grouping key.
+pub fn get_event_log_source_attributes_field() -> &'static String {
+    EVENT_LOG_SOURCE_ATTRIBUTES_FIELD
+        .get_or_init(|| env::var("EVENT_LOG_SOURCE_ATTRIBUTES_FIELD").unwrap_or_default())
 }
 
 // Within the log metadata object itself, these are fields we care to parse for
@@ -108,6 +121,33 @@ fn build_map(
     val_map
 }
 
+// Flattens the configured logMetadata sub-field (an object) to a string map. Not a granularity
+// field, so it never affects which events are emitted. Null leaves are skipped.
+fn build_source_attributes(
+    event: &LogEvent,
+    log_metadata_field: &str,
+    source_attributes_field: &str,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if source_attributes_field.is_empty() {
+        return map;
+    }
+    if let Ok(Some(val)) = event.parse_path_and_get_value(format!(
+        "{}.{}",
+        log_metadata_field, source_attributes_field
+    )) {
+        if let Some(obj) = val.as_object() {
+            for (key, value) in obj {
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                map.insert(key.to_string(), value.to_string().replace('"', ""));
+            }
+        }
+    }
+    map
+}
+
 // Sometimes, an event might actually be a batch of messages
 // To handle this, we allow the option for message itself to tell us the count to use
 // If specified we use it, otherwise we default to 1
@@ -167,6 +207,7 @@ pub fn generate_count_map(
     let log_metadata_field = get_event_log_metadata_field();
     let granularity_fields = get_event_log_granularity_fields(for_delivery_events);
     let message_count_override_field = get_event_log_count_override_field();
+    let source_attributes_field = get_event_log_source_attributes_field();
     let mut count_map = HashMap::new();
     for event in events {
         // Check if it's a log event (see enum defined in lib/vector-core/src/event/mod.rs)
@@ -207,6 +248,17 @@ pub fn generate_count_map(
                     metric_count,
                     size: message_bytes,
                     delivery_path_count: None,
+                    // Not a grouping key: populated on file-send events only (skipped for
+                    // delivery events, which never emit it) from the first record in the group.
+                    source_attributes: if for_delivery_events {
+                        HashMap::new()
+                    } else {
+                        build_source_attributes(
+                            log_event,
+                            log_metadata_field,
+                            source_attributes_field,
+                        )
+                    },
                 });
 
             if for_delivery_events {
@@ -245,6 +297,7 @@ pub fn generate_count_map(
                                     selected: path_count.selected,
                                     content_ranges: Vec::new(),
                                 }),
+                                source_attributes: HashMap::new(),
                             });
                     }
                 }
@@ -538,5 +591,162 @@ mod tests {
             !build_map(&event, "log_metadata", &vec!["system".to_string()], false,)
                 .contains_key("system")
         );
+    }
+
+    // ---- event-log grouping and stamping ----
+    // build_key decides how many events are emitted: one per distinct combination of the
+    // granularity fields. build_source_attributes reads the stamped object off an event and is
+    // never part of that key, and aggregation keeps the first event's copy.
+
+    // Builds a log event with the given logMetadata granularity leaves and source-attribute
+    // sub-keys (under "source_attrs").
+    fn log_event_with(
+        granularity_leaves: &[(&str, &str)],
+        attribute_leaves: &[(&str, &str)],
+    ) -> LogEvent {
+        let mut log = LogEvent::from("message");
+        for &(name, value) in granularity_leaves {
+            let path = format!("log_metadata.{name}");
+            log.insert(path.as_str(), value);
+        }
+        for &(name, value) in attribute_leaves {
+            let path = format!("log_metadata.source_attrs.{name}");
+            log.insert(path.as_str(), value);
+        }
+        log
+    }
+
+    #[test]
+    fn granularity_fields_determine_event_count() {
+        // One event is emitted per distinct build_key result.
+        struct Case {
+            name: &'static str,
+            granularity: Vec<&'static str>,
+            events: Vec<Vec<(&'static str, &'static str)>>,
+            expected_groups: usize,
+        }
+        let cases = vec![
+            Case {
+                name: "no granularity collapses to one event",
+                granularity: vec![],
+                events: vec![vec![("topic", "t1")], vec![("topic", "t2")]],
+                expected_groups: 1,
+            },
+            Case {
+                name: "one field splits by its value",
+                granularity: vec!["topic"],
+                events: vec![
+                    vec![("topic", "t1")],
+                    vec![("topic", "t1")],
+                    vec![("topic", "t2")],
+                ],
+                expected_groups: 2,
+            },
+            Case {
+                name: "two fields split by combination",
+                granularity: vec!["topic", "pod"],
+                events: vec![
+                    vec![("topic", "t1"), ("pod", "a")],
+                    vec![("topic", "t1"), ("pod", "b")],
+                    vec![("topic", "t1"), ("pod", "a")],
+                ],
+                expected_groups: 2,
+            },
+        ];
+        for case in cases {
+            let granularity: Vec<String> =
+                case.granularity.iter().map(|s| s.to_string()).collect();
+            let keys: std::collections::HashSet<String> = case
+                .events
+                .iter()
+                .map(|leaves| {
+                    build_key(&log_event_with(leaves, &[]), "log_metadata", &granularity, false)
+                })
+                .collect();
+            assert_eq!(keys.len(), case.expected_groups, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn source_attributes_are_read_from_the_events_object() {
+        struct Case {
+            name: &'static str,
+            attrs: Vec<(&'static str, &'static str)>,
+            expected: Vec<(&'static str, &'static str)>,
+        }
+        let cases = vec![
+            Case {
+                name: "single key",
+                attrs: vec![("k", "v")],
+                expected: vec![("k", "v")],
+            },
+            Case {
+                name: "multiple keys",
+                attrs: vec![("a", "1"), ("b", "2")],
+                expected: vec![("a", "1"), ("b", "2")],
+            },
+            Case {
+                name: "no object stays empty",
+                attrs: vec![],
+                expected: vec![],
+            },
+        ];
+        for case in cases {
+            let got = build_source_attributes(
+                &log_event_with(&[], &case.attrs),
+                "log_metadata",
+                "source_attrs",
+            );
+            let want: HashMap<String, String> = case
+                .expected
+                .iter()
+                .map(|&(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            assert_eq!(got, want, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn null_source_attribute_leaves_are_skipped() {
+        let mut log = LogEvent::from("message");
+        log.insert("log_metadata.source_attrs.present", "yes");
+        log.insert("log_metadata.source_attrs.absent", Value::Null);
+        let got = build_source_attributes(&log, "log_metadata", "source_attrs");
+        assert_eq!(got.get("present").map(String::as_str), Some("yes"));
+        assert!(!got.contains_key("absent"));
+    }
+
+    #[test]
+    fn aggregating_a_group_keeps_the_first_source_attributes() {
+        use vector_common::internal_event::vector_event::file_send_event::combine_file_send_events;
+
+        // Same count-map key across events with differing source_attributes: aggregation keeps
+        // the first event's, matching how a group stamps the first record it sees. Counts sum.
+        let event = |attr: &str| {
+            let mut count_map = HashMap::new();
+            count_map.insert(
+                "shared-key".to_string(),
+                MetadataValuesCount {
+                    value_map: HashMap::new(),
+                    count: 1,
+                    metric_count: 1,
+                    size: 0,
+                    delivery_path_count: None,
+                    source_attributes: HashMap::from([("c".to_string(), attr.to_string())]),
+                },
+            );
+            VectorFileSendEvent {
+                file_metadata: FileEventMetadata::default(),
+                count_map,
+            }
+        };
+        let combined =
+            combine_file_send_events(vec![event("first"), event("second"), event("third")]);
+        let entry = combined.count_map.get("shared-key").unwrap();
+        assert_eq!(
+            entry.source_attributes.get("c").map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(entry.count, 3);
     }
 }

@@ -134,6 +134,7 @@ impl VectorFileSendEvent {
             info!(
                 message = message,
                 keys = serde_json::to_string(&value.value_map).unwrap(),
+                source_attributes = serde_json::to_string(&value.source_attributes).unwrap(),
                 bytes = value.size,
                 events_len = value.count,
                 blob = self.file_metadata.blob,

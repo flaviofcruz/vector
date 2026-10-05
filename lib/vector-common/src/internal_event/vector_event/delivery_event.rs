@@ -903,6 +903,10 @@ pub struct MetadataValuesCount {
     pub size: usize,
     /// Path-specific metric projection. `None` identifies the unscoped VEL/counter entry.
     pub delivery_path_count: Option<DeliveryPathCount>,
+    /// Source-attribute map populated onto each emitted event. Granularity fields (value_map)
+    /// control which events are emitted. These do not: set from the first record seen in the
+    /// group and left unchanged across merges, so they never affect fanout.
+    pub source_attributes: HashMap<String, String>,
 }
 
 // Struct for vector sink delivery events (staged, delivered)
@@ -1037,6 +1041,7 @@ mod topic_inference_tests {
                     metric_count: count as usize,
                     size: 0,
                     delivery_path_count: Some(path),
+                    source_attributes: HashMap::new(),
                 },
             )]))
         };
@@ -1696,6 +1701,7 @@ mod read_accumulation_tests {
             metric_count: 4,
             size: 512,
             delivery_path_count: None,
+            source_attributes: HashMap::new(),
         };
 
         let recorder = DebuggingRecorder::new();
