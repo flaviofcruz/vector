@@ -10,10 +10,17 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(feature = "static-executor")]
-use std::{ptr, slice, sync::OnceLock};
+use std::{
+    ffi::c_void,
+    panic::{self, AssertUnwindSafe},
+    ptr, slice,
+    sync::OnceLock,
+};
 
 #[cfg(feature = "static-executor")]
 use bytes::Bytes;
+#[cfg(feature = "static-executor")]
+use prost::Message;
 
 mod proto_bindings {
     include!(concat!(env!("OUT_DIR"), "/_bindings.rs"));
@@ -24,6 +31,16 @@ pub use proto_bindings::databricks::logstructuredredactionplan as plan_proto;
 
 #[cfg(feature = "static-executor")]
 const EXPECTED_ABI_VERSION: u32 = 2;
+
+#[cfg(feature = "static-executor")]
+const PUID_LOOKUP_FOUND: i32 = 0;
+#[cfg(feature = "static-executor")]
+const PUID_LOOKUP_MISSING: i32 = 1;
+#[cfg(feature = "static-executor")]
+const PUID_LOOKUP_ERROR: i32 = 2;
+
+#[cfg(feature = "static-executor")]
+type PuidLookupCallback = unsafe extern "C-unwind" fn(*mut c_void, i64, *mut i64) -> i32;
 
 #[cfg(feature = "static-executor")]
 #[repr(C)]
@@ -122,6 +139,21 @@ unsafe extern "C" {
         out_record: *mut ForeignBuffer,
         out_error: *mut ForeignBuffer,
     ) -> i32;
+    fn db_redactor_redact_with_puid_lookup(
+        handle: u64,
+        record: *const u8,
+        record_len: usize,
+        shape_enforcement_mode: u8,
+        keep_original: u8,
+        shard_name: ForeignStringView,
+        workspace_fallback: ForeignStringView,
+        account_fallback: ForeignStringView,
+        metastore_fallback: ForeignStringView,
+        lookup: Option<PuidLookupCallback>,
+        lookup_context: *mut c_void,
+        out_record: *mut ForeignBuffer,
+        out_error: *mut ForeignBuffer,
+    ) -> i32;
     fn db_redactor_field_value_conforms(
         shapes: *const i32,
         shapes_len: usize,
@@ -183,6 +215,45 @@ pub enum ShapeEnforcement {
 pub enum KeepMode {
     Wipe,
     Keep,
+}
+
+/// Result of looking up one globally unique positive user ID.
+#[cfg(feature = "static-executor")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PuidLookupResult {
+    Found(i64),
+    Missing,
+    Error,
+}
+
+/// Validates that every `GENERATE_PUID` action targets a native int64 and returns whether the plan
+/// needs the regional lookup. String PUIDs are a Classic-only legacy contract.
+#[cfg(feature = "static-executor")]
+pub fn plan_requires_puid_lookup(plan_bytes: &[u8]) -> Result<bool, RedactError> {
+    use plan_proto::field_action::Action;
+
+    let plan = plan_proto::RedactionPlanSet::decode(plan_bytes)
+        .map_err(|error| RedactError::InvalidPlan(error.to_string()))?;
+    let mut requires_puid_lookup = false;
+    for entry in plan.plans.iter().flat_map(|plan| &plan.actions) {
+        let Some(Action::RedactFrom(redact_from)) = entry
+            .action
+            .as_ref()
+            .and_then(|action| action.action.as_ref())
+        else {
+            continue;
+        };
+        if redact_from.transform != Some(plan_proto::RedactFromTransform::GeneratePuid as i32) {
+            continue;
+        }
+        if redact_from.puid_target_type != Some(plan_proto::PuidTargetType::Int64 as i32) {
+            return Err(RedactError::InvalidPlan(
+                "Vector GENERATE_PUID targets must be INT64".to_owned(),
+            ));
+        }
+        requires_puid_lookup = true;
+    }
+    Ok(requires_puid_lookup)
 }
 
 #[cfg(feature = "static-executor")]
@@ -262,6 +333,70 @@ pub fn redact_with_mode(
     };
     status_result(status, &error)?;
     Ok(output.into_bytes())
+}
+
+/// Redacts a record while resolving `GENERATE_PUID` actions through a synchronous lookup.
+#[cfg(feature = "static-executor")]
+pub fn redact_with_puid_lookup<F>(
+    handle: u64,
+    record: &[u8],
+    enforcement: ShapeEnforcement,
+    keep_mode: KeepMode,
+    lookup: &F,
+) -> Result<Bytes, RedactError>
+where
+    F: Fn(i64) -> PuidLookupResult,
+{
+    ensure_abi_version()?;
+    let mut output = ForeignBuffer::EMPTY;
+    let mut error = ForeignBuffer::EMPTY;
+    let lookup_context = ptr::from_ref(lookup).cast_mut().cast::<c_void>();
+    // SAFETY: The record and lookup remain live for this synchronous call. The callback context
+    // points to `lookup`, and both output pointers reference distinct initialized locals.
+    let status = unsafe {
+        db_redactor_redact_with_puid_lookup(
+            handle,
+            record.as_ptr(),
+            record.len(),
+            u8::from(enforcement == ShapeEnforcement::On),
+            u8::from(keep_mode == KeepMode::Keep),
+            ForeignStringView::EMPTY,
+            ForeignStringView::EMPTY,
+            ForeignStringView::EMPTY,
+            ForeignStringView::EMPTY,
+            Some(puid_lookup_callback::<F>),
+            lookup_context,
+            &mut output,
+            &mut error,
+        )
+    };
+    status_result(status, &error)?;
+    Ok(output.into_bytes())
+}
+
+#[cfg(feature = "static-executor")]
+unsafe extern "C-unwind" fn puid_lookup_callback<F>(
+    context: *mut c_void,
+    user_id: i64,
+    out_puid: *mut i64,
+) -> i32
+where
+    F: Fn(i64) -> PuidLookupResult,
+{
+    if context.is_null() || out_puid.is_null() {
+        return PUID_LOOKUP_ERROR;
+    }
+    // SAFETY: `redact_with_puid_lookup` supplies a live `F` for the synchronous ABI call.
+    let lookup = unsafe { &*context.cast::<F>() };
+    match panic::catch_unwind(AssertUnwindSafe(|| lookup(user_id))) {
+        Ok(PuidLookupResult::Found(puid)) => {
+            // SAFETY: The canonical executor supplies a writable i64 output slot.
+            unsafe { out_puid.write(puid) };
+            PUID_LOOKUP_FOUND
+        }
+        Ok(PuidLookupResult::Missing) => PUID_LOOKUP_MISSING,
+        Ok(PuidLookupResult::Error) | Err(_) => PUID_LOOKUP_ERROR,
+    }
 }
 
 #[cfg(feature = "static-executor")]
