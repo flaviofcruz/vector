@@ -1,14 +1,25 @@
 // Note: Using v0.21 Azure SDKs to match azure_storage_* crate versions
-use azure_core_for_storage::{Error as AzureError, auth::Secret};
-use azure_identity_for_storage::{ClientCertificateCredential, ClientCertificateCredentialOptions};
+use azure_core_for_storage::{
+    Error as AzureError, Url,
+    auth::{AccessToken, TokenCredential},
+    error::ErrorKind,
+};
+use azure_identity_for_storage::{TokenCredentialOptions, federated_credentials_flow};
 use base64::prelude::*;
-use openssl::pkcs12::Pkcs12;
-use openssl::pkey::PKey;
+use openssl::hash::MessageDigest;
+use openssl::pkey::{Id, PKey, Private};
+use openssl::rsa::Padding;
+use openssl::sign::Signer;
 use openssl::x509::X509;
 use pem::Pem;
 use snafu::{ResultExt, Snafu};
-use std::fs;
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    fmt, fs,
+    path::Path,
+    time::{Duration, SystemTime},
+};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use vector_lib::configurable::configurable_component;
 
@@ -27,8 +38,11 @@ pub enum PemCertificateError {
     #[snafu(display("Failed to parse certificate from PEM file: {}", source))]
     CertificateParse { source: openssl::error::ErrorStack },
 
-    #[snafu(display("Failed to create PKCS12 structure: {}", source))]
-    Pkcs12Creation { source: openssl::error::ErrorStack },
+    #[snafu(display("Client certificate authentication requires an RSA private key"))]
+    UnsupportedPrivateKey,
+
+    #[snafu(display("Client certificate does not match the private key"))]
+    CertificateKeyMismatch,
 
     #[snafu(display("Failed to create Azure ClientCertificateCredential: {}", source))]
     CredentialCreation { source: AzureError },
@@ -49,9 +63,8 @@ const fn default_send_certificate_chain() -> bool {
 /// Configuration that must be provided by the client if they want to
 /// use service principal based SNI authentication.
 ///
-/// [Internal] We use this struct as a wrapper around the azure-sdk-for-rust's
-/// ClientCertificateCredential as the same only supports PKCS12 format certificates,
-/// while SEAR mounted certificates use the PEM format.
+/// SEAR mounts PEM credentials. Sign assertions directly with that key: converting
+/// through the SDK's PKCS12 credential requires PKCS12KDF, unavailable in FIPS mode.
 #[configurable_component]
 #[derive(Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -100,45 +113,29 @@ impl PemCertificateCredential {
         }
     }
 
-    /// Converts PEM certificate to PKCS12 format and creates Azure ClientCertificateCredential.
-    pub fn create_client_certificate_credential(&self) -> Result<ClientCertificateCredential> {
+    /// Loads the PEM key and certificate for signing Azure client assertions.
+    pub fn create_client_certificate_credential(&self) -> Result<PemTokenCredential> {
+        self.create_credential_with_options(TokenCredentialOptions::default())
+    }
+
+    fn create_credential_with_options(
+        &self,
+        options: TokenCredentialOptions,
+    ) -> Result<PemTokenCredential> {
         let pem_path = Path::new(&self.client_certificate_path);
         let pem_content = fs::read_to_string(pem_path).context(FileReadSnafu {
             path: pem_path.to_path_buf(),
         })?;
-
         let (private_key, certificate) = self.parse_pem_content(&pem_content)?;
-
-        // Generate a random temporary password for PKCS12 encryption
-        let temp_random_password = self.generate_temp_random_password();
-        let pkcs12_data = self.create_pkcs12(&private_key, &certificate, &temp_random_password)?;
-
-        let mut credential_options = ClientCertificateCredentialOptions::default();
-        credential_options.set_send_certificate_chain(self.send_certificate_chain);
-
-        let client_certificate_secret =
-            Secret::new(base64::prelude::BASE64_STANDARD.encode(&pkcs12_data));
-        let password_secret = Secret::new(temp_random_password);
-
-        let client_credential = ClientCertificateCredential::new(
-            self.tenant_id.clone(),
-            self.client_id.clone(),
-            client_certificate_secret,
-            password_secret,
-            credential_options,
-        )
-        .context(CredentialCreationSnafu)?;
-
-        Ok(client_credential)
-    }
-
-    /// Generates a random temporary password for PKCS12 encryption.
-    /// The password is used internally when converting PEM certificates to PKCS12 format.
-    /// This would be used by the azure_identity crate to decode the PKCS12 data provided
-    /// and extract the certificate and the private key.
-    /// We make use a constant prefix and a UUID as the password.
-    fn generate_temp_random_password(&self) -> String {
-        format!("vector-azure-temp-{}", Uuid::new_v4())
+        if private_key.id() != Id::RSA {
+            return Err(PemCertificateError::UnsupportedPrivateKey);
+        }
+        let public_key = certificate.public_key().context(CertificateParseSnafu)?;
+        if !private_key.public_eq(&public_key) {
+            return Err(PemCertificateError::CertificateKeyMismatch);
+        }
+        PemTokenCredential::new(self, private_key, &certificate, options)
+            .context(CredentialCreationSnafu)
     }
 
     /// Parses PEM content to extract private key and certificate.
@@ -186,22 +183,140 @@ impl PemCertificateCredential {
 
         Ok((private_key, certificate))
     }
+}
 
-    /// Creates PKCS12 structure from private key and certificate.
-    fn create_pkcs12(
-        &self,
-        private_key: &PKey<openssl::pkey::Private>,
+/// An Azure token credential that signs directly with a PEM private key.
+///
+/// The key is held for the lifetime of the source, matching the previous SDK
+/// credential's behavior. Rebuilding the source reloads the mounted certificate.
+pub struct PemTokenCredential {
+    tenant_id: String,
+    client_id: String,
+    private_key: PKey<Private>,
+    header: String,
+    authority_host: Url,
+    audience: Url,
+    options: TokenCredentialOptions,
+    cache: Mutex<HashMap<String, AccessToken>>,
+}
+
+impl fmt::Debug for PemTokenCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PemTokenCredential")
+            .field("tenant_id", &self.tenant_id)
+            .field("client_id", &self.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PemTokenCredential {
+    fn new(
+        config: &PemCertificateCredential,
+        private_key: PKey<Private>,
         certificate: &X509,
-        temp_random_password: &str,
-    ) -> Result<Vec<u8>> {
-        let pkcs12 = Pkcs12::builder()
-            .pkey(private_key)
-            .cert(certificate)
-            .build2(temp_random_password)
-            .context(Pkcs12CreationSnafu)?;
+        options: TokenCredentialOptions,
+    ) -> azure_core_for_storage::Result<Self> {
+        let authority_host = options.authority_host()?;
+        let audience = authority_host.join(&format!("/{}/oauth2/v2.0/token", config.tenant_id))?;
+        // x5t identifies the certificate with SHA-1; the assertion uses RSA/SHA-256.
+        let thumbprint = certificate
+            .digest(MessageDigest::sha1())
+            .map_err(Self::openssl_error)?;
+        let mut header = serde_json::json!({
+            "alg": "RS256",
+            "typ": "JWT",
+            "x5t": BASE64_STANDARD.encode(thumbprint),
+        });
+        if config.send_certificate_chain {
+            // Preserve azure_identity 0.21's SNI header representation.
+            header["x5c"] = serde_json::json!([
+                BASE64_STANDARD.encode(certificate.to_pem().map_err(Self::openssl_error)?)
+            ]);
+        }
+        Ok(Self {
+            tenant_id: config.tenant_id.clone(),
+            client_id: config.client_id.clone(),
+            private_key,
+            header: BASE64_URL_SAFE_NO_PAD.encode(header.to_string()),
+            authority_host,
+            audience,
+            options,
+            cache: Mutex::new(HashMap::new()),
+        })
+    }
 
-        let pkcs12_der = pkcs12.to_der().context(Pkcs12CreationSnafu)?;
-        Ok(pkcs12_der)
+    fn client_assertion(&self) -> azure_core_for_storage::Result<String> {
+        let now = chrono::Utc::now().timestamp();
+        let payload = serde_json::json!({
+            "aud": self.audience.as_str(),
+            "exp": now + 300,
+            "iss": self.client_id,
+            "jti": Uuid::new_v4().to_string(),
+            "nbf": now,
+            "sub": self.client_id,
+        });
+        let jwt = format!(
+            "{}.{}",
+            self.header,
+            BASE64_URL_SAFE_NO_PAD.encode(payload.to_string())
+        );
+        let mut signer =
+            Signer::new(MessageDigest::sha256(), &self.private_key).map_err(Self::openssl_error)?;
+        signer
+            .set_rsa_padding(Padding::PKCS1)
+            .map_err(Self::openssl_error)?;
+        signer.update(jwt.as_bytes()).map_err(Self::openssl_error)?;
+        let signature = signer.sign_to_vec().map_err(Self::openssl_error)?;
+        Ok(format!(
+            "{}.{}",
+            jwt,
+            BASE64_URL_SAFE_NO_PAD.encode(signature)
+        ))
+    }
+
+    fn openssl_error(error: openssl::error::ErrorStack) -> AzureError {
+        AzureError::new(ErrorKind::Credential, error)
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenCredential for PemTokenCredential {
+    async fn get_token(&self, scopes: &[&str]) -> azure_core_for_storage::Result<AccessToken> {
+        let [scope] = scopes else {
+            return Err(AzureError::message(
+                ErrorKind::Credential,
+                "Exactly one Azure storage scope is required",
+            ));
+        };
+        // Serialize refreshes so the blob and queue clients share one token request.
+        let mut cache = self.cache.lock().await;
+        if let Some(token) = cache.get(*scope)
+            && SystemTime::from(token.expires_on) > SystemTime::now() + Duration::from_secs(20)
+        {
+            return Ok(token.clone());
+        }
+        let assertion = self.client_assertion()?;
+        // Certificate and federated assertions use the same OAuth token exchange.
+        let response = federated_credentials_flow::perform(
+            self.options.http_client(),
+            &self.client_id,
+            &assertion,
+            scopes,
+            &self.tenant_id,
+            &self.authority_host,
+        )
+        .await?;
+        let token = AccessToken::new(
+            response.access_token,
+            (SystemTime::now() + Duration::from_secs(response.expires_in)).into(),
+        );
+        cache.insert((*scope).to_owned(), token.clone());
+        Ok(token)
+    }
+
+    async fn clear_cache(&self) -> azure_core_for_storage::Result<()> {
+        self.cache.lock().await.clear();
+        Ok(())
     }
 }
 
@@ -374,51 +489,15 @@ FLgLKNR10xCWvrfoLa2uhwFmt1pjfBCV+GRkscoq3DxIpTxzESL5jIX5VRUSug==
     }
 
     #[test]
-    fn test_create_pkcs12_valid() {
-        let cred = PemCertificateCredential::new(
-            "tenant-123".to_string(),
-            "client-456".to_string(),
-            "storageaccount".to_string(),
-            "/path/to/cert.pem".to_string(),
-            None,
-        );
-
-        // Contains the private key, and then the certificate
-        let test_pem_content: String = PEM_PRIVATE_KEY_ONLY.to_string() + PEM_CERTIFICATE_ONLY;
-        let (private_key, certificate) = cred.parse_pem_content(test_pem_content.as_str()).unwrap();
-        let temp_password = cred.generate_temp_random_password();
-        let result = cred.create_pkcs12(&private_key, &certificate, &temp_password);
-
-        assert!(
-            result.is_ok(),
-            "PKCS12 creation should succeed with valid key and cert"
-        );
-        let pkcs12_data = result.unwrap();
-        assert!(!pkcs12_data.is_empty(), "PKCS12 data should not be empty");
-    }
-
-    #[test]
-    fn test_create_pkcs12_valid_reverse() {
-        let cred = PemCertificateCredential::new(
-            "tenant-123".to_string(),
-            "client-456".to_string(),
-            "storageaccount".to_string(),
-            "/path/to/cert.pem".to_string(),
-            None,
-        );
-
-        // Contains the certificate, and then the private key
-        let test_pem_content: String = PEM_CERTIFICATE_ONLY.to_string() + PEM_PRIVATE_KEY_ONLY;
-        let (private_key, certificate) = cred.parse_pem_content(test_pem_content.as_str()).unwrap();
-        let temp_password = cred.generate_temp_random_password();
-        let result = cred.create_pkcs12(&private_key, &certificate, &temp_password);
-
-        assert!(
-            result.is_ok(),
-            "PKCS12 creation should succeed with valid key and cert"
-        );
-        let pkcs12_data = result.unwrap();
-        assert!(!pkcs12_data.is_empty(), "PKCS12 data should not be empty");
+    fn test_create_credential_valid() {
+        for content in [
+            format!("{PEM_PRIVATE_KEY_ONLY}{PEM_CERTIFICATE_ONLY}"),
+            format!("{PEM_CERTIFICATE_ONLY}{PEM_PRIVATE_KEY_ONLY}"),
+        ] {
+            let file = create_temp_pem_file(&content);
+            let config = test_config(&file, true);
+            config.create_client_certificate_credential().unwrap();
+        }
     }
 
     #[test]
@@ -460,5 +539,280 @@ FLgLKNR10xCWvrfoLa2uhwFmt1pjfBCV+GRkscoq3DxIpTxzESL5jIX5VRUSug==
             PemCertificateError::InvalidPemFormat => {} // Expected error - missing certificate
             other => panic!("Expected InvalidPemFormat error, got: {:?}", other),
         }
+    }
+    fn test_config(file: &NamedTempFile, send_chain: bool) -> PemCertificateCredential {
+        PemCertificateCredential::new(
+            "tenant-123".to_owned(),
+            "client-456".to_owned(),
+            "storageaccount".to_owned(),
+            file.path().to_string_lossy().into_owned(),
+            Some(send_chain),
+        )
+    }
+
+    // Only the Azure HTTP boundary is simulated; PEM parsing, signing, token exchange,
+    // response handling, and the credential cache all use the production implementation.
+    #[derive(Debug)]
+    struct TokenEndpoint {
+        send_chain: bool,
+        fail_first: bool,
+        requests: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl azure_core_for_storage::HttpClient for TokenEndpoint {
+        async fn execute_request(
+            &self,
+            request: &azure_core_for_storage::Request,
+        ) -> azure_core_for_storage::Result<azure_core_for_storage::Response> {
+            use azure_core_for_storage::{Body, Method, Response, StatusCode, headers};
+            use openssl::sign::Verifier;
+
+            tokio::task::yield_now().await;
+            assert_eq!(request.method(), &Method::Post);
+            assert_eq!(
+                request.url().as_str(),
+                "https://login.microsoftonline.us/tenant-123/oauth2/v2.0/token"
+            );
+            assert_eq!(
+                request.headers().get_str(&headers::CONTENT_TYPE).unwrap(),
+                "application/x-www-form-urlencoded"
+            );
+            let Body::Bytes(body) = request.body() else {
+                panic!("expected token request body")
+            };
+            let form: HashMap<_, _> = url::form_urlencoded::parse(body).into_owned().collect();
+            assert_eq!(form["client_id"], "client-456");
+            assert_eq!(form["grant_type"], "client_credentials");
+            assert_eq!(
+                form["client_assertion_type"],
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+            );
+            let parts: Vec<_> = form["client_assertion"].split('.').collect();
+            assert_eq!(parts.len(), 3);
+            let decode = |part| {
+                serde_json::from_slice::<serde_json::Value>(
+                    &BASE64_URL_SAFE_NO_PAD.decode(part).unwrap(),
+                )
+                .unwrap()
+            };
+            let header = decode(parts[0]);
+            let claims = decode(parts[1]);
+            assert_eq!(header["alg"], "RS256");
+            assert_eq!(header["typ"], "JWT");
+            let certificate = X509::from_pem(PEM_CERTIFICATE_ONLY.as_bytes()).unwrap();
+            assert_eq!(
+                BASE64_STANDARD
+                    .decode(header["x5t"].as_str().unwrap())
+                    .unwrap(),
+                certificate.digest(MessageDigest::sha1()).unwrap().as_ref()
+            );
+            if self.send_chain {
+                let chain = header["x5c"].as_array().unwrap();
+                assert_eq!(chain.len(), 1);
+                assert_eq!(
+                    BASE64_STANDARD.decode(chain[0].as_str().unwrap()).unwrap(),
+                    certificate.to_pem().unwrap()
+                );
+            } else {
+                assert!(header.get("x5c").is_none());
+            }
+            assert_eq!(claims["aud"], request.url().as_str());
+            assert_eq!(claims["iss"], "client-456");
+            assert_eq!(claims["sub"], "client-456");
+            let nbf = claims["nbf"].as_i64().unwrap();
+            assert!((chrono::Utc::now().timestamp() - nbf).abs() < 30);
+            assert_eq!(claims["exp"].as_i64().unwrap() - nbf, 300);
+            let jti = claims["jti"].as_str().unwrap();
+            assert_eq!(Uuid::parse_str(jti).unwrap().get_version_num(), 4);
+            let public_key = certificate.public_key().unwrap();
+            let mut verifier = Verifier::new(MessageDigest::sha256(), &public_key).unwrap();
+            verifier.set_rsa_padding(Padding::PKCS1).unwrap();
+            verifier
+                .update(format!("{}.{}", parts[0], parts[1]).as_bytes())
+                .unwrap();
+            assert!(
+                verifier
+                    .verify(&BASE64_URL_SAFE_NO_PAD.decode(parts[2]).unwrap())
+                    .unwrap()
+            );
+            let mut requests = self.requests.lock().unwrap();
+            assert!(requests.iter().all(|(_, previous_jti)| previous_jti != jti));
+            requests.push((form["scope"].clone(), jti.to_owned()));
+            let (status, response) = if self.fail_first && requests.len() == 1 {
+                (
+                    StatusCode::Unauthorized,
+                    serde_json::json!({"error": "invalid_client", "error_description": "test rejection"}),
+                )
+            } else {
+                (
+                    StatusCode::Ok,
+                    serde_json::json!({
+                        "token_type": "Bearer", "expires_in": 3600, "ext_expires_in": 3600,
+                        "access_token": format!("test-token-{}", requests.len()),
+                    }),
+                )
+            };
+            Ok(Response::new(
+                status,
+                headers::Headers::new(),
+                Box::pin(futures::stream::once(async move {
+                    Ok(bytes::Bytes::from(response.to_string()))
+                })),
+            ))
+        }
+    }
+
+    fn token_test_credential(
+        send_chain: bool,
+        fail_first: bool,
+    ) -> (PemTokenCredential, std::sync::Arc<TokenEndpoint>) {
+        let file = create_temp_pem_file(&format!("{PEM_PRIVATE_KEY_ONLY}{PEM_CERTIFICATE_ONLY}"));
+        let endpoint = std::sync::Arc::new(TokenEndpoint {
+            send_chain,
+            fail_first,
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let http = std::sync::Arc::clone(&endpoint);
+        let mut options = TokenCredentialOptions::from(
+            http as std::sync::Arc<dyn azure_core_for_storage::HttpClient>,
+        );
+        options.set_authority_host("https://login.microsoftonline.us".to_owned());
+        let credential = test_config(&file, send_chain)
+            .create_credential_with_options(options)
+            .unwrap();
+        (credential, endpoint)
+    }
+
+    #[tokio::test]
+    async fn test_token_acquisition_cache_refresh_and_clear() {
+        let (credential, endpoint) = token_test_credential(true, false);
+        let scopes = ["https://storage.azure.com/.default"];
+        let (first, concurrent) =
+            tokio::join!(credential.get_token(&scopes), credential.get_token(&scopes));
+        let first = first.unwrap();
+        assert_eq!(first.token.secret(), "test-token-1");
+        assert_eq!(concurrent.unwrap().token.secret(), first.token.secret());
+        assert_eq!(endpoint.requests.lock().unwrap().len(), 1);
+        let seconds_remaining = SystemTime::from(first.expires_on)
+            .duration_since(SystemTime::now())
+            .unwrap()
+            .as_secs();
+        assert!((3590..=3600).contains(&seconds_remaining));
+
+        // A different scope must never reuse the storage token.
+        assert_eq!(
+            credential
+                .get_token(&["https://management.azure.com/.default"])
+                .await
+                .unwrap()
+                .token
+                .secret(),
+            "test-token-2"
+        );
+        credential
+            .cache
+            .lock()
+            .await
+            .get_mut(scopes[0])
+            .unwrap()
+            .expires_on = (SystemTime::now() + Duration::from_secs(10)).into();
+        assert_eq!(
+            credential.get_token(&scopes).await.unwrap().token.secret(),
+            "test-token-3"
+        );
+        credential.clear_cache().await.unwrap();
+        assert_eq!(
+            credential.get_token(&scopes).await.unwrap().token.secret(),
+            "test-token-4"
+        );
+        assert_eq!(endpoint.requests.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_token_acquisition_without_certificate_chain() {
+        let (credential, endpoint) = token_test_credential(false, false);
+        credential
+            .get_token(&["https://storage.azure.com/.default"])
+            .await
+            .unwrap();
+        assert_eq!(endpoint.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_failed_token_request_is_not_cached() {
+        let (credential, endpoint) = token_test_credential(true, true);
+        let scopes = ["https://storage.azure.com/.default"];
+        let error = credential.get_token(&scopes).await.unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::HttpResponse {
+                status: azure_core_for_storage::StatusCode::Unauthorized,
+                ..
+            }
+        ));
+        assert!(credential.cache.lock().await.is_empty());
+        assert_eq!(
+            credential.get_token(&scopes).await.unwrap().token.secret(),
+            "test-token-2"
+        );
+        assert_eq!(endpoint.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_scopes_do_not_send_a_request() {
+        let (credential, endpoint) = token_test_credential(true, false);
+        assert!(credential.get_token(&[]).await.is_err());
+        assert!(credential.get_token(&["first", "second"]).await.is_err());
+        assert!(endpoint.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_mismatched_certificate_is_rejected() {
+        let key = PKey::from_rsa(openssl::rsa::Rsa::generate(2048).unwrap()).unwrap();
+        let content = format!(
+            "{}{PEM_CERTIFICATE_ONLY}",
+            String::from_utf8(key.private_key_to_pem_pkcs8().unwrap()).unwrap()
+        );
+        let file = create_temp_pem_file(&content);
+        assert!(matches!(
+            test_config(&file, true).create_client_certificate_credential(),
+            Err(PemCertificateError::CertificateKeyMismatch)
+        ));
+    }
+
+    #[test]
+    fn test_non_rsa_key_is_rejected() {
+        let group =
+            openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(openssl::ec::EcKey::generate(&group).unwrap()).unwrap();
+        let content = format!(
+            "{}{PEM_CERTIFICATE_ONLY}",
+            String::from_utf8(key.private_key_to_pem_pkcs8().unwrap()).unwrap()
+        );
+        let file = create_temp_pem_file(&content);
+        assert!(matches!(
+            test_config(&file, true).create_client_certificate_credential(),
+            Err(PemCertificateError::UnsupportedPrivateKey)
+        ));
+    }
+
+    #[test]
+    fn test_fips_policy_when_requested() {
+        if std::env::var("VECTOR_TEST_EXPECT_FIPS").as_deref() != Ok("true") {
+            return;
+        }
+        // Run the credential suite in a separate process with the FIPS config;
+        // never change OpenSSL's process-wide defaults from a unit test.
+        assert!(openssl::hash::hash(MessageDigest::md5(), b"policy probe").is_err());
+        let key = PKey::private_key_from_pem(PEM_PRIVATE_KEY_ONLY.as_bytes()).unwrap();
+        let cert = X509::from_pem(PEM_CERTIFICATE_ONLY.as_bytes()).unwrap();
+        assert!(
+            openssl::pkcs12::Pkcs12::builder()
+                .pkey(&key)
+                .cert(&cert)
+                .build2("vector-test-password-long-enough")
+                .is_err()
+        );
     }
 }
