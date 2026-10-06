@@ -467,6 +467,60 @@ mod tests {
 
     use super::*;
 
+    fn puid_plan(target_type: plan_proto::PuidTargetType) -> Vec<u8> {
+        use plan_proto::field_action::Action;
+
+        let derived_shapes = (target_type == plan_proto::PuidTargetType::String).then(|| {
+            plan_proto::redact_from::DerivedShapes {
+                shapes: vec![DataShape::Numeric as i32],
+            }
+        });
+        plan_proto::RedactionPlanSet {
+            plans: vec![plan_proto::MessageRedactionPlan {
+                actions: vec![
+                    plan_proto::FieldActionEntry {
+                        field_number: Some(1),
+                        action: Some(plan_proto::FieldAction {
+                            action: Some(Action::Remove(plan_proto::Remove {})),
+                        }),
+                    },
+                    plan_proto::FieldActionEntry {
+                        field_number: Some(2),
+                        action: Some(plan_proto::FieldAction {
+                            action: Some(Action::RedactFrom(plan_proto::RedactFrom {
+                                source_field_number: Some(1),
+                                transform: Some(
+                                    plan_proto::RedactFromTransform::GeneratePuid as i32,
+                                ),
+                                derived_shapes,
+                                is_repeated: Some(false),
+                                puid_target_type: Some(target_type as i32),
+                                ..Default::default()
+                            })),
+                        }),
+                    },
+                ],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    fn encode_int64_field(field_number: u64, value: i64) -> Vec<u8> {
+        let mut output = Vec::new();
+        encode_varint(field_number << 3, &mut output);
+        encode_varint(value as u64, &mut output);
+        output
+    }
+
+    fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
+        while value >= 0x80 {
+            output.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        output.push(value as u8);
+    }
+
     #[test]
     fn uses_current_abi_version() {
         assert_eq!(
@@ -564,5 +618,85 @@ mod tests {
             !field_value_conforms(&[DataShape::Uuid as i32], "not-a-uuid")
                 .expect("shape validation should succeed")
         );
+    }
+
+    #[test]
+    fn detects_puid_plan_requirement() {
+        assert!(
+            plan_requires_puid_lookup(&puid_plan(plan_proto::PuidTargetType::Int64))
+                .expect("plan should decode")
+        );
+        assert!(!plan_requires_puid_lookup(&[0x0a, 0x00]).expect("minimal plan should decode"));
+    }
+
+    #[test]
+    fn rejects_string_puid_targets() {
+        assert!(matches!(
+            plan_requires_puid_lookup(&puid_plan(plan_proto::PuidTargetType::String)),
+            Err(RedactError::InvalidPlan(_))
+        ));
+    }
+
+    #[test]
+    fn puid_lookup_preserves_full_signed_range() {
+        let record = [0x08, 0x07];
+        for puid in [0, i64::MIN, i64::MAX] {
+            let handle = register_plan(&puid_plan(plan_proto::PuidTargetType::Int64))
+                .expect("plan should register");
+            let output = redact_with_puid_lookup(
+                handle,
+                &record,
+                ShapeEnforcement::On,
+                KeepMode::Wipe,
+                &|user_id| {
+                    assert_eq!(user_id, 7);
+                    PuidLookupResult::Found(puid)
+                },
+            )
+            .expect("record should redact");
+            assert_eq!(output.as_ref(), encode_int64_field(2, puid));
+            release_plan(handle);
+        }
+    }
+
+    #[test]
+    fn puid_miss_error_and_panic_are_nonblocking() {
+        let plan = puid_plan(plan_proto::PuidTargetType::Int64);
+        let record = [0x08, 0x07];
+        for lookup in [PuidLookupResult::Missing, PuidLookupResult::Error] {
+            let handle = register_plan(&plan).expect("plan should register");
+            let output = redact_with_puid_lookup(
+                handle,
+                &record,
+                ShapeEnforcement::On,
+                KeepMode::Wipe,
+                &|_| lookup,
+            )
+            .expect("mapping failure should retain the record");
+            assert!(output.is_empty());
+            release_plan(handle);
+        }
+
+        let handle = register_plan(&plan).expect("plan should register");
+        let output = redact_with_puid_lookup(
+            handle,
+            &record,
+            ShapeEnforcement::On,
+            KeepMode::Wipe,
+            &|_| -> PuidLookupResult { panic!("lookup panic") },
+        )
+        .expect("lookup panic should become a nonblocking lookup error");
+        assert!(output.is_empty());
+        release_plan(handle);
+    }
+
+    #[test]
+    fn legacy_entry_point_treats_missing_resolver_as_nonblocking() {
+        let handle = register_plan(&puid_plan(plan_proto::PuidTargetType::Int64))
+            .expect("plan should register");
+        let output = redact(handle, &[0x08, 0x07], ShapeEnforcement::On)
+            .expect("missing resolver should omit the PUID without failing the record");
+        assert!(output.is_empty());
+        release_plan(handle);
     }
 }
