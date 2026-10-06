@@ -69,6 +69,7 @@ impl Drop for PlanHandle {
 #[derive(Clone, Debug)]
 pub struct PlanResolver {
     handles: HashMap<PlanKey, Arc<PlanHandle>>,
+    requires_puid_lookup: bool,
 }
 
 impl PlanResolver {
@@ -80,11 +81,14 @@ impl PlanResolver {
     /// [`handle_for`](Self::handle_for) lookup is the same either way; the caller supplies the key.
     pub fn from_plan_file(path: &str) -> Result<Self, LoadError> {
         let bytes = std::fs::read(path).map_err(|e| LoadError::Read(path.to_owned(), e))?;
+        let requires_puid_lookup =
+            executor::plan_requires_puid_lookup(&bytes).map_err(LoadError::Register)?;
         // The fleet HMAC key for `RedactFrom` (HMAC_HASH) derivation is read from the environment,
         // where the VA/VAP deployment mounts it (see the LP HMAC-hash design doc — key provisioning
         // + security review are the gating step). Absent/empty ⇒ `None`, and the executor then
-        // rejects any plan carrying a `RedactFrom` (fail-closed): the whole feature stays dormant
-        // until the key is provisioned. Plans without a `RedactFrom` register regardless.
+        // rejects any plan carrying an HMAC_HASH `RedactFrom` (fail-closed): that transform stays
+        // dormant until the key is provisioned. Other transforms, including GENERATE_PUID, do not
+        // require this key.
         let hmac_key = std::env::var(HMAC_KEY_ENV_VAR)
             .ok()
             .filter(|k| !k.is_empty());
@@ -93,12 +97,20 @@ impl PlanResolver {
                 .map_err(LoadError::Register)?;
         let mut handles = HashMap::new();
         handles.insert(PlanKey::default(), Arc::new(PlanHandle(handle)));
-        Ok(Self { handles })
+        Ok(Self {
+            handles,
+            requires_puid_lookup,
+        })
     }
 
     /// Returns the executor handle registered for `key`, if any.
     pub fn handle_for(&self, key: &PlanKey) -> Option<u64> {
         self.handles.get(key).map(|h| h.0)
+    }
+
+    /// Returns whether this resolver's plan contains a `GENERATE_PUID` action.
+    pub fn requires_puid_lookup(&self) -> bool {
+        self.requires_puid_lookup
     }
 }
 
