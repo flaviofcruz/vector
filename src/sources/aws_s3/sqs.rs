@@ -110,6 +110,13 @@ pub(super) struct Config {
     #[configurable(validation(format = "uri"))]
     pub(super) queue_url: String,
 
+    /// Override the SQS service endpoint independently of S3.
+    ///
+    /// Defaults to the source-level `endpoint` when set, otherwise the AWS resolver.
+    /// An explicit endpoint takes precedence over `AWS_USE_FIPS_ENDPOINT` for SQS only.
+    #[configurable(validation(format = "uri"))]
+    pub(super) endpoint: Option<String>,
+
     /// How long to wait while polling the queue for new messages, in seconds.
     ///
     /// Generally, this should not be changed unless instructed to do so, as if messages are available,
@@ -1833,7 +1840,10 @@ fn test_eventbridge_key_not_urldecoded() {
         _ => panic!("Expected EventBridge variant"),
     };
     let s3: S3Event = eb.into();
-    assert_eq!(s3.records[0].s3.object.key, "structured-logs/span/a+b%2Bc.log");
+    assert_eq!(
+        s3.records[0].s3.object.key,
+        "structured-logs/span/a+b%2Bc.log"
+    );
 }
 
 #[test]

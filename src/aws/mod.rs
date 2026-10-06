@@ -9,6 +9,8 @@ mod endpoint_tests;
     test,
     any(
         feature = "sources-aws_s3",
+        feature = "sources-aws_sqs",
+        feature = "sinks-aws_sqs",
         feature = "sinks-aws_s3",
         feature = "sinks-aws_kinesis_streams"
     )

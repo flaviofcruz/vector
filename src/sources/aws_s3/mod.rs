@@ -231,6 +231,13 @@ impl AwsS3Config {
             .or_else(|| self.region.region())
     }
 
+    fn sqs_client_endpoint(&self) -> Option<String> {
+        self.sqs
+            .as_ref()
+            .and_then(|sqs| sqs.endpoint.clone())
+            .or_else(|| self.region.endpoint())
+    }
+
     async fn create_sqs_ingestor(
         &self,
         multiline: Option<line_agg::Config>,
@@ -246,7 +253,7 @@ impl AwsS3Config {
             },
             &self.auth,
             self.s3_client_region(),
-            endpoint.clone(),
+            endpoint,
             proxy,
             self.tls_options.as_ref(),
             None,
@@ -263,7 +270,7 @@ impl AwsS3Config {
                     &SqsClientBuilder {},
                     &self.auth,
                     region.clone(),
-                    endpoint,
+                    self.sqs_client_endpoint(),
                     proxy,
                     sqs.tls_options.as_ref(),
                     sqs.timeout.as_ref(),
@@ -330,6 +337,65 @@ async fn s3_object_decoder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sqs_override_preserves_s3_endpoint_and_region() {
+        use crate::aws::{ClientBuilder, test_util::CaptureClient};
+
+        for shared_endpoint in [None, Some("http://localhost:4566")] {
+            for sqs_endpoint in [None, Some("https://sqs.ca-central-1.amazonaws.com")] {
+                let config: AwsS3Config = serde_json::from_value(serde_json::json!({
+                    "region": "ca-central-1",
+                    "s3_region": "us-east-1",
+                    "endpoint": shared_endpoint,
+                    "strategy": "sqs",
+                    "sqs": {
+                        "queue_url": "https://sqs.ca-central-1.amazonaws.com/123456789012/test",
+                        "endpoint": sqs_endpoint,
+                    }
+                }))
+                .unwrap();
+                let s3_http = CaptureClient::new("");
+                let mut s3_config = s3_http
+                    .config(config.s3_client_region().unwrap().as_ref(), Some(true))
+                    .into_builder();
+                s3_config.set_endpoint_url(config.region.endpoint());
+                S3ClientBuilder {
+                    force_path_style: Some(true),
+                }
+                .build(&s3_config.build())
+                .head_bucket()
+                .bucket("test-bucket")
+                .send()
+                .await
+                .unwrap();
+                let expected_s3 = shared_endpoint
+                    .map(|endpoint| format!("{endpoint}/test-bucket/"))
+                    .unwrap_or_else(|| {
+                        "https://test-bucket.s3-fips.us-east-1.amazonaws.com/".to_owned()
+                    });
+                assert_eq!(s3_http.requests.lock().unwrap()[0].uri(), expected_s3);
+
+                let sqs_http = CaptureClient::new("{}");
+                let mut sqs_config = sqs_http.config("ca-central-1", Some(true)).into_builder();
+                sqs_config.set_endpoint_url(config.sqs_client_endpoint());
+                SqsClientBuilder
+                    .build(&sqs_config.build())
+                    .receive_message()
+                    .queue_url(config.sqs.as_ref().unwrap().queue_url.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                let expected_sqs = sqs_endpoint
+                    .or(shared_endpoint)
+                    .unwrap_or("https://sqs-fips.ca-central-1.amazonaws.com");
+                assert_eq!(
+                    sqs_http.requests.lock().unwrap()[0].uri(),
+                    format!("{expected_sqs}/")
+                );
+            }
+        }
+    }
 
     #[test]
     fn s3_client_region_prefers_override_then_source() {
