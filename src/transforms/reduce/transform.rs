@@ -462,6 +462,7 @@ mod test {
                         delivery_method: "file".into(),
                         service_system: "service".into(),
                         source_pod_id: "pod".into(),
+                        workspace_id: None,
                     },
                     ["online".into()],
                 );

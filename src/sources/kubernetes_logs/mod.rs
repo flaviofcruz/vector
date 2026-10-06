@@ -888,18 +888,20 @@ fn attach_delivery_path_accounting(
     service_system: Option<&str>,
     source_pod_id: Option<&str>,
     time_parity: i64,
+    workspace_id: Option<&str>,
 ) {
     if delivery_paths.is_empty() {
         return;
     }
 
-    let source = DeliverySourceLabels::at_read(
+    let source = DeliverySourceLabels::at_read_with_workspace_id(
         source_path,
         source_context,
         service_system,
         source_pod_id,
         vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
         time_parity,
+        workspace_id,
     );
     let matching_paths = delivery_paths
         .iter()
@@ -1419,7 +1421,7 @@ impl Source {
                 .unwrap()
                 .get(&PathBuf::from(&line.filename))
                 .cloned();
-            let (file_info, service_system, source_pod_id) = annotator
+            let (file_info, service_system, source_pod_id, workspace_id) = annotator
                 .annotate_with_delivery_metric_metadata(
                     &mut event,
                     &line.filename,
@@ -1439,6 +1441,7 @@ impl Source {
                 service_system.as_deref(),
                 source_pod_id.as_deref(),
                 time_parity,
+                workspace_id.as_deref(),
             );
 
             // Pod metadata is available only after annotation. Emit the read
@@ -1455,6 +1458,7 @@ impl Source {
                 time_parity,
                 true,
                 event.metadata().delivery_path_accounting(),
+                workspace_id.as_deref(),
             );
 
             emit!(KubernetesLogsEventsReceived {
@@ -1898,6 +1902,7 @@ mod tests {
             Some("service"),
             Some("pod"),
             3_600_000,
+            None,
         );
         let accounting = event
             .metadata()
@@ -1922,6 +1927,7 @@ mod tests {
             None,
             None,
             3_600_000,
+            None,
         );
         assert_eq!(
             unmatched
@@ -1944,6 +1950,7 @@ mod tests {
             None,
             None,
             3_600_000,
+            None,
         );
         assert!(event.metadata().delivery_path_accounting().is_none());
         assert!(

@@ -119,6 +119,7 @@ fn delivery_path_accounting_preserves_source_labels_and_selection_through_disk_e
         delivery_method: "VECTOR_WOODCHUCK_V2_FILE".to_owned(),
         service_system: "money-settings".to_owned(),
         source_pod_id: "source-pod".to_owned(),
+        workspace_id: Some("12345".to_owned()),
     };
     let mut first = LogEvent::from("first record");
     first

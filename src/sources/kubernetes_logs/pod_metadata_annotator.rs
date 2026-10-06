@@ -217,7 +217,12 @@ impl PodMetadataAnnotator {
         event: &mut Event,
         file: &'a str,
         cached_file_info: Option<LogFileInfo>,
-    ) -> (Option<LogFileInfo>, Option<String>, Option<String>) {
+    ) -> (
+        Option<LogFileInfo>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
         let log = event.as_mut_log();
         let file_info_opt: Option<LogFileInfo> =
             cached_file_info.or_else(|| parse_log_file_path(file));
@@ -225,11 +230,12 @@ impl PodMetadataAnnotator {
             let obj =
                 ObjectRef::<Pod>::new(&(file_info.pod_name)).within(&(file_info.pod_namespace));
             let Some(resource) = self.pods_state_reader.get(&obj) else {
-                return (None, None, None);
+                return (None, None, None, None);
             };
             let pod: &Pod = resource.as_ref();
             let service_system = service_system_from_metadata(&pod.metadata);
             let source_pod_id = source_pod_id_from_metadata(&pod.metadata);
+            let workspace_id = Some(workspace_id_from_metadata(&pod.metadata));
 
             annotate_from_file_info(log, &self.fields_spec, &file_info, self.log_namespace);
             annotate_from_metadata(log, &self.fields_spec, &pod.metadata, self.log_namespace);
@@ -263,11 +269,34 @@ impl PodMetadataAnnotator {
                     }
                 }
             }
-            (Some(file_info), service_system, source_pod_id)
+            (Some(file_info), service_system, source_pod_id, workspace_id)
         } else {
-            (None, None, None)
+            (None, None, None, None)
         }
     }
+}
+
+fn resolved_workspace_id(org_id: Option<&str>) -> String {
+    org_id
+        .and_then(|id| id.parse::<i64>().ok())
+        .filter(|id| *id >= -1)
+        .unwrap_or(-1)
+        .to_string()
+}
+
+/// Resolves the workspace from the workload pod annotation carried on the source event.
+pub(super) fn workspace_id_from_metadata(metadata: &ObjectMeta) -> String {
+    let org_id = metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("orgId"))
+        .or_else(|| {
+            metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("orgId"))
+        });
+    resolved_workspace_id(org_id.map(String::as_str))
 }
 
 /// Resolves the same source identity for read and pre-admission delivery metrics.
@@ -575,6 +604,25 @@ mod tests {
     use vector_lib::lookup::{event_path, metadata_path};
 
     use super::*;
+
+    #[test]
+    fn workspace_id_prefers_org_id_annotation() {
+        let metadata = ObjectMeta {
+            annotations: Some([("orgId".to_owned(), "12345".to_owned())].into()),
+            labels: Some([("orgId".to_owned(), "67890".to_owned())].into()),
+            ..ObjectMeta::default()
+        };
+        assert_eq!(workspace_id_from_metadata(&metadata), "12345");
+    }
+
+    #[test]
+    fn workspace_id_falls_back_to_org_id_label() {
+        let metadata = ObjectMeta {
+            labels: Some([("orgId".to_owned(), "67890".to_owned())].into()),
+            ..ObjectMeta::default()
+        };
+        assert_eq!(workspace_id_from_metadata(&metadata), "67890");
+    }
 
     #[test]
     fn service_system_prefers_pod_label() {

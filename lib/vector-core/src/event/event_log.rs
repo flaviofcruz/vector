@@ -77,10 +77,17 @@ fn build_key(
     log_metadata_field: &str,
     granularity_fields: &Vec<String>,
     for_delivery_events: bool,
+    workspace_id: Option<&str>,
 ) -> String {
     let mut key_vals: Vec<String> = Vec::new();
     // Get the field that holds the metadata struct itself
     for key_part in granularity_fields {
+        if for_delivery_events && key_part == "workspaceId" {
+            if let Some(workspace_id) = workspace_id {
+                key_vals.push(format!("workspaceId={workspace_id}"));
+                continue;
+            }
+        }
         if for_delivery_events && key_part == "system" {
             if let Some(service_system) = event.metadata().delivery_event_service_system() {
                 key_vals.push(format!("{}={}", key_part, service_system));
@@ -102,9 +109,16 @@ fn build_map(
     log_metadata_field: &str,
     granularity_fields: &Vec<String>,
     for_delivery_events: bool,
+    workspace_id: Option<&str>,
 ) -> HashMap<String, String> {
     let mut val_map = HashMap::new();
     for key_part in granularity_fields {
+        if for_delivery_events && key_part == "workspaceId" {
+            if let Some(workspace_id) = workspace_id {
+                val_map.insert(key_part.to_string(), workspace_id.to_owned());
+                continue;
+            }
+        }
         if for_delivery_events && key_part == "system" {
             if let Some(service_system) = event.metadata().delivery_event_service_system() {
                 val_map.insert(key_part.to_string(), service_system.to_string());
@@ -192,6 +206,20 @@ fn get_message_bytes(log_event: &LogEvent, log_metadata_field: &str) -> usize {
     }
 }
 
+fn workspace_id_from_event(event: &LogEvent, log_metadata_field: &str) -> String {
+    event
+        .parse_path_and_get_value(format!("{}.workspaceId", log_metadata_field))
+        .ok()
+        .flatten()
+        .and_then(|value| {
+            value
+                .as_integer()
+                .or_else(|| value.to_string().trim_matches('"').parse::<i64>().ok())
+        })
+        .filter(|id| *id >= -1)
+        .map_or_else(|| "-1".to_owned(), |id| id.to_string())
+}
+
 /*
 * On a list of events, iterate through them and track the counts per unique combination of
 * specified fields
@@ -212,6 +240,15 @@ pub fn generate_count_map(
     for event in events {
         // Check if it's a log event (see enum defined in lib/vector-core/src/event/mod.rs)
         if let Event::Log(log_event) = event {
+            let workspace_id = if for_delivery_events
+                && granularity_fields
+                    .iter()
+                    .any(|field| field == "workspaceId")
+            {
+                Some(workspace_id_from_event(log_event, log_metadata_field))
+            } else {
+                None
+            };
             let message_count = get_message_count(
                 event,
                 log_metadata_field,
@@ -231,6 +268,7 @@ pub fn generate_count_map(
                     log_metadata_field,
                     granularity_fields,
                     for_delivery_events,
+                    workspace_id.as_deref(),
                 ))
                 .and_modify(|x: &mut MetadataValuesCount| {
                     x.count += message_count;
@@ -243,6 +281,7 @@ pub fn generate_count_map(
                         log_metadata_field,
                         granularity_fields,
                         for_delivery_events,
+                        workspace_id.as_deref(),
                     ),
                     count: message_count,
                     metric_count,
@@ -427,6 +466,7 @@ mod tests {
                 delivery_method: "file".to_owned(),
                 service_system: "service".to_owned(),
                 source_pod_id: "pod".to_owned(),
+                workspace_id: None,
             },
             ["blob".to_owned(), "online".to_owned()],
         );
@@ -559,9 +599,15 @@ mod tests {
         let event = event_with_service_system("money-settings");
 
         assert_eq!(
-            build_map(&event, "log_metadata", &vec!["system".to_string()], true,)
-                .get("system")
-                .map(String::as_str),
+            build_map(
+                &event,
+                "log_metadata",
+                &vec!["system".to_string()],
+                true,
+                None
+            )
+            .get("system")
+            .map(String::as_str),
             Some("money-settings")
         );
     }
@@ -572,14 +618,60 @@ mod tests {
         event.insert("log_metadata.system", "explicit-system");
 
         assert_eq!(
-            build_map(&event, "log_metadata", &vec!["system".to_string()], true,)
-                .get("system")
-                .map(String::as_str),
+            build_map(
+                &event,
+                "log_metadata",
+                &vec!["system".to_string()],
+                true,
+                None
+            )
+            .get("system")
+            .map(String::as_str),
             Some("source-system")
         );
         assert_eq!(
-            build_key(&event, "log_metadata", &vec!["system".to_string()], true),
+            build_key(
+                &event,
+                "log_metadata",
+                &vec!["system".to_string()],
+                true,
+                None
+            ),
             "system=source-system"
+        );
+    }
+
+    #[test]
+    fn delivery_workspace_id_uses_event_metadata_or_unassigned() {
+        let mut event = LogEvent::from("message");
+        event.insert("log_metadata.workspaceId", 12345);
+        assert_eq!(
+            workspace_id_from_event(&event, "log_metadata"),
+            "12345".to_owned()
+        );
+        event.insert("log_metadata.workspaceId", -1);
+        assert_eq!(
+            workspace_id_from_event(&event, "log_metadata"),
+            "-1".to_owned()
+        );
+        let missing = LogEvent::from("message");
+        assert_eq!(workspace_id_from_event(&missing, "log_metadata"), "-1");
+    }
+
+    #[test]
+    fn delivery_map_separates_workspaces_in_the_same_hour() {
+        let event = event_with_service_system("service");
+        let fields = vec!["timeParity".to_string(), "workspaceId".to_string()];
+        let key_a = build_key(&event, "log_metadata", &fields, true, Some("-1"));
+        let key_b = build_key(&event, "log_metadata", &fields, true, Some("12345"));
+        assert_ne!(key_a, key_b);
+        assert_eq!(
+            build_map(&event, "log_metadata", &fields, true, Some("-1"))["workspaceId"],
+            "-1"
+        );
+        assert_eq!(
+            build_map(&event, "log_metadata", &fields, true, Some("12345"))["workspaceId"],
+            "12345"
         );
     }
 
@@ -588,8 +680,14 @@ mod tests {
         let event = event_with_service_system("money-settings");
 
         assert!(
-            !build_map(&event, "log_metadata", &vec!["system".to_string()], false,)
-                .contains_key("system")
+            !build_map(
+                &event,
+                "log_metadata",
+                &vec!["system".to_string()],
+                false,
+                None
+            )
+            .contains_key("system")
         );
     }
 
@@ -654,13 +752,18 @@ mod tests {
             },
         ];
         for case in cases {
-            let granularity: Vec<String> =
-                case.granularity.iter().map(|s| s.to_string()).collect();
+            let granularity: Vec<String> = case.granularity.iter().map(|s| s.to_string()).collect();
             let keys: std::collections::HashSet<String> = case
                 .events
                 .iter()
                 .map(|leaves| {
-                    build_key(&log_event_with(leaves, &[]), "log_metadata", &granularity, false)
+                    build_key(
+                        &log_event_with(leaves, &[]),
+                        "log_metadata",
+                        &granularity,
+                        false,
+                        None,
+                    )
                 })
                 .collect();
             assert_eq!(keys.len(), case.expected_groups, "{}", case.name);

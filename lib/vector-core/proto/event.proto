@@ -114,6 +114,7 @@ message DeliveryPathCount {
   uint64 count = 8;
   bool selected = 9;
   repeated DeliveryContentRange content_ranges = 10;
+  optional string workspace_id = 11;
 }
 
 message DeliveryContentRange {

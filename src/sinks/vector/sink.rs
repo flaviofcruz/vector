@@ -193,6 +193,7 @@ mod tests {
                                 delivery_method: "file".into(),
                                 service_system: "service".into(),
                                 source_pod_id: "pod".into(),
+                                workspace_id: None,
                             },
                             ["online".into()],
                         );
@@ -296,6 +297,7 @@ mod tests {
                     delivery_method: "file".to_owned(),
                     service_system: "service".to_owned(),
                     source_pod_id: "pod".to_owned(),
+                    workspace_id: None,
                 },
                 ["archive".to_owned(), "online".to_owned()],
             );

@@ -12,6 +12,8 @@ pub struct DeliverySourceLabels {
     pub delivery_method: String,
     pub service_system: String,
     pub source_pod_id: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 #[cfg(feature = "byte_size_of")]
@@ -22,6 +24,7 @@ impl ByteSizeOf for DeliverySourceLabels {
             + self.delivery_method.allocated_bytes()
             + self.service_system.allocated_bytes()
             + self.source_pod_id.allocated_bytes()
+            + self.workspace_id.allocated_bytes()
     }
 }
 
@@ -209,6 +212,7 @@ mod tests {
             delivery_method: "VECTOR_WOODCHUCK_V2_FILE".to_owned(),
             service_system: "test-service".to_owned(),
             source_pod_id: "source-pod".to_owned(),
+            workspace_id: None,
         }
     }
 

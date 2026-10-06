@@ -57,6 +57,7 @@ const KUBERNETES_LOGS_FALLBACK_TOPIC: &str = "sawmill-service-log";
 
 const UNKNOWN_SERVICE_SYSTEM: &str = "unknown";
 const UNKNOWN_SOURCE_POD_ID: &str = "unknown";
+const UNASSIGNED_WORKSPACE_ID: &str = "-1";
 // Kubernetes pod names cannot contain underscores, so this cannot collide with
 // a real source identity. The export transform selects this aggregate series
 // when source-pod cardinality is disabled.
@@ -256,6 +257,27 @@ impl DeliverySourceLabels {
         source_type: &str,
         time_parity: i64,
     ) -> Self {
+        Self::at_read_with_workspace_id(
+            path,
+            source_context,
+            service_system,
+            source_pod_id,
+            source_type,
+            time_parity,
+            None,
+        )
+    }
+
+    /// Uses the source pod's orgId when it is available before the READ counter fires.
+    pub fn at_read_with_workspace_id(
+        path: &str,
+        source_context: &Option<HashMap<String, String>>,
+        service_system: Option<&str>,
+        source_pod_id: Option<&str>,
+        source_type: &str,
+        time_parity: i64,
+        workspace_id: Option<&str>,
+    ) -> Self {
         let empty = HashMap::new();
         Self {
             process_generation_id: PROCESS_GENERATION_ID.to_string(),
@@ -268,6 +290,7 @@ impl DeliverySourceLabels {
             delivery_method: delivery_method_for_source_type(source_type).to_owned(),
             service_system: service_system_label(service_system),
             source_pod_id: source_pod_id_label(source_pod_id),
+            workspace_id: Some(workspace_id.unwrap_or(UNASSIGNED_WORKSPACE_ID).to_owned()),
         }
     }
 }
@@ -278,6 +301,7 @@ struct DeliveryCounterLabels {
     delivery_method: String,
     service_system: String,
     source_pod_id: String,
+    workspace_id: Option<String>,
 }
 
 impl From<&DeliverySourceLabels> for DeliveryCounterLabels {
@@ -288,6 +312,7 @@ impl From<&DeliverySourceLabels> for DeliveryCounterLabels {
             delivery_method: source.delivery_method.clone(),
             service_system: source.service_system.clone(),
             source_pod_id: source.source_pod_id.clone(),
+            workspace_id: source.workspace_id.clone(),
         }
     }
 }
@@ -300,6 +325,7 @@ impl DeliveryCounterLabels {
             delivery_method: delivery_method_from_value_map(value_map),
             service_system: service_system_from_value_map(value_map),
             source_pod_id: source_pod_id_from_value_map(value_map),
+            workspace_id: value_map.get("workspaceId").cloned(),
         }
     }
 
@@ -320,6 +346,9 @@ impl DeliveryCounterLabels {
                 metrics::Label::new("service_system", self.service_system.clone()),
                 metrics::Label::new("source_pod_id", source_pod_id.to_owned()),
             ];
+            if let Some(workspace_id) = &self.workspace_id {
+                labels.push(metrics::Label::new("workspace_id", workspace_id.clone()));
+            }
             labels.extend_from_slice(extra_labels);
             if let Some(events) = events.filter(|count| *count > 0) {
                 counter!("delivery_events_total", labels.clone()).increment(events);
@@ -547,18 +576,20 @@ impl DeliveryEventSingleton {
         time_parity: i64,
         emitted_after_multiline_agg: bool,
         delivery_paths: Option<&DeliveryPathAccounting>,
+        workspace_id: Option<&str>,
     ) {
         if !read_should_emit(emitted_after_multiline_agg) {
             return;
         }
 
-        let source = DeliverySourceLabels::at_read(
+        let source = DeliverySourceLabels::at_read_with_workspace_id(
             &path,
             source_context,
             service_system,
             source_pod_id,
             source_type,
             time_parity,
+            workspace_id,
         );
         if let Some(accounting) = delivery_paths {
             for count in &accounting.counts {
@@ -1015,6 +1046,63 @@ mod topic_inference_tests {
     use super::*;
 
     #[test]
+    fn read_labels_prefer_source_pod_workspace() {
+        let source = DeliverySourceLabels::at_read_with_workspace_id(
+            "/var/log/service.log",
+            &None,
+            Some("service"),
+            Some("pod"),
+            SOURCE_TYPE_KUBERNETES_LOGS,
+            3_600_000,
+            Some("12345"),
+        );
+        assert_eq!(source.workspace_id.as_deref(), Some("12345"));
+        let unassigned = DeliverySourceLabels::at_read_with_workspace_id(
+            "/var/log/service.log",
+            &None,
+            Some("service"),
+            Some("pod"),
+            SOURCE_TYPE_KUBERNETES_LOGS,
+            3_600_000,
+            None,
+        );
+        assert_eq!(unassigned.workspace_id.as_deref(), Some("-1"));
+    }
+
+    #[test]
+    fn delivery_counter_carries_workspace_label() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let labels = DeliveryCounterLabels {
+            time_parity: "3600000".to_owned(),
+            topic: "service-log".to_owned(),
+            delivery_method: "file".to_owned(),
+            service_system: "service".to_owned(),
+            source_pod_id: "pod".to_owned(),
+            workspace_id: Some("12345".to_owned()),
+        };
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            labels.emit(DeliveryEventStage::Read, Some(5), Some(50), &[]);
+        });
+        let metrics = snapshotter.snapshot().into_vec();
+        assert_eq!(metrics.len(), 4);
+        for (key, _, _, value) in metrics {
+            assert!(
+                key.key()
+                    .labels()
+                    .any(|label| { label.key() == "workspace_id" && label.value() == "12345" })
+            );
+            if key.key().name() == "delivery_events_total" {
+                assert_eq!(value, DebugValue::Counter(5));
+            } else {
+                assert_eq!(value, DebugValue::Counter(50));
+            }
+        }
+    }
+
+    #[test]
     fn delivery_path_counts_survive_both_sink_batch_merge_apis() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
@@ -1028,6 +1116,7 @@ mod topic_inference_tests {
                     delivery_method: "file".to_owned(),
                     service_system: "service".to_owned(),
                     source_pod_id: "source-pod".to_owned(),
+                    workspace_id: None,
                 },
                 count,
                 selected: true,
@@ -1418,6 +1507,7 @@ mod read_accumulation_tests {
                     TP,
                     emit_read_event_after_multiline_agg(),
                     accounting.as_ref(),
+                    None,
                 );
             });
             let metrics = snapshotter.snapshot().into_vec();
@@ -1439,9 +1529,10 @@ mod read_accumulation_tests {
                     PROCESS_GENERATION_ID.as_str()
                 );
                 assert_eq!(labels["delivery_event_type"], "VECTOR_SOURCE_READ");
+                assert_eq!(labels["workspace_id"], "-1");
                 if key.key().name() == "delivery_event_bytes_total" {
                     assert_eq!(value, DebugValue::Counter(123));
-                    assert_eq!(labels.len(), 7);
+                    assert_eq!(labels.len(), 8);
                 } else {
                     assert_eq!(key.key().name(), "delivery_events_total");
                     assert_eq!(value, DebugValue::Counter(1));
@@ -1451,9 +1542,9 @@ mod read_accumulation_tests {
                             labels["source_process_generation_id"],
                             PROCESS_GENERATION_ID.as_str()
                         );
-                        assert_eq!(labels.len(), 9);
+                        assert_eq!(labels.len(), 10);
                     } else {
-                        assert_eq!(labels.len(), 7);
+                        assert_eq!(labels.len(), 8);
                     }
                 }
             }
@@ -1546,6 +1637,7 @@ mod read_accumulation_tests {
             SOURCE_TYPE_FILE,
             TP,
             false,
+            None,
             None,
         );
         assert!(

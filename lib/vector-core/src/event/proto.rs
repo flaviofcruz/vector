@@ -668,6 +668,7 @@ impl From<path_accounting::DeliveryPathCount> for DeliveryPathCount {
             delivery_method: value.source.delivery_method,
             service_system: value.source.service_system,
             source_pod_id: value.source.source_pod_id,
+            workspace_id: value.source.workspace_id,
             count: value.count,
             selected: value.selected,
             content_ranges: value
@@ -694,6 +695,7 @@ impl From<DeliveryPathCount> for path_accounting::DeliveryPathCount {
                 delivery_method: value.delivery_method,
                 service_system: value.service_system,
                 source_pod_id: value.source_pod_id,
+                workspace_id: value.workspace_id,
             },
             count: value.count,
             selected: value.selected,

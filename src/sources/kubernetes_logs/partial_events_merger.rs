@@ -262,6 +262,7 @@ mod test {
                         delivery_method: "VECTOR_WOODCHUCK_V2_FILE".to_owned(),
                         service_system: "test-service".to_owned(),
                         source_pod_id: "source-pod".to_owned(),
+                        workspace_id: None,
                     },
                     ["online".to_owned()],
                 );

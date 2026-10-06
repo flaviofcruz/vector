@@ -258,6 +258,7 @@ mod tests {
                     delivery_method: "file".to_owned(),
                     service_system: "service".to_owned(),
                     source_pod_id: "pod".to_owned(),
+                    workspace_id: None,
                 },
                 ["blob".to_owned(), "online".to_owned()],
             )));
