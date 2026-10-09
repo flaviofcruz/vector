@@ -1,0 +1,34 @@
+name: "BLOCKING: Upstream Workflows Disabled"
+
+on:
+  pull_request:
+    branches:
+      - v*-custom
+
+permissions:
+  contents: read
+
+jobs:
+  check-upstream-workflows-disabled:
+    runs-on:
+      group: databricks-eng-protected-runner-group
+      labels: linux-ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      # Upstream workflows are kept only to reduce merge conflicts: their `on:` trigger is
+      # removed so they never run. A version-upgrade merge can silently restore it.
+      - name: Fail if a non-Databricks workflow has a trigger
+        run: |
+          status=0
+          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            case "$(basename "$f")" in databricks-*) continue ;; esac
+            if grep -qE "^(on|\"on\"|'on')[[:space:]]*:" "$f"; then
+              echo "::error file=$f::Upstream workflow has an 'on:' trigger: remove it so it stays disabled."
+              status=1
+            fi
+          done
+          exit "$status"

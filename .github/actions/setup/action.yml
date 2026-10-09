@@ -178,8 +178,14 @@ runs:
         TEMP=$(mktemp -d)
         MOLD_VERSION=1.2.1
         MOLD_TARGET=mold-${MOLD_VERSION}-$(uname -m)-linux
+        case "$(uname -m)" in
+          x86_64) MOLD_SHA256=dc7cd3b23756f97df030cc69ce9fc275f60dae7c37e5faa8fa65d5fd8a761829 ;;
+          aarch64) MOLD_SHA256=767cb3e96b231b4d89616708017bd67f8c6bf7def01bb783b8e6e9bc1327e9fd ;;
+          *) echo "No mold checksum for $(uname -m)"; exit 1 ;;
+        esac
         curl -fsSL "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${MOLD_TARGET}.tar.gz" \
         --output "$TEMP/${MOLD_TARGET}.tar.gz"
+        echo "${MOLD_SHA256}  ${TEMP}/${MOLD_TARGET}.tar.gz" | sha256sum --check -
         tar \
             -xvf "${TEMP}/${MOLD_TARGET}.tar.gz" \
             -C "${TEMP}"
@@ -225,6 +231,7 @@ runs:
         curl \
           -L https://github.com/cue-lang/cue/releases/download/v0.10.0/cue_v0.10.0_linux_amd64.tar.gz \
           -o "${TEMP}/cue_v0.10.0_linux_amd64.tar.gz"
+        echo "8f449c76f69c94fd17fff869e96ec34de7f059d6d63bf05617477ed0e6133fd2  ${TEMP}/cue_v0.10.0_linux_amd64.tar.gz" | sha256sum --check -
         tar \
           -xvf "${TEMP}/cue_v0.10.0_linux_amd64.tar.gz" \
           -C "${TEMP}"

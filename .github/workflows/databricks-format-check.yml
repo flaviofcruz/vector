@@ -7,7 +7,6 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write
   contents: read
 
 env:
@@ -17,6 +16,9 @@ env:
 
 jobs:
   check-rust:
+    permissions:
+      id-token: write # JFrog OIDC auth
+      contents: read
     runs-on:
       group: databricks-eng-protected-runner-group
       labels: linux-ubuntu-latest
@@ -26,6 +28,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           path: vector
+          persist-credentials: false
 
       - name: Generate access token for VRL repository
         id: generate-token-gh-app
@@ -35,6 +38,7 @@ jobs:
           private-key: ${{ secrets.VECTOR_VRL_GH_PRIVATE_KEY }}
           owner: databricks-eng
           repositories: vrl
+          permission-contents: read
 
       - name: Checkout VRL repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -49,8 +53,9 @@ jobs:
         uses: ./.github/actions/jfrog-auth
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
+          toolchain: "1.92"
           components: rustfmt, clippy
 
       - name: Configure Cargo cache
