@@ -758,28 +758,35 @@ where
                                             }
                                         }
                                         Ok(_) => {
-                                            // No line available right now. For
-                                            // archive watchers this means the
-                                            // decompressed stream is exhausted —
-                                            // a definitive completion signal,
-                                            // because the size-based outer guard
-                                            // can't fire for archives (target is
-                                            // `u64::MAX`). Persist the checkpoint
-                                            // and drop the drain target.
-                                            if self.is_archive(&watcher.path) {
-                                                drain_targets.swap_remove(&file_id);
-                                                checkpoints
-                                                    .update(file_id, watcher.get_file_position());
-                                                if let Err(error) =
-                                                    drain_checkpointer.write_checkpoints().await
-                                                {
-                                                    error!(
-                                                        ?error,
-                                                        "Error writing checkpoints during drain"
-                                                    );
-                                                }
-                                                progress = true;
+                                            // EOF on this watcher's open file. If the watcher is still
+                                            // findable, its internal buffer may hold an unterminated
+                                            // partial line that `read_line()` hasn't yet emitted
+                                            // (it only emits buffered partials when `!file_findable()`).
+                                            // Mark it not findable and re-read to flush the buffered
+                                            // partial as a normal line before completing the drain.
+                                            if watcher.file_findable() {
+                                                watcher.set_file_findable(false);
+                                                continue;
                                             }
+                                            // Now !file_findable(), so any buffered partial has been
+                                            // flushed or the buffer is empty. Everything on disk at
+                                            // snapshot time has been read, so the drain is done even
+                                            // if `target` was not reached: for archives the target is
+                                            // the `u64::MAX` sentinel, and for a rotated-away watcher
+                                            // `target` is the size of a different file now at the same
+                                            // path, which this handle can never reach.
+                                            drain_targets.swap_remove(&file_id);
+                                            checkpoints
+                                                .update(file_id, watcher.get_file_position());
+                                            if let Err(error) =
+                                                drain_checkpointer.write_checkpoints().await
+                                            {
+                                                error!(
+                                                    ?error,
+                                                    "Error writing checkpoints during drain"
+                                                );
+                                            }
+                                            progress = true;
                                             break;
                                         }
                                         Err(_) => {
@@ -1475,6 +1482,157 @@ mod tests {
         assert_eq!(from_a, 100, "expected 100 lines from a.log, got {}", from_a);
         assert_eq!(from_b, 100, "expected 100 lines from b.log, got {}", from_b);
         assert_eq!(received.len(), 200);
+    }
+
+    /// A watcher whose file was renamed away keeps the old path, which now names a larger file.
+    /// Its drain target (the new file's size) is unreachable through the old handle, so the drain
+    /// must finish at EOF instead of spinning forever.
+    #[tokio::test]
+    async fn drain_on_shutdown_completes_when_path_now_names_larger_file() {
+        use futures::FutureExt;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let log_path = tmp.path().join("a.log");
+        let old_content: String = (0..10).map(|i| format!("old line {i}\n")).collect();
+        fs::write(&log_path, &old_content).await.unwrap();
+
+        let file_server = make_file_server(vec![log_path.clone()], data_dir.clone(), true);
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+        let (shutdown_tx, shutdown_rx) = futures::channel::oneshot::channel::<()>();
+        let shutdown = shutdown_rx.shared();
+        let checkpointer = Checkpointer::new(data_dir.as_path());
+        let server = tokio::spawn(file_server.run(tx, shutdown.clone(), shutdown, checkpointer));
+
+        let mut received = Vec::new();
+        while received.len() < 10 {
+            received.extend(rx.next().await.expect("server exited early"));
+        }
+
+        // Rotate: the open watcher keeps `a.log` as its path, which now names a bigger file.
+        fs::rename(&log_path, tmp.path().join("a.log.1"))
+            .await
+            .unwrap();
+        let new_content: String = (0..100)
+            .map(|i| format!("new line {i} with padding\n"))
+            .collect();
+        fs::write(&log_path, &new_content).await.unwrap();
+        shutdown_tx.send(()).unwrap();
+
+        let collector = tokio::spawn(async move { rx.collect::<Vec<_>>().await });
+        let result = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("drain did not finish for a rotated-away watcher");
+        assert!(result.unwrap().is_ok());
+        collector.await.unwrap();
+
+        let old_lines: Vec<_> = received.iter().map(|line| line.text.clone()).collect();
+        assert_eq!(old_lines[0], Bytes::from("old line 0"));
+        assert_eq!(old_lines[9], Bytes::from("old line 9"));
+    }
+
+    /// Regression test for ES-2267297: when a watched file is rotated away and replaced by a
+    /// larger file, the watcher's buffered unterminated tail line must be emitted during drain
+    /// before the drain target is completed and the position is checkpointed. Without the fix,
+    /// the unterminated tail is dropped and lost forever.
+    #[tokio::test]
+    async fn drain_on_shutdown_emits_buffered_unterminated_tail_before_completing() {
+        use futures::FutureExt;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let log_path = tmp.path().join("a.log");
+        // Write 10 lines with newlines, then one without a trailing newline.
+        let mut old_content: String = (0..10).map(|i| format!("old line {i}\n")).collect();
+        old_content.push_str("tail without newline");
+        fs::write(&log_path, &old_content).await.unwrap();
+
+        let file_server = make_file_server(vec![log_path.clone()], data_dir.clone(), true);
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+        let (shutdown_tx, shutdown_rx) = futures::channel::oneshot::channel::<()>();
+        let shutdown = shutdown_rx.shared();
+        let checkpointer = Checkpointer::new(data_dir.as_path());
+        let server = tokio::spawn(file_server.run(tx, shutdown.clone(), shutdown, checkpointer));
+
+        // Wait until all 10 terminated lines are received.
+        let mut received = Vec::new();
+        while received.len() < 10 {
+            received.extend(rx.next().await.expect("server exited early"));
+        }
+
+        // Rotate: the open watcher keeps `a.log` as its path, which now names a bigger file.
+        fs::rename(&log_path, tmp.path().join("a.log.1"))
+            .await
+            .unwrap();
+        let new_content: String = (0..100)
+            .map(|i| format!("new line {i} with padding\n"))
+            .collect();
+        fs::write(&log_path, &new_content).await.unwrap();
+        shutdown_tx.send(()).unwrap();
+
+        let collector = tokio::spawn(async move { rx.collect::<Vec<_>>().await });
+        let result = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("drain did not finish for a rotated-away watcher");
+        assert!(result.unwrap().is_ok());
+        let drain_batches = collector.await.unwrap();
+
+        // Collect all received lines including the tail from both pre-drain and drain phases.
+        let mut all_lines: Vec<_> = received.iter().map(|line| line.text.clone()).collect();
+        for batch in drain_batches {
+            all_lines.extend(batch.iter().map(|line| line.text.clone()));
+        }
+
+        let expected_tail = Bytes::from("tail without newline");
+        let tail_count = all_lines
+            .iter()
+            .filter(|line| *line == &expected_tail)
+            .count();
+        assert_eq!(
+            tail_count, 1,
+            "unterminated tail should be emitted exactly once"
+        );
+    }
+
+    /// If the consumer stops reading mid-drain (e.g. the source's event loop hit its shutdown
+    /// deadline and dropped the receiver), the drain must exit instead of blocking on send.
+    #[tokio::test]
+    async fn drain_on_shutdown_exits_when_receiver_dropped() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let log_path = tmp.path().join("big.log");
+        let content: String = (0..5_000)
+            .map(|i| format!("line {i:05} -- padding to make this longer\n"))
+            .collect();
+        fs::write(&log_path, &content).await.unwrap();
+
+        let file_server = make_file_server(vec![log_path], data_dir.clone(), true);
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+        let checkpointer = Checkpointer::new(data_dir.as_path());
+
+        // Shut down immediately so the whole file is left to the drain, read one batch, then
+        // stop consuming.
+        let server = tokio::spawn(file_server.run(
+            tx,
+            futures::future::ready(()),
+            futures::future::ready(()),
+            checkpointer,
+        ));
+        rx.next()
+            .await
+            .expect("expected at least one drained batch");
+        drop(rx);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("drain blocked after the receiver was dropped");
+        assert!(result.unwrap().is_ok());
     }
 
     #[tokio::test]

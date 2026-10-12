@@ -1201,7 +1201,7 @@ impl Source {
 
     async fn run(
         self,
-        mut out: SourceSender,
+        out: SourceSender,
         global_shutdown: ShutdownSignal,
         log_namespace: LogNamespace,
     ) -> crate::Result<()> {
@@ -1529,13 +1529,11 @@ impl Source {
 
         let (events_count, _) = events.size_hint();
 
-        let mut stream = if auto_partial_merge {
+        let stream = if auto_partial_merge {
             merge_partial_events(events, log_namespace, max_merged_line_bytes).left_stream()
         } else {
             events.right_stream()
         };
-
-        let event_processing_loop = out.send_event_stream(&mut stream);
 
         let mut lifecycle = Lifecycle::new();
         {
@@ -1559,8 +1557,9 @@ impl Source {
         }
         {
             let (slot, shutdown) = lifecycle.add();
-            let fut = util::complete_with_deadline_on_signal(
-                event_processing_loop,
+            let fut = util::send_stream_with_deadline_on_signal(
+                out,
+                stream,
                 shutdown,
                 Duration::from_secs(30), // more than enough time to propagate
             )
@@ -1580,7 +1579,8 @@ impl Source {
             slot.bind(Box::pin(fut));
         }
 
-        lifecycle.run(global_shutdown).await;
+        // Hold the token until cleanup is done; dropping it reports this source as shut down.
+        let _shutdown_token = lifecycle.run(global_shutdown).await;
         // Shared path: the guard handles reflector cleanup on drop (when the
         // last consumer drops, reflectors are automatically aborted).
         // Non-shared path: OwnedReflectorHandles aborts tasks on drop.

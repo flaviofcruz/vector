@@ -12,7 +12,7 @@ use futures::{
     stream::FuturesOrdered,
 };
 
-use crate::shutdown::ShutdownSignal;
+use crate::shutdown::{ShutdownSignal, ShutdownSignalToken};
 
 /// Lifecycle encapsulates logic for managing a lifecycle of multiple futures
 /// that are bounded together by a shared shutdown condition.
@@ -29,13 +29,18 @@ pub struct Lifecycle<'bound> {
 /// Holds a "global" shutdown signal or shutdown signal token.
 /// Effectively used to hold the token or signal such that it can be dropped
 /// after the shutdown is complete.
+///
+/// Dropping the [`ShutdownSignalToken`] tells the topology that this source has finished
+/// shutting down, which disarms its force-shutdown deadline. It must therefore outlive every
+/// managed future, or a future that never finishes (e.g. a stuck file drain) blocks a config
+/// reload forever.
 #[derive(Debug)]
 pub enum GlobalShutdownToken {
     /// The global shutdown signal was consumed.
-    Token,
+    Token(ShutdownSignalToken),
     /// The [`ShutdownSignal`] wasn't consumed, and still holds on to the
     /// [`ShutdownSignalToken`].
-    Unused,
+    Unused(ShutdownSignal),
 }
 
 impl<'bound> Lifecycle<'bound> {
@@ -67,19 +72,23 @@ impl<'bound> Lifecycle<'bound> {
         let first_task_fut = self.futs.next();
         pin_mut!(first_task_fut);
 
-        let token = match select(first_task_fut, &mut global_shutdown).await {
+        let shutdown_signal_token = match select(first_task_fut, &mut global_shutdown).await {
             Either::Left((None, _)) => {
                 trace!(message = "Lifecycle had no tasks upon run, we're done.");
-                GlobalShutdownToken::Unused
+                None
             }
             Either::Left((Some(()), _)) => {
                 trace!(message = "Lifecycle had the first task completed.");
-                GlobalShutdownToken::Unused
+                None
             }
-            Either::Right((_shutdown_signal_token, _)) => {
+            Either::Right((shutdown_signal_token, _)) => {
                 trace!(message = "Lifecycle got a global shutdown request.");
-                GlobalShutdownToken::Token
+                Some(shutdown_signal_token)
             }
+        };
+        let token = match shutdown_signal_token {
+            Some(token) => GlobalShutdownToken::Token(token),
+            None => GlobalShutdownToken::Unused(global_shutdown),
         };
 
         // Send the shutdowns to all managed futures.
@@ -132,5 +141,62 @@ impl Future for ShutdownHandle {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         _ = ready!(self.0.poll_unpin(cx));
         Poll::Ready(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::*;
+    use crate::{config::ComponentKey, shutdown::SourceShutdownCoordinator};
+
+    /// The topology force-stops a source that misses its shutdown deadline, but only while the
+    /// source still holds its shutdown token. A managed future that never finishes must not
+    /// disarm that deadline.
+    #[tokio::test]
+    async fn stuck_managed_future_is_force_shut_down() {
+        let mut coordinator = SourceShutdownCoordinator::default();
+        let id = ComponentKey::from("kubernetes_logs");
+        let (shutdown, force_shutdown) = coordinator.register_source(&id, false);
+
+        let mut lifecycle = Lifecycle::new();
+        let (slot, fut_shutdown) = lifecycle.add();
+        slot.bind(Box::pin(async move {
+            fut_shutdown.await;
+            futures::future::pending::<()>().await;
+        }));
+        let running = tokio::spawn(lifecycle.run(shutdown));
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let completed_cleanly = coordinator.shutdown_source(&id, deadline).await;
+        assert!(
+            !completed_cleanly,
+            "source reported shutdown complete while a managed future was still running"
+        );
+        tokio::time::timeout(Duration::from_secs(5), force_shutdown)
+            .await
+            .expect("force shutdown was not triggered");
+        running.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_completes_once_managed_futures_finish() {
+        let mut coordinator = SourceShutdownCoordinator::default();
+        let id = ComponentKey::from("kubernetes_logs");
+        let (shutdown, _force_shutdown) = coordinator.register_source(&id, false);
+
+        let mut lifecycle = Lifecycle::new();
+        let (slot, fut_shutdown) = lifecycle.add();
+        slot.bind(Box::pin(fut_shutdown));
+        let running = tokio::spawn(async move {
+            let _token = lifecycle.run(shutdown).await;
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(coordinator.shutdown_source(&id, deadline).await);
+        running.await.unwrap();
     }
 }
