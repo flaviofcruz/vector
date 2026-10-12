@@ -16,6 +16,9 @@ use vrl::value::{Kind, kind::Collection};
 
 use super::util::MultilineConfig;
 pub use super::util::object_storage_compression::Compression;
+use super::util::object_storage_rate_limit::{
+    ObjectStorageRateLimitConfig, ObjectStorageRateLimiter,
+};
 use crate::{
     aws::{RegionOrEndpoint, auth::AwsAuthentication, create_client, create_client_and_region},
     codecs::DecodingConfig,
@@ -125,6 +128,15 @@ pub struct AwsS3Config {
     /// Only triggered for messages with `process_custom_message = true`.
     #[configurable(derived)]
     pub ingestion_callback: Option<super::ingestion_callback::IngestionCallbackConfig>,
+
+    /// Byte-rate pacing for object downloads.
+    ///
+    /// Disabled unless `max_bytes_per_sec` is set, in which case the source
+    /// processes each object at full speed and pauses between pulls to hold its
+    /// data rate to the configured limit.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub rate_limit: ObjectStorageRateLimitConfig,
 }
 
 const fn default_framing() -> FramingConfig {
@@ -295,6 +307,7 @@ impl AwsS3Config {
                     multiline,
                     decoder,
                     callback_client,
+                    ObjectStorageRateLimiter::new(&self.rate_limit),
                 )
                 .await?;
 

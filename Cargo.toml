@@ -408,6 +408,7 @@ ipnet = { version = "2", default-features = false, optional = true, features = [
 itertools.workspace = true
 k8s-openapi = { version = "0.22.0", default-features = false, features = ["v1_26"], optional = true }
 kube = { version = "0.93.0", default-features = false, features = ["client", "openssl-tls", "runtime"], optional = true }
+leaky-bucket = { version = "1.1.2", optional = true }
 listenfd = { version = "1.0.2", default-features = false, optional = true }
 libc.workspace = true
 lru = { version = "0.16.3", default-features = false }
@@ -685,9 +686,9 @@ sources-amqp = ["lapin"]
 sources-apache_metrics = ["sources-utils-http-client"]
 sources-aws_ecs_metrics = ["sources-utils-http-client"]
 sources-aws_kinesis_firehose = ["dep:base64"]
-sources-aws_s3 = ["aws-core", "dep:aws-sdk-sqs", "dep:aws-sdk-s3", "dep:async-compression", "sources-aws_sqs", "tokio-util/io"]
+sources-aws_s3 = ["aws-core", "dep:aws-sdk-sqs", "dep:aws-sdk-s3", "dep:async-compression", "dep:leaky-bucket", "sources-aws_sqs", "tokio-util/io"]
 sources-aws_sqs = ["aws-core", "dep:aws-sdk-sqs"]
-sources-azure_blob = ["dep:azure_core", "dep:azure_identity", "dep:azure_identity_for_storage", "dep:azure_storage", "dep:azure_storage_blobs", "dep:azure_storage_queues", "dep:async-compression", "dep:base64", "dep:reqwest_012", "sources-utils-http-client" ]
+sources-azure_blob = ["dep:azure_core", "dep:azure_identity", "dep:azure_identity_for_storage", "dep:azure_storage", "dep:azure_storage_blobs", "dep:azure_storage_queues", "dep:async-compression", "dep:base64", "dep:leaky-bucket", "dep:reqwest_012", "sources-utils-http-client" ]
 sources-datadog_agent = ["sources-utils-http-encoding", "protobuf-build", "dep:prost"]
 sources-demo_logs = ["dep:fakedata"]
 sources-dnstap = ["sources-utils-net-tcp", "dep:base64", "dep:hickory-proto", "dep:dnsmsg-parser", "dep:dnstap-parser", "protobuf-build", "dep:prost", "vector-vrl-functions/dnstap"]
@@ -697,7 +698,7 @@ sources-exec = []
 sources-file = ["vector-lib/file-source"]
 sources-file_descriptor = ["tokio-util/io"]
 sources-fluent = ["dep:base64", "sources-utils-net-tcp", "sources-utils-net-unix", "tokio-util/net", "dep:rmpv", "dep:rmp-serde", "dep:serde_bytes"]
-sources-gcp_gcs = ["gcp", "dep:base64", "dep:async-compression", "tokio-util/io"]
+sources-gcp_gcs = ["gcp", "dep:base64", "dep:async-compression", "dep:leaky-bucket", "tokio-util/io"]
 sources-gcp_pubsub = ["gcp", "dep:h2", "dep:prost", "dep:prost-types", "protobuf-build", "dep:tonic"]
 sources-heroku_logs = ["sources-utils-http", "sources-utils-http-query", "sources-http_server"]
 sources-host_metrics = ["heim/cpu", "heim/host", "heim/memory", "heim/net"]

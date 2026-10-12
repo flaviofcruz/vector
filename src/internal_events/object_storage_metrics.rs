@@ -104,6 +104,59 @@ impl InternalEvent for ObjectStorageIngestionLatency<'_> {
     }
 }
 
+/// Emitted after a source pauses to honor its configured byte-rate limit.
+#[derive(Debug)]
+pub struct ObjectStoragePaced {
+    pub wait_seconds: f64,
+    pub bytes: u64,
+}
+
+impl NamedInternalEvent for ObjectStoragePaced {
+    fn name(&self) -> &'static str {
+        "ObjectStoragePaced"
+    }
+}
+
+impl InternalEvent for ObjectStoragePaced {
+    fn emit(self) {
+        debug!(
+            message = "Paced object-storage processing to honor byte-rate limit.",
+            wait_seconds = %self.wait_seconds,
+            bytes = self.bytes,
+        );
+        histogram!("object_storage_pacing_wait_seconds").record(self.wait_seconds);
+        counter!("object_storage_paced_bytes_total").increment(self.bytes);
+    }
+}
+
+/// Emitted when a single object's decoded size exceeds the configured warn
+/// threshold. Observability only — no data is dropped or deferred.
+#[derive(Debug)]
+pub struct ObjectStorageLargeObject<'a> {
+    pub bytes: u64,
+    pub bucket: &'a str,
+    pub key: &'a str,
+}
+
+impl NamedInternalEvent for ObjectStorageLargeObject<'_> {
+    fn name(&self) -> &'static str {
+        "ObjectStorageLargeObject"
+    }
+}
+
+impl InternalEvent for ObjectStorageLargeObject<'_> {
+    fn emit(self) {
+        warn!(
+            message = "Object decoded size exceeds warn threshold; may risk the queue visibility timeout even at full speed.",
+            bytes = self.bytes,
+            bucket = %self.bucket,
+            key = %self.key,
+            internal_log_rate_limit = true,
+        );
+        counter!("object_storage_large_object_total").increment(1);
+    }
+}
+
 /// Helper function to safely parse RFC3339 timestamps and calculate second differences
 pub fn calculate_duration_seconds(
     start_time: &str,

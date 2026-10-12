@@ -64,6 +64,7 @@ use crate::{
     shutdown::ShutdownSignal,
     sources::aws_s3::AwsS3Config,
     sources::ingestion_callback::IngestionCallbackClient,
+    sources::util::object_storage_rate_limit::{ByteCounter, ObjectStorageRateLimiter},
     tls::TlsConfig,
 };
 
@@ -331,6 +332,7 @@ pub struct State {
     deferred: Option<DeferredConfig>,
     process_custom_message: bool,
     callback_client: Option<IngestionCallbackClient>,
+    rate_limiter: ObjectStorageRateLimiter,
 }
 
 pub(super) struct Ingestor {
@@ -347,6 +349,7 @@ impl Ingestor {
         multiline: Option<line_agg::Config>,
         decoder: Decoder,
         callback_client: Option<IngestionCallbackClient>,
+        rate_limiter: ObjectStorageRateLimiter,
     ) -> Result<Ingestor, IngestorNewError> {
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 10 {
             return Err(IngestorNewError::InvalidNumberOfMessages {
@@ -378,6 +381,7 @@ impl Ingestor {
             deferred: config.deferred,
             process_custom_message: config.process_custom_message,
             callback_client,
+            rate_limiter,
         });
 
         Ok(Ingestor { state })
@@ -427,6 +431,8 @@ pub struct IngestorProcess {
     bytes_received: Registered<BytesReceived>,
     events_received: Registered<EventsReceived>,
     backoff: ExponentialBackoff,
+    // Decoded bytes processed in the current batch, drained after each poll to pace.
+    byte_counter: ByteCounter,
 }
 
 impl IngestorProcess {
@@ -446,6 +452,7 @@ impl IngestorProcess {
             bytes_received: register!(BytesReceived::from(Protocol::HTTP)),
             events_received: register!(EventsReceived),
             backoff: ExponentialBackoff::default().max_delay(Duration::from_secs(30)),
+            byte_counter: ByteCounter::default(),
         }
     }
 
@@ -688,6 +695,14 @@ impl IngestorProcess {
                 }
             }
         }
+
+        // Pace between polls: the batch is fully processed and its messages are
+        // deleted, so nothing is in flight while we wait to honor the byte rate.
+        self.state
+            .rate_limiter
+            .pace(self.byte_counter.take())
+            .await;
+
         Ok(())
     }
 
@@ -1023,12 +1038,16 @@ impl IngestorProcess {
         let mut read_error = None;
         let bytes_received = self.bytes_received.clone();
         let events_received = self.events_received.clone();
+        // Count decoded bytes for this object (for rate pacing and the large-object warning).
+        let byte_counter = self.byte_counter.clone();
+        let obj_start_bytes = byte_counter.get();
 
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = Box::new(
             FramedRead::new(object_reader, self.state.decoder.framer.clone())
                 .map(|res| {
                     res.inspect(|bytes| {
                         bytes_received.emit(ByteSize(bytes.len()));
+                        byte_counter.add(bytes.len());
                     })
                     .map_err(|err| {
                         read_error = Some(err);
@@ -1098,6 +1117,14 @@ impl IngestorProcess {
         drop(stream);
 
         let duration = download_start.elapsed();
+
+        // Observability-only: warn if this object's decoded size is large enough to
+        // risk the queue visibility timeout even at full speed. Never drops data.
+        self.state.rate_limiter.note_object(
+            byte_counter.get().saturating_sub(obj_start_bytes),
+            &bucket,
+            &key,
+        );
 
         if read_error.is_some() {
             emit!(S3ObjectProcessingFailed {
