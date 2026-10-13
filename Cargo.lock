@@ -14146,7 +14146,6 @@ dependencies = [
  "rand 0.9.2",
  "rand_distr",
  "regex",
- "ryu",
  "schannel",
  "security-framework 3.5.1",
  "serde",
@@ -14175,6 +14174,7 @@ dependencies = [
  "vector-config-common",
  "vector-lookup",
  "vrl",
+ "zmij",
 ]
 
 [[package]]

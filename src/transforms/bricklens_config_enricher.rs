@@ -1721,21 +1721,21 @@ mod tests {
         let log = out.as_log();
         // The sink encodes these .destination sub-fields into the -external Destination message.
         assert_eq!(
-            log.get("destination.uc_resource_target")
+            log.get("destination.unity_catalog_table.uc_resource_target")
                 .unwrap()
                 .as_str()
                 .unwrap(),
             "main.obs.otel_logs"
         );
         assert_eq!(
-            log.get("destination.service_principal_resource")
+            log.get("destination.unity_catalog_table.service_principal_resource")
                 .unwrap()
                 .as_str()
                 .unwrap(),
             "accounts/acct/bricklens"
         );
         assert_eq!(
-            log.get("destination.workspace_id")
+            log.get("destination.unity_catalog_table.workspace_id")
                 .unwrap()
                 .as_integer()
                 .unwrap(),

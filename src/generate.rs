@@ -682,6 +682,7 @@ mod tests {
                 - source0
                 drop_on_abort: false
                 drop_on_error: false
+                enable_hot_reload: false
                 metric_tag_values: single
                 reroute_dropped: false
                 runtime: ast
@@ -749,6 +750,7 @@ mod tests {
                   ],
                   "drop_on_abort": false,
                   "drop_on_error": false,
+                  "enable_hot_reload": false,
                   "metric_tag_values": "single",
                   "reroute_dropped": false,
                   "runtime": "ast",
