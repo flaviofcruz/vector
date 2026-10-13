@@ -179,16 +179,15 @@ pub fn emit_object_storage_non_ack_metrics(
     bucket: &str,
 ) {
     if let Some(notification_ts) = queue_notification_create_timestamp {
-        let _ = calculate_duration_seconds(blob_creation_time, notification_ts).and_then(
-            |delay_seconds| {
+        let _ =
+            calculate_duration_seconds(blob_creation_time, notification_ts).map(|delay_seconds| {
                 emit!(QueueNotificationCreationDelay {
                     delay_seconds,
                     cloud,
                     bucket,
                 });
-                Some(()) // Return Some(()) to continue the chain
-            },
-        );
+                // Return Some(()) to continue the chain
+            });
 
         let lag_duration = processing_start_time.signed_duration_since(notification_ts);
         let lag_seconds = lag_duration.num_milliseconds() as f64 / 1000.0;

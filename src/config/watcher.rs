@@ -474,7 +474,7 @@ mod tests {
         let delay = Duration::from_secs(3);
         let dir = temp_dir().to_path_buf();
         let watcher_conf = WatcherConfig::RecommendedWatcher;
-        let component_file_path = vec![dir.join("tls.cert"), dir.join("tls.key")];
+        let component_file_path = [dir.join("tls.cert"), dir.join("tls.key")];
         let http_component = ComponentKey::from("http");
         let http_component_2 = ComponentKey::from("http2");
 
@@ -531,7 +531,7 @@ mod tests {
         let delay = Duration::from_secs(3);
         let dir = temp_dir().to_path_buf();
         let watcher_conf = WatcherConfig::RecommendedWatcher;
-        let component_file_path = vec![dir.join("tls.cert"), dir.join("vector.toml")];
+        let component_file_path = [dir.join("tls.cert"), dir.join("vector.toml")];
         let http_component = ComponentKey::from("http");
 
         std::fs::create_dir(&dir).unwrap();
@@ -935,7 +935,7 @@ mod tests {
         drain_initial_reload(&mut signal_rx, delay * 5).await;
 
         if !test_signal(
-            &mut vec![file],
+            &mut [file],
             crate::signal::SignalTo::ReloadFromDisk,
             delay * 5,
             signal_rx,
@@ -961,7 +961,7 @@ mod tests {
         drain_initial_reload(&mut signal_rx, delay * 5).await;
 
         if !test_signal(
-            &mut vec![file],
+            &mut [file],
             crate::signal::SignalTo::ReloadFromDisk,
             delay * 5,
             signal_rx,
@@ -991,7 +991,7 @@ mod tests {
         drain_initial_reload(&mut signal_rx, delay * 5).await;
 
         if !test_signal(
-            &mut vec![file],
+            &mut [file],
             crate::signal::SignalTo::ReloadFromDisk,
             delay * 5,
             signal_rx,
@@ -1021,7 +1021,7 @@ mod tests {
         drain_initial_reload(&mut signal_rx, delay * 5).await;
 
         if !test_signal(
-            &mut vec![file],
+            &mut [file],
             crate::signal::SignalTo::ReloadFromDisk,
             delay * 5,
             signal_rx,

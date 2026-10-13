@@ -150,8 +150,7 @@ where
             // Check for blacklist responses
             let received_blacklist = kpp_response
                 .results
-                .iter()
-                .any(|status| *status == ResponseCodes::KafkaBlacklistTopicErrorCode);
+                .contains(&ResponseCodes::KafkaBlacklistTopicErrorCode);
 
             if received_blacklist {
                 blacklist_state.store(Arc::new(State::Blocked(Instant::now())));
@@ -236,10 +235,10 @@ mod tests {
         fn call(&mut self, request: KPPRequest) -> Self::Future {
             let mut response = mock_response(false);
 
-            if let Some(first) = request.request.messages.first() {
-                if String::from_utf8(first.data().to_vec()).unwrap() == "blacklist" {
-                    response = mock_response(true);
-                }
+            if let Some(first) = request.request.messages.first()
+                && String::from_utf8(first.data().to_vec()).unwrap() == "blacklist"
+            {
+                response = mock_response(true);
             }
 
             Box::pin(async move { Ok(response) })

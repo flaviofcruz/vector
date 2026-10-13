@@ -34,8 +34,10 @@ pub struct ResponseConfig {
 #[derive(Clone, Debug)]
 #[serde(tag = "strategy", rename_all = "snake_case")]
 #[configurable(metadata(docs::enum_tag_description = "The pagination strategy to use."))]
+#[derive(Default)]
 pub enum PaginationConfig {
     /// No pagination: a single request returns the full dataset.
+    #[default]
     None,
 
     /// Cursor/token pagination: the response carries a token pointing at the next page, which
@@ -72,12 +74,6 @@ pub enum PaginationConfig {
         #[configurable(metadata(docs::examples = 1000))]
         page_size: usize,
     },
-}
-
-impl Default for PaginationConfig {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Guardrails bounding how much data a single refresh will fetch.

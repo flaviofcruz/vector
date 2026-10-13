@@ -34,13 +34,13 @@ pub static EVENT_LOG_SOURCE_ATTRIBUTES_FIELD: OnceLock<String> = OnceLock::new()
 pub fn get_event_log_metadata_field() -> &'static String {
     // Initialize the static variable once, or return the value if it's already initialized/computed
     EVENT_LOG_METADATA_FIELD
-        .get_or_init(|| env::var("EVENT_LOG_METADATA_FIELD").unwrap_or_else(|_| "".to_string()))
+        .get_or_init(|| env::var("EVENT_LOG_METADATA_FIELD").unwrap_or_else(|_| String::new()))
 }
 
 // Where we can find the message count override field
 pub fn get_event_log_count_override_field() -> &'static String {
     EVENT_LOG_COUNT_OVERRIDE_FIELD.get_or_init(|| {
-        env::var("EVENT_LOG_COUNT_OVERRIDE_FIELD").unwrap_or_else(|_| "".to_string())
+        env::var("EVENT_LOG_COUNT_OVERRIDE_FIELD").unwrap_or_else(|_| String::new())
     })
 }
 
@@ -82,22 +82,24 @@ fn build_key(
     let mut key_vals: Vec<String> = Vec::new();
     // Get the field that holds the metadata struct itself
     for key_part in granularity_fields {
-        if for_delivery_events && key_part == "workspaceId" {
-            if let Some(workspace_id) = workspace_id {
-                key_vals.push(format!("workspaceId={workspace_id}"));
-                continue;
-            }
+        if for_delivery_events
+            && key_part == "workspaceId"
+            && let Some(workspace_id) = workspace_id
+        {
+            key_vals.push(format!("workspaceId={workspace_id}"));
+            continue;
         }
-        if for_delivery_events && key_part == "system" {
-            if let Some(service_system) = event.metadata().delivery_event_service_system() {
-                key_vals.push(format!("{}={}", key_part, service_system));
-                continue;
-            }
+        if for_delivery_events
+            && key_part == "system"
+            && let Some(service_system) = event.metadata().delivery_event_service_system()
+        {
+            key_vals.push(format!("{key_part}={service_system}"));
+            continue;
         }
         if let Ok(Some(val)) =
-            event.parse_path_and_get_value(format!("{}.{}", log_metadata_field, key_part))
+            event.parse_path_and_get_value(format!("{log_metadata_field}.{key_part}"))
         {
-            key_vals.push(format!("{}={}", key_part, val));
+            key_vals.push(format!("{key_part}={val}"));
         }
     }
     key_vals.join("/")
@@ -113,23 +115,25 @@ fn build_map(
 ) -> HashMap<String, String> {
     let mut val_map = HashMap::new();
     for key_part in granularity_fields {
-        if for_delivery_events && key_part == "workspaceId" {
-            if let Some(workspace_id) = workspace_id {
-                val_map.insert(key_part.to_string(), workspace_id.to_owned());
-                continue;
-            }
+        if for_delivery_events
+            && key_part == "workspaceId"
+            && let Some(workspace_id) = workspace_id
+        {
+            val_map.insert(key_part.clone(), workspace_id.to_owned());
+            continue;
         }
-        if for_delivery_events && key_part == "system" {
-            if let Some(service_system) = event.metadata().delivery_event_service_system() {
-                val_map.insert(key_part.to_string(), service_system.to_string());
-                continue;
-            }
+        if for_delivery_events
+            && key_part == "system"
+            && let Some(service_system) = event.metadata().delivery_event_service_system()
+        {
+            val_map.insert(key_part.clone(), service_system.to_string());
+            continue;
         }
         if let Ok(Some(val)) =
-            event.parse_path_and_get_value(format!("{}.{}", log_metadata_field, key_part))
+            event.parse_path_and_get_value(format!("{log_metadata_field}.{key_part}"))
         {
             // Remove extra quotes from string
-            val_map.insert(key_part.to_string(), val.to_string().replace("\"", ""));
+            val_map.insert(key_part.clone(), val.to_string().replace('"', ""));
         }
     }
     val_map
@@ -146,17 +150,15 @@ fn build_source_attributes(
     if source_attributes_field.is_empty() {
         return map;
     }
-    if let Ok(Some(val)) = event.parse_path_and_get_value(format!(
-        "{}.{}",
-        log_metadata_field, source_attributes_field
-    )) {
-        if let Some(obj) = val.as_object() {
-            for (key, value) in obj {
-                if matches!(value, Value::Null) {
-                    continue;
-                }
-                map.insert(key.to_string(), value.to_string().replace('"', ""));
+    if let Ok(Some(val)) =
+        event.parse_path_and_get_value(format!("{log_metadata_field}.{source_attributes_field}"))
+        && let Some(obj) = val.as_object()
+    {
+        for (key, value) in obj {
+            if matches!(value, Value::Null) {
+                continue;
             }
+            map.insert(key.to_string(), value.to_string().replace('"', ""));
         }
     }
     map
@@ -178,7 +180,7 @@ fn get_message_count(
             1
         };
     }
-    let path = format!("{}.{}", log_metadata_field, message_count_override_field);
+    let path = format!("{log_metadata_field}.{message_count_override_field}");
     match event.as_log().parse_path_and_get_value(path) {
         Ok(Some(value)) => {
             // If it's an integer, use that value as the count
@@ -197,7 +199,7 @@ fn get_message_count(
 // metadata like the other granularity fields) when present, falling back to the
 // in-memory `size_of()` estimate for events that don't carry it.
 fn get_message_bytes(log_event: &LogEvent, log_metadata_field: &str) -> usize {
-    let path = format!("{}.bytes", log_metadata_field);
+    let path = format!("{log_metadata_field}.bytes");
     match log_event.parse_path_and_get_value(path) {
         Ok(Some(value)) => value
             .as_integer()
@@ -208,7 +210,7 @@ fn get_message_bytes(log_event: &LogEvent, log_metadata_field: &str) -> usize {
 
 fn workspace_id_from_event(event: &LogEvent, log_metadata_field: &str) -> String {
     event
-        .parse_path_and_get_value(format!("{}.workspaceId", log_metadata_field))
+        .parse_path_and_get_value(format!("{log_metadata_field}.workspaceId"))
         .ok()
         .flatten()
         .and_then(|value| {
@@ -300,45 +302,42 @@ pub fn generate_count_map(
                     },
                 });
 
-            if for_delivery_events {
-                if let Some(accounting) = accounting {
-                    for path_count in accounting.counts.iter().filter(|count| count.selected) {
-                        let key = format!(
-                            "delivery-path:{}",
-                            serde_json::to_string(&(
-                                &path_count.path,
-                                &path_count.source,
-                                path_count.selected,
-                            ))
-                            .expect("delivery path count keys must serialize")
-                        );
-                        count_map
-                            .entry(key)
-                            .and_modify(|value: &mut MetadataValuesCount| {
-                                value.count = value.count.saturating_add(path_count.count as usize);
-                                value.metric_count = value.count;
-                                if let Some(existing) = &mut value.delivery_path_count {
-                                    existing.count =
-                                        existing.count.saturating_add(path_count.count);
-                                }
-                            })
-                            .or_insert_with(|| MetadataValuesCount {
-                                value_map: HashMap::new(),
-                                count: path_count.count as usize,
-                                metric_count: path_count.count as usize,
-                                size: 0,
-                                // Content ranges are needed only while transforming payloads,
-                                // not in the per-request counter projection.
-                                delivery_path_count: Some(DeliveryPathCount {
-                                    path: path_count.path.clone(),
-                                    source: path_count.source.clone(),
-                                    count: path_count.count,
-                                    selected: path_count.selected,
-                                    content_ranges: Vec::new(),
-                                }),
-                                source_attributes: HashMap::new(),
-                            });
-                    }
+            if for_delivery_events && let Some(accounting) = accounting {
+                for path_count in accounting.counts.iter().filter(|count| count.selected) {
+                    let key = format!(
+                        "delivery-path:{}",
+                        serde_json::to_string(&(
+                            &path_count.path,
+                            &path_count.source,
+                            path_count.selected,
+                        ))
+                        .expect("delivery path count keys must serialize")
+                    );
+                    count_map
+                        .entry(key)
+                        .and_modify(|value: &mut MetadataValuesCount| {
+                            value.count = value.count.saturating_add(path_count.count as usize);
+                            value.metric_count = value.count;
+                            if let Some(existing) = &mut value.delivery_path_count {
+                                existing.count = existing.count.saturating_add(path_count.count);
+                            }
+                        })
+                        .or_insert_with(|| MetadataValuesCount {
+                            value_map: HashMap::new(),
+                            count: path_count.count as usize,
+                            metric_count: path_count.count as usize,
+                            size: 0,
+                            // Content ranges are needed only while transforming payloads,
+                            // not in the per-request counter projection.
+                            delivery_path_count: Some(DeliveryPathCount {
+                                path: path_count.path.clone(),
+                                source: path_count.source.clone(),
+                                count: path_count.count,
+                                selected: path_count.selected,
+                                content_ranges: Vec::new(),
+                            }),
+                            source_attributes: HashMap::new(),
+                        });
                 }
             }
         }
@@ -375,9 +374,9 @@ pub fn generate_count_map_from_event_array(
 
 fn compute_event_log(event: Event) -> VectorSinkEventMetadata {
     let delivery_event =
-        VectorSinkDeliveryEvent::with_count_map(generate_count_map(&vec![event.clone()], true));
+        VectorSinkDeliveryEvent::with_count_map(generate_count_map(&[event.clone()], true));
     VectorSinkEventMetadata {
-        delivery_event: delivery_event,
+        delivery_event,
         file_send_event: None,
     }
 }
@@ -387,14 +386,14 @@ fn compute_event_log_with_file_event(
     file_metadata: FileEventMetadata,
 ) -> VectorSinkEventMetadata {
     let delivery_event =
-        VectorSinkDeliveryEvent::with_count_map(generate_count_map(&vec![event.clone()], true));
+        VectorSinkDeliveryEvent::with_count_map(generate_count_map(&[event.clone()], true));
     let file_send_event = Some(VectorFileSendEvent {
-        file_metadata: file_metadata,
-        count_map: generate_count_map(&vec![event.clone()], false),
+        file_metadata,
+        count_map: generate_count_map(&[event.clone()], false),
     });
     VectorSinkEventMetadata {
-        delivery_event: delivery_event,
-        file_send_event: file_send_event,
+        delivery_event,
+        file_send_event,
     }
 }
 
@@ -752,7 +751,11 @@ mod tests {
             },
         ];
         for case in cases {
-            let granularity: Vec<String> = case.granularity.iter().map(|s| s.to_string()).collect();
+            let granularity: Vec<String> = case
+                .granularity
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
             let keys: std::collections::HashSet<String> = case
                 .events
                 .iter()

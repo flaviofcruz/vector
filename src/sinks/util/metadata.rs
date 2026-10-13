@@ -97,7 +97,7 @@ impl RequestMetadataBuilder {
         builder
     }
 
-    pub fn new_with_event_log(
+    pub const fn new_with_event_log(
         event_count: usize,
         events_byte_size: usize,
         grouped_events_byte_size: GroupedCountByteSize,
@@ -111,7 +111,7 @@ impl RequestMetadataBuilder {
         }
     }
 
-    pub fn new(
+    pub const fn new(
         event_count: usize,
         events_byte_size: usize,
         grouped_events_byte_size: GroupedCountByteSize,
@@ -145,9 +145,7 @@ impl RequestMetadataBuilder {
             size,
             size,
             self.grouped_events_byte_size.clone(),
-            self.event_log_metadata
-                .clone()
-                .unwrap_or(VectorSinkEventMetadata::new()),
+            self.event_log_metadata.clone().unwrap_or_default(),
         )
     }
 

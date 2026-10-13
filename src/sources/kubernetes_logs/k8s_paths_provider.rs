@@ -75,7 +75,7 @@ fn source_pod_id_from_pod(pod: &Pod) -> Option<String> {
 
 impl K8sPathsProvider {
     /// Create a new [`K8sPathsProvider`].
-    pub fn new(
+    pub const fn new(
         pod_state: Store<Pod>,
         namespace_state: Store<Namespace>,
         annotation_selector: AnnotationSelector,
@@ -590,12 +590,11 @@ fn get_databricks_pod_logs_directories(
         );
     }
     // If a hostpath annotation key is configured, resolve the annotation and include its directory.
-    if let Some(annotation_key) = hostpath_logging_annotation_key {
-        if let Some(hostpath_logs_directory) =
+    if let Some(annotation_key) = hostpath_logging_annotation_key
+        && let Some(hostpath_logs_directory) =
             extract_hostpath_logging_annotation_directory(pod, annotation_key)
-        {
-            log_dirs.push(hostpath_logs_directory);
-        }
+    {
+        log_dirs.push(hostpath_logs_directory);
     }
     log_dirs
 }

@@ -806,7 +806,7 @@ mod test {
             error_message: &'static str,
         }
 
-        let test_cases = vec![
+        let test_cases = [
             TestCase {
                 case_name: "Config without any auth method should parse but fail at runtime",
                 config: r#"
@@ -1020,8 +1020,7 @@ mod test {
             description: &'static str,
         }
 
-        let test_cases = vec![
-            TestCase {
+        let test_cases = [TestCase {
                 case_name: "Invalid connection string should fail",
                 config: AzureBlobConfig {
                     connection_string: Some("InvalidConnectionString".to_string()),
@@ -1109,8 +1108,7 @@ mod test {
                 },
                 expected_error: CreateQueueIngestorError::ClientCertificateCreationFailed { source: Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "dummy")) },
                 description: "Client certificate with invalid PEM file path should fail with ClientCertificateCreationFailed",
-            },
-        ];
+            }];
 
         for (i, test_case) in test_cases.iter().enumerate() {
             let result = test_case

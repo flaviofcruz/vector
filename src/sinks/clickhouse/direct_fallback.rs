@@ -147,7 +147,10 @@ impl DirectFallbackService {
 
     /// Drives one endpoint's retry stack to completion and returns its final
     /// result. `should_fail_over` decides what that result means for the caller.
-    async fn run_endpoint(svc: &mut RetryingEndpoint, request: &HttpRequest<PartitionKey>) -> SinkResult {
+    async fn run_endpoint(
+        svc: &mut RetryingEndpoint,
+        request: &HttpRequest<PartitionKey>,
+    ) -> SinkResult {
         svc.ready().await?.call(request.clone()).await
     }
 
@@ -226,7 +229,11 @@ mod tests {
         )
     }
 
-    fn spawn_server(addr: std::net::SocketAddr, status: u16, body: &'static str) -> Arc<AtomicUsize> {
+    fn spawn_server(
+        addr: std::net::SocketAddr,
+        status: u16,
+        body: &'static str,
+    ) -> Arc<AtomicUsize> {
         spawn_flaky_server(addr, 0, status, status, body)
     }
 
@@ -249,8 +256,17 @@ mod tests {
                     let hits = hits.clone();
                     async move {
                         let n = hits.fetch_add(1, Ordering::SeqCst);
-                        let status = if n < fail_times { fail_status } else { ok_status };
-                        Ok::<_, Infallible>(HyperResponse::builder().status(status).body(Body::from(body)).unwrap())
+                        let status = if n < fail_times {
+                            fail_status
+                        } else {
+                            ok_status
+                        };
+                        Ok::<_, Infallible>(
+                            HyperResponse::builder()
+                                .status(status)
+                                .body(Body::from(body))
+                                .unwrap(),
+                        )
                     }
                 }))
             }
@@ -278,7 +294,8 @@ mod tests {
             compression: Default::default(),
             query_settings: Default::default(),
         };
-        let uri = |a: std::net::SocketAddr| format!("http://{}:{}/", a.ip(), a.port()).parse().unwrap();
+        let uri =
+            |a: std::net::SocketAddr| format!("http://{}:{}/", a.ip(), a.port()).parse().unwrap();
         let client = HttpClient::new(None, &ProxyConfig::default()).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         DirectFallbackService::new(
@@ -314,7 +331,11 @@ mod tests {
         let p_hits = primary.map_or_else(no_hits, |(s, b)| spawn_server(p_addr, s, b));
         let fb_hits = fallback.map_or_else(no_hits, |(s, b)| spawn_server(fb_addr, s, b));
         let result = drive(p_addr, fb_addr, non_retriable_codes).await;
-        (p_hits.load(Ordering::SeqCst), fb_hits.load(Ordering::SeqCst), result)
+        (
+            p_hits.load(Ordering::SeqCst),
+            fb_hits.load(Ordering::SeqCst),
+            result,
+        )
     }
 
     // --- Primary succeeds (no failover) ---
@@ -372,7 +393,12 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_fall_back_on_non_retriable_clickhouse_error() {
-        let (p, fb, res) = run(Some((500, "Code: 70. DB::Exception")), Some((200, "")), Some(vec![70])).await;
+        let (p, fb, res) = run(
+            Some((500, "Code: 70. DB::Exception")),
+            Some((200, "")),
+            Some(vec![70]),
+        )
+        .await;
         assert_eq!(res.unwrap().http_response.status().as_u16(), 500);
         assert_eq!((p, fb), (1, 0));
     }
@@ -380,8 +406,12 @@ mod tests {
     #[tokio::test]
     async fn non_retriable_on_fallback_is_returned_as_is() {
         // Primary exhausts on 503, fails over; fallback returns a non-retriable 500 (code 70).
-        let (p, fb, res) =
-            run(Some((503, "overloaded")), Some((500, "Code: 70. DB::Exception")), Some(vec![70])).await;
+        let (p, fb, res) = run(
+            Some((503, "overloaded")),
+            Some((500, "Code: 70. DB::Exception")),
+            Some(vec![70]),
+        )
+        .await;
         assert_eq!(res.unwrap().http_response.status().as_u16(), 500);
         assert_eq!((p, fb), (2, 1));
     }
@@ -421,7 +451,13 @@ mod tests {
         // Both endpoints keep failing (503), so each is driven to its full,
         // default attempt budget: proxy 2, fallback 3.
         let (p, fb, _res) = run(Some((503, "overloaded")), Some((503, "still down")), None).await;
-        assert_eq!(p, DEFAULT_PRIMARY_MAX_ATTEMPTS, "proxy should be tried exactly twice");
-        assert_eq!(fb, DEFAULT_SECONDARY_MAX_ATTEMPTS, "direct SMK should be tried exactly three times");
+        assert_eq!(
+            p, DEFAULT_PRIMARY_MAX_ATTEMPTS,
+            "proxy should be tried exactly twice"
+        );
+        assert_eq!(
+            fb, DEFAULT_SECONDARY_MAX_ATTEMPTS,
+            "direct SMK should be tried exactly three times"
+        );
     }
 }

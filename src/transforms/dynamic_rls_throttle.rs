@@ -60,7 +60,7 @@ pub(crate) enum ThrottleMode {
 }
 
 impl ThrottleMode {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             ThrottleMode::Shadow => "shadow",
             ThrottleMode::Enforce => "enforce",

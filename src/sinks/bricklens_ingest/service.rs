@@ -4,17 +4,17 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use http::{Request, Uri};
 use hyper::Body;
-use prost_reflect::{prost::Message, MethodDescriptor, ReflectMessage};
+use prost_reflect::{MethodDescriptor, ReflectMessage, prost::Message};
 use snafu::Snafu;
 use tower::Service;
 use tracing::{debug, warn};
 
+use vector_lib::EstimatedJsonEncodedSizeOf;
 use vector_lib::config::telemetry;
 use vector_lib::finalization::{EventFinalizers, Finalizable};
 use vector_lib::internal_event::{ComponentEventsDropped, INTENTIONAL, UNINTENTIONAL};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
-use vector_lib::EstimatedJsonEncodedSizeOf;
 
 use crate::sinks::util::retries::RetryLogic;
 
@@ -57,7 +57,7 @@ pub enum BricklensIngestError {
 impl BricklensIngestError {
     /// Whether this error is retriable — i.e. a transient condition where retrying the request
     /// could succeed.
-    fn is_retriable(&self) -> bool {
+    const fn is_retriable(&self) -> bool {
         match self {
             // Transport-level failures are virtually always transient.
             Self::Transport { .. } => true,
@@ -291,7 +291,7 @@ pub struct BricklensIngestService {
 }
 
 impl BricklensIngestService {
-    pub fn new(
+    pub const fn new(
         client: hyper::Client<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>,
         endpoint: Uri,
         method: MethodDescriptor,
@@ -819,12 +819,12 @@ impl Service<BricklensIngestRequest> for BricklensIngestService {
 #[cfg(test)]
 mod tests {
     use prost_reflect::{
-        prost_types::{
-            field_descriptor_proto, DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto,
-            FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet, MethodDescriptorProto,
-            ServiceDescriptorProto,
-        },
         DynamicMessage,
+        prost_types::{
+            DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto, FieldDescriptorProto,
+            FileDescriptorProto, FileDescriptorSet, MethodDescriptorProto, ServiceDescriptorProto,
+            field_descriptor_proto,
+        },
     };
     use vector_lib::event::{Event, LogEvent};
 
@@ -2049,8 +2049,8 @@ mod tests {
         // the real events. The call() path must derive events_sent from req.events, so the count is
         // the true number of delivered events rather than the zeroed metadata field.
         use crate::sinks::util::RequestBuilder;
-        use vector_lib::config::telemetry;
         use vector_lib::EstimatedJsonEncodedSizeOf;
+        use vector_lib::config::telemetry;
 
         let events = vec![log_event("a"), log_event("b"), log_event("c")];
 

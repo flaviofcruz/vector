@@ -285,16 +285,17 @@ where
                     // is done but there are still unacknowledged records — flushing
                     // batches lets the sink process them and send acks back so the
                     // buffer can fully drain.
-                    if let Some(signal) = this.flush_signal.as_ref() {
-                        if signal.take() && !this.batches.is_empty() {
-                            this.timer.clear();
-                            this.closed_batches.extend(
-                                this.batches
-                                    .drain()
-                                    .map(|(key, mut batch)| (key, batch.take_batch())),
-                            );
-                            continue;
-                        }
+                    if let Some(signal) = this.flush_signal.as_ref()
+                        && signal.take()
+                        && !this.batches.is_empty()
+                    {
+                        this.timer.clear();
+                        this.closed_batches.extend(
+                            this.batches
+                                .drain()
+                                .map(|(key, mut batch)| (key, batch.take_batch())),
+                        );
+                        continue;
                     }
 
                     match this.timer.poll_expired(cx) {

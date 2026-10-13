@@ -192,7 +192,8 @@ impl CheckpointsView {
         // it was rather than restarting on load. A still-present file clears
         // this again on its first rediscovery (see `clear_dead`).
         if let Some(removed_ts) = checkpoint.removed_ts {
-            self.removed_times.insert(checkpoint.fingerprint, removed_ts);
+            self.removed_times
+                .insert(checkpoint.fingerprint, removed_ts);
         }
         // Restore the archive path mapping for any checkpoint that has one,
         // regardless of is_done status. This allows skipping fingerprinting

@@ -65,7 +65,7 @@ impl ZerobusSinkError {
     /// The SDK surfaces `InvalidSchema` from both stream setup (`build_arrow` →
     /// `StreamInitError`) and mid-stream recovery (`wait_for_offset`/`flush` →
     /// `IngestionError`), so both variants are inspected.
-    pub fn is_schema_rejection(&self) -> bool {
+    pub const fn is_schema_rejection(&self) -> bool {
         let (Self::ZerobusError { source }
         | Self::StreamInitError { source }
         | Self::IngestionError { source }) = self

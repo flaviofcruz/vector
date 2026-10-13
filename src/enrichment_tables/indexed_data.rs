@@ -30,7 +30,7 @@ impl IndexedData {
     /// Creates a new [`IndexedData`] from column headers and rows. Rows are expected to be
     /// aligned with `headers` (one value per column, in header order). No indexes are built
     /// yet; callers register them via [`IndexedData::add_index`].
-    pub fn new(headers: Vec<String>, data: Vec<Vec<Value>>) -> Self {
+    pub const fn new(headers: Vec<String>, data: Vec<Vec<Value>>) -> Self {
         Self {
             headers,
             data,
@@ -44,17 +44,17 @@ impl IndexedData {
     }
 
     /// The number of rows held.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.data.len()
     }
 
     /// Whether the table holds no rows.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
     /// The number of indexes built.
-    pub fn index_count(&self) -> usize {
+    pub const fn index_count(&self) -> usize {
         self.indexes.len()
     }
 

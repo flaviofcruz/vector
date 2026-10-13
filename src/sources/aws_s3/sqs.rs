@@ -784,10 +784,7 @@ impl IngestorProcess {
 
         // Pace between polls: the batch is fully processed and its messages are
         // deleted, so nothing is in flight while we wait to honor the byte rate.
-        self.state
-            .rate_limiter
-            .pace(self.byte_counter.take())
-            .await;
+        self.state.rate_limiter.pace(self.byte_counter.take()).await;
 
         Ok(())
     }
@@ -1228,7 +1225,7 @@ impl IngestorProcess {
         // reference must be dropped before the status of the batch is sent to the channel.
         drop(batch);
 
-        let processing_result = if let Some(error) = read_error {
+        if let Some(error) = read_error {
             Err(ProcessingError::ReadObject {
                 source: error,
                 bucket: bucket.clone(),
@@ -1281,9 +1278,7 @@ impl IngestorProcess {
                     }
                 }
             }
-        };
-
-        processing_result
+        }
     }
 
     async fn receive_messages(

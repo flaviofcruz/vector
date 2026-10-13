@@ -105,11 +105,12 @@ where
                     // Unconditional (matching `PartitionedBatcher`): the signal only
                     // exists for disk-buffered sinks and is only ever set at shutdown,
                     // so this has zero steady-state effect.
-                    if let Some(signal) = this.flush_signal.as_ref() {
-                        if signal.take() && this.state.len() != 0 {
-                            this.timer.set(Maybe::None);
-                            return Poll::Ready(Some(this.state.take_batch()));
-                        }
+                    if let Some(signal) = this.flush_signal.as_ref()
+                        && signal.take()
+                        && this.state.len() != 0
+                    {
+                        this.timer.set(Maybe::None);
+                        return Poll::Ready(Some(this.state.take_batch()));
                     }
 
                     return {

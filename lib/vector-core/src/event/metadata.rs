@@ -410,10 +410,10 @@ impl EventMetadata {
         // Reducers start with empty metadata. Preserve the source enrollment view used by
         // downstream VRL, independently of the selected counts on a particular branch.
         let enrollment_path = vrl::path!("delivery_path_accounting", "paths");
-        if inner.value.get(enrollment_path).is_none() {
-            if let Some(paths) = other.value.get(enrollment_path) {
-                inner.value.insert(enrollment_path, paths.clone());
-            }
+        if inner.value.get(enrollment_path).is_none()
+            && let Some(paths) = other.value.get(enrollment_path)
+        {
+            inner.value.insert(enrollment_path, paths.clone());
         }
         if let Some(other) = other.delivery_path_accounting {
             inner

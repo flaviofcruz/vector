@@ -403,7 +403,7 @@ impl FileSink {
 
         trace!(message = "Writing an event to file.", path = ?path);
         let event_size = event.estimated_json_encoded_size_of();
-        let count_map = generate_count_map(&vec![event.clone()], true);
+        let count_map = generate_count_map(&[event.clone()], true);
         let finalizers = event.take_finalizers();
         match write_event_to_file(file, event, &self.transformer, &mut self.encoder).await {
             Ok(byte_size) => {

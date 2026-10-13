@@ -905,7 +905,8 @@ fn attach_delivery_path_accounting(
     );
     let matching_paths = delivery_paths
         .iter()
-        .filter_map(|(path, condition)| condition.check(event.clone()).0.then(|| path.clone()));
+        .filter(|&(path, condition)| condition.check(event.clone()).0)
+        .map(|(path, condition)| path.clone());
     let accounting = DeliveryPathAccounting::at_read(source, matching_paths);
     let exposed_paths = accounting
         .counts
@@ -1291,12 +1292,9 @@ impl Source {
         }
         // Convert the TTL removal config to FileTTLRemovalConfig used by file_server
         // Primarily involves converting Pathbufs -> glob patterns
-        let file_ttl_removal_config = match ttl_removal_config {
-            Some(ttl_removal_config_value) => Some(convert_to_file_ttl_removal_config(
-                &ttl_removal_config_value,
-            )),
-            None => None,
-        };
+        let file_ttl_removal_config = ttl_removal_config.map(|ttl_removal_config_value| {
+            convert_to_file_ttl_removal_config(&ttl_removal_config_value)
+        });
 
         // TODO: maybe more of the parameters have to be configurable.
 

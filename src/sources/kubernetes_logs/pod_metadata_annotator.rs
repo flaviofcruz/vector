@@ -200,10 +200,10 @@ impl PodMetadataAnnotator {
 
 impl PodMetadataAnnotator {
     /// Annotates an event with the information from the [`Pod::metadata`].
-    pub fn annotate<'a>(
+    pub fn annotate(
         &self,
         event: &mut Event,
-        file: &'a str,
+        file: &str,
         cached_file_info: Option<LogFileInfo>,
     ) -> Option<LogFileInfo> {
         self.annotate_with_delivery_metric_metadata(event, file, cached_file_info)
@@ -212,10 +212,10 @@ impl PodMetadataAnnotator {
 
     /// Annotates an event and returns delivery-metric identities resolved from
     /// the same Pod metadata.
-    pub fn annotate_with_delivery_metric_metadata<'a>(
+    pub fn annotate_with_delivery_metric_metadata(
         &self,
         event: &mut Event,
-        file: &'a str,
+        file: &str,
         cached_file_info: Option<LogFileInfo>,
     ) -> (
         Option<LogFileInfo>,

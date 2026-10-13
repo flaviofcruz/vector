@@ -19,7 +19,7 @@ pub struct LoginServiceHeadersProvider {
 
 impl LoginServiceHeadersProvider {
     /// Create a new LoginServiceHeadersProvider.
-    pub fn new(
+    pub const fn new(
         token_manager: Arc<TokenManager>,
         table_name: String,
         custom_headers: &'static HashMap<&'static str, String>,
@@ -45,10 +45,10 @@ impl HeadersProvider for LoginServiceHeadersProvider {
         let mut headers = HashMap::new();
         headers.insert("authorization", format!("Bearer {}", token));
         headers.insert("x-databricks-zerobus-table-name", self.table_name.clone());
-        if let Ok(app_instance) = std::env::var("ZEROBUS_APP_INSTANCE_NAME") {
-            if !app_instance.is_empty() {
-                headers.insert("x-databricks-app-instance-name", app_instance);
-            }
+        if let Ok(app_instance) = std::env::var("ZEROBUS_APP_INSTANCE_NAME")
+            && !app_instance.is_empty()
+        {
+            headers.insert("x-databricks-app-instance-name", app_instance);
         }
         headers.extend(self.custom_headers.iter().map(|(k, v)| (*k, v.clone())));
         Ok(headers)

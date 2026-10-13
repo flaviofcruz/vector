@@ -626,9 +626,8 @@ impl ClickhouseConfig {
             params.request_builder,
         );
 
-        let healthcheck = healthcheck_override.unwrap_or_else(|| {
-            Box::pin(healthcheck(params.client, params.endpoint, params.auth))
-        });
+        let healthcheck = healthcheck_override
+            .unwrap_or_else(|| Box::pin(healthcheck(params.client, params.endpoint, params.auth)));
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
     }
 
@@ -926,7 +925,9 @@ async fn healthcheck_either(
     )
     .await
     // A timed-out primary probe is a retriable failure.
-    .unwrap_or_else(|_elapsed| ProbeOutcome::Retriable("primary healthcheck probe timed out".into()));
+    .unwrap_or_else(|_elapsed| {
+        ProbeOutcome::Retriable("primary healthcheck probe timed out".into())
+    });
 
     match primary_outcome {
         // Primary healthy: the runtime writes through it, so pass immediately.
@@ -1244,7 +1245,10 @@ mod tests {
         }
 
         /// Convenience: healthy-vs-status endpoints, no hang, no custom codes.
-        async fn run(primary: Option<u16>, fallback: Option<u16>) -> (usize, usize, crate::Result<()>) {
+        async fn run(
+            primary: Option<u16>,
+            fallback: Option<u16>,
+        ) -> (usize, usize, crate::Result<()>) {
             let (p, fb, res, _) = run_ext(
                 primary.map(|s| (s, "", false)),
                 fallback.map(|s| (s, "", false)),
@@ -1264,7 +1268,10 @@ mod tests {
         async fn primary_down_falls_back_to_healthy_fallback() {
             // Primary port unbound (connection refused, retriable); fallback answers 200.
             let (p, fb, res) = run(None, Some(200)).await;
-            assert!(res.is_ok(), "a healthy fallback must satisfy the healthcheck");
+            assert!(
+                res.is_ok(),
+                "a healthy fallback must satisfy the healthcheck"
+            );
             assert_eq!((p, fb), (0, 1));
         }
 
@@ -1315,7 +1322,10 @@ mod tests {
             )
             .await
             .expect("healthcheck must resolve within the outer deadline despite a hanging primary");
-            assert!(res.2.is_ok(), "healthy fallback should satisfy the healthcheck");
+            assert!(
+                res.2.is_ok(),
+                "healthy fallback should satisfy the healthcheck"
+            );
         }
 
         #[tokio::test]
@@ -1335,7 +1345,10 @@ mod tests {
         #[tokio::test]
         async fn both_endpoints_down_errors() {
             let (p, fb, res) = run(None, None).await;
-            assert!(res.is_err(), "healthcheck must fail when neither endpoint is healthy");
+            assert!(
+                res.is_err(),
+                "healthcheck must fail when neither endpoint is healthy"
+            );
             assert_eq!((p, fb), (0, 0));
         }
 
@@ -1352,7 +1365,10 @@ mod tests {
             .await;
             // Well under PROBE_TIMEOUT, so a surviving probe is still in flight.
             tokio::time::sleep(Duration::from_millis(500)).await;
-            assert_eq!(fb_hits, 1, "the fallback probe must have reached the server");
+            assert_eq!(
+                fb_hits, 1,
+                "the fallback probe must have reached the server"
+            );
             assert_eq!(
                 fb_in_flight.load(Ordering::SeqCst),
                 0,

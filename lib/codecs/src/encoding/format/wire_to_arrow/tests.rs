@@ -496,7 +496,7 @@ fn repeated_scalar_unpacked_roundtrip() {
     // Hand-craft wire bytes for two rows:
     //   row 0: numbers = [1, 2, 3] (unpacked: 3 tag+value pairs)
     //   row 1: numbers = [42]      (single tag+value)
-    let tag = (1u8 << 3) | 0; // field 1, wire type 0 (varint)
+    let tag = 1u8 << 3; // field 1, wire type 0 (varint)
     let mut row0 = Vec::new();
     for v in [1i32, 2, 3] {
         row0.push(tag);
@@ -1089,10 +1089,10 @@ fn int64_to_timestamp_micros_coercion() {
     // Inputs are epoch-milliseconds; the encoder must scale them ms->us (x1000) into the
     // micros Arrow column.
     let mut row0 = Vec::new();
-    row0.push((1u8 << 3) | 0); // tag 1, varint
+    row0.push(1u8 << 3); // tag 1, varint
     encode_varint_into(&mut row0, 1_700_000_000_000_u64);
     let mut row1 = Vec::new();
-    row1.push((1u8 << 3) | 0);
+    row1.push(1u8 << 3);
     encode_varint_into(&mut row1, 1_800_000_000_000_u64);
 
     let batch = enc
@@ -1129,7 +1129,7 @@ fn oneof_variants_map_to_separate_columns() {
 
     // Row 0: only `a = 42`.
     let mut row0 = Vec::new();
-    row0.push((1u8 << 3) | 0); // field 1, varint
+    row0.push(1u8 << 3); // field 1, varint
     encode_varint_into(&mut row0, 42);
 
     // Row 1: only `b = "hello"`.
@@ -2307,7 +2307,10 @@ fn array_of_variant_from_repeated_messages() {
         .unwrap();
     let items = list.values();
     assert_eq!(items.len(), 2);
-    assert_eq!(decode_variant_wire(items, 0), serde_json::json!({"k": "a", "n": 1}));
+    assert_eq!(
+        decode_variant_wire(items, 0),
+        serde_json::json!({"k": "a", "n": 1})
+    );
     assert_eq!(decode_variant_wire(items, 1), serde_json::json!({"k": "b"}));
 }
 

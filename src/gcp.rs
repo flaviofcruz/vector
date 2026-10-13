@@ -273,16 +273,16 @@ pub struct InnerCreds {
 
 impl GcpAuthenticator {
     async fn from_file(path: &str, scope: Scope) -> crate::Result<Self> {
-        if let Ok(credential_contents) = fs::read(path) {
-            if matches!(
+        if let Ok(credential_contents) = fs::read(path)
+            && matches!(
                 serde_json::from_slice::<CredentialFileType>(&credential_contents),
                 Ok(CredentialFileType { credential_type }) if credential_type == "external_account"
-            ) {
-                let credentials =
-                    serde_json::from_slice::<ExternalAccountCredentials>(&credential_contents)
-                        .context(InvalidExternalAccountCredentialsSnafu)?;
-                return Self::from_external_account(credentials, scope).await;
-            }
+            )
+        {
+            let credentials =
+                serde_json::from_slice::<ExternalAccountCredentials>(&credential_contents)
+                    .context(InvalidExternalAccountCredentialsSnafu)?;
+            return Self::from_external_account(credentials, scope).await;
         }
 
         let creds = Credentials::from_file(path).context(InvalidCredentialsSnafu)?;
@@ -339,7 +339,6 @@ impl GcpAuthenticator {
     pub fn apply_uri(&self, uri: &mut Uri) {
         match self {
             Self::Credentials(_) | Self::ExternalAccount(_) | Self::StaticToken(_) | Self::None => {
-                ()
             }
             Self::ApiKey(api_key) => {
                 let mut parts = uri.clone().into_parts();

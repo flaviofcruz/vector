@@ -80,13 +80,14 @@ impl TokenManager {
                 service: OAUTH_SERVICE_NAME.into(),
             })?;
 
-        let endpoint: Uri = config
-            .login_service
-            .login_endpoint
-            .parse()
-            .context(InvalidLoginEndpointSnafu {
-                uri: config.login_service.login_endpoint.clone(),
-            })?;
+        let endpoint: Uri =
+            config
+                .login_service
+                .login_endpoint
+                .parse()
+                .context(InvalidLoginEndpointSnafu {
+                    uri: config.login_service.login_endpoint.clone(),
+                })?;
 
         let client = build_hyper_openssl_client(&config)?;
 

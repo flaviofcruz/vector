@@ -114,7 +114,7 @@ impl K8sEndpointProvider {
     ///   ports are silently dropped
     /// * `namespace_annotation_labels` - Per-namespace map of annotation key
     ///   → label name; empty disables the feature
-    pub fn new(
+    pub const fn new(
         pod_state: Store<Pod>,
         named_port: Option<Regex>,
         annotation_name: Option<String>,

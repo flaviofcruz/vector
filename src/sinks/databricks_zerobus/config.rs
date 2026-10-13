@@ -50,6 +50,7 @@ pub enum DatabricksAuthentication {
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SchemaSource {
     /// Path to a protobuf descriptor file.
     ///
@@ -77,13 +78,8 @@ pub enum SchemaSource {
     /// automatically generate a protobuf descriptor from it.
     /// Uses the same authentication credentials as the sink.
     #[serde(rename = "unity_catalog")]
+    #[default]
     UnityCatalog,
-}
-
-impl Default for SchemaSource {
-    fn default() -> Self {
-        SchemaSource::UnityCatalog
-    }
 }
 
 /// Arrow IPC compression codec for Zerobus Arrow Flight payloads.
@@ -283,7 +279,7 @@ impl SinkConfig for ZerobusSinkConfig {
 
         let request_limits = self.request.into_settings();
 
-        let sink = ZerobusSink::new(service, request_limits, self.batch.clone())?;
+        let sink = ZerobusSink::new(service, request_limits, self.batch)?;
 
         let healthcheck = async move {
             healthcheck_service
@@ -425,11 +421,11 @@ impl ZerobusSinkConfig {
 }
 
 // Default value functions
-fn default_flush_timeout_ms() -> u64 {
+const fn default_flush_timeout_ms() -> u64 {
     30000
 }
 
-fn default_server_ack_timeout_ms() -> u64 {
+const fn default_server_ack_timeout_ms() -> u64 {
     60000
 }
 
@@ -819,9 +815,10 @@ mod tests {
         // safe to set and is the only way to route OAuth-auth traffic to a
         // personal pod.
         let mut config = create_test_config();
-        config
-            .custom_headers
-            .insert("x-databricks-app-instance-name".into(), "shinkansen-dev".into());
+        config.custom_headers.insert(
+            "x-databricks-app-instance-name".into(),
+            "shinkansen-dev".into(),
+        );
         assert!(config.validate().is_ok());
     }
 

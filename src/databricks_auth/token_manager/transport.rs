@@ -26,12 +26,18 @@ pub(super) fn build_hyper_openssl_client(
         .context(SslBuilderSnafu)?;
 
     ssl_builder
-        .set_certificate_file(&config.login_service.tls_crt_file, openssl::ssl::SslFiletype::PEM)
+        .set_certificate_file(
+            &config.login_service.tls_crt_file,
+            openssl::ssl::SslFiletype::PEM,
+        )
         .context(LoadClientCertSnafu {
             path: config.login_service.tls_crt_file.clone(),
         })?;
     ssl_builder
-        .set_private_key_file(&config.login_service.tls_key_file, openssl::ssl::SslFiletype::PEM)
+        .set_private_key_file(
+            &config.login_service.tls_key_file,
+            openssl::ssl::SslFiletype::PEM,
+        )
         .context(LoadClientKeySnafu {
             path: config.login_service.tls_key_file.clone(),
         })?;

@@ -203,8 +203,7 @@ where
                     if self.remaining_attempts == 0 {
                         if self.log_drop_on_exhaustion {
                             error!(
-                                message =
-                                    "OK/retry response but retries exhausted; dropping the request.",
+                                message = "OK/retry response but retries exhausted; dropping the request.",
                             );
                         }
                         self.emit_attempts_histogram();

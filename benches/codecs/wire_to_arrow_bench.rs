@@ -162,9 +162,15 @@ fn check_correctness(
         .iter()
         .flat_map(|b| deserializer.parse(b.clone(), LogNamespace::Vector).unwrap())
         .collect();
-    let old_batch = old_encoder.encode_to_record_batch(&events).expect("old encode");
+    let old_batch = old_encoder
+        .encode_to_record_batch(&events)
+        .expect("old encode");
 
-    assert_eq!(new_batch.num_rows(), old_batch.num_rows(), "{label}: row count");
+    assert_eq!(
+        new_batch.num_rows(),
+        old_batch.num_rows(),
+        "{label}: row count"
+    );
     assert_eq!(
         new_batch.num_columns(),
         old_batch.num_columns(),
@@ -179,7 +185,10 @@ fn check_correctness(
             new_batch.schema().field(i).name(),
         );
     }
-    eprintln!("correctness gate [{label}]: {} messages match ✓", messages.len());
+    eprintln!(
+        "correctness gate [{label}]: {} messages match ✓",
+        messages.len()
+    );
 }
 
 // -------------------------------------------------------------------------
@@ -210,7 +219,9 @@ fn bench_wire_to_arrow(c: &mut Criterion) {
     ];
 
     for v in &variants {
-        let messages: Vec<Bytes> = (0..100).map(|i| (v.build_bytes)(&v.descriptor, i)).collect();
+        let messages: Vec<Bytes> = (0..100)
+            .map(|i| (v.build_bytes)(&v.descriptor, i))
+            .collect();
         check_correctness(&v.descriptor, v.schema.clone(), &messages, v.name);
     }
 
@@ -220,13 +231,11 @@ fn bench_wire_to_arrow(c: &mut Criterion) {
     group.sample_size(50);
 
     for v in &variants {
-        let new_encoder = Arc::new(
-            WireToArrowEncoder::new(&v.descriptor, v.schema.clone()).expect("plan build"),
-        );
+        let new_encoder =
+            Arc::new(WireToArrowEncoder::new(&v.descriptor, v.schema.clone()).expect("plan build"));
         let deserializer = Arc::new(ProtobufDeserializer::new(v.descriptor.clone()));
         let reference_serializer = Arc::new(
-            ArrowStreamSerializer::new(ArrowStreamSerializerConfig::new(v.schema.clone()))
-                .unwrap(),
+            ArrowStreamSerializer::new(ArrowStreamSerializerConfig::new(v.schema.clone())).unwrap(),
         );
 
         for &batch_size in &[100_usize, 1_000, 10_000] {

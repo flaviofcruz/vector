@@ -145,6 +145,6 @@ pub struct LoginServiceAuthConfig {
     pub login_service: LoginServiceConfig,
 }
 
-fn default_sp_type() -> i32 {
+const fn default_sp_type() -> i32 {
     SERVICE_PRINCIPAL_TYPE_SYSTEM
 }

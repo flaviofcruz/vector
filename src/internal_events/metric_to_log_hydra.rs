@@ -1,6 +1,6 @@
 use metrics::counter;
-use vector_lib::internal_event::{ComponentEventsDropped, InternalEvent, INTENTIONAL};
 use vector_lib::NamedInternalEvent;
+use vector_lib::internal_event::{ComponentEventsDropped, INTENTIONAL, InternalEvent};
 
 /// One per `metric_to_log_hydra` drop. Increments `metric_to_log_hydra_dropped_total{reason}`;
 /// when `counts_as_loss`, also emits the standard `component_discarded_events_total` discard.

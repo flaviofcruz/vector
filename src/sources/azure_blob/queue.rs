@@ -467,10 +467,10 @@ impl Ingestor {
 
         // Wait for all tasks to complete, propagating any panics
         for handle in handles.drain(..) {
-            if let Err(e) = handle.await {
-                if e.is_panic() {
-                    panic::resume_unwind(e.into_panic());
-                }
+            if let Err(e) = handle.await
+                && e.is_panic()
+            {
+                panic::resume_unwind(e.into_panic());
             }
         }
 
@@ -729,10 +729,7 @@ impl IngestorProcess {
 
         // Pace between polls: the batch is fully processed and its messages are
         // deleted, so nothing is in flight while we wait to honor the byte rate.
-        self.state
-            .rate_limiter
-            .pace(self.byte_counter.take())
-            .await;
+        self.state.rate_limiter.pace(self.byte_counter.take()).await;
 
         // Wait for next poll interval
         tokio::time::sleep(Duration::from_secs(self.state.poll_secs)).await;
@@ -1057,11 +1054,10 @@ impl IngestorProcess {
         let byte_counter = Arc::clone(&compressed_bytes);
         let body_stream = blob_response.data.map(move |result| {
             result
-                .map(|chunk| {
+                .inspect(|chunk| {
                     byte_counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                    chunk
                 })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .map_err(std::io::Error::other)
         });
 
         // Decode blob content based on compression settings

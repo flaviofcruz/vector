@@ -59,7 +59,10 @@ fn parse_base_url(endpoint: Option<String>) -> crate::Result<url::Url> {
     let url = url::Url::parse(&raw)
         .map_err(|e| format!("invalid gcp_gcs storage_endpoint {raw:?}: {e}"))?;
     if url.cannot_be_a_base() {
-        return Err(format!("gcp_gcs storage_endpoint {raw:?} must be a base URL (e.g. https://host)").into());
+        return Err(format!(
+            "gcp_gcs storage_endpoint {raw:?} must be a base URL (e.g. https://host)"
+        )
+        .into());
     }
     Ok(url)
 }
@@ -425,7 +428,10 @@ mod tests {
     fn parse_base_url_defaults_and_rejects_invalid() {
         let cases: [(Option<&str>, Option<&str>); 4] = [
             (None, Some("https://storage.googleapis.com/")),
-            (Some("https://gcs.example.com"), Some("https://gcs.example.com/")),
+            (
+                Some("https://gcs.example.com"),
+                Some("https://gcs.example.com/"),
+            ),
             (Some("not a url"), None),
             (Some("mailto:x@example.com"), None),
         ];

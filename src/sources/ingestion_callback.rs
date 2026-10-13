@@ -159,7 +159,7 @@ pub enum HttpMethod {
 }
 
 impl HttpMethod {
-    fn to_method(&self) -> Method {
+    const fn to_method(&self) -> Method {
         match self {
             HttpMethod::POST => Method::POST,
             HttpMethod::PUT => Method::PUT,
@@ -750,7 +750,7 @@ impl IngestionCallbackClient {
     }
 }
 
-fn batch_status_str(status: BatchStatus) -> &'static str {
+const fn batch_status_str(status: BatchStatus) -> &'static str {
     match status {
         BatchStatus::Delivered => "DELIVERED",
         BatchStatus::Errored => "ERRORED",

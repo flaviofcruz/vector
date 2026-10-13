@@ -284,7 +284,10 @@ impl HttpClientContext for PrometheusScrapeContext {
     /// Parses the Prometheus HTTP response into metric events
     fn on_response(&mut self, url: &Uri, header: &Parts, body: &Bytes) -> Option<Vec<Event>> {
         let decoded = match decompress::maybe_gunzip(
-            header.headers.get(http::header::CONTENT_ENCODING).map(|v| v.as_bytes()),
+            header
+                .headers
+                .get(http::header::CONTENT_ENCODING)
+                .map(|v| v.as_bytes()),
             body,
         ) {
             Ok(decoded) => decoded,
@@ -401,16 +404,14 @@ mod test {
 
         let (_guard, in_addr) = next_addr();
 
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder
             .write_all(b"promhttp_metric_handler_requests_total{code=\"200\"} 100 1612411516789\n")
             .unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let dummy_endpoint = warp::path!("metrics").map(move || {
-            warp::reply::with_header(compressed.clone(), "content-encoding", "gzip")
-        });
+        let dummy_endpoint = warp::path!("metrics")
+            .map(move || warp::reply::with_header(compressed.clone(), "content-encoding", "gzip"));
 
         tokio::spawn(warp::serve(dummy_endpoint).run(in_addr));
         wait_for_tcp(in_addr).await;

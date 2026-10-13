@@ -82,12 +82,12 @@ fn saturating_u64_to_usize(v: u64) -> usize {
     feature = "sources-gcp_gcs"
 ))]
 mod limiter {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use vector_lib::emit;
 
-    use super::{saturating_u64_to_usize, ObjectStorageRateLimitConfig};
+    use super::{ObjectStorageRateLimitConfig, saturating_u64_to_usize};
     use crate::internal_events::{ObjectStorageLargeObject, ObjectStoragePaced};
 
     /// Accumulator for decoded bytes processed. Cloneable so a source can hand a
@@ -141,7 +141,7 @@ mod limiter {
         }
 
         /// Whether pacing is active.
-        pub fn is_enabled(&self) -> bool {
+        pub const fn is_enabled(&self) -> bool {
             self.limiter.is_some()
         }
 

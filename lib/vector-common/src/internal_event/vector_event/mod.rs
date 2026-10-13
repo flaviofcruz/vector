@@ -14,6 +14,7 @@ pub struct VectorSinkEventMetadata {
 }
 
 impl VectorSinkEventMetadata {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             delivery_event: VectorSinkDeliveryEvent::new(),
@@ -31,6 +32,7 @@ impl VectorSinkEventMetadata {
 
 // Combines both delivery and file send events
 // NOTE: This assumes that all the extra file send metadata is the same (filename, etc.)
+#[must_use]
 pub fn combine_sink_event_metadata(
     events: Vec<VectorSinkEventMetadata>,
 ) -> VectorSinkEventMetadata {
@@ -72,7 +74,7 @@ impl AddAssign for VectorSinkEventMetadata {
 
 impl VectorSinkEventMetadata {
     /// Merge another metadata into self in-place, avoiding O(N²) cloning
-    /// that occurred when using combine_sink_event_metadata(vec![self, other]).
+    /// that occurred when using `combine_sink_event_metadata(vec`![self, other]).
     pub fn merge(&mut self, other: VectorSinkEventMetadata) {
         self.delivery_event.merge(other.delivery_event);
         match (&mut self.file_send_event, other.file_send_event) {

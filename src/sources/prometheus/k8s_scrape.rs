@@ -515,7 +515,12 @@ async fn scrape_endpoint(
     let body_bytes = response.into_body().collect().await?.to_bytes();
 
     let decoded_body = decompress::maybe_gunzip(content_encoding.as_deref(), body_bytes.as_ref())
-        .map_err(|e| format!("Failed to gzip-decode response body from {}: {}", endpoint.url, e))?;
+        .map_err(|e| {
+        format!(
+            "Failed to gzip-decode response body from {}: {}",
+            endpoint.url, e
+        )
+    })?;
 
     let body_str = std::str::from_utf8(decoded_body.as_ref())
         .map_err(|e| format!("Invalid UTF-8 in response body: {}", e))?;
@@ -654,7 +659,7 @@ fn prepare_label_selector(extra: &str) -> String {
     }
 }
 
-fn default_scrape_interval() -> Duration {
+const fn default_scrape_interval() -> Duration {
     Duration::from_secs(DEFAULT_SCRAPE_INTERVAL_SECS)
 }
 
@@ -662,7 +667,7 @@ fn default_scrape_timeout() -> Duration {
     Duration::from_secs_f64(DEFAULT_SCRAPE_TIMEOUT_SECS)
 }
 
-fn default_use_apiserver_cache() -> bool {
+const fn default_use_apiserver_cache() -> bool {
     false
 }
 
@@ -674,7 +679,7 @@ fn default_annotation_name() -> Option<String> {
     Some("system_metrics_enabled".to_string())
 }
 
-fn default_max_endpoints_per_pod() -> usize {
+const fn default_max_endpoints_per_pod() -> usize {
     2
 }
 
@@ -1008,13 +1013,12 @@ test_gauge 3.14
 
         // Verify original label was preserved
         for event in &events {
-            if let Event::Metric(metric) = event {
-                if let Some(tags) = metric.tags() {
-                    if let Some(pod_name) = tags.get("pod_name") {
-                        // Original label should be preserved when honor_labels is true
-                        assert_eq!(pod_name, "original_name");
-                    }
-                }
+            if let Event::Metric(metric) = event
+                && let Some(tags) = metric.tags()
+                && let Some(pod_name) = tags.get("pod_name")
+            {
+                // Original label should be preserved when honor_labels is true
+                assert_eq!(pod_name, "original_name");
             }
         }
     }
@@ -1381,13 +1385,13 @@ http_requests_total{method="POST",status="201"} 5678
         let events = result.unwrap();
         assert!(!events.is_empty());
         for event in &events {
-            if let Event::Metric(metric) = event {
-                if let Some(tags) = metric.tags() {
-                    assert!(
-                        !tags.contains_key("tenant"),
-                        "no label should appear when extra_labels is empty"
-                    );
-                }
+            if let Event::Metric(metric) = event
+                && let Some(tags) = metric.tags()
+            {
+                assert!(
+                    !tags.contains_key("tenant"),
+                    "no label should appear when extra_labels is empty"
+                );
             }
         }
     }
@@ -1463,13 +1467,13 @@ http_requests_total{method="POST",status="201"} 5678
         let events = result.unwrap();
         assert!(!events.is_empty());
         for event in &events {
-            if let Event::Metric(metric) = event {
-                if let Some(tags) = metric.tags() {
-                    assert!(
-                        !tags.contains_key("tenant"),
-                        "extra_labels must not be applied when emit_pod_metadata is false"
-                    );
-                }
+            if let Event::Metric(metric) = event
+                && let Some(tags) = metric.tags()
+            {
+                assert!(
+                    !tags.contains_key("tenant"),
+                    "extra_labels must not be applied when emit_pod_metadata is false"
+                );
             }
         }
     }

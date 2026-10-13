@@ -268,12 +268,11 @@ mod tests {
                     key.key().labels().map(|l| (l.key(), l.value())).collect();
                 if key.key().name() == "delivery_events_total"
                     && labels.get("source_pod_id") == Some(&"pod")
+                    && let DebugValue::Counter(count) = value
                 {
-                    if let DebugValue::Counter(count) = value {
-                        *totals
-                            .entry(labels["delivery_event_type"].to_owned())
-                            .or_insert(0) += count;
-                    }
+                    *totals
+                        .entry(labels["delivery_event_type"].to_owned())
+                        .or_insert(0) += count;
                 }
             }
             assert_eq!(totals["VECTOR_SOURCE_READ"], 3);

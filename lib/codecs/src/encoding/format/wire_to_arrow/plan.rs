@@ -719,7 +719,7 @@ mod tests {
             Field::new("id", DataType::Int32, true),
             Field::new("email", DataType::LargeUtf8, true),
         ]);
-        let plan = MessagePlan::build(&desc, &Fields::from(schema.fields().clone())).unwrap();
+        let plan = MessagePlan::build(&desc, &schema.fields().clone()).unwrap();
         assert_eq!(plan.slots.len(), 3);
         assert!(matches!(
             plan.slots[0],
@@ -745,7 +745,7 @@ mod tests {
             Field::new("deleted_in_proto", DataType::Int32, true),
             Field::new("id", DataType::Int32, true),
         ]);
-        let plan = MessagePlan::build(&desc, &Fields::from(schema.fields().clone())).unwrap();
+        let plan = MessagePlan::build(&desc, &schema.fields().clone()).unwrap();
         assert!(matches!(
             plan.slots[0],
             PlanSlot::Scalar(ScalarKind::String)
@@ -766,8 +766,7 @@ mod tests {
             DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int32, true)])),
             true,
         )]);
-        let err = MessagePlan::build(&desc, &Fields::from(schema.fields().clone()))
-            .expect_err("should fail");
+        let err = MessagePlan::build(&desc, &schema.fields().clone()).expect_err("should fail");
         assert!(matches!(
             err,
             WireToArrowError::UnsupportedCombination { .. }
@@ -782,7 +781,7 @@ mod tests {
         // well-formed and don't need a fallthrough that fails the whole batch.
         let desc = load_person_descriptor();
         let schema = Schema::new(vec![Field::new("name", DataType::Int32, true)]);
-        let err = MessagePlan::build(&desc, &Fields::from(schema.fields().clone()))
+        let err = MessagePlan::build(&desc, &schema.fields().clone())
             .expect_err("plan-build must reject String/Int32 pairing");
         assert!(
             matches!(err, WireToArrowError::UnsupportedCombination { .. }),

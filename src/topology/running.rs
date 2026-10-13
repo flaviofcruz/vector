@@ -805,25 +805,24 @@ impl RunningTopology {
                 // force-abort the stragglers — sources only. Wave-2 transforms/sinks keep
                 // flushing until the overall deadline (the `timeout` future force-aborts
                 // anything still alive then).
-                if let Some(is_deadline) = internal_source_deadline {
-                    if tokio::time::timeout_at(
+                if let Some(is_deadline) = internal_source_deadline
+                    && tokio::time::timeout_at(
                         is_deadline,
                         futures::future::join_all(wave2_source_wait_handles),
                     )
                     .await
                     .is_err()
-                    {
-                        let (aborted_components, aborted_tasks) =
-                            abort_active_tasks(&wave2_source_abort_handles);
-                        if aborted_tasks > 0 {
-                            warn!(
-                                aborted_components = aborted_components,
-                                aborted_tasks = aborted_tasks,
-                                message = "Wave 2: internal-source drain deadline exceeded; \
+                {
+                    let (aborted_components, aborted_tasks) =
+                        abort_active_tasks(&wave2_source_abort_handles);
+                    if aborted_tasks > 0 {
+                        warn!(
+                            aborted_components = aborted_components,
+                            aborted_tasks = aborted_tasks,
+                            message = "Wave 2: internal-source drain deadline exceeded; \
                                            force-aborted stuck internal-source tasks.",
-                                internal_log_rate_limit = false,
-                            );
-                        }
+                            internal_log_rate_limit = false,
+                        );
                     }
                 }
 
@@ -865,7 +864,8 @@ impl RunningTopology {
                 );
                 // Prometheus mirror of the COMPONENTS_CLOSED VEL (see the two-wave branch). Single-pass
                 // shutdown is never "graceful" in the wave-1 sense, so this is always `false`.
-                counter!("shutdown_components_closed_total", "gracefully_closed" => "false").increment(1);
+                counter!("shutdown_components_closed_total", "gracefully_closed" => "false")
+                    .increment(1);
 
                 // See the matching comment in the two-wave branch above.
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2105,12 +2105,15 @@ fn reusable_buffers(
 }
 
 fn sink_buffer_config(config: &Config, key: &ComponentKey) -> Option<BufferConfig> {
-    config.sink(key).map(|sink| sink.buffer.clone()).or_else(|| {
-        config
-            .enrichment_table(key)
-            .and_then(|table| table.as_sink(key))
-            .map(|(_, sink)| sink.buffer)
-    })
+    config
+        .sink(key)
+        .map(|sink| sink.buffer.clone())
+        .or_else(|| {
+            config
+                .enrichment_table(key)
+                .and_then(|table| table.as_sink(key))
+                .map(|(_, sink)| sink.buffer)
+        })
 }
 
 #[cfg(test)]
@@ -2165,12 +2168,11 @@ mod tests {
         // A changed credential file adds the sink to components_to_reload even though the parsed
         // Vector config is identical. That selection must not turn an unchanged disk buffer into
         // a recreate: the replacement sink gets the existing queue and ledger instead.
-        let diff = ConfigDiff::new(
-            &config,
-            &config,
-            HashSet::from_iter([sink_key.clone()]),
-        );
+        let diff = ConfigDiff::new(&config, &config, HashSet::from_iter([sink_key.clone()]));
 
-        assert_eq!(reusable_buffers(&config, &config, &diff), HashSet::from([sink_key]));
+        assert_eq!(
+            reusable_buffers(&config, &config, &diff),
+            HashSet::from([sink_key])
+        );
     }
 }

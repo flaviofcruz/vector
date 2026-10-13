@@ -93,7 +93,7 @@ struct ParsedLog<'a> {
 }
 
 #[inline]
-fn parse_log_as_unstructured(line: &[u8]) -> ParsedLog<'_> {
+const fn parse_log_as_unstructured(line: &[u8]) -> ParsedLog<'_> {
     ParsedLog {
         timestamp: None,
         priority: &[],

@@ -120,7 +120,7 @@ impl ComponentConfig {
                 || self.canonicalized_paths.contains(p)
                 || fs::canonicalize(p)
                     .ok()
-                    .map_or(false, |p| self.canonicalized_paths.contains(&p))
+                    .is_some_and(|p| self.canonicalized_paths.contains(&p))
         }) {
             return Some((self.component_key.clone(), self.component_type.clone()));
         }

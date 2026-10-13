@@ -33,8 +33,7 @@ mod tests {
     use super::*;
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
     }
@@ -43,7 +42,10 @@ mod tests {
     fn passes_plaintext_through_borrowed() {
         let body = b"# HELP foo bar\nfoo 1\n";
         let out = maybe_gunzip(None, body).unwrap();
-        assert!(matches!(out, Cow::Borrowed(_)), "plaintext should not be copied");
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "plaintext should not be copied"
+        );
         assert_eq!(out.as_ref(), body);
     }
 
@@ -68,7 +70,10 @@ mod tests {
     fn content_encoding_match_is_case_insensitive() {
         let plain = b"foo 1\n";
         let compressed = gzip(plain);
-        assert_eq!(maybe_gunzip(Some(b"GZIP"), &compressed).unwrap().as_ref(), plain);
+        assert_eq!(
+            maybe_gunzip(Some(b"GZIP"), &compressed).unwrap().as_ref(),
+            plain
+        );
     }
 
     #[test]

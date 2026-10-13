@@ -1,5 +1,5 @@
-use futures::{stream::BoxStream, StreamExt};
-use prost_reflect::{prost::Message, DescriptorPool};
+use futures::{StreamExt, stream::BoxStream};
+use prost_reflect::{DescriptorPool, prost::Message};
 use tower::ServiceBuilder;
 use vector_lib::stream::BatcherSettings;
 
@@ -7,7 +7,7 @@ use crate::{
     codecs::{Encoder, Transformer},
     config::SinkContext,
     event::Event,
-    sinks::util::{builder::SinkBuilderExt, Compression, ServiceBuilderExt, StreamSink},
+    sinks::util::{Compression, ServiceBuilderExt, StreamSink, builder::SinkBuilderExt},
 };
 
 use super::{
@@ -225,7 +225,7 @@ impl BricklensIngestSink {
         let request_builder_concurrency = self
             .request_limits
             .concurrency
-            .and_then(|n| std::num::NonZeroUsize::new(n))
+            .and_then(std::num::NonZeroUsize::new)
             .unwrap_or_else(|| std::num::NonZeroUsize::new(10).unwrap());
 
         // Wrap the gRPC service in the Tower request-middleware stack so the configured

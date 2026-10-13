@@ -116,16 +116,16 @@ impl RedactionPattern {
 
     fn should_redact_match(&self, input: &[u8]) -> bool {
         if let Some(validation) = &self.validation {
-            if let Some(min_entropy) = validation.min_entropy {
-                if entropy(input) < min_entropy {
-                    return false;
-                }
+            if let Some(min_entropy) = validation.min_entropy
+                && entropy(input) < min_entropy
+            {
+                return false;
             }
 
-            if let Some(deny_pattern) = validation.deny_pattern.as_ref() {
-                if deny_pattern.is_match(input) {
-                    return false;
-                }
+            if let Some(deny_pattern) = validation.deny_pattern.as_ref()
+                && deny_pattern.is_match(input)
+            {
+                return false;
             }
         }
 
@@ -145,15 +145,15 @@ impl RedactionPattern {
                 };
 
                 // If we're hashing a replacement and this is the group then make it happen.
-                if let Some(info) = &self.replace_group_info {
-                    if info.index == index {
-                        dst.extend_from_slice(&info.replacement);
-                        dst.push(b'(');
-                        let hash = format!("{:x}", Md5::digest(span.as_bytes()));
-                        dst.extend_from_slice(&hash.as_bytes()[..info.hash_prefix]);
-                        dst.push(b')');
-                        return;
-                    }
+                if let Some(info) = &self.replace_group_info
+                    && info.index == index
+                {
+                    dst.extend_from_slice(&info.replacement);
+                    dst.push(b'(');
+                    let hash = format!("{:x}", Md5::digest(span.as_bytes()));
+                    dst.extend_from_slice(&hash.as_bytes()[..info.hash_prefix]);
+                    dst.push(b')');
+                    return;
                 }
 
                 // Otherwise just replace.

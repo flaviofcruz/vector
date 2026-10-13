@@ -119,7 +119,7 @@ struct RequestGuard {
 
 impl RequestGuard {
     /// Marks the request as completed so `Drop` won't remove the endpoint.
-    fn complete(&mut self) {
+    const fn complete(&mut self) {
         self.completed = true;
     }
 }
@@ -294,10 +294,8 @@ impl HeadlessService {
 
         let (discover_tx, discover_rx) = mpsc::unbounded_channel::<DiscoverEvent>();
 
-        let initial_ips: HashSet<IpAddr> = initial_uris
-            .iter()
-            .filter_map(|uri| dns::ip_from_uri(uri))
-            .collect();
+        let initial_ips: HashSet<IpAddr> =
+            initial_uris.iter().filter_map(dns::ip_from_uri).collect();
 
         if initial_ips.is_empty() {
             return Err("DNS resolution returned no usable IP addresses for ClickHouse".into());
@@ -321,18 +319,18 @@ impl HeadlessService {
 
         // Build TrackedHttpService for each initial IP and send Insert events.
         for uri in &initial_uris {
-            if let Some(ip) = dns::ip_from_uri(uri) {
-                if let Some(&generation) = known_ips.get(&ip) {
-                    let service = TrackedHttpService {
-                        inner: build_endpoint_service(&client, uri.clone(), &svc_config),
-                        ip,
-                        generation,
-                        pending: Arc::new(AtomicUsize::new(0)),
-                        discover_tx: discover_tx.clone(),
-                        shared: shared.clone(),
-                    };
-                    let _ = discover_tx.send(Ok(Change::Insert(ip, service)));
-                }
+            if let Some(ip) = dns::ip_from_uri(uri)
+                && let Some(&generation) = known_ips.get(&ip)
+            {
+                let service = TrackedHttpService {
+                    inner: build_endpoint_service(&client, uri.clone(), &svc_config),
+                    ip,
+                    generation,
+                    pending: Arc::new(AtomicUsize::new(0)),
+                    discover_tx: discover_tx.clone(),
+                    shared: shared.clone(),
+                };
+                let _ = discover_tx.send(Ok(Change::Insert(ip, service)));
             }
         }
 
@@ -421,7 +419,7 @@ impl tower::Service<HttpRequest<PartitionKey>> for HeadlessService {
                 active_endpoints = self.shared.active_count.load(Ordering::Relaxed),
             );
             let fut = self.inner.call(request);
-            Box::pin(async move { fut.await.map_err(Into::into) })
+            Box::pin(fut)
         }
     }
 }
@@ -567,10 +565,7 @@ fn reconcile_endpoints(
     svc_config: &EndpointServiceConfig,
     new_uris: &[Uri],
 ) {
-    let new_ips: HashSet<IpAddr> = new_uris
-        .iter()
-        .filter_map(|u| dns::ip_from_uri(u))
-        .collect();
+    let new_ips: HashSet<IpAddr> = new_uris.iter().filter_map(dns::ip_from_uri).collect();
 
     // Compute diff and update state under the lock, then release before sends.
     let (stale_ips, fresh_entries, active) = {
@@ -588,9 +583,9 @@ fn reconcile_endpoints(
         let mut fresh_entries: Vec<(Uri, IpAddr, u64)> = Vec::new();
         for uri in new_uris {
             if let Some(ip) = dns::ip_from_uri(uri) {
-                if !known.contains_key(&ip) {
+                if let std::collections::hash_map::Entry::Vacant(e) = known.entry(ip) {
                     let next_gen = shared.next_generation.fetch_add(1, Ordering::Relaxed);
-                    known.insert(ip, next_gen);
+                    e.insert(next_gen);
                     fresh_entries.push((uri.clone(), ip, next_gen));
                 } else {
                     trace!(

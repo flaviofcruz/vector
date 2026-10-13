@@ -108,7 +108,7 @@ const DEFAULT_SERVICE_PRINCIPAL_TYPE: &str = "SERVICE_PRINCIPAL_TYPE_SYSTEM";
 /// delivers it as a proto enum (wire form is the number). Mirrors central/api/users/
 /// service_principal_type.proto. Kept as a small explicit map (not a generated binding) because the
 /// transform only needs the name string to hand to the downstream sink.
-fn service_principal_type_name(number: i32) -> Option<&'static str> {
+const fn service_principal_type_name(number: i32) -> Option<&'static str> {
     match number {
         0 => Some("SERVICE_PRINCIPAL_TYPE_UNSPECIFIED"),
         1 => Some("SERVICE_PRINCIPAL_TYPE_USER_MANAGED"),
@@ -212,10 +212,12 @@ impl TransformConfig for BricklensConfigEnricherConfig {
         let (Some(_endpoint), Some(_descriptor)) =
             (&self.bricklens_config_endpoint, &self.proto_descriptor_path)
         else {
-            return Err("bricklens_config_enricher requires both bricklens_config_endpoint and \
+            return Err(
+                "bricklens_config_enricher requires both bricklens_config_endpoint and \
                         proto_descriptor_path to be set (there is no no-op fallback; a partial or \
                         empty config would silently drop all events)"
-                .into());
+                    .into(),
+            );
         };
         // Resolver stack (outer -> inner): cache -> retry -> live gRPC. A cache hit skips both retry
         // and the RPC; on a miss, RetryResolver retries the gRPC call with backoff, and only the
@@ -421,7 +423,11 @@ impl RetryResolver {
 
     /// Test-only constructor allowing a tiny backoff so retry tests don't sleep for real.
     #[cfg(test)]
-    fn with_backoff(inner: Arc<dyn ConfigResolver>, max_retries: u32, backoff_base: Duration) -> Self {
+    fn with_backoff(
+        inner: Arc<dyn ConfigResolver>,
+        max_retries: u32,
+        backoff_base: Duration,
+    ) -> Self {
         Self {
             inner,
             max_retries,
@@ -842,9 +848,9 @@ impl CachedConfigResolver {
     /// post-fetch-lock re-check share identical freshness logic.
     fn fresh_cached(&self, key: &ConfigLookupKey) -> Option<Option<RouteInfo>> {
         let mut cache = self.cache.lock().expect("cache mutex poisoned");
-        cache.get(key).and_then(|entry| {
-            (entry.fetched_at.elapsed() < self.ttl).then(|| entry.value.clone())
-        })
+        cache
+            .get(key)
+            .and_then(|entry| (entry.fetched_at.elapsed() < self.ttl).then(|| entry.value.clone()))
     }
 
     pub async fn resolve(&self, key: &ConfigLookupKey) -> crate::Result<Option<RouteInfo>> {
@@ -1034,7 +1040,8 @@ fn lookup_key_from_event(event: &Event) -> Option<ConfigLookupKey> {
     // conversion rather than `as i32`, which would silently wrap an out-of-range value into a
     // different (valid-looking) enum number and route to the wrong config. An out-of-range value
     // is a malformed event, so return None -> route() drops it (fail closed).
-    let workload_type = i32::try_from(log.get("workload_type").and_then(|v| v.as_integer())?).ok()?;
+    let workload_type =
+        i32::try_from(log.get("workload_type").and_then(|v| v.as_integer())?).ok()?;
     let config_id = log.get("config_id").and_then(|v| v.as_str())?.into_owned();
     let workspace_id = log.get("workspace_id").and_then(|v| v.as_integer())?;
     Some(ConfigLookupKey {
@@ -1284,8 +1291,15 @@ mod tests {
         });
         let counter = Arc::clone(&inner);
         let retry = RetryResolver::with_backoff(inner, 2, Duration::from_millis(1));
-        assert_eq!(retry.resolve(&test_key()).await.unwrap(), Some(enabled_action()));
-        assert_eq!(counter.calls.load(Ordering::SeqCst), 3, "1 initial + 2 retries");
+        assert_eq!(
+            retry.resolve(&test_key()).await.unwrap(),
+            Some(enabled_action())
+        );
+        assert_eq!(
+            counter.calls.load(Ordering::SeqCst),
+            3,
+            "1 initial + 2 retries"
+        );
     }
 
     #[tokio::test]
@@ -1299,7 +1313,11 @@ mod tests {
         let counter = Arc::clone(&inner);
         let retry = RetryResolver::with_backoff(inner, 2, Duration::from_millis(1));
         assert!(retry.resolve(&test_key()).await.is_err());
-        assert_eq!(counter.calls.load(Ordering::SeqCst), 3, "1 initial + 2 retries, then give up");
+        assert_eq!(
+            counter.calls.load(Ordering::SeqCst),
+            3,
+            "1 initial + 2 retries, then give up"
+        );
     }
 
     #[tokio::test]
@@ -1312,7 +1330,11 @@ mod tests {
         let counter = Arc::clone(&inner);
         let retry = RetryResolver::with_backoff(inner, 0, Duration::from_millis(1));
         assert!(retry.resolve(&test_key()).await.is_err());
-        assert_eq!(counter.calls.load(Ordering::SeqCst), 1, "max_retries=0 => no retry");
+        assert_eq!(
+            counter.calls.load(Ordering::SeqCst),
+            1,
+            "max_retries=0 => no retry"
+        );
     }
 
     #[test]
@@ -1602,7 +1624,10 @@ mod tests {
         // wrongly dropped despite a resolvable destination existing.
         let config = encode_telemetry_config_two_sinks("", "main.obs.otel_logs");
         let action = route_info_from_telemetry_config(&config).expect("some route action");
-        assert!(action.enabled, "must resolve to the enabled (non-empty-table) sink");
+        assert!(
+            action.enabled,
+            "must resolve to the enabled (non-empty-table) sink"
+        );
         assert_eq!(action.uc_resource_target, "main.obs.otel_logs");
     }
 

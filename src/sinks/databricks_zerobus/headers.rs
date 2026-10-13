@@ -115,6 +115,9 @@ mod tests {
             "dbc-abc123"
         );
         // Scheme-less endpoints are normalized like the SDK does.
-        assert_eq!(workspace_id_from_endpoint("ingest.dev.databricks.com"), "ingest");
+        assert_eq!(
+            workspace_id_from_endpoint("ingest.dev.databricks.com"),
+            "ingest"
+        );
     }
 }

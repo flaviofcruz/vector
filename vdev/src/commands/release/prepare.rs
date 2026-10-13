@@ -327,7 +327,7 @@ impl Prepare {
                     .ok_or_else(|| anyhow!("Invalid weight format"))?;
                 let weight: i32 = weight_str
                     .parse()
-                    .map_err(|e| anyhow!("Failed to parse weight: {}", e))?;
+                    .map_err(|e| anyhow!("Failed to parse weight: {e}"))?;
                 // Increase by 1
                 let new_weight = weight + 1;
                 updated_lines.push(format!("weight: {new_weight}"));

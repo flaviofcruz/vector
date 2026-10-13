@@ -192,7 +192,7 @@ async fn telemetry() {
 async fn handles_failure_v1() {
     let (_expected, mut rx) =
         start_test_error(ApiStatus::BadRequestv1, BatchStatus::Rejected).await;
-    assert!(matches!(rx.try_recv(), Err(_)));
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -205,7 +205,7 @@ async fn handles_failure_v2() {
     let (_expected, mut rx) =
         start_test_error(ApiStatus::BadRequestv2, BatchStatus::Rejected).await;
 
-    assert!(matches!(rx.try_recv(), Err(_)));
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]

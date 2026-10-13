@@ -120,11 +120,13 @@ pub struct DeferredSourceShutdowns {
 
 impl DeferredSourceShutdowns {
     /// Returns true if there are any deferred sources to shut down.
+    #[must_use]
     pub fn has_deferred_sources(&self) -> bool {
         !self.begun_triggers.is_empty()
     }
 
     /// Returns the set of deferred source component keys.
+    #[must_use]
     pub fn deferred_keys(&self) -> std::collections::HashSet<ComponentKey> {
         self.begun_triggers.keys().cloned().collect()
     }

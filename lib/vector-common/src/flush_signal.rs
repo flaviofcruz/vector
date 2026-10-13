@@ -15,6 +15,7 @@ pub struct FlushSignal(Arc<AtomicBool>);
 
 impl FlushSignal {
     /// Creates a new `FlushSignal` in the unset state.
+    #[must_use]
     pub fn new() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
     }
@@ -25,6 +26,7 @@ impl FlushSignal {
     }
 
     /// Atomically reads and clears the flush signal, returning `true` if it was set.
+    #[must_use]
     pub fn take(&self) -> bool {
         self.0.swap(false, Ordering::AcqRel)
     }
@@ -59,6 +61,7 @@ pub fn with_flush_signal<F: std::future::Future>(
 ///
 /// Returns `Some(FlushSignal)` if one has been set for the current task
 /// (i.e. the sink is backed by a disk buffer), or `None` otherwise.
+#[must_use]
 pub fn get_task_flush_signal() -> Option<FlushSignal> {
-    FLUSH_SIGNAL.try_with(|s| s.clone()).ok()
+    FLUSH_SIGNAL.try_with(std::clone::Clone::clone).ok()
 }

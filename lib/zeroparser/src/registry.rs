@@ -100,13 +100,13 @@ impl DescriptorWithFieldCache {
                     .filter(|_| field.proto3_optional != Some(true));
 
                 // Register in the oneof group if applicable.
-                if let Some(idx) = oneof_index {
-                    if let Some(group) = oneof_groups.get_mut(idx as usize) {
-                        group.push(OneofMember {
-                            is_scalar,
-                            storage_index,
-                        });
-                    }
+                if let Some(idx) = oneof_index
+                    && let Some(group) = oneof_groups.get_mut(idx as usize)
+                {
+                    group.push(OneofMember {
+                        is_scalar,
+                        storage_index,
+                    });
                 }
 
                 let info = FieldInfo {

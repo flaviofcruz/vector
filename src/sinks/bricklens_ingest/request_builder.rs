@@ -154,7 +154,11 @@ mod tests {
             events.is_empty(),
             "split_input must return an empty event list for the payload encoder"
         );
-        assert_eq!(metadata.events.len(), 3, "all events must be kept in metadata");
+        assert_eq!(
+            metadata.events.len(),
+            3,
+            "all events must be kept in metadata"
+        );
     }
 
     #[test]

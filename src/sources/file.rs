@@ -640,12 +640,10 @@ pub fn file_source(
 
     // Convert the TTL removal config to FileTTLRemovalConfig used by file_server
     // Primarily involves converting Pathbufs -> glob patterns
-    let file_ttl_removal_config = match &config.ttl_removal_config {
-        Some(ttl_removal_config_value) => Some(convert_to_file_ttl_removal_config(
-            &ttl_removal_config_value,
-        )),
-        None => None,
-    };
+    let file_ttl_removal_config = config
+        .ttl_removal_config
+        .as_ref()
+        .map(convert_to_file_ttl_removal_config);
 
     let checkpointer = Checkpointer::new(&data_dir).with_dead_retention(
         chrono::Duration::from_std(config.checkpoint_dead_retention)
@@ -2889,7 +2887,7 @@ mod tests {
 
         sleep_500_millis().await;
 
-        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
+        let received = run_file_source(config, false, NoAcks, LogNamespace::Legacy, async {
             sleep(Duration::from_secs(remove_after_secs + 2)).await;
         })
         .await;
@@ -3232,7 +3230,6 @@ mod tests {
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             sleep_500_millis().await; // Give vector some time to start
             let mut file = fs::OpenOptions::new()
-                .write(true)
                 .append(true)
                 .open(&file_path)
                 .unwrap();

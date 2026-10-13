@@ -25,6 +25,7 @@ pub struct FileEventMetadata {
 }
 
 impl FileEventMetadata {
+    #[must_use]
     pub fn new(
         bytes: usize,
         events_len: usize,
@@ -41,12 +42,13 @@ impl FileEventMetadata {
         }
     }
 
+    #[must_use]
     pub fn default() -> Self {
         Self {
             bytes: 0,
             events_len: 0,
-            blob: "".to_string(),
-            container: "".to_string(),
+            blob: String::new(),
+            container: String::new(),
             bucket: None,
         }
     }
@@ -66,6 +68,7 @@ pub struct VectorFileSendEvent {
 }
 
 impl VectorFileSendEvent {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             file_metadata: FileEventMetadata::default(),
@@ -73,9 +76,10 @@ impl VectorFileSendEvent {
         }
     }
 
+    #[must_use]
     pub fn new_with_file_metadata(file_metadata: FileEventMetadata) -> Self {
         Self {
-            file_metadata: file_metadata,
+            file_metadata,
             count_map: HashMap::new(),
         }
     }
@@ -149,6 +153,7 @@ impl VectorFileSendEvent {
 }
 
 // NOTE: This adds up the count map but will only keep the first filename/blob/container/bucket etc.
+#[must_use]
 pub fn combine_file_send_events(events: Vec<VectorFileSendEvent>) -> VectorFileSendEvent {
     let mut combined = VectorFileSendEvent::new();
     let mut combined_map: HashMap<String, MetadataValuesCount> = HashMap::new();

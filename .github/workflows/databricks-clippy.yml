@@ -45,6 +45,12 @@ jobs:
           components: clippy
           shared-key: rust-clippy-v1
 
+      # Lints that already existed are grandfathered in .github/clippy-grandfathered-exceptions.txt. The script
+      # regenerates that file, so a diff means a lint was added or fixed.
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --locked --features databricks-redaction -- -D warnings
+        run: scripts/clippy-grandfathered-exceptions.sh
+        working-directory: vector
+
+      - name: Fail on new clippy lints
+        run: git diff --exit-code -- .github/clippy-grandfathered-exceptions.txt
         working-directory: vector

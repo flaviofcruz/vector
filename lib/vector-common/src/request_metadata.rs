@@ -289,6 +289,7 @@ impl RequestMetadata {
         }
     }
 
+    #[must_use]
     pub fn new_with_event_log(
         event_count: usize,
         events_byte_size: usize,
@@ -303,10 +304,11 @@ impl RequestMetadata {
             events_estimated_json_encoded_byte_size,
             request_encoded_size,
             request_wire_size,
-            event_log_metadata: event_log_metadata,
+            event_log_metadata,
         }
     }
 
+    #[must_use]
     pub fn event_log_metadata(&self) -> &VectorSinkEventMetadata {
         &self.event_log_metadata
     }

@@ -86,7 +86,9 @@ impl TransformConfig for MetricToLogHydraConfig {
             Some(cfg) => Some(Arc::new(PodRouting::compile(cfg)?)),
             None => None,
         };
-        Ok(Transform::synchronous(MetricToLogHydra::with_routing(routing)))
+        Ok(Transform::synchronous(MetricToLogHydra::with_routing(
+            routing,
+        )))
     }
 
     fn input(&self) -> Input {
@@ -195,8 +197,9 @@ impl PodRouting {
             }
             if r.system == CATCH_ALL_SYSTEM {
                 if default.replace(r.pods.clone()).is_some() {
-                    return Err("metric_to_log_hydra pod_routing: more than one `*` catch-all rule"
-                        .into());
+                    return Err(
+                        "metric_to_log_hydra pod_routing: more than one `*` catch-all rule".into(),
+                    );
                 }
             } else if by_system_uri
                 .insert(format!("system:{}", r.system), r.pods.clone())
@@ -209,9 +212,8 @@ impl PodRouting {
                 .into());
             }
         }
-        let default = default.ok_or(
-            "metric_to_log_hydra pod_routing: a `*` catch-all rule is required",
-        )?;
+        let default =
+            default.ok_or("metric_to_log_hydra pod_routing: a `*` catch-all rule is required")?;
         Ok(Self {
             default,
             by_system_uri,
@@ -268,7 +270,7 @@ impl MetricToLogHydra {
         Self::default()
     }
 
-    fn with_routing(routing: Option<Arc<PodRouting>>) -> Self {
+    const fn with_routing(routing: Option<Arc<PodRouting>>) -> Self {
         Self { routing }
     }
 
@@ -394,14 +396,17 @@ impl MetricToLogHydra {
         // from `start_ts`; `_partition_date` is its UTC date; `_system`/`_shard_name` mirror the
         // promoted `system`/`shardName` tags under the table's column names.
         let event_time = DateTime::<Utc>::from_timestamp_millis(timestamp_ms).unwrap_or_default();
-        let timestamp_hour = DateTime::<Utc>::from_timestamp_millis(timestamp_hour_ms)
-            .unwrap_or_default();
+        let timestamp_hour =
+            DateTime::<Utc>::from_timestamp_millis(timestamp_hour_ms).unwrap_or_default();
         let partition_date = event_time.format("%Y-%m-%d").to_string();
 
         let mut log = LogEvent::new_with_metadata(metadata);
 
         log.insert(event_path!("_event_time"), Value::Timestamp(event_time));
-        log.insert(event_path!("_timestamp_hour"), Value::Timestamp(timestamp_hour));
+        log.insert(
+            event_path!("_timestamp_hour"),
+            Value::Timestamp(timestamp_hour),
+        );
         log.insert(
             event_path!("_partition_date"),
             Value::Bytes(partition_date.into()),
@@ -811,7 +816,11 @@ mod tests {
         );
         // Stale metric → dropped.
         assert_eq!(
-            run_default(&mut t, make_gauge("stale_metric", 1.0, &[], now_ms - 700_000)).len(),
+            run_default(
+                &mut t,
+                make_gauge("stale_metric", 1.0, &[], now_ms - 700_000)
+            )
+            .len(),
             0,
             "stale metric should be dropped"
         );
@@ -960,7 +969,11 @@ mod tests {
     fn unmatched_system_falls_back_to_default_port() {
         let now = Utc::now().timestamp_millis();
         let (mut t, ports) = routing("pod0", &[("lakebase-storage", &["poda"])]);
-        let counts = run_ports(&mut t, &ports, make_gauge("m", 1.0, &[("system", "obs")], now));
+        let counts = run_ports(
+            &mut t,
+            &ports,
+            make_gauge("m", 1.0, &[("system", "obs")], now),
+        );
         assert_eq!(counts["pod0"], 1);
         assert_eq!(counts["poda"], 0);
     }
@@ -979,10 +992,7 @@ mod tests {
     fn multi_pod_system_fans_out_to_every_pod() {
         let now = Utc::now().timestamp_millis();
         // Migration / fan-out: one system → three pods. Each event emitted once per pod.
-        let (mut t, ports) = routing(
-            "pod0",
-            &[("lakebase-storage", &["poda", "podb", "pod0"])],
-        );
+        let (mut t, ports) = routing("pod0", &[("lakebase-storage", &["poda", "podb", "pod0"])]);
         let counts = run_ports(
             &mut t,
             &ports,

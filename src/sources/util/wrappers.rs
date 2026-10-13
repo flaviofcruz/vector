@@ -242,7 +242,7 @@ pub struct TolerateTrailingEof<R> {
 impl<R> TolerateTrailingEof<R> {
     /// Wraps `inner`, setting `tolerated` to `true` if a trailing `UnexpectedEof` after some
     /// output is converted to a clean end-of-stream.
-    pub fn new(inner: R, tolerated: Arc<AtomicBool>) -> Self {
+    pub const fn new(inner: R, tolerated: Arc<AtomicBool>) -> Self {
         Self {
             inner,
             produced_output: false,

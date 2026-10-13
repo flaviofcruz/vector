@@ -840,10 +840,10 @@ mod tests {
                 .labels()
                 .map(|label| (label.key(), label.value()))
                 .collect();
-            if labels.get("bucket") == Some(&"test-bucket") {
-                if let DebugValue::Counter(count) = value {
-                    attempts_by_status.insert(labels["status"].to_owned(), count);
-                }
+            if labels.get("bucket") == Some(&"test-bucket")
+                && let DebugValue::Counter(count) = value
+            {
+                attempts_by_status.insert(labels["status"].to_owned(), count);
             }
         }
         assert_eq!(attempts_by_status.get("failure"), Some(&2));

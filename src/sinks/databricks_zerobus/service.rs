@@ -504,13 +504,13 @@ impl ZerobusService {
         // Someone else reloaded while we waited for the lock. Counted as a
         // reload: this batch does get retried against a new shape, and the
         // fetch it piggybacked on reported its own outcome.
-        if let Some(current) = self.schema.read().await.as_ref() {
-            if !Arc::ptr_eq(current, rejected) {
-                emit!(ZerobusSchemaReloadOutcome {
-                    outcome: SchemaReloadOutcome::Reloaded,
-                });
-                return Ok(true);
-            }
+        if let Some(current) = self.schema.read().await.as_ref()
+            && !Arc::ptr_eq(current, rejected)
+        {
+            emit!(ZerobusSchemaReloadOutcome {
+                outcome: SchemaReloadOutcome::Reloaded,
+            });
+            return Ok(true);
         }
 
         let resolved = self.resolve_schema().await?;
@@ -1313,10 +1313,10 @@ mod tests {
         // Inject a retryable error for the next call.
         {
             let guard = service.stream.lock().await;
-            if let Some(pinned) = guard.as_ref() {
-                if let ActiveStream::Mock(mock) = pinned.stream.as_ref() {
-                    mock.set_next_error(ZerobusError::ChannelCreationError("reset".to_string()));
-                }
+            if let Some(pinned) = guard.as_ref()
+                && let ActiveStream::Mock(mock) = pinned.stream.as_ref()
+            {
+                mock.set_next_error(ZerobusError::ChannelCreationError("reset".to_string()));
             }
         }
 

@@ -83,6 +83,7 @@ impl DeliveryPathAccounting {
         accounting
     }
 
+    #[must_use]
     pub fn has_path(&self, path: &str) -> bool {
         self.counts.iter().any(|count| count.path == path)
     }
@@ -386,10 +387,10 @@ mod tests {
             assert_eq!(value, DebugValue::Counter(1));
             match labels["delivery_event_type"] {
                 "VECTOR_SOURCE_READ" => {
-                    assert!(!labels.contains_key("reason"))
+                    assert!(!labels.contains_key("reason"));
                 }
                 "VECTOR_DELIVERY_INTENTIONAL_DROP" => {
-                    assert_eq!(labels["reason"], "policy_exclusion")
+                    assert_eq!(labels["reason"], "policy_exclusion");
                 }
                 stage => panic!("unexpected accounting stage: {stage}"),
             }

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{Fields, Schema};
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use prost_reflect::MessageDescriptor;
@@ -36,7 +36,7 @@ impl WireToArrowEncoder {
     /// Every field in `schema` must exist (by name) in `descriptor`. Proto
     /// fields absent from `schema` are silently skipped at scan time.
     pub fn new(descriptor: &MessageDescriptor, schema: Schema) -> Result<Self> {
-        let plan = MessagePlan::build(descriptor, &Fields::from(schema.fields().clone()))?;
+        let plan = MessagePlan::build(descriptor, &schema.fields().clone())?;
         Ok(Self {
             plan: Arc::new(plan),
             schema: Arc::new(schema),

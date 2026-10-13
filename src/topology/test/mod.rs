@@ -1278,7 +1278,8 @@ async fn run_wave1_delivery_test(
     trace_init();
     let tmpdir = tempfile::tempdir().expect("no tmpdir");
 
-    let (mut ext_tx, ext_source, produced_counter) = basic_source_with_event_counter(force_shutdown);
+    let (mut ext_tx, ext_source, produced_counter) =
+        basic_source_with_event_counter(force_shutdown);
 
     // Gated sink: nothing drains until `sink_gate` opens (after shutdown), so the pipeline backs up.
     let (sink_out, wave1_sink) = basic_sink(1);
@@ -1312,7 +1313,11 @@ async fn run_wave1_delivery_test(
     config.add_source("ext_source", ext_source);
     config.add_source("internal_logs", internal_source);
     let sink_input = if with_transform {
-        config.add_transform("wave1_transform", &["ext_source"], basic_transform(" w1", 0.0));
+        config.add_transform(
+            "wave1_transform",
+            &["ext_source"],
+            basic_transform(" w1", 0.0),
+        );
         "wave1_transform"
     } else {
         "ext_source"
@@ -1432,7 +1437,6 @@ async fn topology_gracefully_closed_implies_no_acks_pulled_event_not_dropped() {
         "gracefully_closed=true but only {delivered}/{pulled} pulled no-acks events delivered"
     );
 }
-
 
 /// Shutdown must finish the instant all flushing components report drained, NOT sleep to the
 /// wave/overall deadline. Each wave wait is a `timeout_at(deadline, join_all(tasks))`, which

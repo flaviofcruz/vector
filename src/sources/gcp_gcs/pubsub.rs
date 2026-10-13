@@ -320,7 +320,7 @@ impl ProcessingError {
     /// Pub/Sub message should be acknowledged immediately to prevent an
     /// infinite retry loop. Returns `true` for transient errors that may
     /// resolve on re-delivery.
-    pub fn is_retriable(&self) -> bool {
+    pub const fn is_retriable(&self) -> bool {
         match self {
             // Permanently-invalid: message payload is broken, or the object is
             // gone for good. No amount of retrying will ever succeed.
@@ -600,10 +600,10 @@ impl Ingestor {
         }
 
         for handle in handles.drain(..) {
-            if let Err(e) = handle.await {
-                if e.is_panic() {
-                    panic::resume_unwind(e.into_panic());
-                }
+            if let Err(e) = handle.await
+                && e.is_panic()
+            {
+                panic::resume_unwind(e.into_panic());
             }
         }
 
@@ -817,22 +817,19 @@ impl IngestorProcess {
             }
         }
 
-        if !ack_ids.is_empty() {
-            if let Err(err) = self.acknowledge_messages(&ack_ids).await {
-                error!(
-                    message = "Failed to acknowledge Pub/Sub messages.",
-                    error = %err,
-                    count = %ack_ids.len(),
-                );
-            }
+        if !ack_ids.is_empty()
+            && let Err(err) = self.acknowledge_messages(&ack_ids).await
+        {
+            error!(
+                message = "Failed to acknowledge Pub/Sub messages.",
+                error = %err,
+                count = %ack_ids.len(),
+            );
         }
 
         // Pace between pulls: the batch is fully processed and its messages are
         // acked, so nothing is in flight while we wait to honor the byte rate.
-        self.state
-            .rate_limiter
-            .pace(self.byte_counter.take())
-            .await;
+        self.state.rate_limiter.pace(self.byte_counter.take()).await;
     }
 
     /// Decodes and dispatches a single Pub/Sub message according to the configured format.
@@ -910,22 +907,23 @@ impl IngestorProcess {
             reason: "message has no attributes".to_string(),
         })?;
 
-        let (bucket, object) = match parse_gcs_native_notification(attributes).map_err(|reason| {
-            ProcessingError::InvalidNativeNotification {
-                message_id: message_id.to_string(),
-                reason,
-            }
-        })? {
-            GcsNativeOutcome::Skip => {
-                debug!(
-                    message = "Skipping non-finalize GCS notification.",
-                    message_id = %message_id,
-                    internal_log_rate_limit = true,
-                );
-                return Ok(());
-            }
-            GcsNativeOutcome::Ingest { bucket, object } => (bucket, object),
-        };
+        let (bucket, object) =
+            match parse_gcs_native_notification(attributes).map_err(|reason| {
+                ProcessingError::InvalidNativeNotification {
+                    message_id: message_id.to_string(),
+                    reason,
+                }
+            })? {
+                GcsNativeOutcome::Skip => {
+                    debug!(
+                        message = "Skipping non-finalize GCS notification.",
+                        message_id = %message_id,
+                        internal_log_rate_limit = true,
+                    );
+                    return Ok(());
+                }
+                GcsNativeOutcome::Ingest { bucket, object } => (bucket, object),
+            };
 
         if let Some(ts) = publish_time {
             let lag_secs = Utc::now().signed_duration_since(ts).num_milliseconds() as f64 / 1000.0;
@@ -1067,9 +1065,7 @@ impl IngestorProcess {
         let status = response.status();
         let body_bytes = http_body::Body::collect(response.into_body())
             .await
-            .map_err(|e| HttpError::CallRequest {
-                source: hyper::Error::from(e),
-            })?
+            .map_err(|e| HttpError::CallRequest { source: e })?
             .to_bytes();
 
         // Non-2xx: surface as an error with the response body for debugging.
@@ -1382,15 +1378,17 @@ mod tests {
         let json = r#"{"kind": "INGEST", "bucket": "b", "key": "k", "file_id": "f"}"#;
         let msg: DirectIngestMessage =
             serde_json::from_str(json).expect("missing log_type must parse — field is optional");
-        assert_eq!(msg.log_type, None, "absent log_type must deserialize to None");
+        assert_eq!(
+            msg.log_type, None,
+            "absent log_type must deserialize to None"
+        );
     }
 
     /// log_type is carried through when the upstream Log Access service sets it,
     /// so the ingestion path can segregate CP / DP-spark / DP-service logs.
     #[test]
     fn message_with_log_type_is_parsed() {
-        let json =
-            r#"{"kind": "INGEST", "bucket": "b", "key": "k", "file_id": "f", "log_type": "cp_logs"}"#;
+        let json = r#"{"kind": "INGEST", "bucket": "b", "key": "k", "file_id": "f", "log_type": "cp_logs"}"#;
         let msg: DirectIngestMessage =
             serde_json::from_str(json).expect("log_type must parse when present");
         assert_eq!(msg.log_type.as_deref(), Some("cp_logs"));

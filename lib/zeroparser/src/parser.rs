@@ -301,17 +301,17 @@ impl<'a> ParsedMessage<'a> {
                 let nested_type_name = field_info.type_name.as_deref().unwrap_or("");
 
                 // Check if this is a map entry.
-                if let Some(nested_desc) = registry.get(nested_type_name) {
-                    if nested_desc.is_map_entry {
-                        let (key, value) = ParsedMessage::parse_map_entry_recursive(
-                            nested_bytes,
-                            nested_desc,
-                            registry,
-                            depth + 1,
-                        )?;
-                        result.add_map_entry(field_info, field_num, key, value)?;
-                        continue;
-                    }
+                if let Some(nested_desc) = registry.get(nested_type_name)
+                    && nested_desc.is_map_entry
+                {
+                    let (key, value) = ParsedMessage::parse_map_entry_recursive(
+                        nested_bytes,
+                        nested_desc,
+                        registry,
+                        depth + 1,
+                    )?;
+                    result.add_map_entry(field_info, field_num, key, value)?;
+                    continue;
                 }
 
                 // Parse nested message recursively.

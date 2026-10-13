@@ -147,6 +147,7 @@ fn resolve_received_topic(
 /// pipeline stage. Matches the spec for `time_period_parity` ("the unix time
 /// the log was discovered by logging-agent, truncated to the hour, consistent
 /// across all stages").
+#[must_use]
 pub fn current_hour_time_parity_ms_value() -> i64 {
     const HOUR_MS: i64 = 60 * 60 * 1000;
     let now_ms = Utc::now().timestamp_millis();
@@ -217,6 +218,7 @@ fn source_pod_id_label(source_pod_id: Option<&str>) -> String {
 /// Extracts the source workload identity from file roots whose first child is
 /// the pod UID or pod name. This mirrors the logging-agent wrapper transform so
 /// file-source reads and sink deliveries use the same metric label.
+#[must_use]
 pub fn source_pod_id_from_file_path(path: &str) -> Option<&str> {
     const SOURCE_POD_PATH_PREFIXES: [&str; 3] = [
         "/var/lib/kubelet/pods/",
@@ -249,6 +251,7 @@ fn delivery_method_for_source_type(source_type: &str) -> &'static str {
 
 impl DeliverySourceLabels {
     /// Uses exactly the same attribution rules as the original source READ counter.
+    #[must_use]
     pub fn at_read(
         path: &str,
         source_context: &Option<HashMap<String, String>>,
@@ -554,7 +557,7 @@ impl DeliveryEventSingleton {
         loop {
             tokio::select! {
                 _ = ticker.tick() => self.flush(),
-                _ = self.shutdown.notified() => {
+                () = self.shutdown.notified() => {
                     self.flush();
                     break;
                 }
@@ -874,7 +877,7 @@ fn emit_sink_delivery_log(
 
 /// Emits one VEL `info!` log per aggregated `value_map`. Used by the sink
 /// delivery legs of the singleton flush. Each entry's component span is
-/// re-entered so the trace BroadcastLayer copies `.vector.component_*` onto the
+/// re-entered so the trace `BroadcastLayer` copies `.vector.component_*` onto the
 /// log. The matching counters are emitted separately and inline by
 /// [`emit_delivery_counters`].
 fn emit_sink_delivery_logs<'a>(
@@ -934,7 +937,7 @@ pub struct MetadataValuesCount {
     pub size: usize,
     /// Path-specific metric projection. `None` identifies the unscoped VEL/counter entry.
     pub delivery_path_count: Option<DeliveryPathCount>,
-    /// Source-attribute map populated onto each emitted event. Granularity fields (value_map)
+    /// Source-attribute map populated onto each emitted event. Granularity fields (`value_map`)
     /// control which events are emitted. These do not: set from the first record seen in the
     /// group and left unchanged across merges, so they never affect fanout.
     pub source_attributes: HashMap<String, String>,
@@ -951,6 +954,7 @@ pub struct VectorSinkDeliveryEvent {
 }
 
 impl VectorSinkDeliveryEvent {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             count_map: HashMap::new(),
@@ -958,6 +962,7 @@ impl VectorSinkDeliveryEvent {
         }
     }
 
+    #[must_use]
     pub fn with_count_map(count_map: HashMap<String, MetadataValuesCount>) -> Self {
         Self {
             count_map,
@@ -983,6 +988,7 @@ impl VectorSinkDeliveryEvent {
     }
 }
 
+#[must_use]
 pub fn combine_sink_delivery_events(
     events: Vec<VectorSinkDeliveryEvent>,
 ) -> VectorSinkDeliveryEvent {
@@ -1020,7 +1026,7 @@ impl Add<VectorSinkDeliveryEvent> for VectorSinkDeliveryEvent {
 }
 
 impl VectorSinkDeliveryEvent {
-    /// Merge another event's count_map into self in-place, avoiding O(N²) cloning.
+    /// Merge another event's `count_map` into self in-place, avoiding O(N²) cloning.
     pub fn merge(&mut self, other: VectorSinkDeliveryEvent) {
         for (key, value) in other.count_map {
             self.count_map

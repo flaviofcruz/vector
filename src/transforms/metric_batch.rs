@@ -361,7 +361,10 @@ fn assemble_generic_log(
     let mut log = LogEvent::new_with_metadata(metadata);
     log.insert(event_path!("name"), name);
     log.insert(event_path!("labels"), labels_obj);
-    log.insert(event_path!("start_ts"), JsonValue::Number(start_ts_ms.into()));
+    log.insert(
+        event_path!("start_ts"),
+        JsonValue::Number(start_ts_ms.into()),
+    );
     log.insert(event_path!("end_ts"), JsonValue::Number(end_ts_ms.into()));
     log.insert(event_path!("values"), values);
     if let Some((path, shard)) = output_shard {
@@ -424,7 +427,13 @@ async fn flush(
     let mut batch: Vec<(String, Vec<(i64, f64)>, i64, i64, u64)> = Vec::new();
     for (key, g) in groups.iter_mut() {
         if !g.values.is_empty() {
-            batch.push((key.clone(), std::mem::take(&mut g.values), g.start_ts, g.end_ts, g.hash));
+            batch.push((
+                key.clone(),
+                std::mem::take(&mut g.values),
+                g.start_ts,
+                g.end_ts,
+                g.hash,
+            ));
             g.start_ts = i64::MAX; // reset; next sample re-seeds the window's min ts
             g.end_ts = i64::MIN; // reset; next sample re-seeds the window's max ts
         }
@@ -442,9 +451,7 @@ async fn flush(
                     .map(|(ts, v)| serde_json::json!({"ts": ts, "v": v}))
                     .collect(),
             );
-            let output_shard = output_sharding
-                .as_ref()
-                .map(|(n, path)| (path, hash % n));
+            let output_shard = output_sharding.as_ref().map(|(n, path)| (path, hash % n));
             let log = assemble_generic_log(
                 &name,
                 &labels,

@@ -146,7 +146,7 @@ mod tests {
     async fn test_resolve_endpoints_deduplicates() {
         let uri: Uri = "http://localhost:8123/".parse().unwrap();
         let result = resolve_endpoints(&uri).await.unwrap();
-        let ips: Vec<_> = result.iter().filter_map(|u| ip_from_uri(u)).collect();
+        let ips: Vec<_> = result.iter().filter_map(ip_from_uri).collect();
         let unique: HashSet<_> = ips.iter().collect();
         assert_eq!(ips.len(), unique.len(), "IPs should be deduplicated");
     }

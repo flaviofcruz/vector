@@ -156,7 +156,7 @@ where
     /// Returns `true` if the path has an extension that matches one of the
     /// configured archive extensions (immutable files that never change).
     fn is_archive(&self, path: &Path) -> bool {
-        path.extension().map_or(false, |ext| {
+        path.extension().is_some_and(|ext| {
             self.archive_extensions
                 .iter()
                 .any(|archive_ext| ext == archive_ext.as_str())
@@ -813,11 +813,11 @@ where
                             }
 
                             let to_send = std::mem::take(&mut lines);
-                            if !to_send.is_empty() {
-                                if let Err(error) = chans.send(to_send).await {
-                                    error!(message = "Output channel closed during drain.", %error);
-                                    break;
-                                }
+                            if !to_send.is_empty()
+                                && let Err(error) = chans.send(to_send).await
+                            {
+                                error!(message = "Output channel closed during drain.", %error);
+                                break;
                             }
 
                             if !progress {
@@ -2248,9 +2248,12 @@ mod tests {
         let line0 = format!("{ts0} logline1");
         let line0b = format!("{ts0} logline1b");
         let line0c = format!("{ts0} logline1c");
-        fs::write(&active_json, format!("{line0}\n{line0b}\n{line0c}\n").as_bytes())
-            .await
-            .unwrap();
+        fs::write(
+            &active_json,
+            format!("{line0}\n{line0b}\n{line0c}\n").as_bytes(),
+        )
+        .await
+        .unwrap();
 
         let current_paths: Arc<Mutex<Vec<PathBuf>>> =
             Arc::new(Mutex::new(vec![active_json.clone()]));
@@ -2336,7 +2339,9 @@ mod tests {
                 // (logline1 fingerprint) becomes unfindable.
                 fs::rename(&active_json, &active_1_json).await.unwrap();
                 let new_content = format!("{new_session_line}\n");
-                fs::write(&active_json, new_content.as_bytes()).await.unwrap();
+                fs::write(&active_json, new_content.as_bytes())
+                    .await
+                    .unwrap();
                 *paths.lock().unwrap() = vec![active_json.clone()];
                 tokio::time::sleep(Duration::from_secs(3)).await; // ≥2 glob cycles @ 1 s cooldown
 
@@ -2383,12 +2388,7 @@ mod tests {
 
         let checkpointer = Checkpointer::new(data_dir.as_path());
         file_server
-            .run(
-                tx,
-                shutdown_data,
-                futures::future::ready(()),
-                checkpointer,
-            )
+            .run(tx, shutdown_data, futures::future::ready(()), checkpointer)
             .await
             .expect("FileServer::run failed");
 
@@ -2477,7 +2477,9 @@ mod tests {
         let line0b = format!("{ts0} logline1b");
         let line0c = format!("{ts0} logline1c");
         let orig_content = format!("{line0}\n{line0b}\n{line0c}\n");
-        fs::write(&active_json, orig_content.as_bytes()).await.unwrap();
+        fs::write(&active_json, orig_content.as_bytes())
+            .await
+            .unwrap();
 
         // Fingerprint + full length of the original file, used to simulate the
         // checkpoint a fix would persist once the file is fully read.
@@ -2548,11 +2550,10 @@ mod tests {
         // periodic checkpoint writer keeps ticking every glob_minimum_cooldown
         // during the run instead of exiting on its first select!.
         let (ckpt_shutdown_tx, ckpt_shutdown_rx) = oneshot::channel::<()>();
-        let shutdown_checkpointer: std::pin::Pin<
-            Box<dyn std::future::Future<Output = ()> + Send>,
-        > = Box::pin(async move {
-            let _ = ckpt_shutdown_rx.await;
-        });
+        let shutdown_checkpointer: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(async move {
+                let _ = ckpt_shutdown_rx.await;
+            });
 
         // Shared buffer so the stage driver can observe delivery in real time and
         // stop as soon as the .gz re-delivery has landed.
@@ -2608,9 +2609,9 @@ mod tests {
                 loop {
                     let all_delivered = {
                         let buf = delivered.lock().unwrap();
-                        [&line0, &line0b, &line0c].iter().all(|orig| {
-                            buf.iter().any(|l| l.as_str() == orig.as_str())
-                        })
+                        [&line0, &line0b, &line0c]
+                            .iter()
+                            .all(|orig| buf.iter().any(|l| l.as_str() == orig.as_str()))
                     };
                     if all_delivered || waited >= deliver_deadline {
                         break;

@@ -19,12 +19,12 @@ use bytes::{Buf, Bytes};
 use http::{Request, Uri};
 use http_body::Body as HttpBody;
 use hyper::Body;
-use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use serde::{Deserialize, Serialize};
 use vector_lib::{
+    TimeZone,
     conversion::Conversion,
     enrichment::{Case, Condition, IndexHandle, Table},
-    TimeZone,
 };
 use vrl::value::{ObjectMap, Value};
 
@@ -918,10 +918,12 @@ mod tests {
             field: "user_id",
             value: Value::Integer(42),
         }];
-        assert!(table
-            .find_table_rows(Case::Sensitive, &condition, None, None, Some(user_id_index),)
-            .unwrap()
-            .is_empty());
+        assert!(
+            table
+                .find_table_rows(Case::Sensitive, &condition, None, None, Some(user_id_index),)
+                .unwrap()
+                .is_empty()
+        );
 
         {
             let specs = table.shared.index_specs.lock().unwrap();
@@ -1078,11 +1080,13 @@ mod tests {
     #[test]
     fn none_and_cursor_pagination_seed_no_first_request_params() {
         assert!(initial_page_params(&PaginationConfig::None).is_empty());
-        assert!(initial_page_params(&PaginationConfig::Cursor {
-            token_pointer: "/next".to_string(),
-            token_param: "cursor".to_string(),
-        })
-        .is_empty());
+        assert!(
+            initial_page_params(&PaginationConfig::Cursor {
+                token_pointer: "/next".to_string(),
+                token_param: "cursor".to_string(),
+            })
+            .is_empty()
+        );
     }
 
     #[test]

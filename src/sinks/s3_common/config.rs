@@ -488,15 +488,16 @@ mod tests {
     fn test_retriable() {
         // Handle unhandled + 400 status code case (from expired token code)
         let response = "Once(Some(b\"<?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>\\n<Error><Code>ExpiredToken</Code><Message>The provided token has expired.</Message></Error>\"))";
-        assert!(!RetryStrategy::Default.is_retriable_error(
-            &SdkError::<PutObjectError, HttpResponse>::service_error(
-                PutObjectError::unhandled(BadError),
-                HttpResponse::new(
-                    http::StatusCode::from_u16(400).unwrap().into(),
-                    SdkBody::from(response)
-                )
+        assert!(!RetryStrategy::Default.is_retriable_error(&SdkError::<
+            PutObjectError,
+            HttpResponse,
+        >::service_error(
+            PutObjectError::unhandled(BadError),
+            HttpResponse::new(
+                http::StatusCode::from_u16(400).unwrap().into(),
+                SdkBody::from(response)
             )
-        ));
+        )));
     }
 
     #[derive(Debug)]
