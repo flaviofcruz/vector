@@ -14,6 +14,9 @@ use vrl::value::Kind;
 
 use super::util::MultilineConfig;
 pub use super::util::object_storage_compression::Compression;
+use super::util::object_storage_rate_limit::{
+    ObjectStorageRateLimitConfig, ObjectStorageRateLimiter,
+};
 use crate::{
     codecs::DecodingConfig,
     config::{SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput},
@@ -121,6 +124,15 @@ pub struct GcpGcsConfig {
     /// service after a direct-ingest file finishes processing.
     #[configurable(derived)]
     pub ingestion_callback: Option<IngestionCallbackConfig>,
+
+    /// Byte-rate pacing for object downloads.
+    ///
+    /// Disabled unless `max_bytes_per_sec` is set, in which case the source
+    /// processes each object at full speed and pauses between pulls to hold its
+    /// data rate to the configured limit.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub rate_limit: ObjectStorageRateLimitConfig,
 }
 
 const fn default_framing() -> FramingConfig {
@@ -254,6 +266,7 @@ impl GcpGcsConfig {
             downloader,
             callback_client,
             message_format,
+            ObjectStorageRateLimiter::new(&self.rate_limit),
         )
         .await?;
 
@@ -492,6 +505,9 @@ mod ingestor_tests {
     use super::Compression;
     use super::object::GcsDownloader;
     use super::pubsub::{Config as PubSubConfig, Ingestor, IngestorNewError};
+    use crate::sources::util::object_storage_rate_limit::{
+        ObjectStorageRateLimitConfig, ObjectStorageRateLimiter,
+    };
 
     fn make_test_downloader() -> Arc<GcsDownloader> {
         let framing = FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig {
@@ -532,6 +548,7 @@ mod ingestor_tests {
             make_test_downloader(),
             None,
             super::pubsub::MessageFormat::DirectIngest,
+            ObjectStorageRateLimiter::new(&ObjectStorageRateLimitConfig::default()),
         )
         .await
     }

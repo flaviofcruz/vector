@@ -36,6 +36,7 @@ use crate::{
     },
     shutdown::ShutdownSignal,
     sources::ingestion_callback::IngestionCallbackClient,
+    sources::util::object_storage_rate_limit::{ByteCounter, ObjectStorageRateLimiter},
 };
 
 use super::object::GcsDownloader;
@@ -496,6 +497,7 @@ struct State {
     acknowledge_failed_message: bool,
     callback_client: Option<IngestionCallbackClient>,
     message_format: MessageFormat,
+    rate_limiter: ObjectStorageRateLimiter,
 }
 
 /// Resolves a Google API base endpoint: the configured override with any trailing
@@ -524,6 +526,7 @@ impl Ingestor {
         downloader: Arc<GcsDownloader>,
         callback_client: Option<IngestionCallbackClient>,
         message_format: MessageFormat,
+        rate_limiter: ObjectStorageRateLimiter,
     ) -> Result<Self, IngestorNewError> {
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 1000 {
             return Err(IngestorNewError::InvalidNumberOfMessages {
@@ -557,6 +560,7 @@ impl Ingestor {
             acknowledge_failed_message: config.acknowledge_failed_message,
             callback_client,
             message_format,
+            rate_limiter,
         });
 
         Ok(Self { state, downloader })
@@ -707,6 +711,8 @@ struct IngestorProcess {
     log_namespace: vector_lib::config::LogNamespace,
     bytes_received: Registered<BytesReceived>,
     events_received: Registered<EventsReceived>,
+    // Decoded bytes processed in the current batch, drained after each pull to pace.
+    byte_counter: ByteCounter,
 }
 
 impl IngestorProcess {
@@ -727,6 +733,7 @@ impl IngestorProcess {
             log_namespace,
             bytes_received: register!(BytesReceived::from(Protocol::HTTP)),
             events_received: register!(EventsReceived),
+            byte_counter: ByteCounter::default(),
         }
     }
 
@@ -819,6 +826,13 @@ impl IngestorProcess {
                 );
             }
         }
+
+        // Pace between pulls: the batch is fully processed and its messages are
+        // acked, so nothing is in flight while we wait to honor the byte rate.
+        self.state
+            .rate_limiter
+            .pace(self.byte_counter.take())
+            .await;
     }
 
     /// Decodes and dispatches a single Pub/Sub message according to the configured format.
@@ -986,6 +1000,7 @@ impl IngestorProcess {
         );
 
         let processing_start = std::time::Instant::now();
+        let obj_start_bytes = self.byte_counter.get();
         let result = self
             .downloader
             .process_object(
@@ -998,8 +1013,17 @@ impl IngestorProcess {
                 self.state.acknowledge_failed_message,
                 &self.bytes_received,
                 &self.events_received,
+                &self.byte_counter,
             )
             .await;
+
+        // Observability-only: warn if this object's decoded size is large enough to
+        // risk the Pub/Sub ack deadline even at full speed. Never drops data.
+        self.state.rate_limiter.note_object(
+            self.byte_counter.get().saturating_sub(obj_start_bytes),
+            &msg.bucket,
+            &msg.key,
+        );
 
         // Fire ingestion callback if configured (non-blocking).
         if let Some(ref cb_client) = self.state.callback_client {

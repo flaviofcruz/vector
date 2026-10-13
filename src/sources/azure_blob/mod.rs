@@ -29,6 +29,9 @@ use vrl::value::{Kind, kind::Collection};
 // Local imports
 use super::util::MultilineConfig;
 pub use super::util::object_storage_compression::Compression;
+use super::util::object_storage_rate_limit::{
+    ObjectStorageRateLimitConfig, ObjectStorageRateLimiter,
+};
 use crate::codecs::DecodingConfig;
 use crate::{
     config::{
@@ -149,6 +152,15 @@ pub struct AzureBlobConfig {
     /// Only triggered for messages with `process_custom_message = true`.
     #[configurable(derived)]
     pub ingestion_callback: Option<super::ingestion_callback::IngestionCallbackConfig>,
+
+    /// Byte-rate pacing for blob downloads.
+    ///
+    /// Disabled unless `max_bytes_per_sec` is set, in which case the source
+    /// processes each blob at full speed and pauses between polls to hold its
+    /// data rate to the configured limit.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub rate_limit: ObjectStorageRateLimitConfig,
 }
 
 /// Default framing configuration for backward compatibility.
@@ -347,6 +359,7 @@ impl AzureBlobConfig {
             callback_client,
             cross_account_credentials,
             self.allowed_storage_accounts.clone(),
+            ObjectStorageRateLimiter::new(&self.rate_limit),
         )
         .await?;
 

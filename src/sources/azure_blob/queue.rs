@@ -50,6 +50,7 @@ use crate::{
     sources::azure_blob::AzureBlobConfig,
     sources::ingestion_callback::IngestionCallbackClient,
     sources::util::TolerateTrailingEof,
+    sources::util::object_storage_rate_limit::{ByteCounter, ObjectStorageRateLimiter},
     tls::TlsConfig,
 };
 use vector_lib::config::{LegacyKey, LogNamespace, log_schema};
@@ -327,10 +328,11 @@ pub struct State {
     tolerate_truncated_archives: bool,
     /// Optional callback client for notifying upstream on processing completion
     callback_client: Option<IngestionCallbackClient>,
-
     /// Blob clients for allowlisted cross-account read targets, keyed by account and built
     /// eagerly at startup. The configured account is served by `blob_client`, not listed here.
     extra_blob_clients: HashMap<String, BlobServiceClient>,
+    /// Byte-rate pacer shared across polling workers
+    rate_limiter: ObjectStorageRateLimiter,
 }
 
 impl State {
@@ -363,6 +365,7 @@ impl Ingestor {
         callback_client: Option<IngestionCallbackClient>,
         cross_account_credentials: Option<StorageCredentials>,
         allowed_storage_accounts: Vec<String>,
+        rate_limiter: ObjectStorageRateLimiter,
     ) -> Result<Ingestor, IngestorNewError> {
         // Validate message batch size
         if config.max_number_of_messages < 1 || config.max_number_of_messages > 32 {
@@ -423,6 +426,7 @@ impl Ingestor {
             tolerate_truncated_archives: config.tolerate_truncated_archives,
             callback_client,
             extra_blob_clients,
+            rate_limiter,
         });
 
         Ok(Ingestor { state })
@@ -542,6 +546,8 @@ pub struct IngestorProcess {
     bytes_received: Registered<BytesReceived>,
     /// Counter for events received
     events_received: Registered<EventsReceived>,
+    /// Decoded bytes processed in the current batch, drained after each poll to pace.
+    byte_counter: ByteCounter,
 }
 
 impl IngestorProcess {
@@ -561,6 +567,7 @@ impl IngestorProcess {
             log_namespace,
             bytes_received: register!(BytesReceived::from(Protocol::HTTP)),
             events_received: register!(EventsReceived),
+            byte_counter: ByteCounter::default(),
         }
     }
 
@@ -719,6 +726,13 @@ impl IngestorProcess {
                 cloud: CLOUD_PROVIDER,
             });
         }
+
+        // Pace between polls: the batch is fully processed and its messages are
+        // deleted, so nothing is in flight while we wait to honor the byte rate.
+        self.state
+            .rate_limiter
+            .pace(self.byte_counter.take())
+            .await;
 
         // Wait for next poll interval
         tokio::time::sleep(Duration::from_secs(self.state.poll_secs)).await;
@@ -1080,6 +1094,9 @@ impl IngestorProcess {
         let mut read_error = None;
         let bytes_received = self.bytes_received.clone();
         let events_received = self.events_received.clone();
+        // Count decoded bytes for this blob (for rate pacing and the large-object warning).
+        let byte_counter = self.byte_counter.clone();
+        let obj_start_bytes = byte_counter.get();
 
         // Create stream of decoded lines
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = Box::new(
@@ -1087,6 +1104,7 @@ impl IngestorProcess {
                 .map(|res| {
                     res.inspect(|bytes| {
                         bytes_received.emit(ByteSize(bytes.len()));
+                        byte_counter.add(bytes.len());
                     })
                     .map_err(|err| {
                         read_error = Some(err);
@@ -1183,6 +1201,14 @@ impl IngestorProcess {
         {
             read_error = None;
         }
+
+        // Observability-only: warn if this blob's decoded size is large enough to
+        // risk the queue visibility timeout even at full speed. Never drops data.
+        self.state.rate_limiter.note_object(
+            byte_counter.get().saturating_sub(obj_start_bytes),
+            &container,
+            &blob,
+        );
 
         // Handle any errors that occurred
         let mut delivered = false;

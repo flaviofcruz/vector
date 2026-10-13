@@ -30,6 +30,7 @@ use crate::{
     },
     line_agg::{self, LineAgg},
     sources::gcp_gcs::{Compression, GcpGcsConfig},
+    sources::util::object_storage_rate_limit::ByteCounter,
 };
 
 pub use crate::sources::gcp_gcs::pubsub::ProcessingError;
@@ -96,6 +97,7 @@ impl GcsDownloader {
         acknowledge_failed: bool,
         bytes_received: &Registered<BytesReceived>,
         events_received: &Registered<EventsReceived>,
+        byte_counter: &ByteCounter,
     ) -> Result<(), ProcessingError> {
         let processing_start_time = Utc::now();
         let bucket = bucket.to_owned();
@@ -185,12 +187,15 @@ impl GcsDownloader {
         let mut read_error = None;
         let bytes_received = bytes_received.clone();
         let events_received = events_received.clone();
+        // Count decoded bytes so the caller can pace on the batch total.
+        let byte_counter = byte_counter.clone();
 
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = Box::new(
             FramedRead::new(object_reader, self.decoder.framer.clone())
                 .map(|res| {
                     res.inspect(|bytes| {
                         bytes_received.emit(ByteSize(bytes.len()));
+                        byte_counter.add(bytes.len());
                     })
                     .map_err(|err| {
                         read_error = Some(err);
@@ -601,6 +606,7 @@ mod tests {
                 false,
                 &register!(BytesReceived::from(Protocol::HTTP)),
                 &register!(EventsReceived),
+                &ByteCounter::default(),
             )
             .await;
 
@@ -657,6 +663,7 @@ mod tests {
                 false,
                 &bytes_received,
                 &events_received,
+                &ByteCounter::default(),
             )
             .await;
 
@@ -686,6 +693,7 @@ mod tests {
                 false,
                 &register!(BytesReceived::from(Protocol::HTTP)),
                 &register!(EventsReceived),
+                &ByteCounter::default(),
             )
             .await;
 
@@ -749,6 +757,7 @@ mod tests {
                     false,
                     &register!(BytesReceived::from(Protocol::HTTP)),
                     &register!(EventsReceived),
+                    &ByteCounter::default(),
                 )
                 .await;
 
