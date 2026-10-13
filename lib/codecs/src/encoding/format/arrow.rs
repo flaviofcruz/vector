@@ -20,14 +20,14 @@ use arrow::{
 };
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
 use rust_decimal::Decimal;
 use snafu::Snafu;
 use std::collections::HashMap;
 use std::sync::Arc;
 use vector_config::configurable_component;
 
-use vector_core::event::{Event, Value};
+use vector_core::event::{Event, LogEvent, Value};
 
 use super::variant::{is_variant_field, value_to_variant};
 
@@ -436,7 +436,7 @@ macro_rules! define_build_primitive_array_fn {
 
             for event in events {
                 if let Event::Log(log) = event {
-                    match log.get(field_name) {
+                    match get_field_value(log, field_name) {
                         $(
                             $value_pat $(if $guard)? => builder.append_value($append_expr),
                         )+
@@ -457,14 +457,50 @@ macro_rules! define_build_primitive_array_fn {
     };
 }
 
+/// Fetches a top-level field by its exact name before interpreting the name as a path.
+///
+/// ClickHouse permits dots in column names, and VRL can emit those names as literal object keys.
+/// Retaining path lookup as a fallback preserves the existing behavior for nested event fields.
+fn get_field_value<'a>(log: &'a LogEvent, field_name: &str) -> Option<&'a Value> {
+    log.as_map()
+        .and_then(|fields| fields.get(field_name))
+        .or_else(|| log.get(field_name))
+}
+
 fn extract_timestamp(value: &Value) -> Option<DateTime<Utc>> {
     match value {
         Value::Timestamp(ts) => Some(*ts),
-        Value::Bytes(bytes) => std::str::from_utf8(bytes)
-            .ok()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc)),
+        Value::Bytes(bytes) => std::str::from_utf8(bytes).ok().and_then(|value| {
+            if value
+                .as_bytes()
+                .get(10)
+                .is_some_and(|separator| *separator == b'T' || *separator == b't')
+            {
+                DateTime::parse_from_rfc3339(value)
+                    .map(|timestamp| timestamp.with_timezone(&Utc))
+                    .ok()
+            } else {
+                NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                    .map(|timestamp| timestamp.and_utc())
+                    .ok()
+            }
+        }),
         _ => None,
+    }
+}
+
+fn timestamp_value(value: &Value, time_unit: TimeUnit) -> Option<i64> {
+    if let Some(ts) = extract_timestamp(value) {
+        match time_unit {
+            TimeUnit::Second => Some(ts.timestamp()),
+            TimeUnit::Millisecond => Some(ts.timestamp_millis()),
+            TimeUnit::Microsecond => Some(ts.timestamp_micros()),
+            TimeUnit::Nanosecond => ts.timestamp_nanos_opt(),
+        }
+    } else if let Value::Integer(value) = value {
+        Some(*value)
+    } else {
+        None
     }
 }
 
@@ -477,35 +513,25 @@ fn build_timestamp_array(
     missing_default: Option<&str>,
 ) -> Result<ArrayRef, ArrowEncodingError> {
     macro_rules! build_array {
-        ($builder:ty, $converter:expr) => {{
+        ($builder:ty) => {{
             let mut builder = <$builder>::with_capacity(events.len());
             for event in events {
                 if let Event::Log(log) = event {
-                    match log.get(field_name) {
+                    match get_field_value(log, field_name) {
                         // Absent or null: epoch when coercing, else null/error.
                         None | Some(Value::Null) => match missing_default {
                             Some(_) => builder.append_value(0), // epoch
                             None => handle_null_constraints!(builder, nullable, field_name),
                         },
-                        Some(value) => {
-                            // Try a native or string timestamp, else a raw integer.
-                            let parsed = if let Some(ts) = extract_timestamp(value) {
-                                $converter(&ts)
-                            } else if let Value::Integer(i) = value {
-                                Some(*i)
-                            } else {
-                                None
-                            };
-                            match parsed {
-                                Some(v) => builder.append_value(v),
-                                None => present_value_invalid!(
-                                    builder,
-                                    nullable,
-                                    field_name,
-                                    missing_default
-                                ),
-                            }
-                        }
+                        Some(value) => match timestamp_value(value, time_unit) {
+                            Some(v) => builder.append_value(v),
+                            None => present_value_invalid!(
+                                builder,
+                                nullable,
+                                field_name,
+                                missing_default
+                            ),
+                        },
                     }
                 }
             }
@@ -519,25 +545,42 @@ fn build_timestamp_array(
     }
 
     match time_unit {
-        TimeUnit::Second => {
-            build_array!(TimestampSecondBuilder, |ts: &DateTime<Utc>| Some(
-                ts.timestamp()
-            ))
-        }
-        TimeUnit::Millisecond => {
-            build_array!(TimestampMillisecondBuilder, |ts: &DateTime<Utc>| Some(
-                ts.timestamp_millis()
-            ))
-        }
-        TimeUnit::Microsecond => {
-            build_array!(TimestampMicrosecondBuilder, |ts: &DateTime<Utc>| Some(
-                ts.timestamp_micros()
-            ))
-        }
-        TimeUnit::Nanosecond => {
-            build_array!(TimestampNanosecondBuilder, |ts: &DateTime<Utc>| ts
-                .timestamp_nanos_opt())
-        }
+        TimeUnit::Second => build_array!(TimestampSecondBuilder),
+        TimeUnit::Millisecond => build_array!(TimestampMillisecondBuilder),
+        TimeUnit::Microsecond => build_array!(TimestampMicrosecondBuilder),
+        TimeUnit::Nanosecond => build_array!(TimestampNanosecondBuilder),
+    }
+}
+
+fn build_timestamp_value_array(
+    values: &[Value],
+    field: &Field,
+    time_unit: TimeUnit,
+    timezone: Option<Arc<str>>,
+) -> Result<ArrayRef, ArrowEncodingError> {
+    macro_rules! build_array {
+        ($builder:ty) => {{
+            let mut builder = <$builder>::with_capacity(values.len());
+            for value in values {
+                match timestamp_value(value, time_unit) {
+                    Some(value) => builder.append_value(value),
+                    None => handle_null_constraints!(builder, field.is_nullable(), field.name()),
+                }
+            }
+            let array = builder.finish();
+            if let Some(timezone) = timezone {
+                Ok(Arc::new(array.with_timezone(timezone)))
+            } else {
+                Ok(Arc::new(array))
+            }
+        }};
+    }
+
+    match time_unit {
+        TimeUnit::Second => build_array!(TimestampSecondBuilder),
+        TimeUnit::Millisecond => build_array!(TimestampMillisecondBuilder),
+        TimeUnit::Microsecond => build_array!(TimestampMicrosecondBuilder),
+        TimeUnit::Nanosecond => build_array!(TimestampNanosecondBuilder),
     }
 }
 
@@ -557,7 +600,7 @@ fn build_date32_array(
     let mut builder = Date32Builder::with_capacity(events.len());
     for event in events {
         if let Event::Log(log) = event {
-            match log.get(field_name) {
+            match get_field_value(log, field_name) {
                 // Absent or null: epoch when coercing, else null/error.
                 None | Some(Value::Null) => match missing_default {
                     Some(_) => builder.append_value(0), // epoch (1970-01-01)
@@ -593,7 +636,7 @@ fn build_date64_array(
     let mut builder = Date64Builder::with_capacity(events.len());
     for event in events {
         if let Event::Log(log) = event {
-            match log.get(field_name) {
+            match get_field_value(log, field_name) {
                 // Absent or null: epoch when coercing, else null/error.
                 None | Some(Value::Null) => match missing_default {
                     Some(_) => builder.append_value(0), // epoch (1970-01-01)
@@ -633,7 +676,7 @@ fn build_string_array(
     for event in events {
         if let Event::Log(log) = event {
             let mut appended = false;
-            if let Some(value) = log.get(field_name) {
+            if let Some(value) = get_field_value(log, field_name) {
                 match value {
                     Value::Bytes(bytes) => {
                         // Attempt direct UTF-8 conversion first, fallback to lossy
@@ -689,7 +732,7 @@ fn build_string_dictionary_array(
     for event in events {
         if let Event::Log(log) = event {
             let mut appended = false;
-            if let Some(value) = log.get(field_name) {
+            if let Some(value) = get_field_value(log, field_name) {
                 match value {
                     Value::Bytes(bytes) => {
                         match std::str::from_utf8(bytes) {
@@ -765,7 +808,7 @@ fn build_int64_array(
 
     for event in events {
         if let Event::Log(log) = event {
-            match log.get(field_name) {
+            match get_field_value(log, field_name) {
                 Some(Value::Integer(i)) => builder.append_value(*i),
                 Some(Value::Bytes(bytes)) if missing_default.is_some() => {
                     match std::str::from_utf8(bytes)
@@ -849,7 +892,7 @@ fn build_binary_array(
 
     for event in events {
         if let Event::Log(log) = event {
-            match log.get(field_name) {
+            match get_field_value(log, field_name) {
                 Some(Value::Bytes(bytes)) => builder.append_value(bytes),
                 _ => match missing_default {
                     Some(default) => builder.append_value(default),
@@ -873,7 +916,7 @@ fn build_large_string_array(
     for event in events {
         if let Event::Log(log) = event {
             let mut appended = false;
-            if let Some(value) = log.get(field_name) {
+            if let Some(value) = get_field_value(log, field_name) {
                 match value {
                     Value::Bytes(bytes) => {
                         match std::str::from_utf8(bytes) {
@@ -924,7 +967,7 @@ fn build_large_binary_array(
 
     for event in events {
         if let Event::Log(log) = event {
-            match log.get(field_name) {
+            match get_field_value(log, field_name) {
                 Some(Value::Bytes(bytes)) => builder.append_value(bytes),
                 _ => match missing_default {
                     Some(default) => builder.append_value(default),
@@ -956,7 +999,7 @@ fn build_decimal128_array(
 
     for event in events {
         if let Event::Log(log) = event {
-            match log.get(field_name) {
+            match get_field_value(log, field_name) {
                 Some(Value::Float(f)) => match Decimal::try_from(f.into_inner()) {
                     Ok(mut decimal) => {
                         decimal.rescale(target_scale);
@@ -1007,7 +1050,7 @@ fn build_decimal256_array(
 
     for event in events {
         if let Event::Log(log) = event {
-            match log.get(field_name) {
+            match get_field_value(log, field_name) {
                 Some(Value::Float(f)) => match Decimal::try_from(f.into_inner()) {
                     Ok(mut decimal) => {
                         decimal.rescale(target_scale);
@@ -1189,7 +1232,7 @@ fn build_struct_array(
     let mut validity: Vec<bool> = Vec::with_capacity(events.len());
     for event in events {
         if let Event::Log(log) = event {
-            let valid = if let Some(value) = log.get(path) {
+            let valid = if let Some(value) = get_field_value(log, path) {
                 // Present non-object under coercion: valid row of child defaults, counted.
                 // Without coercion, any present value yields a valid row.
                 if missing_default.is_some() && !matches!(value, Value::Object(_) | Value::Null) {
@@ -1283,7 +1326,7 @@ fn build_variant_array(
 
     for event in events {
         if let Event::Log(log) = event {
-            let present = match log.get(path) {
+            let present = match get_field_value(log, path) {
                 Some(value) if !matches!(value, Value::Null) => Some(value),
                 _ => None,
             };
@@ -1419,7 +1462,7 @@ fn build_map_array(
 
     for event in events {
         if let Event::Log(log) = event {
-            match log.get(path) {
+            match get_field_value(log, path) {
                 Some(Value::Object(obj)) => {
                     validity.push(true);
                     for (k, v) in obj.iter() {
@@ -1510,7 +1553,7 @@ fn build_list_array(
 
     for event in events {
         let value = if let Event::Log(log) = event {
-            log.get(path)
+            get_field_value(log, path)
         } else {
             None
         };
@@ -1848,6 +1891,27 @@ fn build_map_value_array(values: &[Value], field: &Field) -> Result<ArrayRef, Ar
             }
             Ok(Arc::new(builder.finish()))
         }
+        DataType::Dictionary(key, value)
+            if matches!(key.as_ref(), DataType::Int32)
+                && matches!(value.as_ref(), DataType::Utf8) =>
+        {
+            let mut builder =
+                StringDictionaryBuilder::<Int32Type>::with_capacity(values.len(), 0, 0);
+            for v in values {
+                match v {
+                    Value::Bytes(b) => match std::str::from_utf8(b) {
+                        Ok(s) => builder.append_value(s),
+                        Err(_) => builder.append_value(&String::from_utf8_lossy(b)),
+                    },
+                    Value::Null => handle_null_constraints!(builder, nullable, field.name()),
+                    _ => builder.append_value(&v.to_string_lossy()),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Timestamp(time_unit, timezone) => {
+            build_timestamp_value_array(values, field, *time_unit, timezone.clone())
+        }
         DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _) => {
             // build_list_item_array handles all three. Map is included so a Map-valued Map builds
             // here instead of erroring, keeping this set equal to what
@@ -1866,9 +1930,9 @@ mod tests {
     use super::*;
     use arrow::{
         array::{
-            Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array,
-            StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-            TimestampNanosecondArray, TimestampSecondArray,
+            Array, BinaryArray, BooleanArray, Date32Array, Date64Array, DictionaryArray,
+            Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+            TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
         },
         datatypes::Field,
         ipc::reader::StreamReader,
@@ -1876,7 +1940,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use rstest::rstest;
     use std::io::Cursor;
-    use vector_core::event::LogEvent;
+    use vector_core::event::{LogEvent, ObjectMap};
 
     #[test]
     fn test_encode_all_types() {
@@ -2963,17 +3027,28 @@ mod tests {
 
     #[test]
     fn test_encode_mixed_timestamp_string_and_native() {
-        // Test mixing string timestamps with native Timestamp values
+        // Test both accepted string formats alongside native and integer timestamps.
         let mut log1 = LogEvent::default();
-        log1.insert("ts", "2025-10-22T10:18:44.256Z"); // String
+        log1.insert("ts", "2025-10-22T10:18:44.256Z");
 
         let mut log2 = LogEvent::default();
-        log2.insert("ts", Utc::now()); // Native Timestamp
+        log2.insert("ts", "2025-10-22 10:18:44.256000000");
 
         let mut log3 = LogEvent::default();
-        log3.insert("ts", 1729594724256000000_i64); // Integer (nanoseconds)
+        log3.insert(
+            "ts",
+            Utc.with_ymd_and_hms(2025, 10, 22, 10, 18, 45).unwrap(),
+        );
 
-        let events = vec![Event::Log(log1), Event::Log(log2), Event::Log(log3)];
+        let mut log4 = LogEvent::default();
+        log4.insert("ts", 1729594724256000000_i64);
+
+        let events = vec![
+            Event::Log(log1),
+            Event::Log(log2),
+            Event::Log(log3),
+            Event::Log(log4),
+        ];
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "ts",
@@ -2989,7 +3064,7 @@ mod tests {
         let mut reader = StreamReader::try_new(cursor, None).unwrap();
         let batch = reader.next().unwrap().unwrap();
 
-        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_rows(), 4);
 
         let ts_array = batch
             .column(0)
@@ -2997,20 +3072,16 @@ mod tests {
             .downcast_ref::<TimestampNanosecondArray>()
             .unwrap();
 
-        // All three should be non-null
-        assert!(!ts_array.is_null(0));
-        assert!(!ts_array.is_null(1));
-        assert!(!ts_array.is_null(2));
+        assert_eq!(ts_array.null_count(), 0);
 
-        // First one should match the parsed string
-        let expected = chrono::DateTime::parse_from_rfc3339("2025-10-22T10:18:44.256Z")
+        let expected = DateTime::parse_from_rfc3339("2025-10-22T10:18:44.256Z")
             .unwrap()
             .timestamp_nanos_opt()
             .unwrap();
         assert_eq!(ts_array.value(0), expected);
+        assert_eq!(ts_array.value(1), expected);
 
-        // Third one should match the integer
-        assert_eq!(ts_array.value(2), 1729594724256000000_i64);
+        assert_eq!(ts_array.value(3), 1729594724256000000_i64);
     }
 
     #[test]
@@ -4019,6 +4090,161 @@ mod tests {
         let mut reader = StreamReader::try_new(Cursor::new(ipc), None).expect("IPC reader");
         let read_back = reader.next().expect("one batch").expect("valid batch");
         assert_eq!(read_back.num_rows(), 1);
+    }
+
+    fn string_dictionary_type() -> DataType {
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+    }
+
+    fn map_type(key_type: DataType, value_type: DataType) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", key_type, false),
+                    Field::new("value", value_type, false),
+                ])),
+                false,
+            )),
+            false,
+        )
+    }
+
+    #[derive(Debug)]
+    enum ExpectedCollectionValues {
+        Dictionary(Vec<Option<&'static str>>),
+        Nanoseconds(Vec<i64>),
+    }
+
+    fn dictionary_values(array: &ArrayRef) -> Option<Vec<Option<String>>> {
+        if let Some(dictionary) = array.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+            let values = dictionary
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("dictionary values are strings");
+            return Some(
+                (0..dictionary.len())
+                    .map(|index| {
+                        (!dictionary.is_null(index)).then(|| {
+                            values
+                                .value(dictionary.keys().value(index) as usize)
+                                .to_owned()
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
+            return dictionary_values(list.values());
+        }
+        if let Some(map) = array.as_any().downcast_ref::<MapArray>() {
+            return dictionary_values(map.keys()).or_else(|| dictionary_values(map.values()));
+        }
+        None
+    }
+
+    fn nanosecond_values(array: &ArrayRef) -> Option<Vec<i64>> {
+        if let Some(timestamps) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+            return Some(
+                (0..timestamps.len())
+                    .map(|index| timestamps.value(index))
+                    .collect(),
+            );
+        }
+        if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
+            return nanosecond_values(list.values());
+        }
+        if let Some(map) = array.as_any().downcast_ref::<MapArray>() {
+            return nanosecond_values(map.keys()).or_else(|| nanosecond_values(map.values()));
+        }
+        None
+    }
+
+    fn assert_collection_values(array: &ArrayRef, expected: &ExpectedCollectionValues) {
+        match expected {
+            ExpectedCollectionValues::Dictionary(expected) => assert_eq!(
+                dictionary_values(array).expect("dictionary array exists"),
+                expected
+                    .iter()
+                    .map(|value| value.map(str::to_owned))
+                    .collect::<Vec<_>>()
+            ),
+            ExpectedCollectionValues::Nanoseconds(expected) => assert_eq!(
+                nanosecond_values(array).expect("nanosecond array exists"),
+                *expected
+            ),
+        }
+    }
+
+    #[rstest]
+    #[case::map_key(
+        Field::new("data", map_type(string_dictionary_type(), DataType::Utf8), false),
+        serde_json::json!({"alpha": "one", "beta": "two"}),
+        ExpectedCollectionValues::Dictionary(vec![Some("alpha"), Some("beta")])
+    )]
+    #[case::list_item(
+        Field::new(
+            "data",
+            DataType::List(Arc::new(Field::new("item", string_dictionary_type(), false))),
+            false,
+        ),
+        serde_json::json!(["one", "one", "two"]),
+        ExpectedCollectionValues::Dictionary(vec![Some("one"), Some("one"), Some("two")])
+    )]
+    #[case::list_of_maps_key(
+        Field::new(
+            "data",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                map_type(string_dictionary_type(), DataType::Utf8),
+                false,
+            ))),
+            false,
+        ),
+        serde_json::json!([{"alpha": "one"}, {"beta": "two"}]),
+        ExpectedCollectionValues::Dictionary(vec![Some("alpha"), Some("beta")])
+    )]
+    #[case::list_timestamp(
+        Field::new(
+            "group.times",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ))),
+            false,
+        ),
+        serde_json::json!([
+            "2026-10-08 20:15:30.123456789",
+            "2026-10-08 20:15:31.987654321"
+        ]),
+        ExpectedCollectionValues::Nanoseconds(vec![
+            1_791_490_530_123_456_789,
+            1_791_490_531_987_654_321,
+        ])
+    )]
+    fn test_encode_dictionary_and_timestamp_in_collection(
+        #[case] field: Field,
+        #[case] value: serde_json::Value,
+        #[case] expected: ExpectedCollectionValues,
+    ) {
+        let field_name = field.name().clone();
+        let schema = Arc::new(Schema::new(vec![field]));
+        let log = LogEvent::from(ObjectMap::from_iter([(field_name.into(), value.into())]));
+        let events = vec![Event::Log(log)];
+
+        let batch = build_record_batch(Arc::clone(&schema), &events)
+            .expect("supported collection values should build");
+        assert_eq!(batch.schema_ref().as_ref(), schema.as_ref());
+        assert_collection_values(batch.column(0), &expected);
+
+        let ipc = encode_events_to_arrow_ipc_stream(&events, Some(Arc::clone(&schema)))
+            .expect("supported collection should serialize to Arrow IPC");
+        let mut reader = StreamReader::try_new(Cursor::new(ipc), None).expect("IPC reader");
+        let read_back = reader.next().expect("one batch").expect("valid batch");
+        assert_eq!(read_back.schema_ref().as_ref(), schema.as_ref());
+        assert_collection_values(read_back.column(0), &expected);
     }
 
     #[test]

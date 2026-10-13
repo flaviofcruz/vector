@@ -954,6 +954,7 @@ impl IngestorProcess {
                 self.state.acknowledge_failed_message,
                 &self.bytes_received,
                 &self.events_received,
+                &self.byte_counter,
             )
             .await
     }

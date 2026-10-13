@@ -208,26 +208,70 @@ impl SchemaProvider for ClickHouseSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, TimeUnit};
+    use arrow::datatypes::{DataType, Field, TimeUnit};
+    use rstest::rstest;
+    use std::sync::Arc;
 
-    #[test]
-    fn test_parse_schema() {
-        let response = r#"{"name":"id","type":"Int64"}
-{"name":"message","type":"String"}
-{"name":"timestamp","type":"DateTime"}
-"#;
+    fn string_dictionary_type() -> DataType {
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+    }
 
-        let schema = parse_schema_from_response(response).unwrap();
-        assert_eq!(schema.fields().len(), 3);
-        assert_eq!(schema.field(0).name(), "id");
-        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
-        assert_eq!(schema.field(1).name(), "message");
-        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
-        assert_eq!(schema.field(2).name(), "timestamp");
-        assert_eq!(
-            schema.field(2).data_type(),
-            &DataType::Timestamp(TimeUnit::Second, None)
-        );
+    fn map_type(key_type: DataType, value_type: DataType) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", key_type, false),
+                        Field::new("value", value_type, false),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        )
+    }
+
+    #[rstest]
+    #[case("Int64", DataType::Int64)]
+    #[case("String", DataType::Utf8)]
+    #[case("DateTime", DataType::Timestamp(TimeUnit::Second, None))]
+    #[case("Decimal(18, 2)", DataType::Decimal128(18, 2))]
+    #[case("DateTime64(6)", DataType::Timestamp(TimeUnit::Microsecond, None))]
+    #[case("Decimal32(4)", DataType::Decimal128(9, 4))]
+    #[case("Enum8('first' = 0, 'second' = 1)", DataType::Utf8)]
+    #[case(
+        "Map(LowCardinality(String), String)",
+        map_type(string_dictionary_type(), DataType::Utf8)
+    )]
+    #[case(
+        "Array(LowCardinality(String))",
+        DataType::List(Arc::new(Field::new("item", string_dictionary_type(), false)))
+    )]
+    #[case(
+        "Array(Map(LowCardinality(String), String))",
+        DataType::List(Arc::new(Field::new(
+            "item",
+            map_type(string_dictionary_type(), DataType::Utf8),
+            false,
+        )))
+    )]
+    #[case(
+        "Array(DateTime64(9))",
+        DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )))
+    )]
+    fn test_parse_schema(#[case] clickhouse_type: &str, #[case] expected: DataType) {
+        let response = serde_json::json!({"name": "column", "type": clickhouse_type}).to_string();
+        let schema = parse_schema_from_response(&response).unwrap();
+
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "column");
+        assert_eq!(schema.field(0).data_type(), &expected);
     }
 
     #[test]
@@ -265,33 +309,6 @@ mod tests {
         assert_eq!(default(8).as_deref(), Some("0")); // DateTime64 -> "0"
         assert_eq!(default(9).as_deref(), Some("0")); // Decimal -> "0"
         assert_eq!(default(10), None); // Nullable(Int32) -> stays NULL
-    }
-
-    #[test]
-    fn test_parse_schema_with_type_parameters() {
-        // Test that type string parsing works for types with parameters
-        let response = r#"{"name":"bytes_sent","type":"Decimal(18, 2)"}
-{"name":"timestamp","type":"DateTime64(6)"}
-{"name":"duration_ms","type":"Decimal32(4)"}
-"#;
-
-        let schema = parse_schema_from_response(response).unwrap();
-        assert_eq!(schema.fields().len(), 3);
-
-        // Check Decimal parsed from type string
-        assert_eq!(schema.field(0).name(), "bytes_sent");
-        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(18, 2));
-
-        // Check DateTime64 parsed from type string
-        assert_eq!(schema.field(1).name(), "timestamp");
-        assert_eq!(
-            schema.field(1).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
-
-        // Check Decimal32 parsed from type string
-        assert_eq!(schema.field(2).name(), "duration_ms");
-        assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(9, 4));
     }
 
     #[test]

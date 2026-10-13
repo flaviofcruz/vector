@@ -115,6 +115,10 @@ pub fn clickhouse_type_to_arrow(ch_type: &str) -> Result<(DataType, bool), Strin
         // Strings
         "String" | "FixedString" => DataType::Utf8,
 
+        // ClickHouse accepts enum labels from Arrow string columns and resolves them to the
+        // configured numeric enum values during insert.
+        "Enum8" | "Enum16" => DataType::Utf8,
+
         // JSON is sent as a string; ClickHouse parses it into the JSON column on
         // insert (Arrow Utf8 -> JSON is converted server-side).
         "JSON" => DataType::Utf8,
@@ -288,11 +292,11 @@ fn ch_type_to_arrow_field(name: &str, inner_ch_type: &str) -> Result<Field, Stri
 }
 
 /// The collection builders (`build_map_value_array` / `build_list_item_array`) handle a narrower set
-/// than a top-level column. This admits only what they build, rejecting the rest (`Dictionary`/
-/// LowCardinality, `Int8/16`, `UInt8/16`, `Decimal`, `Date`/`DateTime`). `Struct`/`List`/`Map` pass
-/// through, and their own inner fields are validated recursively as they are parsed.
+/// than a top-level column. This admits only what they build, rejecting the rest.
+/// `Dictionary`-encoded strings and `Struct`/`List`/`Map` pass through, and their own inner fields
+/// are validated recursively as they are parsed.
 fn reject_unsupported_nested_type(ch_type: &str, data_type: &DataType) -> Result<(), String> {
-    let supported = matches!(
+    let supported_scalar_or_collection = matches!(
         data_type,
         DataType::Utf8
             | DataType::LargeUtf8
@@ -305,17 +309,25 @@ fn reject_unsupported_nested_type(ch_type: &str, data_type: &DataType) -> Result
             | DataType::UInt64
             | DataType::Float32
             | DataType::Float64
+            | DataType::Timestamp(_, _)
             | DataType::Struct(_)
             | DataType::List(_)
             | DataType::Map(_, _)
     );
+    let supported_dictionary = matches!(
+        data_type,
+        DataType::Dictionary(key, value)
+            if matches!(key.as_ref(), DataType::Int32)
+                && matches!(value.as_ref(), DataType::Utf8)
+    );
+    let supported = supported_scalar_or_collection || supported_dictionary;
     if supported {
         Ok(())
     } else {
         Err(format!(
             "ClickHouse type '{}' (Arrow {:?}) is not supported as a collection element/key/value; \
-             only String, Binary, Bool, Int32/64, UInt32/64, Float32/64, and nested \
-             Array/Tuple/Map are supported inside a collection.",
+            only String, Binary, Bool, Int32/64, UInt32/64, Float32/64, DateTime, and nested \
+            Array/Tuple/Map are supported inside a collection.",
             ch_type, data_type
         ))
     }
@@ -398,6 +410,7 @@ fn split_tuple_element(arg: &str, index: usize) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     // Helper function for tests that don't need metadata
     fn convert_type_no_metadata(ch_type: &str) -> Result<(DataType, bool), String> {
@@ -737,6 +750,26 @@ mod tests {
         assert!(!nullable);
     }
 
+    #[rstest]
+    #[case("Enum8('first' = 0, 'second' = 1)")]
+    #[case("Enum16('small' = 1, 'large' = 1000)")]
+    fn test_enum_types_map_to_strings(#[case] ch_type: &str) {
+        assert_eq!(
+            convert_type_no_metadata(ch_type).expect("enum labels should map to Arrow strings"),
+            (DataType::Utf8, false)
+        );
+    }
+
+    #[rstest]
+    #[case("Map(LowCardinality(String), String)")]
+    #[case("Array(LowCardinality(String))")]
+    #[case("Array(Map(LowCardinality(String), String))")]
+    #[case("Array(DateTime64(9))")]
+    fn test_dictionary_and_timestamp_types_inside_collections(#[case] ch_type: &str) {
+        convert_type_no_metadata(ch_type)
+            .unwrap_or_else(|error| panic!("{ch_type} should be supported: {error}"));
+    }
+
     #[test]
     fn test_nested_collection_recursion() {
         // Map(String, Array(Int64)) exercises a string key + list value + recursion, all of which
@@ -762,13 +795,9 @@ mod tests {
         // parse (schema resolution), so the sink's JSONEachRow fallback catches them instead of
         // crashing on every batch at encode time.
         for ty in [
-            "Array(Int8)",                         // Int8 not a supported list element
-            "Array(Decimal(10, 2))",               // Decimal not supported inside a collection
-            "Array(DateTime)",                     // Timestamp not supported inside a collection
-            "Map(LowCardinality(String), String)", // Dictionary key not supported
-            "Map(String, LowCardinality(String))", // Dictionary value not supported
-            "Map(Int64, DateTime64(3))",           // DateTime64 value not supported
-            "Tuple(a Int16, b String)",            // Int16 tuple element not supported
+            "Array(Int8)",              // Int8 not a supported list element
+            "Array(Decimal(10, 2))",    // Decimal not supported inside a collection
+            "Tuple(a Int16, b String)", // Int16 tuple element not supported
         ] {
             let result = convert_type_no_metadata(ty);
             assert!(

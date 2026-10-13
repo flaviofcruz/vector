@@ -18,7 +18,7 @@ use tokio::time::{Duration, timeout};
 use vector_lib::{
     codecs::encoding::BatchSerializerConfig,
     event::{BatchNotifier, BatchStatus, BatchStatusReceiver, Event, LogEvent},
-    lookup::PathPrefix,
+    lookup::{PathPrefix, event_path},
 };
 use warp::Filter;
 
@@ -548,7 +548,12 @@ async fn insert_events_arrow_with_schema_fetching() {
     client
         .create_table(
             &table,
-            "host String, timestamp DateTime64(3), message String, id Int64, name String, score Float64, active Bool",
+            "host String, timestamp DateTime64(3), message String, id Int64, name String, \
+             score Float64, active Bool, state Enum8('UNKNOWN' = 0, 'ACTIVE' = 1), \
+             labels Map(LowCardinality(String), String), \
+             categories Array(LowCardinality(String)), \
+             `group.times` Array(DateTime64(9)), \
+             records Array(Map(LowCardinality(String), String))",
         )
         .await;
 
@@ -578,6 +583,20 @@ async fn insert_events_arrow_with_schema_fetching() {
         event.insert("name", format!("user_{}", i));
         event.insert("score", 95.5 + i as f64);
         event.insert("active", i % 2 == 0);
+        event.insert("state", "ACTIVE");
+        event.insert("labels", serde_json::json!({"alpha": "one", "beta": "two"}));
+        event.insert("categories", serde_json::json!(["one", "one", "two"]));
+        event.insert(
+            event_path!("group.times"),
+            serde_json::json!([
+                "2026-10-08 20:15:30.123456789",
+                "2026-10-08 20:15:31.987654321"
+            ]),
+        );
+        event.insert(
+            "records",
+            serde_json::json!([{"alpha": "one"}, {"beta": "two"}]),
+        );
         events.push(event.into());
     }
 
@@ -587,7 +606,7 @@ async fn insert_events_arrow_with_schema_fetching() {
     assert_eq!(3, output.rows);
 
     // Verify all fields exist and have the correct types
-    for row in output.data.iter() {
+    for row in &output.data {
         // Check standard Vector fields exist
         assert!(row.get("host").and_then(|v| v.as_str()).is_some());
         assert!(row.get("message").and_then(|v| v.as_str()).is_some());
@@ -603,5 +622,27 @@ async fn insert_events_arrow_with_schema_fetching() {
         assert!(row.get("name").and_then(|v| v.as_str()).is_some());
         assert!(row.get("score").and_then(|v| v.as_f64()).is_some());
         assert!(row.get("active").and_then(|v| v.as_bool()).is_some());
+        assert_eq!(
+            row.get("state").and_then(|value| value.as_str()),
+            Some("ACTIVE")
+        );
+        assert_eq!(
+            row.get("labels"),
+            Some(&serde_json::json!({"alpha": "one", "beta": "two"}))
+        );
+        assert_eq!(
+            row.get("categories"),
+            Some(&serde_json::json!(["one", "one", "two"]))
+        );
+        assert_eq!(
+            row.get("group.times")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            row.get("records"),
+            Some(&serde_json::json!([{"alpha": "one"}, {"beta": "two"}]))
+        );
     }
 }
