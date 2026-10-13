@@ -11,8 +11,8 @@ permissions:
 jobs:
   check-upstream-workflows-disabled:
     runs-on:
-      group: databricks-eng-protected-runner-group
-      labels: linux-ubuntu-latest
+      group: databricks-emu-protected-runner-group-small
+      labels: linux-ubuntu-latest-2core-8gb
     steps:
       - name: Checkout code
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1

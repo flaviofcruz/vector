@@ -1,0 +1,50 @@
+name: "BLOCKING: Clippy"
+
+on:
+  pull_request:
+    branches:
+      - v*-custom
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Test-only copy of the Universe redaction executor, needed to link the `databricks-redaction` feature.
+  DATABRICKS_VECTOR_REDACTOR_LIB_DIR: ${{ github.workspace }}/vector/lib/vector-redaction-executor/tests/fixtures/linux-x86_64
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  clippy:
+    name: Clippy
+    permissions:
+      id-token: write # JFrog OIDC auth
+      contents: read
+    runs-on:
+      # Use protected runner group with 32 core machines as the regular runner would just OOM
+      group: databricks-emu-protected-runner-group-2xlarge
+      labels: linux-ubuntu-latest-32core-128gb
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          path: vector
+          persist-credentials: false
+
+      - name: Verify redaction test fixture
+        run: echo "7cb19e9e718c22627bc74d508ac0a3c2c072b6bef79258660e37355c6f72f8a9  vector/lib/vector-redaction-executor/tests/fixtures/linux-x86_64/libvector_redactor.a" | sha256sum --check -
+
+      - name: Set up Rust workspace
+        uses: ./vector/.github/actions/setup-rust-workspace
+        with:
+          vrl-app-id: ${{ secrets.VECTOR_VRL_GH_APP_ID }}
+          vrl-private-key: ${{ secrets.VECTOR_VRL_GH_PRIVATE_KEY }}
+          components: clippy
+          shared-key: rust-clippy-v1
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked --features databricks-redaction -- -D warnings
+        working-directory: vector

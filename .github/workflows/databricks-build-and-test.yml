@@ -10,6 +10,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Test-only copy of the Universe redaction executor, needed to link the `databricks-redaction` feature.
+  DATABRICKS_VECTOR_REDACTOR_LIB_DIR: ${{ github.workspace }}/vector/lib/vector-redaction-executor/tests/fixtures/linux-x86_64
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
 
@@ -21,8 +23,8 @@ jobs:
       contents: read
     runs-on:
       # Use protected runner group with 32 core machines as the regular runner would just OOM
-      group: databricks-eng-protected-runner-group-32core
-      labels: linux-ubuntu-latest-32core
+      group: databricks-emu-protected-runner-group-2xlarge
+      labels: linux-ubuntu-latest-32core-128gb
     timeout-minutes: 60
 
     steps:
@@ -32,64 +34,28 @@ jobs:
           path: vector
           persist-credentials: false
 
-      - name: Generate access token for VRL repository
-        id: generate-token-gh-app
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+      - name: Verify redaction test fixture
+        run: echo "7cb19e9e718c22627bc74d508ac0a3c2c072b6bef79258660e37355c6f72f8a9  vector/lib/vector-redaction-executor/tests/fixtures/linux-x86_64/libvector_redactor.a" | sha256sum --check -
+
+      - name: Set up Rust workspace
+        uses: ./vector/.github/actions/setup-rust-workspace
         with:
-          app-id: ${{ secrets.VECTOR_VRL_GH_APP_ID }}
-          private-key: ${{ secrets.VECTOR_VRL_GH_PRIVATE_KEY }}
-          owner: databricks-eng
-          repositories: vrl
-          permission-contents: read
+          vrl-app-id: ${{ secrets.VECTOR_VRL_GH_APP_ID }}
+          vrl-private-key: ${{ secrets.VECTOR_VRL_GH_PRIVATE_KEY }}
 
-      - name: Checkout VRL repository
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          repository: databricks-eng/vrl
-          ref: v0.30.0-custom
-          token: ${{ steps.generate-token-gh-app.outputs.token }}
-          persist-credentials: false
-          path: vrl
-
-      - name: Configure JFrog registries
-        uses: ./.github/actions/jfrog-auth
-
-      - name: Install protobuf compiler
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          version: "3.20.2"
-          # Pass the token to avoid rate limiting as per the action docs
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsasl2-dev
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: "1.92"
-          components: rustfmt, clippy
-
-      - name: Configure Cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
-        with:
-          shared-key: rust-v1
-          cache-targets: true
-          cache-all-crates: true
-          workspaces: vector
-          cache-on-failure: true
-
-      - name: Run build test
-        run: cargo build --locked
+      - name: Build workspace
+        run: cargo build --workspace --all-targets --locked --features databricks-redaction
         working-directory: vector
 
       - name: Install cargo-nextest
-        uses: baptiste0928/cargo-install@f204293d9709061b7bc1756fec3ec4e2cd57dec0 # v3.4.0
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
-          crate: cargo-nextest
-          version: 0.9.129
-          locked: true
+          tool: cargo-nextest@0.9.129
 
       - name: Run unit tests
-        run: cargo nextest run --locked
+        run: cargo nextest run --workspace --no-fail-fast --locked --features databricks-redaction
+        working-directory: vector
+
+      - name: Run databricks-redaction tests
+        run: scripts/test-databricks-redaction.sh
         working-directory: vector

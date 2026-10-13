@@ -20,8 +20,8 @@ jobs:
       id-token: write # JFrog OIDC auth
       contents: read
     runs-on:
-      group: databricks-eng-protected-runner-group
-      labels: linux-ubuntu-latest
+      group: databricks-emu-protected-runner-group-small
+      labels: linux-ubuntu-latest-2core-8gb
 
     steps:
       - name: Checkout repository
@@ -30,43 +30,15 @@ jobs:
           path: vector
           persist-credentials: false
 
-      - name: Generate access token for VRL repository
-        id: generate-token-gh-app
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+      - name: Set up Rust workspace
+        uses: ./vector/.github/actions/setup-rust-workspace
         with:
-          app-id: ${{ secrets.VECTOR_VRL_GH_APP_ID }}
-          private-key: ${{ secrets.VECTOR_VRL_GH_PRIVATE_KEY }}
-          owner: databricks-eng
-          repositories: vrl
-          permission-contents: read
-
-      - name: Checkout VRL repository
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          repository: databricks-eng/vrl
-          ref: v0.30.0-custom
-          token: ${{ steps.generate-token-gh-app.outputs.token }}
-          persist-credentials: false
-          path: vrl
-
-      - name: Configure JFrog registries
-        uses: ./.github/actions/jfrog-auth
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: "1.92"
-          components: rustfmt, clippy
-
-      - name: Configure Cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
-        with:
-          shared-key: rust-v1
-          cache-targets: false
-          cache-all-crates: true
-          workspaces: vector
-          cache-on-failure: true
+          vrl-app-id: ${{ secrets.VECTOR_VRL_GH_APP_ID }}
+          vrl-private-key: ${{ secrets.VECTOR_VRL_GH_PRIVATE_KEY }}
+          components: rustfmt
+          cache-targets: 'false'
+          native-deps: 'false'
 
       - name: Run rust fmt check
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
         working-directory: vector

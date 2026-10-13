@@ -15,8 +15,8 @@ permissions:
 jobs:
   check-db-changelog:
     runs-on:
-      group: databricks-eng-protected-runner-group
-      labels: linux-ubuntu-latest
+      group: databricks-emu-protected-runner-group-small
+      labels: linux-ubuntu-latest-2core-8gb
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

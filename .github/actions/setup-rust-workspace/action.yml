@@ -1,0 +1,74 @@
+name: 'Setup Rust workspace'
+description: 'Check out VRL next to the vector checkout, configure JFrog, and install the Rust toolchain, native dependencies and cache. Run after checking out the repository into `vector/`.'
+inputs:
+  vrl-app-id:
+    description: 'GitHub App ID used to read the VRL repository.'
+    required: true
+  vrl-private-key:
+    description: 'GitHub App private key used to read the VRL repository.'
+    required: true
+  components:
+    description: 'Comma-separated rustup components to install.'
+    default: ''
+  shared-key:
+    description: 'Cargo cache key.'
+    default: 'rust-v1'
+  cache-targets:
+    description: 'Whether to cache the target directory.'
+    default: 'true'
+  native-deps:
+    description: 'Install protoc and libsasl2, which are needed to compile Vector.'
+    default: 'true'
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate access token for VRL repository
+      id: generate-token-gh-app
+      uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+      with:
+        app-id: ${{ inputs.vrl-app-id }}
+        private-key: ${{ inputs.vrl-private-key }}
+        owner: databricks-eng
+        repositories: vrl
+        permission-contents: read
+
+    - name: Checkout VRL repository
+      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      with:
+        repository: databricks-eng/vrl
+        ref: v0.30.0-custom
+        token: ${{ steps.generate-token-gh-app.outputs.token }}
+        persist-credentials: false
+        path: vrl
+
+    - name: Configure JFrog registries
+      uses: ./vector/.github/actions/jfrog-auth
+
+    - name: Install protobuf compiler
+      if: ${{ inputs.native-deps == 'true' }}
+      shell: bash
+      run: |
+        echo "d97227fd8bc840dcb1cf7332c8339a2d8f0fc381a98b028006e5c9a911d07c2a  vector/protoc-3.20.2-linux-x86_64.zip" | sha256sum --check -
+        unzip -qq vector/protoc-3.20.2-linux-x86_64.zip -d "$RUNNER_TEMP/protoc"
+        echo "PROTOC=$RUNNER_TEMP/protoc/bin/protoc" >> "$GITHUB_ENV"
+        echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+
+    - name: Install system dependencies
+      if: ${{ inputs.native-deps == 'true' }}
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y libsasl2-dev
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      with:
+        toolchain: '1.92'
+        components: ${{ inputs.components }}
+
+    - name: Configure Cargo cache
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        cache-targets: ${{ inputs.cache-targets }}
+        cache-all-crates: true
+        workspaces: vector
+        cache-on-failure: true
