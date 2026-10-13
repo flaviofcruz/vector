@@ -428,8 +428,9 @@ where
                 stats.record("discovery", start.elapsed());
             }
 
+            const DELETE_KNOWN_SMALL_FILES: bool = false;
             // Cleanup the known_small_files
-            if let Some(grace_period) = self.remove_after {
+            if DELETE_KNOWN_SMALL_FILES && let Some(grace_period) = self.remove_after {
                 let mut set = JoinSet::new();
 
                 let remove_file_tasks: HashMap<Id, PathBuf> = known_small_files
@@ -1166,6 +1167,7 @@ mod tests {
     use tokio::fs;
 
     use crate::{
+        FileTTLAction, FileTTLRemovalConfig,
         file_server::{FileServer, Line},
         paths_provider::PathsProvider,
     };
@@ -1202,6 +1204,53 @@ mod tests {
         }
         fn emit_file_line_too_long(&self, _: &BytesMut, _: usize, _: usize) {
             panic!("unexpected line too long");
+        }
+    }
+
+    #[derive(Clone)]
+    struct SmallFileEvents {
+        failures: tokio::sync::mpsc::UnboundedSender<PathBuf>,
+    }
+
+    impl FileSourceInternalEvents for SmallFileEvents {
+        fn emit_file_added(&self, path: &Path) {
+            NoErrors.emit_file_added(path);
+        }
+        fn emit_file_resumed(&self, path: &Path, position: u64) {
+            NoErrors.emit_file_resumed(path, position);
+        }
+        fn emit_file_watch_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_watch_error(path, error);
+        }
+        fn emit_file_unwatched(&self, path: &Path, reached_eof: bool) {
+            NoErrors.emit_file_unwatched(path, reached_eof);
+        }
+        fn emit_file_deleted(&self, path: &Path) {
+            NoErrors.emit_file_deleted(path);
+        }
+        fn emit_file_delete_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_delete_error(path, error);
+        }
+        fn emit_file_fingerprint_read_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_fingerprint_read_error(path, error);
+        }
+        fn emit_file_checkpointed(&self, count: usize, duration: Duration) {
+            NoErrors.emit_file_checkpointed(count, duration);
+        }
+        fn emit_file_checksum_failed(&self, path: &Path) {
+            self.failures.send(path.to_path_buf()).unwrap();
+        }
+        fn emit_file_checkpoint_write_error(&self, error: Error) {
+            NoErrors.emit_file_checkpoint_write_error(error);
+        }
+        fn emit_files_open(&self, count: usize) {
+            NoErrors.emit_files_open(count);
+        }
+        fn emit_path_globbing_failed(&self, path: &Path, error: &Error) {
+            NoErrors.emit_path_globbing_failed(path, error);
+        }
+        fn emit_file_line_too_long(&self, bytes: &BytesMut, limit: usize, size: usize) {
+            NoErrors.emit_file_line_too_long(bytes, limit, size);
         }
     }
 
@@ -1242,6 +1291,15 @@ mod tests {
         data_dir: PathBuf,
         drain_on_shutdown: bool,
     ) -> FileServer<TestPathsProvider, NoErrors> {
+        make_file_server_with_emitter(paths, data_dir, drain_on_shutdown, NoErrors)
+    }
+
+    fn make_file_server_with_emitter<E: FileSourceInternalEvents>(
+        paths: Vec<PathBuf>,
+        data_dir: PathBuf,
+        drain_on_shutdown: bool,
+        emitter: E,
+    ) -> FileServer<TestPathsProvider, E> {
         FileServer {
             paths_provider: TestPathsProvider { paths },
             max_read_bytes: 2048,
@@ -1264,7 +1322,7 @@ mod tests {
             ),
             oldest_first: false,
             remove_after: None,
-            emitter: NoErrors,
+            emitter,
             rotate_wait: Duration::from_secs(u64::MAX / 2),
             ttl_removal_config: None,
             source_context: None,
@@ -1274,6 +1332,172 @@ mod tests {
             source_type: "file",
             read_loop_min_backoff: 1,
         }
+    }
+
+    async fn assert_small_files_survive_ttl(ttl_removal_config: Option<FileTTLRemovalConfig>) {
+        use tokio::{io::AsyncWriteExt, sync::oneshot};
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let empty_path = tmp.path().join("audit.json");
+        let partial_path = tmp.path().join("partial.json");
+        let rotated_path = tmp.path().join("rotated.log");
+        let mut empty_writer = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&empty_path)
+            .await
+            .unwrap();
+        let mut partial_writer = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&partial_path)
+            .await
+            .unwrap();
+        partial_writer.write_all(b"partial audit").await.unwrap();
+        partial_writer.flush().await.unwrap();
+        fs::write(&rotated_path, b"rotated record\n").await.unwrap();
+
+        let (failures_tx, mut failures_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut file_server = make_file_server_with_emitter(
+            vec![
+                empty_path.clone(),
+                partial_path.clone(),
+                rotated_path.clone(),
+            ],
+            data_dir.clone(),
+            false,
+            SmallFileEvents {
+                failures: failures_tx,
+            },
+        );
+        file_server.remove_after = Some(Duration::from_millis(50));
+        file_server.glob_minimum_cooldown = Duration::from_millis(10);
+        file_server.ttl_removal_config = ttl_removal_config;
+
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(8);
+        let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(batch) = rx.next().await {
+                for line in &batch {
+                    delivered_tx
+                        .send((line.filename.clone(), line.text.clone()))
+                        .unwrap();
+                }
+                received.extend(batch);
+            }
+            received
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let checkpointer = Checkpointer::new(data_dir.as_path());
+        let server = tokio::spawn(file_server.run(
+            tx,
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+            }),
+            futures::future::ready(()),
+            checkpointer,
+        ));
+
+        let mut failed_paths = Vec::new();
+        for _ in 0..2 {
+            failed_paths.push(
+                tokio::time::timeout(Duration::from_secs(5), failures_rx.recv())
+                    .await
+                    .expect("small file was not discovered")
+                    .expect("file server exited before discovering small files"),
+            );
+        }
+        assert!(failed_paths.contains(&empty_path));
+        assert!(failed_paths.contains(&partial_path));
+
+        let rotated_line = tokio::time::timeout(Duration::from_secs(5), delivered_rx.recv())
+            .await
+            .expect("watched file was not read")
+            .expect("file server exited before reading the watched file");
+        assert_eq!(
+            rotated_line,
+            (
+                rotated_path.to_str().unwrap().to_owned(),
+                Bytes::from("rotated record"),
+            )
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(empty_path.exists(), "empty file was TTL-deleted");
+        assert_eq!(fs::read(&partial_path).await.unwrap(), b"partial audit");
+        assert!(
+            !rotated_path.exists(),
+            "watched file should still be TTL-deleted"
+        );
+
+        empty_writer
+            .write_all(b"late audit record\n")
+            .await
+            .unwrap();
+        empty_writer.flush().await.unwrap();
+        partial_writer.write_all(b" record\n").await.unwrap();
+        partial_writer.flush().await.unwrap();
+
+        let mut appended_lines = Vec::new();
+        for _ in 0..2 {
+            appended_lines.push(
+                tokio::time::timeout(Duration::from_secs(5), delivered_rx.recv())
+                    .await
+                    .expect("late append was not delivered")
+                    .expect("file server exited before delivering the late append"),
+            );
+        }
+        appended_lines.sort();
+        assert_eq!(
+            appended_lines,
+            vec![
+                (
+                    empty_path.to_str().unwrap().to_owned(),
+                    Bytes::from("late audit record"),
+                ),
+                (
+                    partial_path.to_str().unwrap().to_owned(),
+                    Bytes::from("partial audit record"),
+                ),
+            ]
+        );
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("file server did not shut down")
+            .unwrap()
+            .unwrap();
+        let received = collector.await.unwrap();
+        let mut texts: Vec<_> = received.iter().map(|line| line.text.clone()).collect();
+        texts.sort();
+        assert_eq!(
+            texts,
+            vec![
+                Bytes::from("late audit record"),
+                Bytes::from("partial audit record"),
+                Bytes::from("rotated record"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn small_files_survive_ttl_without_removal_config() {
+        assert_small_files_survive_ttl(None).await;
+    }
+
+    #[tokio::test]
+    async fn small_files_survive_ttl_with_keep_patterns() {
+        assert_small_files_survive_ttl(Some(FileTTLRemovalConfig {
+            action: FileTTLAction::Keep,
+            patterns: vec![
+                glob::Pattern::new("*/audit.json").unwrap(),
+                glob::Pattern::new("*/partial.json").unwrap(),
+            ],
+        }))
+        .await;
     }
 
     fn test_log_file_info() -> crate::paths_provider::LogFileInfo {
