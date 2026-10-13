@@ -9,7 +9,7 @@ use http::{
 use indoc::indoc;
 use rand::Rng;
 use snafu::{ResultExt, Snafu};
-use tower::ServiceBuilder;
+use tower::{Service, ServiceBuilder};
 use uuid::Uuid;
 use vector_common::internal_event::vector_event::file_send_event::FileEventMetadata;
 use vector_lib::event::event_log::generate_count_map;
@@ -38,9 +38,9 @@ use crate::{
         },
         util::{
             BulkSizeBasedDefaultBatchSettings, Compression, RequestBuilder, ServiceBuilderExt,
-            TowerRequestConfig, batch::BatchConfig, metadata::RequestMetadataBuilder,
-            partitioner::KeyPartitioner, request_builder::EncodeResult,
-            service::TowerRequestConfigDefaults, timezone_to_offset,
+            TowerRequestConfig, TowerRequestSettings, batch::BatchConfig,
+            metadata::RequestMetadataBuilder, partitioner::KeyPartitioner,
+            request_builder::EncodeResult, service::TowerRequestConfigDefaults, timezone_to_offset,
             vector_event_log::EventLoggingService,
         },
     },
@@ -314,30 +314,9 @@ impl GcsSinkConfig {
 
         let protocol = get_http_scheme_from_uri(&base_url.parse::<Uri>().unwrap());
 
-        let bucket = self.bucket.clone();
-        let svc = ServiceBuilder::new()
-            .settings(request, GcsRetryLogic::default())
-            // Add another layer after retries for emitting our event log message
-            // Returns back the same result so it continues to work downstream
-            .map_result(move |result: Result<GcsResponse, _>| {
-                if let Ok(ref response) = result {
-                    response.event_log_metadata.emit_upload_event();
-                }
-                // Unlike the S3/Azure SDKs, a GCS HTTP error still arrives as an `Ok`
-                // response here — `GcsRetryLogic` maps a non-retriable 4xx to
-                // `DontRetry`, not `Err` — so the status has to be inspected, otherwise
-                // failed uploads would be labelled `success`.
-                let success = result
-                    .as_ref()
-                    .is_ok_and(|response| response.inner.status().is_success());
-                emit_blob_file_upload_attempt(success, &bucket);
-                result
-            })
-            .service(GcsService::new(client, base_url, auth));
-
-        // Wrap the service so the same delivery/file-send events the S3 and Azure
-        // blob sinks emit are emitted here too (staged before the request, delivered
-        // on success). Transparent when `ENABLE_SINK_EVENT_LOGGING` is off.
+        let svc = build_gcs_inner_service(client, base_url, auth, request, self.bucket.clone());
+        // This wrapper is outside the retry layer and therefore emits one terminal
+        // delivery/file-send result for the whole request, after retries settle.
         let svc = EventLoggingService::new(svc);
 
         let request_settings = RequestSettings::new(self, cx)?;
@@ -354,6 +333,38 @@ impl GcsSinkConfig {
             None,
         ))
     }
+}
+
+fn build_gcs_inner_service(
+    client: HttpClient,
+    base_url: String,
+    auth: GcpAuthenticator,
+    request: TowerRequestSettings,
+    bucket: String,
+) -> impl Service<GcsRequest, Response = GcsResponse, Error = crate::Error, Future: Send + 'static>
++ Send
++ 'static {
+    ServiceBuilder::new()
+        .settings(request, GcsRetryLogic::default())
+        // This mapper is inside the retry layer, so it runs once per HTTP attempt.
+        // Return the same result so retry and driver behavior are unchanged.
+        .map_result(move |result: Result<GcsResponse, _>| {
+            if let Ok(response) = &result
+                && response.inner.status().is_success()
+            {
+                response.event_log_metadata.emit_upload_event();
+            }
+            // Unlike the S3/Azure SDKs, a GCS HTTP error still arrives as an `Ok`
+            // response here — `GcsRetryLogic` maps a non-retriable 4xx to
+            // `DontRetry`, not `Err` — so the status has to be inspected, otherwise
+            // failed uploads would be labelled `success`.
+            let success = result
+                .as_ref()
+                .is_ok_and(|response| response.inner.status().is_success());
+            emit_blob_file_upload_attempt(success, &bucket);
+            result
+        })
+        .service(GcsService::new(client, base_url, auth))
 }
 
 // Settings required to produce a request that do not change per
@@ -569,6 +580,18 @@ fn make_header((name, value): (&String, &String)) -> crate::Result<(HeaderName, 
 #[cfg(test)]
 mod tests {
     use futures_util::{future::ready, stream};
+    use http::StatusCode;
+    use hyper::{Body, Response};
+    use std::{
+        convert::Infallible,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tower::ServiceExt;
+    use vector_common::internal_event::vector_event::VectorSinkEventMetadata;
     use vector_lib::{
         EstimatedJsonEncodedSizeOf,
         codecs::{
@@ -577,12 +600,15 @@ mod tests {
         },
         partition::Partitioner,
         request_metadata::GroupedCountByteSize,
+        stream::DriverResponse,
     };
 
     use super::*;
     use crate::{
         event::LogEvent,
+        sinks::util::vector_event_log::test_util::VelEventCapture,
         test_util::{
+            addr::next_addr,
             components::{SINK_TAGS, run_and_assert_sink_compliance},
             http::{always_200_response, spawn_blackhole_http_server},
         },
@@ -616,6 +642,248 @@ mod tests {
 
         let event = Event::Log(LogEvent::from("simple message"));
         run_and_assert_sink_compliance(sink, stream::once(ready(event)), &SINK_TAGS).await;
+    }
+
+    async fn spawn_status_server(statuses: Vec<StatusCode>) -> (Uri, Arc<AtomicUsize>) {
+        assert!(!statuses.is_empty());
+        let statuses = Arc::new(statuses);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let handler_count = Arc::clone(&request_count);
+        let endpoint = spawn_blackhole_http_server(move |_| {
+            let statuses = Arc::clone(&statuses);
+            let attempt = handler_count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let status = statuses
+                    .get(attempt)
+                    .copied()
+                    .unwrap_or_else(|| *statuses.last().unwrap());
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+            }
+        })
+        .await;
+        (endpoint, request_count)
+    }
+
+    fn gcs_test_request() -> (GcsRequest, VectorSinkEventMetadata) {
+        let request = build_request(None, false, Compression::None, None);
+        let terminal_event_log = request.metadata.event_log_metadata().clone();
+        assert!(
+            !terminal_event_log
+                .file_send_event
+                .as_ref()
+                .unwrap()
+                .count_map
+                .is_empty()
+        );
+        (request, terminal_event_log)
+    }
+
+    fn gcs_test_tower_settings(retry_attempts: usize) -> TowerRequestSettings {
+        let mut settings =
+            TowerRequestConfig::<GcsTowerRequestConfigDefaults>::default().into_settings();
+        settings.retry_attempts = retry_attempts;
+        settings.retry_initial_backoff = Duration::from_millis(1);
+        settings.retry_max_duration = Duration::from_millis(1);
+        settings.retry_jitter_mode = crate::sinks::util::retries::JitterMode::None;
+        settings.concurrency = Some(1);
+        settings
+    }
+
+    fn gcs_test_client() -> HttpClient {
+        let context = SinkContext::default();
+        HttpClient::new(TlsSettings::default(), context.proxy())
+            .expect("should create a test HTTP client")
+    }
+
+    async fn call_gcs_service(
+        endpoint: String,
+        retry_attempts: usize,
+        event_logging_enabled: bool,
+    ) -> (
+        Result<GcsResponse, crate::Error>,
+        VectorSinkEventMetadata,
+        VelEventCapture,
+    ) {
+        let (request, terminal_event_log) = gcs_test_request();
+        let service = EventLoggingService {
+            inner: build_gcs_inner_service(
+                gcs_test_client(),
+                endpoint,
+                GcpAuthenticator::None,
+                gcs_test_tower_settings(retry_attempts),
+                "test-bucket".to_owned(),
+            ),
+            enable_logs: event_logging_enabled,
+        };
+        let capture = VelEventCapture::default();
+        let response = capture.capture(service.oneshot(request)).await;
+        (response, terminal_event_log, capture)
+    }
+
+    fn assert_vel_terminal_counts(
+        terminal_event_log: &VectorSinkEventMetadata,
+        capture: &VelEventCapture,
+        legacy_uploads: usize,
+        delivered: u32,
+        file_starts: usize,
+        file_uploads: usize,
+        file_errors: usize,
+    ) {
+        assert_eq!(capture.legacy_upload_count(), legacy_uploads);
+        assert_eq!(
+            terminal_event_log
+                .delivery_event
+                .delivered_call_count
+                .load(Ordering::SeqCst),
+            delivered
+        );
+        assert_eq!(
+            capture.file_send_count("VECTOR_FILE_SEND_START"),
+            file_starts
+        );
+        assert_eq!(
+            capture.file_send_count("VECTOR_FILE_SEND_COMPLETE"),
+            file_uploads
+        );
+        assert_eq!(
+            capture.file_send_count("VECTOR_FILE_SEND_WARN"),
+            file_errors
+        );
+    }
+
+    #[tokio::test]
+    async fn gcs_vel_emits_success_only_for_successful_http_response() {
+        let (endpoint, request_count) = spawn_status_server(vec![StatusCode::OK]).await;
+        let (response, terminal_event_log, capture) =
+            call_gcs_service(endpoint.to_string(), 2, true).await;
+
+        let response = response.unwrap();
+        assert_eq!(response.inner.status(), StatusCode::OK);
+        assert_eq!(
+            response.event_status(),
+            crate::event::EventStatus::Delivered
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_vel_terminal_counts(&terminal_event_log, &capture, 1, 1, 1, 1, 0);
+    }
+
+    #[tokio::test]
+    async fn gcs_vel_does_not_emit_success_for_terminal_403() {
+        let (endpoint, request_count) = spawn_status_server(vec![StatusCode::FORBIDDEN]).await;
+        let (response, terminal_event_log, capture) =
+            call_gcs_service(endpoint.to_string(), 2, true).await;
+
+        let response = response.unwrap();
+        assert_eq!(response.inner.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.event_status(), crate::event::EventStatus::Rejected);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_vel_terminal_counts(&terminal_event_log, &capture, 0, 0, 1, 0, 1);
+    }
+
+    #[tokio::test]
+    async fn gcs_vel_does_not_emit_success_when_retries_are_exhausted() {
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            let (endpoint, request_count) = spawn_status_server(vec![status]).await;
+            let (response, terminal_event_log, capture) =
+                call_gcs_service(endpoint.to_string(), 2, true).await;
+
+            let response = response.unwrap();
+            assert_eq!(response.inner.status(), status);
+            let expected_status = if status.is_server_error() {
+                crate::event::EventStatus::Errored
+            } else {
+                crate::event::EventStatus::Rejected
+            };
+            assert_eq!(response.event_status(), expected_status);
+            assert_eq!(request_count.load(Ordering::SeqCst), 3);
+            assert_vel_terminal_counts(&terminal_event_log, &capture, 0, 0, 1, 0, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gcs_vel_separates_per_attempt_upload_from_terminal_delivery() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let (endpoint, request_count) = spawn_status_server(vec![
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::OK,
+        ])
+        .await;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let local_recorder = metrics::set_default_local_recorder(&recorder);
+        let (response, terminal_event_log, capture) =
+            call_gcs_service(endpoint.to_string(), 2, true).await;
+        drop(local_recorder);
+
+        let response = response.unwrap();
+        assert_eq!(response.inner.status(), StatusCode::OK);
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_vel_terminal_counts(&terminal_event_log, &capture, 1, 1, 1, 1, 0);
+
+        let mut attempts_by_status = HashMap::new();
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            if key.key().name() != "blob_sink_file_uploads_total" {
+                continue;
+            }
+            let labels: HashMap<_, _> = key
+                .key()
+                .labels()
+                .map(|label| (label.key(), label.value()))
+                .collect();
+            if labels.get("bucket") == Some(&"test-bucket") {
+                if let DebugValue::Counter(count) = value {
+                    attempts_by_status.insert(labels["status"].to_owned(), count);
+                }
+            }
+        }
+        assert_eq!(attempts_by_status.get("failure"), Some(&2));
+        assert_eq!(attempts_by_status.get("success"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn gcs_vel_emits_error_for_transport_failure() {
+        let (_guard, address) = next_addr();
+        let endpoint = format!("http://{address}");
+        let (response, terminal_event_log, capture) = call_gcs_service(endpoint, 0, true).await;
+
+        assert!(response.is_err());
+        assert_vel_terminal_counts(&terminal_event_log, &capture, 0, 0, 1, 0, 1);
+    }
+
+    #[tokio::test]
+    async fn gcs_vel_wrapper_is_transparent_when_disabled() {
+        let (endpoint, request_count) = spawn_status_server(vec![StatusCode::OK]).await;
+        let (response, terminal_event_log, capture) =
+            call_gcs_service(endpoint.to_string(), 2, false).await;
+
+        let response = response.unwrap();
+        assert_eq!(response.inner.status(), StatusCode::OK);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        // The legacy per-attempt upload event is independent of the terminal wrapper flag.
+        assert_vel_terminal_counts(&terminal_event_log, &capture, 1, 0, 0, 0, 0);
+    }
+
+    #[tokio::test]
+    async fn gcs_vel_rejected_response_is_transparent_when_wrapper_disabled() {
+        let (endpoint, request_count) = spawn_status_server(vec![StatusCode::FORBIDDEN]).await;
+        let (response, terminal_event_log, capture) =
+            call_gcs_service(endpoint.to_string(), 2, false).await;
+
+        let response = response.unwrap();
+        assert_eq!(response.inner.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.event_status(), crate::event::EventStatus::Rejected);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_vel_terminal_counts(&terminal_event_log, &capture, 0, 0, 0, 0, 0);
     }
 
     #[test]

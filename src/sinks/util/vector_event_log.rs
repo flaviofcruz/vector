@@ -6,6 +6,7 @@ use tower::Service;
 
 use crate::event::Finalizable;
 use vector_lib::request_metadata::MetaDescriptive;
+use vector_lib::stream::DriverResponse;
 
 pub static ENABLE_SINK_EVENT_LOGGING: OnceLock<bool> = OnceLock::new();
 // Use an env var to determine whether we should be wrapping services with event loggging
@@ -42,6 +43,7 @@ where
     S::Future: Send + 'static,
     // This is the base request, which will have a wrapped layer around it to help with delivery event logs
     Req: Finalizable + MetaDescriptive + Send + 'static,
+    S::Response: DriverResponse,
     S::Error: std::fmt::Debug,
 {
     type Response = S::Response;
@@ -67,15 +69,33 @@ where
             // Give back the response from the inner service, but first log the delivery event
             Box::pin(async move {
                 let response = response.await;
-                // Only log if the request succeeded (gives back OK)
-                if response.is_ok() {
-                    delivery_event_log.emit_delivered_event();
-                    if let Some(file_send_event_log) = event_log_metadata.file_send_event.as_ref() {
-                        file_send_event_log.emit_uploaded_event();
+                match &response {
+                    Ok(response)
+                        if response.event_status() == crate::event::EventStatus::Delivered =>
+                    {
+                        delivery_event_log.emit_delivered_event();
+                        if let Some(file_send_event_log) =
+                            event_log_metadata.file_send_event.as_ref()
+                        {
+                            file_send_event_log.emit_uploaded_event();
+                        }
                     }
-                } else if let Err(ref e) = response {
-                    if let Some(file_send_event_log) = event_log_metadata.file_send_event.as_ref() {
-                        file_send_event_log.emit_error_event(format!("{:?}", e));
+                    Ok(response) => {
+                        if let Some(file_send_event_log) =
+                            event_log_metadata.file_send_event.as_ref()
+                        {
+                            file_send_event_log.emit_error_event(format!(
+                                "request completed with {:?}",
+                                response.event_status()
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(file_send_event_log) =
+                            event_log_metadata.file_send_event.as_ref()
+                        {
+                            file_send_event_log.emit_error_event(format!("{:?}", error));
+                        }
                     }
                 }
                 response
@@ -91,18 +111,134 @@ where
 }
 
 #[cfg(test)]
+pub(crate) mod test_util {
+    use std::{
+        future::Future,
+        sync::{Arc, Mutex},
+    };
+
+    use tracing::{Event, Subscriber, field::Visit};
+    use tracing_futures::WithSubscriber;
+    use tracing_subscriber::{Layer, layer::Context, layer::SubscriberExt};
+    use vector_common::internal_event::vector_event::file_send_event::{
+        ENABLE_FILE_SEND_EVENTS, enable_file_send_events,
+    };
+
+    #[derive(Clone, Default)]
+    pub(crate) struct VelEventCapture {
+        events: Arc<Mutex<Vec<CapturedVelEvent>>>,
+    }
+
+    #[derive(Default)]
+    struct CapturedVelEvent {
+        file_send_event_type: Option<String>,
+        vector_event_type: Option<String>,
+    }
+
+    impl VelEventCapture {
+        pub(crate) async fn capture<F>(&self, future: F) -> F::Output
+        where
+            F: Future,
+        {
+            let _ = ENABLE_FILE_SEND_EVENTS.set(true);
+            assert!(enable_file_send_events());
+            let subscriber = tracing_subscriber::registry().with(self.clone());
+            future.with_subscriber(subscriber).await
+        }
+
+        pub(crate) fn file_send_count(&self, event_type: &str) -> usize {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.file_send_event_type.as_deref() == Some(event_type))
+                .count()
+        }
+
+        pub(crate) fn legacy_upload_count(&self) -> usize {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.vector_event_type.as_deref() == Some("4"))
+                .count()
+        }
+    }
+
+    impl<S> Layer<S> for VelEventCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut captured = CapturedVelEvent::default();
+            event.record(&mut captured);
+            if captured.file_send_event_type.is_some() || captured.vector_event_type.is_some() {
+                self.events.lock().unwrap().push(captured);
+            }
+        }
+    }
+
+    impl Visit for CapturedVelEvent {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "file_send_event_type" => self.file_send_event_type = Some(value.to_owned()),
+                "vector_event_type" => self.vector_event_type = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            if field.name() == "vector_event_type" {
+                self.vector_event_type = Some(value.to_string());
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "vector_event_type" {
+                self.vector_event_type = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "vector_event_type" {
+                self.vector_event_type = Some(format!("{value:?}"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::EventFinalizers;
+    use crate::event::{Event, EventFinalizers, EventStatus, LogEvent};
+    use crate::sinks::util::vector_event_log::test_util::VelEventCapture;
     use std::pin::Pin;
     use std::sync::atomic::Ordering;
-    use vector_common::internal_event::vector_event::VectorSinkEventMetadata;
+    use vector_common::internal_event::vector_event::{
+        EventWithEventLog, VectorSinkEventMetadata, file_send_event::FileEventMetadata,
+    };
     use vector_lib::event::{BatchNotifier, EventFinalizer};
     use vector_lib::request_metadata::GroupedCountByteSize;
     use vector_lib::request_metadata::RequestMetadata;
 
     #[derive(Debug)]
     struct DoubleError;
+
+    struct DoubleResponse {
+        value: u32,
+        status: EventStatus,
+        events_byte_size: GroupedCountByteSize,
+    }
+
+    impl DriverResponse for DoubleResponse {
+        fn event_status(&self) -> EventStatus {
+            self.status
+        }
+
+        fn events_sent(&self) -> &GroupedCountByteSize {
+            &self.events_byte_size
+        }
+    }
 
     struct DoubleRequest {
         pub value: u32,
@@ -147,7 +283,7 @@ mod tests {
 
     struct DoubleService;
     impl Service<DoubleRequest> for DoubleService {
-        type Response = u32;
+        type Response = DoubleResponse;
         type Error = DoubleError;
         type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -163,13 +299,59 @@ mod tests {
                 let value = req.value;
                 // Only succeed if the value is not 0 (to help us test errors)
                 if value != 0 {
-                    Ok(value * 2)
+                    Ok(DoubleResponse {
+                        value: value * 2,
+                        status: if value == 1 {
+                            EventStatus::Delivered
+                        } else if value == 2 {
+                            EventStatus::Rejected
+                        } else {
+                            EventStatus::Errored
+                        },
+                        events_byte_size: GroupedCountByteSize::default(),
+                    })
                 } else {
                     Err(DoubleError)
                 }
             };
             Box::pin(fut)
         }
+    }
+
+    fn event_log_with_file_event() -> VectorSinkEventMetadata {
+        Event::Log(LogEvent::from("test event")).compute_event_log_with_file_event(
+            FileEventMetadata::new(
+                10,
+                1,
+                "test.log".to_owned(),
+                "test-container".to_owned(),
+                Some("test-bucket".to_owned()),
+            ),
+        )
+    }
+
+    fn assert_delivered_count(event_log: &VectorSinkEventMetadata, delivered: u32) {
+        assert_eq!(
+            event_log
+                .delivery_event
+                .delivered_call_count
+                .load(Ordering::SeqCst),
+            delivered
+        );
+    }
+
+    fn assert_file_send_counts(
+        capture: &VelEventCapture,
+        staged: usize,
+        uploaded: usize,
+        errors: usize,
+    ) {
+        assert_eq!(capture.file_send_count("VECTOR_FILE_SEND_START"), staged);
+        assert_eq!(
+            capture.file_send_count("VECTOR_FILE_SEND_COMPLETE"),
+            uploaded
+        );
+        assert_eq!(capture.file_send_count("VECTOR_FILE_SEND_WARN"), errors);
     }
 
     #[tokio::test]
@@ -180,18 +362,16 @@ mod tests {
             inner: inner_service,
             enable_logs: true,
         };
-        let event_log = VectorSinkEventMetadata::new();
+        let event_log = event_log_with_file_event();
         let request = DoubleRequest::new(1, event_log.clone());
-        let response = event_logging_service.call(request).await;
+        let capture = VelEventCapture::default();
+        let response = capture
+            .capture(async { event_logging_service.call(request).await })
+            .await;
 
-        assert_eq!(response.unwrap(), 2);
-        assert_eq!(
-            event_log
-                .delivery_event
-                .delivered_call_count
-                .load(Ordering::SeqCst),
-            1
-        );
+        assert_eq!(response.unwrap().value, 2);
+        assert_delivered_count(&event_log, 1);
+        assert_file_send_counts(&capture, 1, 1, 0);
     }
 
     #[tokio::test]
@@ -202,17 +382,61 @@ mod tests {
             inner: inner_service,
             enable_logs: true,
         };
-        let event_log = VectorSinkEventMetadata::new();
+        let event_log = event_log_with_file_event();
         let request = DoubleRequest::new(0, event_log.clone());
-        let response = event_logging_service.call(request).await;
+        let capture = VelEventCapture::default();
+        let response = capture
+            .capture(async { event_logging_service.call(request).await })
+            .await;
 
         assert!(response.is_err());
-        assert_eq!(
-            event_log
-                .delivery_event
-                .delivered_call_count
-                .load(Ordering::SeqCst),
-            0
-        );
+        assert_delivered_count(&event_log, 0);
+        assert_file_send_counts(&capture, 1, 0, 1);
+    }
+
+    #[tokio::test]
+    async fn test_event_logging_on_logical_failure() {
+        for value in [2, 3] {
+            let mut event_logging_service = EventLoggingService {
+                inner: DoubleService,
+                enable_logs: true,
+            };
+            let event_log = event_log_with_file_event();
+            let capture = VelEventCapture::default();
+            let response = capture
+                .capture(async {
+                    event_logging_service
+                        .call(DoubleRequest::new(value, event_log.clone()))
+                        .await
+                })
+                .await
+                .unwrap();
+
+            assert_ne!(response.event_status(), EventStatus::Delivered);
+            assert_delivered_count(&event_log, 0);
+            assert_file_send_counts(&capture, 1, 0, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_event_logging_disabled() {
+        let mut event_logging_service = EventLoggingService {
+            inner: DoubleService,
+            enable_logs: false,
+        };
+        let event_log = event_log_with_file_event();
+        let capture = VelEventCapture::default();
+        let response = capture
+            .capture(async {
+                event_logging_service
+                    .call(DoubleRequest::new(1, event_log.clone()))
+                    .await
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.event_status(), EventStatus::Delivered);
+        assert_delivered_count(&event_log, 0);
+        assert_file_send_counts(&capture, 0, 0, 0);
     }
 }

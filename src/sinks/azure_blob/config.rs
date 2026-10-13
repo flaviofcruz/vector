@@ -227,13 +227,13 @@ impl AzureBlobSinkConfig {
         let bucket = self.storage_account.clone().unwrap_or_default();
         let service = ServiceBuilder::new()
             .settings(request_limits, AzureBlobRetryLogic)
-            // Add another layer after retries for emitting our event log message
-            // Returns back the same result so it continues to work downstream
+            // This mapper is inside the retry layer, so it runs once per SDK attempt.
+            // Return the same result so retry and driver behavior are unchanged.
             .map_result(move |result: StdResult<AzureBlobResponse, _>| {
                 if let Ok(ref response) = result {
                     response.event_log_metadata.emit_upload_event();
                 }
-                // One settled PutBlockBlob is one upload attempt. The Azure SDK surfaces
+                // One SDK PutBlockBlob request is one upload attempt. The Azure SDK surfaces
                 // non-2xx as `Err`, so `Ok`/`Err` is already the success/failure split.
                 emit_blob_file_upload_attempt(result.is_ok(), &bucket);
                 result

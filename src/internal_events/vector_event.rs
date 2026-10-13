@@ -20,9 +20,9 @@ use vector_common::internal_event::vector_event::delivery_event::MetadataValuesC
 /// ratio and a failing destination shows up even when nothing lands. Split on the
 /// `status` label (`success` / `failure`) to separate the two.
 ///
-/// Emitted after retries have settled, so one attempt here is one settled upload
-/// rather than one HTTP request. Note that `Ok(response)` alone does not mean success
-/// on `gcp_cloud_storage`, where a non-retriable 4xx still surfaces as `Ok`.
+/// Emitted by the mapper inside the retry layer, so each underlying cloud request
+/// is counted, including retried attempts. Note that `Ok(response)` alone does not
+/// mean success on `gcp_cloud_storage`, where a non-retriable 4xx still surfaces as `Ok`.
 ///
 /// `status` and `bucket` are the explicit labels. The enclosing sink request span adds
 /// `component_id` / `component_type` / `component_kind` automatically (see

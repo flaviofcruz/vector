@@ -239,13 +239,13 @@ impl S3SinkConfig {
         let bucket = self.bucket.clone();
         let service = ServiceBuilder::new()
             .settings(request_limits, retry_strategy)
-            // Add another layer after retries for emitting our event log message
-            // Returns back the same result so it continues to work downstream
+            // This mapper is inside the retry layer, so it runs once per SDK attempt.
+            // Return the same result so retry and driver behavior are unchanged.
             .map_result(move |result: Result<S3Response, _>| {
                 if let Ok(ref response) = result {
                     response.event_log_metadata.emit_upload_event();
                 }
-                // One settled PutObject is one upload attempt. The AWS SDK surfaces
+                // One SDK PutObject request is one upload attempt. The AWS SDK surfaces
                 // non-2xx as `Err`, so `Ok`/`Err` is already the success/failure split.
                 emit_blob_file_upload_attempt(result.is_ok(), &bucket);
                 result
