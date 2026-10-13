@@ -2,7 +2,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use std::{future::ready, num::NonZeroUsize, panic, sync::Arc};
+use std::{
+    future::ready,
+    num::{NonZeroU64, NonZeroUsize},
+    panic,
+    sync::Arc,
+};
 
 // Azure SDK imports for blob and queue operations
 // Note: Using azure_core_for_storage (v0.21) to match azure_storage_* crate versions
@@ -87,11 +92,12 @@ pub(super) struct Config {
     /// How often to sample the queue's approximate depth (backlog) for the `queue_message_count`
     /// gauge, in seconds. Sampled on a dedicated timer independent of `poll_secs`, off the message
     /// receive/delete path, so it never adds latency to draining and its request rate stays fixed
-    /// even if `poll_secs` is lowered. Depth moves slowly; keep this coarse.
+    /// even if `poll_secs` is lowered. Depth moves slowly; keep this coarse. Must be greater than
+    /// zero.
     #[serde(default = "default_depth_poll_secs")]
     #[derivative(Default(value = "default_depth_poll_secs()"))]
     #[configurable(metadata(docs::type_unit = "seconds"))]
-    pub(super) depth_poll_secs: u64,
+    pub(super) depth_poll_secs: NonZeroU64,
 
     /// The visibility timeout to use for messages, in seconds.
     /// When a message is received, it becomes invisible to other consumers for this duration.
@@ -174,8 +180,8 @@ pub(super) struct Config {
 const fn default_poll_secs() -> u64 {
     15
 } // 15 seconds between polls when no messages
-const fn default_depth_poll_secs() -> u64 {
-    60
+const fn default_depth_poll_secs() -> NonZeroU64 {
+    NonZeroU64::new(60).unwrap()
 } // 1 minute between queue-depth (backlog) samples
 const fn default_visibility_timeout_secs() -> u64 {
     300
@@ -305,7 +311,7 @@ pub struct State {
     /// Seconds to wait between polls when no messages
     poll_secs: u64,
     /// Seconds between queue-depth (backlog) samples for the `queue_message_count` gauge
-    depth_poll_secs: u64,
+    depth_poll_secs: NonZeroU64,
     /// Maximum messages to fetch in one batch
     max_number_of_messages: u64,
     /// Number of concurrent polling tasks
@@ -489,7 +495,7 @@ impl Ingestor {
         let shutdown = shutdown.fuse();
         pin!(shutdown);
 
-        let mut ticker = tokio::time::interval(Duration::from_secs(state.depth_poll_secs));
+        let mut ticker = tokio::time::interval(Duration::from_secs(state.depth_poll_secs.get()));
         // On a missed tick (e.g. a slow metadata call), skip it rather than firing a catch-up burst.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -2106,6 +2112,40 @@ mod tests {
         )
         .unwrap();
         assert!(config.tolerate_truncated_archives);
+    }
+
+    #[test]
+    fn test_depth_poll_secs_config_parsing() {
+        // Default: sample every 60 seconds.
+        let config: Config = toml::from_str(
+            r#"
+            queue_name = "my-storage-queue"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.depth_poll_secs, NonZeroU64::new(60).unwrap());
+        assert_eq!(
+            Config::default().depth_poll_secs,
+            NonZeroU64::new(60).unwrap()
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+            queue_name = "my-storage-queue"
+            depth_poll_secs = 300
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.depth_poll_secs, NonZeroU64::new(300).unwrap());
+
+        // Zero would panic the sampler's interval timer, so it must be rejected at parse time.
+        let result: Result<Config, toml::de::Error> = toml::from_str(
+            r#"
+            queue_name = "my-storage-queue"
+            depth_poll_secs = 0
+            "#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
