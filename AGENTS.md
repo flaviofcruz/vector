@@ -21,6 +21,8 @@ This repository is Databricks' `v0.53-custom` Vector fork. Do not assume
 - Do not add upstream `changelog.d/*` fragments for Databricks-only changes.
 - Add a numbered entry to `README.databricks.md` for behavior changes,
   backports, operational fixes, and repo/process changes.
+- Include the PR link in each entry. If the PR has not been opened yet, add
+  its link after creation and push that update to the same PR.
 - Keep the numbering consecutive. If `v0.53-custom` moved while you were
   working, fetch/rebase first, then resolve the README entry at the new end of
   the list.
