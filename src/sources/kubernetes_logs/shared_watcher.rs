@@ -31,6 +31,7 @@ pub(super) struct WatcherKey {
     pub use_apiserver_cache: bool,
     pub delay_deletion: Duration,
     pub insert_namespace_fields: bool,
+    pub relist_interval: Option<Duration>,
 }
 
 /// Stores shared across all sources with the same `WatcherKey`.
@@ -233,6 +234,7 @@ mod tests {
             use_apiserver_cache: false,
             delay_deletion: Duration::from_secs(60),
             insert_namespace_fields: true,
+            relist_interval: None,
         }
     }
 
@@ -335,6 +337,15 @@ mod tests {
         let a = default_key();
         let mut b = default_key();
         b.delay_deletion = Duration::from_secs(120);
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn differing_relist_interval_produces_different_key() {
+        let a = default_key();
+        let mut b = default_key();
+        b.relist_interval = Some(Duration::from_secs(300));
         assert_ne!(a, b);
         assert_ne!(hash_of(&a), hash_of(&b));
     }

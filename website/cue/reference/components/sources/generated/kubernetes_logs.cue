@@ -490,4 +490,20 @@ generated: components: sources: kubernetes_logs: configuration: {
 		required:    false
 		type: bool: default: false
 	}
+	watcher_relist_interval_secs: {
+		description: """
+			Restart the Kubernetes watchers every this many seconds so they re-list the API.
+
+			Set this for APIs that don't reliably report deletions, such as the dblet node discovery
+			API; objects they never report as deleted otherwise stay in the pod store forever. With
+			`share_watcher`, only sources that set the same interval share watchers.
+			"""
+		required: false
+		type: uint: {
+			examples: [
+				300,
+			]
+			unit: "seconds"
+		}
+	}
 }

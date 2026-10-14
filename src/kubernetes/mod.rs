@@ -10,5 +10,7 @@
 pub mod meta_cache;
 pub mod pod_manager_logic;
 pub mod reflector;
+pub mod relist;
 
 pub use reflector::custom_reflector;
+pub use relist::relisting_watcher;

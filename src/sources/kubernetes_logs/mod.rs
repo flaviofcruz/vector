@@ -5,7 +5,7 @@
 
 #![allow(unused_variables, dead_code, unused_imports)]
 #![deny(missing_docs)]
-use std::{cmp::min, collections::HashMap, path::PathBuf, time::Duration};
+use std::{cmp::min, collections::HashMap, num::NonZeroU64, path::PathBuf, time::Duration};
 
 use crate::sources::file::{deserialize_iso8601_timestamp, wrap_with_line_agg};
 use bytes::Bytes;
@@ -21,7 +21,7 @@ use kube::{
     api::Api,
     config::{self, KubeConfigOptions},
     runtime::reflector::store::Store,
-    runtime::{WatchStreamExt, reflector, watcher},
+    runtime::{reflector, watcher},
 };
 use lifecycle::Lifecycle;
 use serde_with::serde_as;
@@ -67,7 +67,7 @@ use crate::{
         KubernetesLogsEventNodeAnnotationError, KubernetesLogsEventsReceived,
         KubernetesLogsPodInfo, StreamClosedError,
     },
-    kubernetes::{custom_reflector, meta_cache::MetaCache},
+    kubernetes::{custom_reflector, meta_cache::MetaCache, relisting_watcher},
     line_agg,
     shutdown::ShutdownSignal,
     sources,
@@ -357,6 +357,17 @@ pub struct Config {
     #[configurable(metadata(docs::human_name = "Delay Deletion"))]
     delay_deletion_ms: Duration,
 
+    /// Restart the Kubernetes watchers every this many seconds so they re-list the API.
+    ///
+    /// Set this for APIs that don't reliably report deletions, such as the dblet node discovery
+    /// API; objects they never report as deleted otherwise stay in the pod store forever. With
+    /// `share_watcher`, only sources that set the same interval share watchers.
+    #[serde(default)]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 300))]
+    #[configurable(metadata(docs::human_name = "Watcher Re-list Interval"))]
+    watcher_relist_interval_secs: Option<NonZeroU64>,
+
     /// The namespace to use for logs. This overrides the global setting.
     #[configurable(metadata(docs::hidden))]
     #[serde(default)]
@@ -542,6 +553,7 @@ impl Default for Config {
             use_apiserver_cache: false,
             share_watcher: default_share_watcher(),
             delay_deletion_ms: default_delay_deletion_ms(),
+            watcher_relist_interval_secs: None,
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
@@ -962,6 +974,9 @@ impl Source {
         let node_selector = prepare_node_selector(self_node_name.as_str())?;
 
         let delay_deletion = config.delay_deletion_ms;
+        let relist_interval = config
+            .watcher_relist_interval_secs
+            .map(|secs| Duration::from_secs(secs.get()));
         let use_apiserver_cache = config.use_apiserver_cache;
         let insert_namespace_fields = config.insert_namespace_fields;
         let share_watcher = config.share_watcher;
@@ -1000,7 +1015,7 @@ impl Source {
 
             // Pod watcher
             let pods = Api::<Pod>::all(client.clone());
-            let pod_watcher = watcher(
+            let pod_watcher = relisting_watcher(
                 pods,
                 watcher::Config {
                     field_selector: Some(field_selector),
@@ -1009,8 +1024,8 @@ impl Source {
                     page_size: get_page_size(use_apiserver_cache),
                     ..Default::default()
                 },
-            )
-            .backoff(watcher::DefaultBackoff::default());
+                relist_interval,
+            );
 
             let pod_store_w = reflector::store::Writer::default();
             let pod_state = pod_store_w.as_reader();
@@ -1028,7 +1043,7 @@ impl Source {
             let ns_state = ns_store_w.as_reader();
             if insert_namespace_fields {
                 let namespaces = Api::<Namespace>::all(client.clone());
-                let ns_watcher = watcher(
+                let ns_watcher = relisting_watcher(
                     namespaces,
                     watcher::Config {
                         label_selector: Some(namespace_label_selector),
@@ -1036,8 +1051,8 @@ impl Source {
                         page_size: get_page_size(use_apiserver_cache),
                         ..Default::default()
                     },
-                )
-                .backoff(watcher::DefaultBackoff::default());
+                    relist_interval,
+                );
 
                 reflector_handles.push(tokio::spawn(custom_reflector(
                     ns_store_w,
@@ -1049,7 +1064,7 @@ impl Source {
 
             // Node watcher
             let nodes = Api::<Node>::all(client);
-            let node_watcher = watcher(
+            let node_watcher = relisting_watcher(
                 nodes,
                 watcher::Config {
                     field_selector: Some(node_selector),
@@ -1057,8 +1072,8 @@ impl Source {
                     page_size: get_page_size(use_apiserver_cache),
                     ..Default::default()
                 },
-            )
-            .backoff(watcher::DefaultBackoff::default());
+                relist_interval,
+            );
             let node_store_w = reflector::store::Writer::default();
             let node_state = node_store_w.as_reader();
             let node_cacher = MetaCache::new();
@@ -1089,6 +1104,7 @@ impl Source {
                 use_apiserver_cache,
                 delay_deletion,
                 insert_namespace_fields,
+                relist_interval,
             };
 
             let kube_config_file = config.kube_config_file.clone();
