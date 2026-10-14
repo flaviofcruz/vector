@@ -66,7 +66,7 @@ pub struct DeliveryPathAccounting {
 
 impl DeliveryPathAccounting {
     /// An empty match set remains explicitly accounted, without falling back to unscoped counters.
-    pub fn at_read(source: DeliverySourceLabels, paths: impl IntoIterator<Item = String>) -> Self {
+    pub fn at_read(source: &DeliverySourceLabels, paths: impl IntoIterator<Item = String>) -> Self {
         let mut accounting = Self::default();
         for path in paths {
             // A repeated configuration path is still one requirement for this READ.
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn branch_copies_select_only_their_existing_requirement() {
         let source = DeliveryPathAccounting::at_read(
-            source_labels("old-process"),
+            &source_labels("old-process"),
             [
                 "archive".to_owned(),
                 "online".to_owned(),
@@ -251,8 +251,8 @@ mod tests {
 
     #[test]
     fn reduction_sums_counts_without_losing_source_labels() {
-        let first = DeliveryPathAccounting::at_read(source_labels("old"), ["archive".to_owned()]);
-        let second = DeliveryPathAccounting::at_read(source_labels("new"), ["archive".to_owned()]);
+        let first = DeliveryPathAccounting::at_read(&source_labels("old"), ["archive".to_owned()]);
+        let second = DeliveryPathAccounting::at_read(&source_labels("new"), ["archive".to_owned()]);
         let mut merged = first.clone();
         merged.merge(first);
         merged.merge(second);
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn merging_does_not_promote_unselected_requirements_to_delivery_credit() {
         let mut unselected =
-            DeliveryPathAccounting::at_read(source_labels("p"), ["archive".to_owned()]);
+            DeliveryPathAccounting::at_read(&source_labels("p"), ["archive".to_owned()]);
         let mut selected = unselected.clone();
         selected.select_path("archive");
         unselected.merge(selected);

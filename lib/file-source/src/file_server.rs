@@ -2399,7 +2399,7 @@ mod tests {
             let checkpointer = Checkpointer::new(data_dir.as_path());
             let _drain = tokio::spawn(async move {
                 let mut rx = rx;
-                while let Some(_) = rx.next().await {}
+                while rx.next().await.is_some() {}
             });
 
             file_server
@@ -2820,8 +2820,6 @@ mod tests {
             let line0c = line0c.clone();
             let delivered = delivered.clone();
             let checkpoints_view = checkpoints_view.clone();
-            let orig_fingerprint = orig_fingerprint;
-            let orig_position = orig_position;
             tokio::spawn(async move {
                 // Stage 0: wait until the batch notifier (delivered buffer) shows
                 // every original line has been delivered — i.e. the file was read

@@ -186,7 +186,7 @@ mod tests {
                     let mut accounting = DeliveryPathAccounting::default();
                     for offset in [0, 3, 6] {
                         let mut record = DeliveryPathAccounting::at_read(
-                            DeliverySourceLabels {
+                            &DeliverySourceLabels {
                                 process_generation_id: "source-process".into(),
                                 time_parity: 0,
                                 topic: "service-log".into(),
@@ -289,7 +289,7 @@ mod tests {
         let events = ["old-process", "new-process"].map(|process| {
             let mut event = LogEvent::from("service message");
             let mut accounting = DeliveryPathAccounting::at_read(
-                DeliverySourceLabels {
+                &DeliverySourceLabels {
                     process_generation_id: process.to_owned(),
                     time_parity: 3_600_000,
                     topic: "service-log".to_owned(),

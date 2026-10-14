@@ -12,65 +12,8 @@ clippy::cast_possible_truncation	lib/vector-core/src/event/event_log.rs	 count a
 clippy::cast_possible_truncation	lib/vector-core/src/event/event_log.rs	 count: path_count.count as usize,
 clippy::cast_possible_truncation	lib/vector-core/src/event/event_log.rs	 metric_count: path_count.count as usize,
 clippy::cast_possible_truncation	lib/vector-core/src/event/event_log.rs	 value.count = value.count.saturating_add(path_count.count as usize);
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/config.rs	 let hits = hits.clone();
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/config.rs	 let hits = hits_srv.clone();
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/config.rs	 let hits_srv = counters.hits.clone();
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/config.rs	 let in_flight = in_flight.clone();
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/config.rs	 let in_flight = in_flight_srv.clone();
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/config.rs	 let in_flight_srv = counters.in_flight.clone();
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/direct_fallback.rs	 let hits = hits.clone();
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/direct_fallback.rs	 let hits = hits_srv.clone();
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/direct_fallback.rs	 let hits_srv = hits.clone();
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/headless.rs	 pending: self.pending.clone(),
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/headless.rs	 shared.clone(),
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/headless.rs	 shared: self.shared.clone(),
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/headless.rs	 shared: shared.clone(),
-clippy::clone_on_ref_ptr	src/sinks/clickhouse/headless.rs	 shared: shared.clone(),
-clippy::clone_on_ref_ptr	src/sources/ingestion_callback.rs	 let codes = codes.clone();
-clippy::clone_on_ref_ptr	src/sources/ingestion_callback.rs	 let codes = codes.clone();
-clippy::clone_on_ref_ptr	src/sources/ingestion_callback.rs	 let count = count.clone();
-clippy::clone_on_ref_ptr	src/sources/ingestion_callback.rs	 let count = count_clone.clone();
-clippy::clone_on_ref_ptr	src/sources/ingestion_callback.rs	 let count_clone = call_count.clone();
-clippy::clone_on_ref_ptr	src/sources/ingestion_callback.rs	 let log = log.clone();
-clippy::clone_on_ref_ptr	src/sources/ingestion_callback.rs	 let log = log_clone.clone();
-clippy::clone_on_ref_ptr	src/sources/ingestion_callback.rs	 let log_clone = request_log.clone();
-clippy::clone_on_ref_ptr	src/transforms/bricklens_config_enricher.rs	 let fetch_lock = self .in_flight .lock() .expect("in_flight mutex poisoned") .entry(key.clone()) .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))) .clone();
-clippy::cloned_ref_to_slice_refs	lib/vector-core/src/event/event_log.rs	 VectorSinkDeliveryEvent::with_count_map(generate_count_map(&[event.clone()], true));
-clippy::cloned_ref_to_slice_refs	lib/vector-core/src/event/event_log.rs	 VectorSinkDeliveryEvent::with_count_map(generate_count_map(&[event.clone()], true));
-clippy::cloned_ref_to_slice_refs	lib/vector-core/src/event/event_log.rs	 count_map: generate_count_map(&[event.clone()], false),
-clippy::doc_lazy_continuation	lib/codecs/src/encoding/format/wire_to_arrow/append.rs	/// The absent/proto3-default case (elided zero value -> null) is handled by the
-clippy::doc_lazy_continuation	lib/codecs/src/encoding/format/wire_to_arrow/append.rs	/// builder-tree's `finalize_row`, not here.
-clippy::doc_lazy_continuation	src/transforms/bricklens_config_enricher.rs	//! Trade-off accepted: a cold miss blocks this event on a synchronous gRPC round-trip (bounded by
-clippy::doc_lazy_continuation	src/transforms/bricklens_config_enricher.rs	//! `request_timeout` + the single-flight + TTL cache below), rather than never blocking as a
-clippy::doc_lazy_continuation	src/transforms/bricklens_config_enricher.rs	//! preloaded table would.
 clippy::large_enum_variant	src/enrichment_tables/mod.rs	pub enum EnrichmentTables { /// Exposes data from a static file as an enrichment table. File(file::FileConfig), /// Exposes data fetched from an HTTP service as an enrichment table. #[cfg(feature = "enrichment-tables-http")] Http(http::HttpConfig), /// Exposes data from a memory cache as an enrichment table. The cache can be written to using /// a sink. #[cfg(feature = "enrichment-tables-memory")] Memory(memory::MemoryConfig), /// Exposes data from a [MaxMind][maxmind] [GeoIP2][geoip2] database as an enrichment table. /// /// [maxmind]: https://www.maxmind.com/ /// [geoip2]: https://www.maxmind.com/en/geoip2-databases #[cfg(feature = "enrichment-tables-geoip")] Geoip(geoip::GeoipConfig), /// Exposes data from a [MaxMind][maxmind] database as an enrichment table. /// /// [maxmind]: https://www.maxmind.com/ #[cfg(feature = "enrichment-tables-mmdb")] Mmdb(mmdb::MmdbConfig), }
 clippy::large_enum_variant	src/sources/azure_blob/queue.rs	enum QueueEvent { DirectIngest(DirectIngestMessage), EventGrid(EventGridEvent), }
-clippy::let_underscore_future	src/sources/aws_s3/sqs.rs	 let _ = cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
-clippy::let_underscore_future	src/sources/azure_blob/queue.rs	 let _ = cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
-clippy::let_underscore_future	src/sources/gcp_gcs/pubsub.rs	 let _ = cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
-clippy::map_unwrap_or	lib/vector-buffers/src/variants/disk_v2/writer.rs	 try_as_record_archive(mmap.as_ref()) .ok() .and_then(|r| decode_record_payload::<T>(r).ok()) .map(|item| { let ec = u64::try_from(item.event_count()) .unwrap_or(1); id.wrapping_add(ec.saturating_sub(1)) <= acked_frontier }) // Valid checksum but undecodable payload: we still saw a // valid record ID, so honor the same rule -- wait only if that // ID is above the frontier, otherwise reclaim. .unwrap_or_else(|| id <= acked_frontier)
-clippy::missing_panics_doc	lib/vector-common/src/internal_event/vector_event/delivery_event.rs	 pub fn flush(&self) {
-clippy::missing_panics_doc	lib/vector-common/src/internal_event/vector_event/delivery_event.rs	pub fn extract_topic_from_source_filename(path: &str) -> Option<String> {
-clippy::missing_panics_doc	lib/vector-common/src/shutdown.rs	 pub fn shutdown_all(self, deadline: Option<Instant>) -> impl Future<Output = ()> {
-clippy::missing_panics_doc	lib/vector-core/src/event/event_log.rs	pub fn generate_count_map( events: &[Event], for_delivery_events: bool, ) -> HashMap<String, MetadataValuesCount> {
-clippy::needless_pass_by_value	lib/vector-common/src/internal_event/vector_event/delivery_path.rs	 pub fn at_read(source: DeliverySourceLabels, paths: impl IntoIterator<Item = String>) -> Self {
-clippy::needless_pass_by_value	lib/vector-common/src/internal_event/vector_event/file_send_event.rs	 pub fn emit_error_event(&self, error: String) {
-clippy::needless_pass_by_value	lib/vector-common/src/internal_event/vector_event/mod.rs	 events: Vec<VectorSinkEventMetadata>,
-clippy::needless_pass_by_value	lib/vector-core/src/event/event_log.rs	 event: Event,
-clippy::needless_pass_by_value	lib/vector-core/src/event/event_log.rs	fn compute_event_log(event: Event) -> VectorSinkEventMetadata {
-clippy::needless_update	src/sources/prometheus/k8s_endpoint_provider.rs	 ..Default::default()
-clippy::needless_update	src/sources/prometheus/k8s_endpoint_provider.rs	 ..Default::default()
-clippy::needless_update	src/sources/prometheus/k8s_endpoint_provider.rs	 ..Default::default()
-clippy::needless_update	src/sources/prometheus/k8s_endpoint_provider.rs	 ..Default::default()
-clippy::ptr_arg	lib/vector-core/src/event/event_log.rs	 events: &Vec<EventWrapper>,
-clippy::redundant_locals	lib/file-source/src/file_server.rs	 let orig_fingerprint = orig_fingerprint;
-clippy::redundant_locals	lib/file-source/src/file_server.rs	 let orig_position = orig_position;
-clippy::redundant_pattern_matching	lib/file-source/src/file_server.rs	 while let Some(_) = rx.next().await {}
-clippy::ref_option	lib/vector-common/src/internal_event/vector_event/delivery_event.rs	 fn record_read( &self, path: String, bytes_read: usize, lines_read: usize, source_context: &Option<HashMap<String, String>>, source_type: &'static str, time_parity: i64, ) { let mut reads = self.reads.lock().expect("delivery reads lock poisoned"); let entry = reads .entry((source_type, path, time_parity)) .or_insert_with(|| ReadAccum { source_context: source_context.clone().unwrap_or_default(), bytes_read: 0, lines_read: 0, // Captured once per key: the source component span is stable per path. span: Span::current(), }); entry.bytes_read += bytes_read; entry.lines_read += lines_read; }
-clippy::should_implement_trait	lib/vector-common/src/internal_event/vector_event/file_send_event.rs	 pub fn default() -> Self { Self { bytes: 0, events_len: 0, blob: String::new(), container: String::new(), bucket: None, } }
-clippy::suspicious_to_owned	src/sources/gcp_gcs/object.rs	 .and_then(|v| v.as_str().map(|s| s.to_owned()));
-clippy::suspicious_to_owned	src/sources/gcp_gcs/object.rs	 .and_then(|v| v.as_str().map(|s| s.to_owned()));
-clippy::suspicious_to_owned	src/sources/gcp_gcs/object.rs	 .and_then(|v| v.as_str().map(|s| s.to_owned()));
 clippy::too_many_arguments	lib/vector-common/src/internal_event/vector_event/delivery_event.rs	 pub fn accumulate_read( &'static self, path: String, bytes_read: usize, lines_read: usize, source_context: &Option<HashMap<String, String>>, service_system: Option<&str>, source_pod_id: Option<&str>, source_type: &'static str, time_parity: i64, emitted_after_multiline_agg: bool, delivery_paths: Option<&DeliveryPathAccounting>, workspace_id: Option<&str>, ) {
 clippy::too_many_arguments	lib/vector-common/src/internal_event/vector_event/delivery_event.rs	 pub fn emit_rejected( &self, path: &str, rejected_events: usize, source_context: &Option<HashMap<String, String>>, service_system: Option<&str>, source_pod_id: Option<&str>, source_type: &'static str, time_parity: i64, rejection_reason: &'static str, ) {
 clippy::too_many_arguments	src/app.rs	pub async fn load_configs( config_paths: &[ConfigPath], watcher_conf: Option<config::watcher::WatcherConfig>, require_healthy: Option<bool>, allow_empty_config: bool, interpolate_env: bool, graceful_shutdown_duration: Option<Duration>, graceful_data_source_shutdown_duration: Option<Duration>, graceful_data_sink_shutdown_duration: Option<Duration>, graceful_internal_source_shutdown_duration: Option<Duration>, signal_handler: &mut SignalHandler, ) -> Result<Config, ExitCode> {
@@ -92,13 +35,3 @@ clippy::too_many_lines	lib/vector-buffers/src/variants/disk_v2/writer.rs	 async 
 clippy::too_many_lines	lib/vector-buffers/src/variants/disk_v2/writer.rs	 pub(super) async fn validate_last_write(&mut self) -> Result<(), WriterError<T>> {
 clippy::too_many_lines	lib/vector-core/src/event/event_log.rs	 fn mixed_batches_keep_vel_totals_but_emit_each_event_in_only_one_counter_form() {
 clippy::too_many_lines	lib/vector-core/src/event/event_log.rs	pub fn generate_count_map( events: &[Event], for_delivery_events: bool, ) -> HashMap<String, MetadataValuesCount> {
-clippy::unnecessary_debug_formatting	vdev/src/commands/check/examples.rs	 bail!("Invalid filename {filename:?}");
-clippy::unnecessary_debug_formatting	vdev/src/commands/release/github.rs	 .map_err(|e| anyhow!("failed to turn path into string: {e:?}"))?;
-clippy::unnecessary_debug_formatting	vdev/src/commands/release/prepare.rs	 return Err(anyhow!("{cue_path:?} not found"));
-clippy::unnecessary_debug_formatting	vdev/src/commands/release/prepare.rs	 return Err(anyhow!("{versions_cue_path:?} not found"));
-clippy::unnecessary_debug_formatting	vdev/src/utils/features.rs	 None => bail!("Invalid filename {filename:?}, no extension"),
-clippy::unnecessary_debug_formatting	vdev/src/utils/features.rs	 Some(_) => bail!("Invalid filename {filename:?}, unknown extension"),
-clippy::unnecessary_filter_map	src/sinks/bricklens_ingest/request_builder.rs	 let finalizers = input .iter() .filter_map(|event| match event { Event::Log(log) => Some(log.metadata().finalizers().clone()), Event::Metric(metric) => Some(metric.metadata().finalizers().clone()), Event::Trace(trace) => Some(trace.metadata().finalizers().clone()), })
-clippy::unnecessary_get_then_check	src/sources/ingestion_callback.rs	 req.headers.get("content-type").is_none(),
-clippy::unnecessary_get_then_check	src/sources/ingestion_callback.rs	 requests[0].headers.get("content-type").is_none(),
-clippy::unnecessary_unwrap	src/sources/util/grpc/mod.rs	 .layer(ConcurrencyLimitLayer::new(max_concurrent_requests.unwrap()))

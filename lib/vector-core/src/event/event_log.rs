@@ -222,14 +222,16 @@ fn workspace_id_from_event(event: &LogEvent, log_metadata_field: &str) -> String
         .map_or_else(|| "-1".to_owned(), |id| id.to_string())
 }
 
-/*
-* On a list of events, iterate through them and track the counts per unique combination of
-* specified fields
-*
-* The map here is String -> MetadataValuesCount
-* where the String is an encoded key of the combination and values
-* and MetadataValuesCount is a struct that holds the count, size, and a map of the values
-*/
+/// On a list of events, iterate through them and track the counts per unique combination of
+/// specified fields.
+///
+/// The map here is String -> `MetadataValuesCount`
+/// where the String is an encoded key of the combination and values
+/// and `MetadataValuesCount` is a struct that holds the count, size, and a map of the values.
+///
+/// # Panics
+///
+/// Panics if the delivery path count keys fail to serialize.
 pub fn generate_count_map(
     events: &[Event],
     for_delivery_events: bool,
@@ -347,7 +349,7 @@ pub fn generate_count_map(
 
 // Some sinks pass events with an extra EventWrapper around them, use this function to first unwrap
 pub fn generate_count_map_event_wrapper(
-    events: &Vec<EventWrapper>,
+    events: &[EventWrapper],
     for_delivery_events: bool,
 ) -> HashMap<String, MetadataValuesCount> {
     let event_map: Vec<Event> = events
@@ -372,9 +374,11 @@ pub fn generate_count_map_from_event_array(
     }
 }
 
-fn compute_event_log(event: Event) -> VectorSinkEventMetadata {
-    let delivery_event =
-        VectorSinkDeliveryEvent::with_count_map(generate_count_map(&[event.clone()], true));
+fn compute_event_log(event: &Event) -> VectorSinkEventMetadata {
+    let delivery_event = VectorSinkDeliveryEvent::with_count_map(generate_count_map(
+        std::slice::from_ref(event),
+        true,
+    ));
     VectorSinkEventMetadata {
         delivery_event,
         file_send_event: None,
@@ -382,14 +386,16 @@ fn compute_event_log(event: Event) -> VectorSinkEventMetadata {
 }
 
 fn compute_event_log_with_file_event(
-    event: Event,
+    event: &Event,
     file_metadata: FileEventMetadata,
 ) -> VectorSinkEventMetadata {
-    let delivery_event =
-        VectorSinkDeliveryEvent::with_count_map(generate_count_map(&[event.clone()], true));
+    let delivery_event = VectorSinkDeliveryEvent::with_count_map(generate_count_map(
+        std::slice::from_ref(event),
+        true,
+    ));
     let file_send_event = Some(VectorFileSendEvent {
         file_metadata,
-        count_map: generate_count_map(&[event.clone()], false),
+        count_map: generate_count_map(std::slice::from_ref(event), false),
     });
     VectorSinkEventMetadata {
         delivery_event,
@@ -400,14 +406,14 @@ fn compute_event_log_with_file_event(
 // Impl EventWithEventLog for the used log events
 impl EventWithEventLog for Event {
     fn compute_event_log(&self) -> VectorSinkEventMetadata {
-        compute_event_log(self.clone())
+        compute_event_log(self)
     }
 
     fn compute_event_log_with_file_event(
         &self,
         file_metadata: FileEventMetadata,
     ) -> VectorSinkEventMetadata {
-        compute_event_log_with_file_event(self.clone(), file_metadata)
+        compute_event_log_with_file_event(self, file_metadata)
     }
 }
 
@@ -458,7 +464,7 @@ mod tests {
     fn mixed_batches_keep_vel_totals_but_emit_each_event_in_only_one_counter_form() {
         let mut event = event_with_delivery_count(7);
         let mut accounting = DeliveryPathAccounting::at_read(
-            DeliverySourceLabels {
+            &DeliverySourceLabels {
                 process_generation_id: "source-process".to_owned(),
                 time_parity: 3_600_000,
                 topic: "service-log".to_owned(),

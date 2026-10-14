@@ -255,7 +255,7 @@ mod test {
                 event.insert(&partial_path, index < 2 || !finish);
                 event.metadata_mut().set_delivery_event_count(count);
                 let mut accounting = DeliveryPathAccounting::at_read(
-                    DeliverySourceLabels {
+                    &DeliverySourceLabels {
                         process_generation_id: "source-process".to_owned(),
                         time_parity: if index < 2 { 0 } else { 3_600_000 },
                         topic: "service-log".to_owned(),

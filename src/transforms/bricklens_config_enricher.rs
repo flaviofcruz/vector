@@ -33,9 +33,9 @@
 //!   * Keeping the gRPC call in a vector component (vs. an operator sidecar writing an enrichment
 //!     file) also gives the routing decision + drop native vector `events_sent`/`events_received`/
 //!     `ComponentEventsDropped` telemetry in one place, rather than split across two processes.
-//!   Trade-off accepted: a cold miss blocks this event on a synchronous gRPC round-trip (bounded by
-//!   `request_timeout` + the single-flight + TTL cache below), rather than never blocking as a
-//!   preloaded table would.
+//!     Trade-off accepted: a cold miss blocks this event on a synchronous gRPC round-trip (bounded by
+//!     `request_timeout` + the single-flight + TTL cache below), rather than never blocking as a
+//!     preloaded table would.
 //!
 //! The bricklens-config gRPC `ConfigResolver` is implemented, reusing the `bricklens_ingest`
 //! sink's dynamic-proto transport (hyper + hyper_openssl mTLS, prost_reflect encode/decode).
@@ -864,13 +864,13 @@ impl CachedConfigResolver {
         // Single-flight: take (or create) the per-key async fetch lock and hold it across the fetch,
         // so concurrent cold misses for the same key collapse into ONE GetTelemetryConfig. Different
         // keys use different locks and still fetch in parallel.
-        let fetch_lock = self
-            .in_flight
-            .lock()
-            .expect("in_flight mutex poisoned")
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let fetch_lock = Arc::clone(
+            self.in_flight
+                .lock()
+                .expect("in_flight mutex poisoned")
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        );
         let _guard = fetch_lock.lock().await;
 
         // Re-check under the fetch lock: a caller we queued behind may have just populated the cache,

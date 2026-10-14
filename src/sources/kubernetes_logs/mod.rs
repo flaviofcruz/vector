@@ -907,7 +907,7 @@ fn attach_delivery_path_accounting(
         .iter()
         .filter(|&(path, condition)| condition.check(event.clone()).0)
         .map(|(path, condition)| path.clone());
-    let accounting = DeliveryPathAccounting::at_read(source, matching_paths);
+    let accounting = DeliveryPathAccounting::at_read(&source, matching_paths);
     let exposed_paths = accounting
         .counts
         .iter()

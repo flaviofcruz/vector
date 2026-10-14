@@ -125,7 +125,7 @@ fn delivery_path_accounting_preserves_source_labels_and_selection_through_disk_e
     first
         .metadata_mut()
         .set_delivery_path_accounting(Some(DeliveryPathAccounting::at_read(
-            source_labels.clone(),
+            &source_labels.clone(),
             ["archive".to_owned(), "online".to_owned()],
         )));
     let mut selected = first.clone();
@@ -142,7 +142,7 @@ fn delivery_path_accounting_preserves_source_labels_and_selection_through_disk_e
     later
         .metadata_mut()
         .set_delivery_path_accounting(Some(DeliveryPathAccounting::at_read(
-            later_source_labels,
+            &later_source_labels,
             ["archive".to_owned()],
         )));
     selected.metadata_mut().merge(later.into_parts().1);

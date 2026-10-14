@@ -1032,7 +1032,7 @@ impl IngestorProcess {
                 ("key".to_string(), msg.key.clone()),
                 ("project".to_string(), self.state.project.clone()),
             ]);
-            let _ = cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
+            cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
         }
 
         result

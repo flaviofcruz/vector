@@ -894,7 +894,7 @@ impl IngestorProcess {
                 ("blob".to_string(), msg.blob.clone()),
                 ("account".to_string(), target_account),
             ]);
-            let _ = cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
+            cb_client.spawn_notify(&result, processing_start.elapsed(), message_fields);
         }
 
         result

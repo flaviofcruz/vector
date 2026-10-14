@@ -133,6 +133,10 @@ impl DeferredSourceShutdowns {
 
     /// Triggers shutdown of all deferred sources and returns a future that resolves once
     /// all have completed or been force-shutdown at the given deadline.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a deferred source's shutdown-complete tripwire or force trigger is missing.
     pub fn shutdown_all(self, deadline: Option<Instant>) -> impl Future<Output = ()> {
         let mut complete_futures = Vec::new();
 

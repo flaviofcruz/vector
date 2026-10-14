@@ -41,17 +41,6 @@ impl FileEventMetadata {
             bucket,
         }
     }
-
-    #[must_use]
-    pub fn default() -> Self {
-        Self {
-            bytes: 0,
-            events_len: 0,
-            blob: String::new(),
-            container: String::new(),
-            bucket: None,
-        }
-    }
 }
 
 // Struct for vector file upload events (sending, uploaded)
@@ -104,7 +93,7 @@ impl VectorFileSendEvent {
         }
     }
 
-    pub fn emit_error_event(&self, error: String) {
+    pub fn emit_error_event(&self, error: &str) {
         if enable_file_send_events() {
             info!(
                 message = format!("File send error: {}", error),

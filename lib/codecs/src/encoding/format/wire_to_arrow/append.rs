@@ -299,8 +299,8 @@ pub(super) fn append_scalar_from_wire(
 ///   - out-of-range value -> `UNKNOWN_ENUM_VALUE_<enum>_<n>` placeholder, never
 ///     a row drop (matches ScalaPB's `generate_unrecognized_enum_value` codegen);
 ///   - a wrong wire type (enum must be a varint) -> `WireTypeMismatch`.
-/// The absent/proto3-default case (elided zero value -> null) is handled by the
-/// builder-tree's `finalize_row`, not here.
+///     The absent/proto3-default case (elided zero value -> null) is handled by the
+///     builder-tree's `finalize_row`, not here.
 #[inline]
 pub(super) fn append_enum_string_from_wire(
     desc: &prost_reflect::EnumDescriptor,

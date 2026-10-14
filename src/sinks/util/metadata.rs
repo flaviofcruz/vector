@@ -63,7 +63,7 @@ impl RequestMetadataBuilder {
                 .map(|event| event.compute_event_log())
                 .collect::<Vec<_>>()
         };
-        builder.event_log_metadata = Some(combine_sink_event_metadata(metadatas));
+        builder.event_log_metadata = Some(combine_sink_event_metadata(&metadatas));
         builder
     }
 

@@ -207,9 +207,9 @@ impl tower::Service<HttpRequest<PartitionKey>> for TrackedHttpService {
         let mut guard = RequestGuard {
             ip,
             generation,
-            pending: self.pending.clone(),
+            pending: Arc::clone(&self.pending),
             discover_tx: self.discover_tx.clone(),
-            shared: self.shared.clone(),
+            shared: Arc::clone(&self.shared),
             completed: false,
         };
 
@@ -328,7 +328,7 @@ impl HeadlessService {
                     generation,
                     pending: Arc::new(AtomicUsize::new(0)),
                     discover_tx: discover_tx.clone(),
-                    shared: shared.clone(),
+                    shared: Arc::clone(&shared),
                 };
                 let _ = discover_tx.send(Ok(Change::Insert(ip, service)));
             }
@@ -367,7 +367,7 @@ impl HeadlessService {
         let refresh_secs = dns_refresh_interval_secs.unwrap_or(DEFAULT_DNS_REFRESH_SECS);
 
         spawn_dns_refresh_task(
-            shared.clone(),
+            Arc::clone(&shared),
             discover_tx,
             client,
             endpoint,
@@ -627,7 +627,7 @@ fn reconcile_endpoints(
             generation,
             pending: Arc::new(AtomicUsize::new(0)),
             discover_tx: discover_tx.clone(),
-            shared: shared.clone(),
+            shared: Arc::clone(shared),
         };
         let _ = discover_tx.send(Ok(Change::Insert(ip, service)));
     }

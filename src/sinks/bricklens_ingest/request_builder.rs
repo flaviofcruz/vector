@@ -70,10 +70,10 @@ impl RequestBuilder<Vec<Event>> for BricklensIngestRequestBuilder {
     ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
         let finalizers = input
             .iter()
-            .filter_map(|event| match event {
-                Event::Log(log) => Some(log.metadata().finalizers().clone()),
-                Event::Metric(metric) => Some(metric.metadata().finalizers().clone()),
-                Event::Trace(trace) => Some(trace.metadata().finalizers().clone()),
+            .map(|event| match event {
+                Event::Log(log) => log.metadata().finalizers().clone(),
+                Event::Metric(metric) => metric.metadata().finalizers().clone(),
+                Event::Trace(trace) => trace.metadata().finalizers().clone(),
             })
             .fold(EventFinalizers::default(), |mut acc, finalizers| {
                 acc.merge(finalizers);

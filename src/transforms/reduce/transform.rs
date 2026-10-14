@@ -455,7 +455,7 @@ mod test {
             for (index, message) in ["aaaa", "bb", "cc"].into_iter().enumerate() {
                 let mut event = LogEvent::from(message);
                 let mut accounting = DeliveryPathAccounting::at_read(
-                    DeliverySourceLabels {
+                    &DeliverySourceLabels {
                         process_generation_id: "process".into(),
                         time_parity: if index < 2 { 0 } else { 3_600_000 },
                         topic: "service-log".into(),

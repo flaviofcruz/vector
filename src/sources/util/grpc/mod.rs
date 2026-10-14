@@ -46,10 +46,10 @@ where
     let stream = listener.accept_stream();
 
     info!(%address, "Building gRPC server.");
-    if max_concurrent_requests.is_some() {
+    if let Some(max_concurrent_requests) = max_concurrent_requests {
         Server::builder()
             // Ok to use ConcurrencyLimitLayer because service will be crated once in Server::serve_with_shutdown using all these layers.
-            .layer(ConcurrencyLimitLayer::new(max_concurrent_requests.unwrap()))
+            .layer(ConcurrencyLimitLayer::new(max_concurrent_requests))
             .layer(build_grpc_trace_layer(span.clone()))
             // This layer explicitly decompresses payloads, if compressed, and reports the number of message bytes we've
             // received if the message is processed successfully, aka `BytesReceived`. We do this because otherwise the only

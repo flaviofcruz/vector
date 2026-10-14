@@ -1037,7 +1037,6 @@ mod tests {
                 pod_ip: Some(ip.to_string()),
                 ..Default::default()
             }),
-            ..Default::default()
         })
     }
 
@@ -1347,7 +1346,6 @@ mod tests {
                 pod_ip: Some(ip.to_string()),
                 ..Default::default()
             }),
-            ..Default::default()
         })
     }
 
@@ -1733,7 +1731,6 @@ mod tests {
                 pod_ip: Some(ip.to_string()),
                 ..Default::default()
             }),
-            ..Default::default()
         })
     }
 
@@ -1819,7 +1816,6 @@ mod tests {
                 ..Default::default()
             }),
             status: None,
-            ..Default::default()
         });
         let endpoints =
             extract_endpoints_by_port_regex(&pod, &port_re("metrics.*"), UNLIMITED, &no_labels());

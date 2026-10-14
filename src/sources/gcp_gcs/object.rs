@@ -557,7 +557,7 @@ mod tests {
         // The source name metadata must be set.
         let source_type = log
             .get(metadata_path!("vector", "source_type"))
-            .and_then(|v| v.as_str().map(|s| s.to_owned()));
+            .and_then(|v| v.as_str());
         assert_eq!(
             source_type.as_deref(),
             Some(GcpGcsConfig::NAME),
@@ -627,7 +627,7 @@ mod tests {
         // log_type from the direct-ingest message is stamped as source metadata.
         let log_type = log
             .get(metadata_path!(GcpGcsConfig::NAME, "log_type"))
-            .and_then(|v| v.as_str().map(|s| s.to_owned()));
+            .and_then(|v| v.as_str());
         assert_eq!(log_type.as_deref(), Some("cp_logs"));
         assert!(
             log.get("object").is_none(),
@@ -640,7 +640,7 @@ mod tests {
 
         let source_type = log
             .get(metadata_path!("vector", "source_type"))
-            .and_then(|v| v.as_str().map(|s| s.to_owned()));
+            .and_then(|v| v.as_str());
         assert_eq!(source_type.as_deref(), Some(GcpGcsConfig::NAME));
     }
 

@@ -248,12 +248,12 @@ mod tests {
         body: &'static str,
     ) -> Arc<AtomicUsize> {
         let hits = Arc::new(AtomicUsize::new(0));
-        let hits_srv = hits.clone();
+        let hits_srv = Arc::clone(&hits);
         let make = make_service_fn(move |_| {
-            let hits = hits_srv.clone();
+            let hits = Arc::clone(&hits_srv);
             async move {
                 Ok::<_, Infallible>(service_fn(move |_req| {
-                    let hits = hits.clone();
+                    let hits = Arc::clone(&hits);
                     async move {
                         let n = hits.fetch_add(1, Ordering::SeqCst);
                         let status = if n < fail_times {

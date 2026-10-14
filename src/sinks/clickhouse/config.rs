@@ -1166,15 +1166,15 @@ mod tests {
             hang: bool,
         ) -> ServerCounters {
             let counters = ServerCounters::default();
-            let hits_srv = counters.hits.clone();
-            let in_flight_srv = counters.in_flight.clone();
+            let hits_srv = Arc::clone(&counters.hits);
+            let in_flight_srv = Arc::clone(&counters.in_flight);
             let make = make_service_fn(move |_| {
-                let hits = hits_srv.clone();
-                let in_flight = in_flight_srv.clone();
+                let hits = Arc::clone(&hits_srv);
+                let in_flight = Arc::clone(&in_flight_srv);
                 async move {
                     Ok::<_, Infallible>(service_fn(move |_req| {
-                        let hits = hits.clone();
-                        let in_flight = in_flight.clone();
+                        let hits = Arc::clone(&hits);
+                        let in_flight = Arc::clone(&in_flight);
                         async move {
                             hits.fetch_add(1, Ordering::SeqCst);
                             in_flight.fetch_add(1, Ordering::SeqCst);

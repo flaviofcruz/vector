@@ -267,7 +267,7 @@ impl Prepare {
         let cure_reference_path = &self.repo_root.join("website").join("cue").join("reference");
         let versions_cue_path = cure_reference_path.join("versions.cue");
         if !versions_cue_path.is_file() {
-            return Err(anyhow!("{versions_cue_path:?} not found"));
+            return Err(anyhow!("{} not found", versions_cue_path.display()));
         }
 
         let vector_version = &self.new_vector_version;
@@ -388,7 +388,7 @@ impl Prepare {
         let version = &self.new_vector_version;
         let cue_path = releases_path.join(format!("{version}.cue"));
         if !cue_path.is_file() {
-            return Err(anyhow!("{cue_path:?} not found"));
+            return Err(anyhow!("{} not found", cue_path.display()));
         }
 
         let vrl_changelog = get_latest_vrl_tag_and_changelog()?;

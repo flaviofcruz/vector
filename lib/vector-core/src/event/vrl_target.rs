@@ -765,7 +765,7 @@ mod test {
             DeliveryPathAccounting, DeliverySourceLabels,
         };
         let mut accounting = DeliveryPathAccounting::at_read(
-            DeliverySourceLabels {
+            &DeliverySourceLabels {
                 process_generation_id: "process".into(),
                 time_parity: 0,
                 topic: "service-log".into(),

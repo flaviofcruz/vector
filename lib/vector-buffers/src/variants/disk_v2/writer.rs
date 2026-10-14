@@ -1155,16 +1155,18 @@ where
                                             try_as_record_archive(mmap.as_ref())
                                                 .ok()
                                                 .and_then(|r| decode_record_payload::<T>(r).ok())
-                                                .map(|item| {
-                                                    let ec = u64::try_from(item.event_count())
-                                                        .unwrap_or(1);
-                                                    id.wrapping_add(ec.saturating_sub(1))
-                                                        <= acked_frontier
-                                                })
                                                 // Valid checksum but undecodable payload: we still saw a
                                                 // valid record ID, so honor the same rule -- wait only if that
                                                 // ID is above the frontier, otherwise reclaim.
-                                                .unwrap_or_else(|| id <= acked_frontier)
+                                                .map_or_else(
+                                                    || id <= acked_frontier,
+                                                    |item| {
+                                                        let ec = u64::try_from(item.event_count())
+                                                            .unwrap_or(1);
+                                                        id.wrapping_add(ec.saturating_sub(1))
+                                                            <= acked_frontier
+                                                    },
+                                                )
                                         }
                                         // Torn/corrupt last record: no ID we can trust, so reclaim.
                                         _ => true,

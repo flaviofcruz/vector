@@ -33,9 +33,7 @@ impl VectorSinkEventMetadata {
 // Combines both delivery and file send events
 // NOTE: This assumes that all the extra file send metadata is the same (filename, etc.)
 #[must_use]
-pub fn combine_sink_event_metadata(
-    events: Vec<VectorSinkEventMetadata>,
-) -> VectorSinkEventMetadata {
+pub fn combine_sink_event_metadata(events: &[VectorSinkEventMetadata]) -> VectorSinkEventMetadata {
     let mut combined = VectorSinkEventMetadata::new();
     combined.delivery_event = combine_sink_delivery_events(
         events

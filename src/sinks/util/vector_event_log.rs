@@ -84,7 +84,7 @@ where
                         if let Some(file_send_event_log) =
                             event_log_metadata.file_send_event.as_ref()
                         {
-                            file_send_event_log.emit_error_event(format!(
+                            file_send_event_log.emit_error_event(&format!(
                                 "request completed with {:?}",
                                 response.event_status()
                             ));
@@ -94,7 +94,7 @@ where
                         if let Some(file_send_event_log) =
                             event_log_metadata.file_send_event.as_ref()
                         {
-                            file_send_event_log.emit_error_event(format!("{:?}", error));
+                            file_send_event_log.emit_error_event(&format!("{:?}", error));
                         }
                     }
                 }

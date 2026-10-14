@@ -1247,19 +1247,19 @@ mod tests {
         let request_log: RequestLog = Arc::new(Mutex::new(Vec::new()));
         let call_count = Arc::new(AtomicU32::new(0));
 
-        let log_clone = request_log.clone();
+        let log_clone = Arc::clone(&request_log);
         let codes = Arc::new(status_codes);
-        let count_clone = call_count.clone();
+        let count_clone = Arc::clone(&call_count);
 
         let make_svc = make_service_fn(move |_| {
-            let log = log_clone.clone();
-            let codes = codes.clone();
-            let count = count_clone.clone();
+            let log = Arc::clone(&log_clone);
+            let codes = Arc::clone(&codes);
+            let count = Arc::clone(&count_clone);
             async move {
                 Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
-                    let log = log.clone();
-                    let codes = codes.clone();
-                    let count = count.clone();
+                    let log = Arc::clone(&log);
+                    let codes = Arc::clone(&codes);
+                    let count = Arc::clone(&count);
                     async move {
                         let method = req.method().to_string();
                         let uri = req.uri().to_string();
@@ -1395,7 +1395,7 @@ mod tests {
         assert_eq!(req.uri, "/v2/files/f-integ-1/mark-successful");
         assert!(req.body.is_empty(), "success endpoint should have no body");
         assert!(
-            req.headers.get("content-type").is_none(),
+            !req.headers.contains_key("content-type"),
             "Content-Type must not be set when body is empty"
         );
 
@@ -1552,7 +1552,7 @@ mod tests {
 
         // Empty-body request must NOT carry Content-Type
         assert!(
-            requests[0].headers.get("content-type").is_none(),
+            !requests[0].headers.contains_key("content-type"),
             "Content-Type must be absent when body is empty"
         );
 

@@ -86,6 +86,10 @@ pub const DELIVERY_METHOD_FILE: &str = "VECTOR_WOODCHUCK_V2_FILE";
 /// archived/rotated form (`<prefix>.<TableNameCamelCase>[LaMigration].pb[.base64][.gz]`),
 /// returning the dash-cased table name (e.g. `"service-request-log"`).
 /// Returns `None` for filenames that do not match either form.
+///
+/// # Panics
+///
+/// Panics if the built-in topic extraction regex fails to compile.
 pub fn extract_topic_from_source_filename(path: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
@@ -622,7 +626,7 @@ impl DeliveryEventSingleton {
             path,
             bytes_read,
             lines_read,
-            source_context,
+            source_context.as_ref(),
             source_type,
             time_parity,
         );
@@ -695,7 +699,7 @@ impl DeliveryEventSingleton {
         path: String,
         bytes_read: usize,
         lines_read: usize,
-        source_context: &Option<HashMap<String, String>>,
+        source_context: Option<&HashMap<String, String>>,
         source_type: &'static str,
         time_parity: i64,
     ) {
@@ -703,7 +707,7 @@ impl DeliveryEventSingleton {
         let entry = reads
             .entry((source_type, path, time_parity))
             .or_insert_with(|| ReadAccum {
-                source_context: source_context.clone().unwrap_or_default(),
+                source_context: source_context.cloned().unwrap_or_default(),
                 bytes_read: 0,
                 lines_read: 0,
                 // Captured once per key: the source component span is stable per path.
@@ -778,6 +782,10 @@ impl DeliveryEventSingleton {
     /// logs are batched here; the `delivery_events_total` counters are emitted
     /// inline at the event sites. Each leg lock is taken only to swap out its
     /// map, so `info!` never runs while a registry lock is held.
+    ///
+    /// # Panics
+    ///
+    /// Panics if one of the internal delivery registry locks is poisoned.
     pub fn flush(&self) {
         let reads = std::mem::take(&mut *self.reads.lock().expect("delivery reads lock poisoned"));
         let staged =
@@ -1493,7 +1501,7 @@ mod read_accumulation_tests {
             TP,
         );
         let enrolled =
-            DeliveryPathAccounting::at_read(source, ["blob".to_owned(), "online".to_owned()]);
+            DeliveryPathAccounting::at_read(&source, ["blob".to_owned(), "online".to_owned()]);
         for accounting in [
             None,
             Some(enrolled),
@@ -1566,7 +1574,7 @@ mod read_accumulation_tests {
             "/f.log".to_string(),
             10,
             1,
-            &None::<HashMap<String, String>>,
+            None::<HashMap<String, String>>.as_ref(),
             SOURCE_TYPE_FILE,
             TP,
         );
@@ -1574,7 +1582,7 @@ mod read_accumulation_tests {
             "/f.log".to_string(),
             25,
             2,
-            &None::<HashMap<String, String>>,
+            None::<HashMap<String, String>>.as_ref(),
             SOURCE_TYPE_FILE,
             TP,
         );
@@ -1603,7 +1611,7 @@ mod read_accumulation_tests {
             "/f.log".to_string(),
             10,
             1,
-            &None::<HashMap<String, String>>,
+            None::<HashMap<String, String>>.as_ref(),
             SOURCE_TYPE_FILE,
             TP,
         );
@@ -1611,7 +1619,7 @@ mod read_accumulation_tests {
             "/f.log".to_string(),
             10,
             1,
-            &None::<HashMap<String, String>>,
+            None::<HashMap<String, String>>.as_ref(),
             SOURCE_TYPE_FILE,
             tp_next,
         );
@@ -1860,7 +1868,7 @@ mod read_accumulation_tests {
             "/f.log".to_string(),
             10,
             1,
-            &None::<HashMap<String, String>>,
+            None::<HashMap<String, String>>.as_ref(),
             SOURCE_TYPE_FILE,
             TP,
         );

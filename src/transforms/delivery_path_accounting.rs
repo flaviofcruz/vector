@@ -199,7 +199,7 @@ mod tests {
         event
             .metadata_mut()
             .set_delivery_path_accounting(Some(DeliveryPathAccounting::at_read(
-                DeliverySourceLabels {
+                &DeliverySourceLabels {
                     process_generation_id: "source-process".to_owned(),
                     time_parity: 3_600_000,
                     topic: "service-log".to_owned(),
