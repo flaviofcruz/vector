@@ -732,7 +732,7 @@ where
                                 };
 
                                 let mut bytes_read: usize = 0;
-                                while watcher.get_file_position() < target {
+                                while watcher.get_checkpoint_position() < target {
                                     match watcher.read_line().await {
                                         Ok(RawLineResult {
                                             raw_line: Some(line),
@@ -778,7 +778,7 @@ where
                                             // path, which this handle can never reach.
                                             drain_targets.swap_remove(&file_id);
                                             checkpoints
-                                                .update(file_id, watcher.get_file_position());
+                                                .update(file_id, watcher.get_checkpoint_position());
                                             if let Err(error) =
                                                 drain_checkpointer.write_checkpoints().await
                                             {
@@ -801,10 +801,10 @@ where
 
                                 // Persist checkpoint once a file reaches its drain target.
                                 if drain_targets.contains_key(&file_id)
-                                    && watcher.get_file_position() >= target
+                                    && watcher.get_checkpoint_position() >= target
                                 {
                                     drain_targets.swap_remove(&file_id);
-                                    checkpoints.update(file_id, watcher.get_file_position());
+                                    checkpoints.update(file_id, watcher.get_checkpoint_position());
                                     if let Err(error) = drain_checkpointer.write_checkpoints().await
                                     {
                                         error!(?error, "Error writing checkpoints during drain");
@@ -2986,5 +2986,49 @@ mod tests {
             "read loop must not advance the checkpoint for un-forwarded data; \
              expected checkpoint 0, got {position}"
         );
+    }
+
+    /// A live (still findable) file whose last bytes at shutdown are an unterminated line: the
+    /// drain must emit those buffered bytes before completing, and must not checkpoint past
+    /// bytes it hasn't emitted, so the next run neither loses nor re-delivers them.
+    #[tokio::test]
+    async fn drain_on_shutdown_emits_live_file_partial_line_exactly_once() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+        let log_path = tmp.path().join("test.log");
+        fs::write(&log_path, "line 1\nline 2\nline 3\npartial")
+            .await
+            .unwrap();
+
+        async fn drain_once(log_path: &Path, data_dir: &Path) -> Vec<Bytes> {
+            let file_server =
+                make_file_server(vec![log_path.to_path_buf()], data_dir.to_path_buf(), true);
+            let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+            let collector = tokio::spawn(async move {
+                let mut lines = Vec::new();
+                while let Some(batch) = rx.next().await {
+                    lines.extend(batch.into_iter().map(|line| line.text));
+                }
+                lines
+            });
+            file_server
+                .run(
+                    tx,
+                    futures::future::ready(()),
+                    futures::future::ready(()),
+                    Checkpointer::new(data_dir),
+                )
+                .await
+                .expect("FileServer::run failed");
+            collector.await.unwrap()
+        }
+
+        assert_eq!(
+            drain_once(&log_path, &data_dir).await,
+            vec!["line 1", "line 2", "line 3", "partial"]
+        );
+        // The checkpoint covers exactly what was emitted, so a restart re-delivers nothing.
+        assert!(drain_once(&log_path, &data_dir).await.is_empty());
     }
 }

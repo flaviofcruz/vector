@@ -255,6 +255,13 @@ impl FileWatcher {
         self.file_position
     }
 
+    /// The read position minus bytes buffered for a line still awaiting its delimiter, i.e. the
+    /// end of the last line `read_line` returned. Checkpoint here, not at `get_file_position`, or
+    /// a restart skips the buffered bytes.
+    pub fn get_checkpoint_position(&self) -> FilePosition {
+        self.file_position.saturating_sub(self.buf.len() as u64)
+    }
+
     /// Read a single line from the underlying file
     ///
     /// This function will attempt to read a new line from its file, blocking,
