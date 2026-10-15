@@ -22,6 +22,8 @@ impl InternalEvent for VectorStarted {
         // at the first `:8687/metrics` scrape even on pods that never reload.
         counter!("reloaded_total").increment(0);
         gauge!("last_config_reload_success").set(1.0);
+        // Initialize reload-in-progress gauge so the series exists at first scrape.
+        gauge!("config_reload_in_progress").set(0.0);
     }
 }
 

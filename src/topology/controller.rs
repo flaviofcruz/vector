@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::{future::Future, pin::pin, sync::Arc, time::Duration};
 
 use futures_util::FutureExt as _;
+use metrics::gauge;
 use tokio::sync::{Mutex, MutexGuard};
 
 #[cfg(feature = "api")]
@@ -60,6 +61,31 @@ pub enum ReloadOutcome {
     FatalError(ShutdownError),
 }
 
+/// How often an in-flight reload re-reports `config_reload_in_progress`. Idle metrics expire
+/// (300s by default), so a reload that hangs must keep refreshing the gauge to stay visible.
+const RELOAD_IN_PROGRESS_REFRESH: Duration = Duration::from_secs(30);
+
+/// Reports `config_reload_in_progress` = 1 while `reload` is pending and 0 once it finishes or is
+/// dropped. Completion-only reload metrics never record a reload that hangs (ES-2267297).
+async fn with_reload_in_progress_gauge<F: Future>(reload: F, refresh: Duration) -> F::Output {
+    struct ResetOnDrop;
+    impl Drop for ResetOnDrop {
+        fn drop(&mut self) {
+            gauge!("config_reload_in_progress").set(0.0);
+        }
+    }
+    let _reset = ResetOnDrop;
+
+    let mut reload = pin!(reload);
+    let mut refresh = tokio::time::interval(refresh);
+    loop {
+        tokio::select! {
+            output = &mut reload => return output,
+            _ = refresh.tick() => gauge!("config_reload_in_progress").set(1.0),
+        }
+    }
+}
+
 impl TopologyController {
     pub async fn reload(&mut self, mut new_config: config::Config) -> ReloadOutcome {
         new_config
@@ -105,10 +131,12 @@ impl TopologyController {
             }
         }
 
-        match self
-            .topology
-            .reload_config_and_respawn(new_config, self.extra_context.clone())
-            .await
+        match with_reload_in_progress_gauge(
+            self.topology
+                .reload_config_and_respawn(new_config, self.extra_context.clone()),
+            RELOAD_IN_PROGRESS_REFRESH,
+        )
+        .await
         {
             Ok(()) => {
                 #[cfg(feature = "api")]
@@ -196,5 +224,70 @@ impl TopologyController {
                 continue;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use vector_lib::{
+        event::{Metric, MetricValue},
+        metrics::Controller,
+    };
+
+    use super::with_reload_in_progress_gauge;
+
+    fn reload_in_progress() -> Option<f64> {
+        Controller::get()
+            .unwrap()
+            .capture_metrics()
+            .into_iter()
+            .find(|metric: &Metric| metric.name() == "config_reload_in_progress")
+            .map(|metric| match metric.value() {
+                MetricValue::Gauge { value } => *value,
+                other => panic!("unexpected metric value {other:?}"),
+            })
+    }
+
+    #[tokio::test]
+    async fn dropped_reload_resets_gauge() {
+        vector_lib::metrics::init_test();
+        let controller = Controller::get().unwrap();
+        controller.reset();
+        controller.set_expiry(Some(0.2), Vec::new()).unwrap();
+
+        let hung_reload =
+            with_reload_in_progress_gauge(std::future::pending::<()>(), Duration::from_millis(50));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), hung_reload)
+                .await
+                .is_err()
+        );
+        // Dropping the reload (the timeout above did) resets the gauge.
+        assert_eq!(reload_in_progress(), Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn stalled_reload_reports_in_progress_until_it_finishes() {
+        vector_lib::metrics::init_test();
+        let controller = Controller::get().unwrap();
+        controller.reset();
+        controller.set_expiry(Some(0.2), Vec::new()).unwrap();
+
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let reload = tokio::spawn(async move {
+            with_reload_in_progress_gauge(finished, Duration::from_millis(50)).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(reload_in_progress(), Some(1.0));
+        // Expiry counts from the last capture that saw a change; several periods pass while the
+        // reload is stuck.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(reload_in_progress(), Some(1.0));
+
+        finish.send(()).unwrap();
+        reload.await.unwrap().unwrap();
+        assert_eq!(reload_in_progress(), Some(0.0));
     }
 }
