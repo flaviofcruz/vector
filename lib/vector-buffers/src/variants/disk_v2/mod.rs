@@ -171,11 +171,13 @@
 
 use core::fmt;
 use std::{
+    env,
     error::Error,
     marker::PhantomData,
-    num::NonZeroU64,
+    num::{NonZeroU64, ParseIntError},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -194,7 +196,7 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
-use self::ledger::Ledger;
+use self::{common::DEFAULT_READER_PROGRESS_RECHECK_INTERVAL, ledger::Ledger};
 pub use self::{
     common::{DiskBufferConfig, DiskBufferConfigBuilder},
     io::{Filesystem, ProductionFilesystem},
@@ -210,6 +212,54 @@ use crate::{
         channel::{ReceiverAdapter, SenderAdapter},
     },
 };
+
+const READER_PROGRESS_RECHECK_ENV_VAR: &str = "VECTOR_DISK_V2_READER_RECHECK_SECS";
+
+static READER_PROGRESS_RECHECK_INTERVAL: LazyLock<Option<Duration>> =
+    LazyLock::new(reader_progress_recheck_interval_from_env);
+
+fn parse_reader_progress_recheck_interval(
+    value: Option<&str>,
+) -> Result<Option<Duration>, ParseIntError> {
+    let Some(value) = value else {
+        return Ok(Some(DEFAULT_READER_PROGRESS_RECHECK_INTERVAL));
+    };
+
+    let seconds = value.parse::<i64>()?;
+    if seconds <= 0 {
+        Ok(None)
+    } else {
+        let seconds = u64::try_from(seconds).expect("positive i64 should fit into u64");
+        Ok(Some(Duration::from_secs(seconds)))
+    }
+}
+
+fn reader_progress_recheck_interval_from_env() -> Option<Duration> {
+    match env::var(READER_PROGRESS_RECHECK_ENV_VAR) {
+        Ok(value) => match parse_reader_progress_recheck_interval(Some(&value)) {
+            Ok(interval) => interval,
+            Err(error) => {
+                warn!(
+                    environment_variable = READER_PROGRESS_RECHECK_ENV_VAR,
+                    value,
+                    %error,
+                    default_seconds = DEFAULT_READER_PROGRESS_RECHECK_INTERVAL.as_secs(),
+                    "Invalid disk buffer reader recheck interval; using the default."
+                );
+                Some(DEFAULT_READER_PROGRESS_RECHECK_INTERVAL)
+            }
+        },
+        Err(env::VarError::NotPresent) => Some(DEFAULT_READER_PROGRESS_RECHECK_INTERVAL),
+        Err(env::VarError::NotUnicode(_)) => {
+            warn!(
+                environment_variable = READER_PROGRESS_RECHECK_ENV_VAR,
+                default_seconds = DEFAULT_READER_PROGRESS_RECHECK_INTERVAL.as_secs(),
+                "Disk buffer reader recheck interval is not valid Unicode; using the default."
+            );
+            Some(DEFAULT_READER_PROGRESS_RECHECK_INTERVAL)
+        }
+    }
+}
 
 /// Error that occurred when creating/loading a disk buffer.
 #[derive(Debug, Snafu)]
@@ -359,6 +409,7 @@ where
     let buffer_path = get_disk_v2_data_dir_path(data_dir, id);
     let config = DiskBufferConfigBuilder::from_path(buffer_path)
         .max_buffer_size(max_size.get())
+        .reader_progress_recheck_interval(*READER_PROGRESS_RECHECK_INTERVAL)
         .build()?;
     Buffer::from_config(config, usage_handle)
         .await

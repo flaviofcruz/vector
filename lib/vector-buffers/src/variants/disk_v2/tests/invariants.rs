@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use tokio_test::{assert_pending, assert_ready, task::spawn};
 use tracing::Instrument;
@@ -11,6 +13,7 @@ use crate::{
     variants::disk_v2::{
         common::{DEFAULT_FLUSH_INTERVAL, MAX_FILE_ID},
         tests::{
+            create_buffer_v2_with_reader_progress_recheck_interval,
             create_buffer_v2_with_write_buffer_size, create_default_buffer_v2,
             get_corrected_max_record_size, get_minimum_data_file_size_for_record_payload,
         },
@@ -106,6 +109,113 @@ async fn publishing_writer_progress_updates_ledger_before_waking_reader() {
 
     let parent = trace_span!("publishing_writer_progress_updates_ledger_before_waking_reader");
     fut.instrument(parent.or_current()).await;
+}
+
+#[tokio::test]
+async fn reader_watchdog_rechecks_after_published_progress_without_notification() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (_writer, reader, ledger) =
+                create_buffer_v2_with_reader_progress_recheck_interval::<_, SizedRecord>(
+                    data_dir,
+                    Some(Duration::from_secs(5)),
+                )
+                .await;
+            let expected_next_record_id = ledger.state().get_next_writer_record_id();
+            let writer_file_id = ledger.get_current_writer_file_id();
+
+            tokio::time::pause();
+
+            let mut wait_for_progress =
+                spawn(reader.wait_for_writer_progress(expected_next_record_id, writer_file_id));
+            assert_pending!(wait_for_progress.poll());
+
+            // Publish state without sending the corresponding notification, simulating a missed wake.
+            unsafe {
+                ledger
+                    .state()
+                    .unsafe_set_writer_next_record_id(expected_next_record_id.wrapping_add(1));
+            }
+
+            tokio::time::advance(Duration::from_secs(4)).await;
+            assert_pending!(wait_for_progress.poll());
+
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert_ready!(wait_for_progress.poll());
+
+            tokio::time::resume();
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disabled_reader_watchdog_waits_for_notification() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (_writer, reader, ledger) =
+                create_buffer_v2_with_reader_progress_recheck_interval::<_, SizedRecord>(
+                    data_dir, None,
+                )
+                .await;
+            let expected_next_record_id = ledger.state().get_next_writer_record_id();
+            let writer_file_id = ledger.get_current_writer_file_id();
+
+            tokio::time::pause();
+
+            let mut wait_for_progress =
+                spawn(reader.wait_for_writer_progress(expected_next_record_id, writer_file_id));
+            assert_pending!(wait_for_progress.poll());
+
+            // Publishing state without a notification must not wake a disabled watchdog.
+            unsafe {
+                ledger
+                    .state()
+                    .unsafe_set_writer_next_record_id(expected_next_record_id.wrapping_add(1));
+            }
+            tokio::time::advance(Duration::from_secs(120)).await;
+            assert_pending!(wait_for_progress.poll());
+
+            ledger.notify_writer_waiters();
+            assert_ready!(wait_for_progress.poll());
+
+            tokio::time::resume();
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn reader_watchdog_stays_asleep_without_published_progress() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+
+        async move {
+            let (_writer, reader, ledger) =
+                create_default_buffer_v2::<_, SizedRecord>(data_dir).await;
+            let expected_next_record_id = ledger.state().get_next_writer_record_id();
+            let writer_file_id = ledger.get_current_writer_file_id();
+
+            tokio::time::pause();
+
+            let mut wait_for_progress =
+                spawn(reader.wait_for_writer_progress(expected_next_record_id, writer_file_id));
+            assert_pending!(wait_for_progress.poll());
+
+            tokio::time::advance(Duration::from_secs(60)).await;
+            assert_pending!(wait_for_progress.poll());
+
+            tokio::time::advance(Duration::from_secs(60)).await;
+            assert_pending!(wait_for_progress.poll());
+
+            tokio::time::resume();
+        }
+    })
+    .await;
 }
 
 #[tokio::test]

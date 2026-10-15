@@ -16,6 +16,32 @@ This repository is Databricks' `v0.53-custom` Vector fork. Do not assume
   again before pushing.
 - Check `git status --short --branch` before editing and before pushing.
 
+## Push and PR Creation Flow
+
+When the user asks to push changes or open a PR (including requests such as
+"commit and push"), complete this entire sequence before returning to the
+user:
+
+1. Make and validate the code or repository changes.
+2. Commit the changes without the `README.databricks.md` entry, then push the
+   branch.
+3. Open the PR against `v0.53-custom` so the final PR number and URL exist.
+4. Fetch `origin/v0.53-custom` again. If it moved, rebase the PR branch before
+   choosing the changelog number. Read the refreshed end of
+   `README.databricks.md` and use the next consecutive number.
+5. Add the changelog entry with the PR's exact URL. Never commit a placeholder
+   such as `pull/TODO`, and never reuse a number already present on the fresh
+   base.
+6. Commit the changelog update as a separate commit and push again. If step 4
+   required a rebase, use `--force-with-lease` rather than an unguarded force
+   push.
+7. Verify that the PR head includes the changelog commit and that the entry's
+   number and URL are correct. Only then report the push or PR as complete.
+
+Do not return immediately after the initial push or PR creation; the follow-up
+changelog commit, second push, and verification are part of the requested
+workflow.
+
 ## Databricks Changelog
 
 - Do not add upstream `changelog.d/*` fragments for Databricks-only changes.

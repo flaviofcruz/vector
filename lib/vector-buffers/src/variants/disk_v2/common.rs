@@ -30,6 +30,10 @@ pub const MINIMUM_MAX_RECORD_SIZE: usize = align16(RECORD_HEADER_LEN + 1);
 // have it configured.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How often a reader caught up to the writer rechecks published progress if no notification
+/// arrives.
+pub(crate) const DEFAULT_READER_PROGRESS_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 // Using 256KB as it aligns nicely with the I/O size exposed by major cloud providers.  This may not
 // be the underlying block size used by the OS, but it still aligns well with what will happen on
 // the "backend" for cloud providers, which is simply a useful default for when we want to look at
@@ -153,6 +157,11 @@ pub struct DiskBufferConfig<FS> {
     /// amount of data written since the last flush would be lost.
     pub(crate) flush_interval: Duration,
 
+    /// Interval for rechecking published writer progress while waiting at same-file EOF.
+    ///
+    /// `None` disables periodic rechecks and waits only for writer notifications.
+    pub(crate) reader_progress_recheck_interval: Option<Duration>,
+
     /// Filesystem implementation for opening data files.
     ///
     /// We allow parameterizing the filesystem implementation for ease of testing.  The "filesystem"
@@ -173,6 +182,7 @@ where
     pub(crate) max_record_size: Option<usize>,
     pub(crate) write_buffer_size: Option<usize>,
     pub(crate) flush_interval: Option<Duration>,
+    pub(crate) reader_progress_recheck_interval: Option<Duration>,
     pub(crate) filesystem: FS,
 }
 
@@ -188,6 +198,7 @@ impl DiskBufferConfigBuilder {
             max_record_size: None,
             write_buffer_size: None,
             flush_interval: None,
+            reader_progress_recheck_interval: Some(DEFAULT_READER_PROGRESS_RECHECK_INTERVAL),
             filesystem: ProductionFilesystem,
         }
     }
@@ -267,6 +278,16 @@ where
         self
     }
 
+    /// Sets how often a reader caught up to the writer rechecks published progress if no
+    /// notification arrives.
+    ///
+    /// `None` disables periodic rechecks and restores notification-only waiting. A zero duration
+    /// is also treated as disabled. Defaults to 60 seconds.
+    pub fn reader_progress_recheck_interval(mut self, interval: Option<Duration>) -> Self {
+        self.reader_progress_recheck_interval = interval.filter(|value| !value.is_zero());
+        self
+    }
+
     /// Filesystem implementation for opening data files.
     ///
     /// We allow parameterizing the filesystem implementation for ease of testing.  The "filesystem"
@@ -286,6 +307,7 @@ where
             max_record_size: self.max_record_size,
             write_buffer_size: self.write_buffer_size,
             flush_interval: self.flush_interval,
+            reader_progress_recheck_interval: self.reader_progress_recheck_interval,
             filesystem,
         }
     }
@@ -300,6 +322,7 @@ where
         let max_record_size = self.max_record_size.unwrap_or(DEFAULT_MAX_RECORD_SIZE);
         let write_buffer_size = self.write_buffer_size.unwrap_or(DEFAULT_WRITE_BUFFER_SIZE);
         let flush_interval = self.flush_interval.unwrap_or(DEFAULT_FLUSH_INTERVAL);
+        let reader_progress_recheck_interval = self.reader_progress_recheck_interval;
         let filesystem = self.filesystem;
 
         // Validate the input parameters.
@@ -411,6 +434,7 @@ where
             max_record_size,
             write_buffer_size,
             flush_interval,
+            reader_progress_recheck_interval,
             filesystem,
         })
     }

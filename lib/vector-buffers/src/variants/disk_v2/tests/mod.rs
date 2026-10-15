@@ -2,6 +2,7 @@ use std::{
     io::{self, Cursor},
     path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use tokio::{
@@ -13,8 +14,30 @@ use super::{
     Buffer, BufferReader, BufferWriter, DiskBufferConfigBuilder, Filesystem, Ledger,
     io::{AsyncFile, Metadata, ProductionFilesystem, ReadableMemoryMap, WritableMemoryMap},
     ledger::LEDGER_LEN,
+    parse_reader_progress_recheck_interval,
     record::RECORD_HEADER_LEN,
 };
+
+#[test]
+fn parses_reader_progress_recheck_interval() {
+    assert_eq!(
+        parse_reader_progress_recheck_interval(None).unwrap(),
+        Some(Duration::from_secs(60))
+    );
+    assert_eq!(
+        parse_reader_progress_recheck_interval(Some("5")).unwrap(),
+        Some(Duration::from_secs(5))
+    );
+    assert_eq!(
+        parse_reader_progress_recheck_interval(Some("0")).unwrap(),
+        None
+    );
+    assert_eq!(
+        parse_reader_progress_recheck_interval(Some("-1")).unwrap(),
+        None
+    );
+    assert!(parse_reader_progress_recheck_interval(Some("invalid")).is_err());
+}
 use crate::{
     Bufferable, buffer_usage_data::BufferUsageHandle, encoding::FixedEncodable,
     variants::disk_v2::common::align16,
@@ -247,6 +270,28 @@ where
         .expect("creating buffer should not fail");
     let usage_handle = BufferUsageHandle::noop();
     Buffer::from_config_inner(config, usage_handle)
+        .await
+        .expect("should not fail to create buffer")
+}
+
+/// Creates a disk v2 buffer with a custom reader progress recheck interval.
+pub(crate) async fn create_buffer_v2_with_reader_progress_recheck_interval<P, R>(
+    data_dir: P,
+    interval: Option<Duration>,
+) -> (
+    BufferWriter<R, FilesystemUnderTest>,
+    BufferReader<R, FilesystemUnderTest>,
+    Arc<Ledger<FilesystemUnderTest>>,
+)
+where
+    P: AsRef<Path>,
+    R: Bufferable,
+{
+    let config = DiskBufferConfigBuilder::from_path(data_dir)
+        .reader_progress_recheck_interval(interval)
+        .build()
+        .expect("creating buffer should not fail");
+    Buffer::from_config_inner(config, BufferUsageHandle::noop())
         .await
         .expect("should not fail to create buffer")
 }

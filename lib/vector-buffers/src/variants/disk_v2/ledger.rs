@@ -436,6 +436,11 @@ where
         self.pending_acks.fetch_add(amount, Ordering::AcqRel);
     }
 
+    /// Returns `true` if acknowledgements are waiting to be processed by the reader.
+    pub fn has_pending_acks(&self) -> bool {
+        self.pending_acks.load(Ordering::Acquire) > 0
+    }
+
     /// Consumes the full amount of pending acknowledgements, and resets the counter to zero.
     pub fn consume_pending_acks(&self) -> u64 {
         self.pending_acks.swap(0, Ordering::AcqRel)

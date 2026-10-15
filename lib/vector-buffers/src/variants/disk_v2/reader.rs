@@ -482,6 +482,47 @@ where
         self.flush_signal.clone()
     }
 
+    /// Waits until the writer signals us or its published state indicates that retrying the read
+    /// could make progress. The periodic state check recovers from a missed notification without
+    /// polling the data file while the buffer is idle.
+    pub(super) async fn wait_for_writer_progress(
+        &self,
+        expected_next_record_id: u64,
+        observed_writer_file_id: u16,
+    ) {
+        let Some(recheck_interval) = self.ledger.config().reader_progress_recheck_interval else {
+            self.ledger.wait_for_writer().await;
+            return;
+        };
+
+        loop {
+            if tokio::time::timeout(recheck_interval, self.ledger.wait_for_writer())
+                .await
+                .is_ok()
+            {
+                return;
+            }
+
+            let published_next_record_id = self.ledger.state().get_next_writer_record_id();
+            let current_writer_file_id = self.ledger.get_current_writer_file_id();
+
+            if published_next_record_id != expected_next_record_id
+                || current_writer_file_id != observed_writer_file_id
+                || self.ledger.has_pending_acks()
+                || self.ledger.is_writer_done()
+            {
+                debug!(
+                    expected_next_record_id,
+                    published_next_record_id,
+                    observed_writer_file_id,
+                    current_writer_file_id,
+                    "Rechecking disk buffer after observing published progress."
+                );
+                return;
+            }
+        }
+    }
+
     fn reset(&mut self) {
         self.reader = None;
         self.bytes_read = 0;
@@ -1176,7 +1217,9 @@ where
                     self.flush_signal.set();
                 }
 
-                self.ledger.wait_for_writer().await;
+                let expected_next_record_id = self.last_reader_record_id.wrapping_add(1);
+                self.wait_for_writer_progress(expected_next_record_id, writer_file_id)
+                    .await;
             } else {
                 debug!(
                     bytes_read = self.bytes_read,
