@@ -198,6 +198,8 @@ fn os_signals(runtime: &Runtime) -> impl Stream<Item = SignalTo> + use<> {
             signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler.");
         let mut sigquit = signal(SignalKind::quit()).expect("Failed to set up SIGQUIT handler.");
         let mut sighup = signal(SignalKind::hangup()).expect("Failed to set up SIGHUP handler.");
+        let mut sigusr2 =
+            signal(SignalKind::user_defined2()).expect("Failed to set up SIGUSR2 handler.");
 
         async_stream::stream! {
             loop {
@@ -218,11 +220,33 @@ fn os_signals(runtime: &Runtime) -> impl Stream<Item = SignalTo> + use<> {
                         info!(message = "Signal received.", signal = "SIGHUP");
                         SignalTo::ReloadFromDisk
                     },
+                    _ = sigusr2.recv() => {
+                        info!(message = "Signal received.", signal = "SIGUSR2");
+                        dump_heap_profile();
+                        continue;
+                    },
                 };
                 yield signal;
             }
         }
     })
+}
+
+/// Writes a jemalloc heap profile so memory can be inspected without a restart.
+#[cfg(all(unix, feature = "tikv-jemallocator"))]
+fn dump_heap_profile() {
+    match crate::jemalloc_stats::dump_heap_profile() {
+        Ok(()) => info!(message = "Dumped jemalloc heap profile."),
+        Err(error) => warn!(
+            message = "Failed to dump jemalloc heap profile. Start Vector with MALLOC_CONF=prof:true.",
+            %error
+        ),
+    }
+}
+
+#[cfg(all(unix, not(feature = "tikv-jemallocator")))]
+fn dump_heap_profile() {
+    warn!(message = "Ignoring SIGUSR2: heap profiling requires the jemalloc allocator.");
 }
 
 /// Signals from OS/user.

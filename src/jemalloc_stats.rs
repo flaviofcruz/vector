@@ -63,6 +63,15 @@ fn dump_full_stats() {
     }
 }
 
+/// Writes a jemalloc heap profile to the `prof_prefix` path from `MALLOC_CONF`.
+///
+/// Fails unless Vector was started with `prof:true` in `MALLOC_CONF`.
+pub fn dump_heap_profile() -> Result<(), tikv_jemalloc_ctl::Error> {
+    // SAFETY: `prof.dump` takes a `const char *` file name; null makes jemalloc
+    // generate one from `prof_prefix`.
+    unsafe { raw::write(b"prof.dump\0", std::ptr::null::<std::ffi::c_char>()) }
+}
+
 fn collect() -> Result<JemallocStats, tikv_jemalloc_ctl::Error> {
     // Advance the epoch to refresh cached counters before reading.
     epoch::advance()?;
@@ -84,4 +93,16 @@ fn collect() -> Result<JemallocStats, tikv_jemalloc_ctl::Error> {
         dirty: pdirty.saturating_mul(page),
         muzzy: pmuzzy.saturating_mul(page),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dump_heap_profile_requires_prof_enabled() {
+        // SAFETY: `opt.prof` is a valid, NUL-terminated mallctl name returning bool.
+        let prof_enabled: bool = unsafe { raw::read(b"opt.prof\0") }.unwrap();
+        assert_eq!(dump_heap_profile().is_ok(), prof_enabled);
+    }
 }
