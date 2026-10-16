@@ -1,4 +1,8 @@
-use std::sync::{Arc, atomic::AtomicBool};
+use std::{
+    num::NonZeroU64,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
 use aws_sdk_kinesis::operation::{
     describe_stream::DescribeStreamError, put_records::PutRecordsError,
@@ -37,10 +41,17 @@ enum HealthcheckError {
     StreamNamesMismatch { name: String, stream_name: String },
 }
 
-pub struct KinesisClientBuilder;
+#[derive(Default)]
+pub struct KinesisClientBuilder {
+    pool_idle_timeout: Option<Duration>,
+}
 
 impl ClientBuilder for KinesisClientBuilder {
     type Client = KinesisClient;
+
+    fn pool_idle_timeout(&self) -> Option<Duration> {
+        self.pool_idle_timeout
+    }
 
     fn build(&self, config: &aws_types::SdkConfig) -> Self::Client {
         let mut builder = aws_sdk_kinesis::config::Builder::from(config);
@@ -89,6 +100,16 @@ pub struct KinesisStreamsSinkConfig {
     #[serde(default)]
     #[configurable(metadata(docs::advanced))]
     pub private_link_failover: bool,
+
+    /// Maximum time a connection remains idle in the Kinesis HTTP pool.
+    ///
+    /// Set below the server's idle timeout to avoid reusing a connection as the server closes it.
+    /// Applies to both the primary and fallback Kinesis clients, but not credential requests.
+    /// Must be greater than zero. When unset, the HTTP client's default of 90 seconds is retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[configurable(metadata(docs::advanced))]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    pub pool_idle_timeout_secs: Option<NonZeroU64>,
 }
 
 impl KinesisStreamsSinkConfig {
@@ -121,7 +142,11 @@ impl KinesisStreamsSinkConfig {
 
     pub async fn create_client(&self, proxy: &ProxyConfig) -> crate::Result<KinesisClient> {
         create_client::<KinesisClientBuilder>(
-            &KinesisClientBuilder {},
+            &KinesisClientBuilder {
+                pool_idle_timeout: self
+                    .pool_idle_timeout_secs
+                    .map(|timeout| Duration::from_secs(timeout.get())),
+            },
             &self.base.auth,
             self.base.region.region(),
             self.base.region.endpoint(),
@@ -136,7 +161,11 @@ impl KinesisStreamsSinkConfig {
     /// endpoint. Used as the PrivateLink failover target.
     pub async fn create_public_client(&self, proxy: &ProxyConfig) -> crate::Result<KinesisClient> {
         create_client::<KinesisClientBuilder>(
-            &KinesisClientBuilder {},
+            &KinesisClientBuilder {
+                pool_idle_timeout: self
+                    .pool_idle_timeout_secs
+                    .map(|timeout| Duration::from_secs(timeout.get())),
+            },
             &self.base.auth,
             self.base.region.region(),
             None,
@@ -279,6 +308,96 @@ mod tests {
     fn generate_config() {
         crate::test_util::test_generate_config::<KinesisStreamsSinkConfig>();
     }
+
+    #[test]
+    fn pool_idle_timeout_rejects_zero() {
+        let error = serde_json::from_value::<KinesisStreamsSinkConfig>(serde_json::json!({
+            "stream_name": "test-stream",
+            "region": "us-west-2",
+            "encoding": { "codec": "json" },
+            "pool_idle_timeout_secs": 0
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("nonzero"), "{error}");
+    }
+
+    // Count real local HTTP connections without contacting AWS.
+    async fn assert_connection_reuse(timeout_secs: Option<u64>, expected_connections: usize) {
+        use crate::config::ProxyConfig;
+        use hyper::{
+            Body, Response, Server,
+            body::HttpBody,
+            service::{make_service_fn, service_fn},
+        };
+        use std::{
+            convert::Infallible,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&connections);
+        let service = make_service_fn(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok::<_, Infallible>(service_fn(|request: hyper::Request<Body>| async {
+                    request.into_body().collect().await.unwrap();
+                    Ok::<_, Infallible>(Response::new(Body::from(
+                        r#"{"StreamNames":[],"HasMoreStreams":false}"#,
+                    )))
+                }))
+            }
+        });
+        let server = Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
+        let endpoint = format!("http://{}", server.local_addr());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(server.with_graceful_shutdown(async {
+            let _ = stopped.await;
+        }));
+        let mut config = serde_json::json!({
+            "stream_name": "test-stream",
+            "region": "us-west-2",
+            "endpoint": endpoint,
+            "encoding": { "codec": "json" },
+            "auth": { "access_key_id": "test-access", "secret_access_key": "test-secret" }
+        });
+        if let Some(timeout) = timeout_secs {
+            config["pool_idle_timeout_secs"] = timeout.into();
+        }
+        let config: KinesisStreamsSinkConfig = serde_json::from_value(config).unwrap();
+        let client = config
+            .create_client(&ProxyConfig {
+                enabled: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        client.list_streams().send().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1250)).await;
+        client.list_streams().send().await.unwrap();
+        assert_eq!(connections.load(Ordering::SeqCst), expected_connections);
+        drop(client);
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pool_idle_timeout_reconnects_after_expiry() {
+        assert_connection_reuse(Some(1), 2).await;
+    }
+
+    #[tokio::test]
+    async fn pool_idle_timeout_keeps_connections_before_expiry() {
+        assert_connection_reuse(Some(5), 1).await;
+    }
+
+    #[tokio::test]
+    async fn pool_idle_timeout_unset_preserves_default_reuse() {
+        assert_connection_reuse(None, 1).await;
+    }
 }
 
 #[cfg(test)]
@@ -300,7 +419,7 @@ mod fips_endpoint_tests {
         ] {
             for requested in [None, Some(false), Some(true)] {
                 let http = CaptureClient::new(LIST_STREAMS_RESPONSE);
-                let client = KinesisClientBuilder.build(&http.config(region, requested));
+                let client = KinesisClientBuilder::default().build(&http.config(region, requested));
                 client.list_streams().send().await.unwrap();
                 let service = if requested == Some(true) && !region.starts_with("us-gov-") {
                     "kinesis-fips"
@@ -333,7 +452,7 @@ mod fips_endpoint_tests {
                     .into_builder()
                     .endpoint_url("https://private-kinesis.example.invalid")
                     .build();
-                let client = KinesisClientBuilder.build(&config);
+                let client = KinesisClientBuilder::default().build(&config);
                 client.list_streams().send().await.unwrap();
                 let requests = http.requests.lock().unwrap();
                 assert_eq!(requests.len(), 1);
@@ -352,7 +471,7 @@ mod fips_endpoint_tests {
             let mut config = http.config("us-east-1", Some(true)).into_builder();
             config.set_region(region.map(aws_types::region::Region::new));
             config.set_endpoint_url(endpoint.map(str::to_owned));
-            let client = KinesisClientBuilder.build(&config.build());
+            let client = KinesisClientBuilder::default().build(&config.build());
             let error = client.list_streams().send().await.unwrap_err();
             if endpoint.is_none() {
                 assert!(format!("{error:?}").contains("Missing Region"), "{error:?}");

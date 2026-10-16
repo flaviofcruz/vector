@@ -123,14 +123,27 @@ fn connector(
     proxy: &ProxyConfig,
     tls_options: Option<&TlsConfig>,
 ) -> crate::Result<SharedHttpClient> {
+    connector_with_pool_idle_timeout(proxy, tls_options, None)
+}
+
+fn connector_with_pool_idle_timeout(
+    proxy: &ProxyConfig,
+    tls_options: Option<&TlsConfig>,
+    pool_idle_timeout: Option<Duration>,
+) -> crate::Result<SharedHttpClient> {
     let tls_settings = MaybeTlsSettings::tls_client(tls_options)?;
+    let mut hyper = hyper::Client::builder();
+    if let Some(timeout) = pool_idle_timeout {
+        hyper.pool_idle_timeout(timeout);
+    }
+    let builder = HyperClientBuilder::new().hyper_builder(hyper);
 
     if proxy.enabled {
         let proxy = build_proxy_connector(tls_settings, proxy)?;
-        Ok(HyperClientBuilder::new().build(proxy))
+        Ok(builder.build(proxy))
     } else {
         let tls_connector = build_tls_connector(tls_settings)?;
-        Ok(HyperClientBuilder::new().build(tls_connector))
+        Ok(builder.build(tls_connector))
     }
 }
 
@@ -141,6 +154,11 @@ pub trait ClientBuilder {
 
     /// Build the client using the given config settings.
     fn build(&self, config: &SdkConfig) -> Self::Client;
+
+    /// Override idle connection retention for this service, leaving credential clients unchanged.
+    fn pool_idle_timeout(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Provides the configured AWS region.
@@ -218,7 +236,8 @@ where
     let provider_config =
         aws_config::provider_config::ProviderConfig::empty().with_region(Some(region.clone()));
 
-    let connector = connector(proxy, tls_options)?;
+    let connector =
+        connector_with_pool_idle_timeout(proxy, tls_options, builder.pool_idle_timeout())?;
 
     // Create a custom http connector that will emit the required metrics for us.
     let connector = AwsHttpClient {

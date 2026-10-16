@@ -114,7 +114,7 @@ async fn run_case() {
     let kinesis_http = CaptureClient::new(r#"{"StreamNames":[],"HasMoreStreams":false}"#);
     let kinesis = create_client(
         &CapturingBuilder {
-            inner: KinesisClientBuilder,
+            inner: KinesisClientBuilder::default(),
             http: kinesis_http.clone(),
         },
         &auth,
