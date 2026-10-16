@@ -663,6 +663,88 @@ mod test {
             .expect("no_decompression_transport must fetch the gzip blob");
     }
 
+    /// The three Storage Queue calls the source makes (receive, delete, metadata) succeed against a
+    /// stamp that omits `Server` on 2xx responses, like syd29prdstr04a behind dblogprodausteast.
+    /// Each mock response mirrors that stamp's real header set: no `Server`.
+    #[tokio::test]
+    async fn queue_calls_succeed_without_server_header() {
+        use azure_storage::CloudLocation;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request_line = String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let (status, extra, body) = if request_line.starts_with("GET ")
+                    && request_line.contains("/messages")
+                {
+                    (
+                        "200 OK",
+                        "Content-Type: application/xml\r\n",
+                        "<?xml version=\"1.0\" encoding=\"utf-8\"?><QueueMessagesList><QueueMessage>\
+                         <MessageId>00000000-0000-0000-0000-000000000000</MessageId>\
+                         <InsertionTime>Fri, 16 Oct 2026 04:00:00 GMT</InsertionTime>\
+                         <ExpirationTime>Fri, 23 Oct 2026 04:00:00 GMT</ExpirationTime>\
+                         <PopReceipt>receipt</PopReceipt>\
+                         <TimeNextVisible>Fri, 16 Oct 2026 04:02:00 GMT</TimeNextVisible>\
+                         <DequeueCount>1</DequeueCount><MessageText>hello</MessageText>\
+                         </QueueMessage></QueueMessagesList>",
+                    )
+                } else if request_line.starts_with("DELETE ") {
+                    ("204 No Content", "", "")
+                } else {
+                    ("200 OK", "x-ms-approximate-messages-count: 7\r\n", "")
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: {len}\r\n\
+                     x-ms-request-id: 83dc881c-4003-007e-6527-5d5804000000\r\n\
+                     x-ms-version: 2019-12-12\r\n\
+                     Date: Fri, 16 Oct 2026 04:30:00 GMT\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    len = body.len(),
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let queue_client = QueueServiceClientBuilder::with_location(
+            CloudLocation::Custom {
+                account: "devacct".to_string(),
+                uri,
+            },
+            StorageCredentials::access_key("devacct", "Zm9vYmFyYmF6"),
+        )
+        .build()
+        .queue_client("lp-blob-ingest-span");
+
+        let messages = queue_client
+            .get_messages()
+            .await
+            .expect("receive must succeed without a Server header")
+            .messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_text, "hello");
+
+        queue_client
+            .pop_receipt_client(messages[0].clone())
+            .delete()
+            .await
+            .expect("delete must succeed without a Server header");
+
+        queue_client
+            .get_metadata()
+            .await
+            .expect("metadata must succeed without a Server header");
+    }
+
     /// allowed_storage_accounts is only valid with client-certificate auth, so pairing it with
     /// connection-string auth is rejected at build.
     #[tokio::test]

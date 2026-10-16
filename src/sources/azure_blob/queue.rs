@@ -2259,4 +2259,27 @@ mod tests {
         assert_eq!(on_failure.body.len(), 2);
         assert_eq!(on_failure.body["file_id"], "{{message.file_id}}");
     }
+
+    /// Some Azure Storage stamps (e.g. syd29prdstr04a, behind dblogprodausteast) omit `Server`
+    /// on successful responses. The vendored azure_storage must still parse the common headers,
+    /// or every queue receive/delete/metadata call fails with "header not found server".
+    #[test]
+    fn common_storage_headers_parse_without_server() {
+        use azure_core_for_storage::headers::{DATE, Headers, REQUEST_ID, SERVER, VERSION};
+        use azure_storage::headers::CommonStorageResponseHeaders;
+
+        let mut headers = Headers::new();
+        headers.insert(REQUEST_ID, "83dc881c-4003-007e-6527-5d5804000000");
+        headers.insert(VERSION, "2019-12-12");
+        headers.insert(DATE, "Fri, 16 Oct 2026 04:30:00 GMT");
+        let parsed = CommonStorageResponseHeaders::try_from(&headers).unwrap();
+        assert_eq!(parsed.server, "");
+
+        headers.insert(SERVER, "Windows-Azure-Queue/1.0 Microsoft-HTTPAPI/2.0");
+        let parsed = CommonStorageResponseHeaders::try_from(&headers).unwrap();
+        assert_eq!(
+            parsed.server,
+            "Windows-Azure-Queue/1.0 Microsoft-HTTPAPI/2.0"
+        );
+    }
 }

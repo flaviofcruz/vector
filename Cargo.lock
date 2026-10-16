@@ -2170,8 +2170,6 @@ dependencies = [
 [[package]]
 name = "azure_storage"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59f838159f4d29cb400a14d9d757578ba495ae64feb07a7516bf9e4415127126"
 dependencies = [
  "RustyXML",
  "async-lock 3.4.2",
