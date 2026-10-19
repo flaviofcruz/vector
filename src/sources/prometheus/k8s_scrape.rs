@@ -169,6 +169,14 @@ pub struct PrometheusK8sScrapeConfig {
     #[configurable(metadata(docs::advanced))]
     emit_pod_metadata: bool,
 
+    /// Whether to group each histogram and summary family into one aggregated metric.
+    ///
+    /// When disabled, each `_bucket`, `_sum`, `_count`, and quantile sample is emitted as its own
+    /// absolute gauge, as if the family had no `# TYPE` line. Counters and gauges are unaffected.
+    #[serde(default = "crate::serde::default_true")]
+    #[configurable(metadata(docs::advanced))]
+    group_metrics: bool,
+
     #[configurable(derived)]
     tls: Option<TlsConfig>,
 
@@ -195,6 +203,7 @@ impl Default for PrometheusK8sScrapeConfig {
             max_endpoints_per_pod: default_max_endpoints_per_pod(),
             namespace_annotation_labels: HashMap::new(),
             emit_pod_metadata: true,
+            group_metrics: true,
             tls: None,
             auth: None,
         }
@@ -252,23 +261,31 @@ impl SourceConfig for PrometheusK8sScrapeConfig {
 
         let config = self.clone();
 
+        let discovery = DiscoverySettings {
+            field_selector,
+            label_selector,
+            use_apiserver_cache: config.use_apiserver_cache,
+            named_port,
+            annotation_name: config.annotation_name,
+            max_endpoints_per_pod: config.max_endpoints_per_pod,
+            namespace_annotation_labels: config.namespace_annotation_labels,
+        };
+        let scrape = ScrapeSettings {
+            interval: config.scrape_interval,
+            timeout: config.scrape_timeout,
+            auth: config.auth,
+            pod_name_tag: config.pod_name_tag,
+            pod_namespace_tag: config.pod_namespace_tag,
+            honor_labels: config.honor_labels,
+            emit_pod_metadata: config.emit_pod_metadata,
+            group_metrics: config.group_metrics,
+        };
+
         Ok(Box::pin(async move {
             run_source(
                 client,
-                field_selector,
-                label_selector,
-                config.use_apiserver_cache,
-                config.scrape_interval,
-                config.scrape_timeout,
-                config.pod_name_tag,
-                config.pod_namespace_tag,
-                config.honor_labels,
-                named_port,
-                config.annotation_name,
-                config.max_endpoints_per_pod,
-                config.namespace_annotation_labels,
-                config.emit_pod_metadata,
-                config.auth,
+                discovery,
+                scrape,
                 tls,
                 cx.proxy,
                 cx.out,
@@ -290,22 +307,33 @@ impl SourceConfig for PrometheusK8sScrapeConfig {
     }
 }
 
-async fn run_source(
-    client: Client,
+/// How pods and their scrape endpoints are discovered.
+struct DiscoverySettings {
     field_selector: String,
     label_selector: String,
     use_apiserver_cache: bool,
-    scrape_interval: Duration,
-    scrape_timeout: Duration,
-    pod_name_tag: Option<String>,
-    pod_namespace_tag: Option<String>,
-    honor_labels: bool,
     named_port: Option<Regex>,
     annotation_name: Option<String>,
     max_endpoints_per_pod: usize,
     namespace_annotation_labels: NamespaceAnnotationLabels,
-    emit_pod_metadata: bool,
+}
+
+/// How each discovered endpoint is scraped and its metrics tagged.
+struct ScrapeSettings {
+    interval: Duration,
+    timeout: Duration,
     auth: Option<Auth>,
+    pod_name_tag: Option<String>,
+    pod_namespace_tag: Option<String>,
+    honor_labels: bool,
+    emit_pod_metadata: bool,
+    group_metrics: bool,
+}
+
+async fn run_source(
+    client: Client,
+    discovery: DiscoverySettings,
+    scrape: ScrapeSettings,
     tls: TlsSettings,
     proxy: ProxyConfig,
     out: SourceSender,
@@ -316,7 +344,7 @@ async fn run_source(
     // Setup pod watcher
     let pods = Api::<Pod>::all(client);
 
-    let list_semantic = if use_apiserver_cache {
+    let list_semantic = if discovery.use_apiserver_cache {
         watcher::ListSemantic::Any
     } else {
         watcher::ListSemantic::MostRecent
@@ -325,8 +353,8 @@ async fn run_source(
     let pod_watcher = watcher(
         pods,
         watcher::Config {
-            field_selector: Some(field_selector),
-            label_selector: Some(label_selector),
+            field_selector: Some(discovery.field_selector),
+            label_selector: Some(discovery.label_selector),
             list_semantic,
             ..Default::default()
         },
@@ -348,28 +376,14 @@ async fn run_source(
     // Create endpoint provider
     let endpoint_provider = K8sEndpointProvider::new(
         pod_state,
-        named_port,
-        annotation_name,
-        max_endpoints_per_pod,
-        namespace_annotation_labels,
+        discovery.named_port,
+        discovery.annotation_name,
+        discovery.max_endpoints_per_pod,
+        discovery.namespace_annotation_labels,
     );
 
     // Run the scraping loop
-    let scrape_result = scrape_loop(
-        endpoint_provider,
-        scrape_interval,
-        scrape_timeout,
-        pod_name_tag,
-        pod_namespace_tag,
-        honor_labels,
-        emit_pod_metadata,
-        auth,
-        tls,
-        proxy,
-        out,
-        shutdown,
-    )
-    .await;
+    let scrape_result = scrape_loop(endpoint_provider, scrape, tls, proxy, out, shutdown).await;
 
     // Cleanup
     reflector_handle.abort();
@@ -380,19 +394,13 @@ async fn run_source(
 
 async fn scrape_loop(
     endpoint_provider: K8sEndpointProvider,
-    scrape_interval: Duration,
-    scrape_timeout: Duration,
-    pod_name_tag: Option<String>,
-    pod_namespace_tag: Option<String>,
-    honor_labels: bool,
-    emit_pod_metadata: bool,
-    auth: Option<Auth>,
+    scrape: ScrapeSettings,
     tls: TlsSettings,
     proxy: ProxyConfig,
     mut out: SourceSender,
     mut shutdown: ShutdownSignal,
 ) -> Result<()> {
-    let mut interval = time::interval(scrape_interval);
+    let mut interval = time::interval(scrape.interval);
     let client = http_client::build_client(&tls, &proxy)?;
 
     loop {
@@ -410,26 +418,7 @@ async fn scrape_loop(
                 // Scrape all endpoints concurrently
                 let scrape_futures: Vec<_> = endpoints
                     .into_iter()
-                    .map(|endpoint| {
-                        let client = client.clone();
-                        let auth = auth.clone();
-                        let pod_name_tag = pod_name_tag.clone();
-                        let pod_namespace_tag = pod_namespace_tag.clone();
-
-                        async move {
-                            scrape_endpoint(
-                                endpoint,
-                                client,
-                                scrape_timeout,
-                                auth,
-                                pod_name_tag,
-                                pod_namespace_tag,
-                                honor_labels,
-                                emit_pod_metadata,
-                            )
-                            .await
-                        }
-                    })
+                    .map(|endpoint| scrape_endpoint(endpoint, client.clone(), &scrape))
                     .collect();
 
                 let results = futures::future::join_all(scrape_futures).await;
@@ -469,12 +458,7 @@ async fn scrape_loop(
 async fn scrape_endpoint(
     endpoint: Endpoint,
     client: http_client::HttpClient,
-    timeout: Duration,
-    auth: Option<Auth>,
-    pod_name_tag: Option<String>,
-    pod_namespace_tag: Option<String>,
-    honor_labels: bool,
-    emit_pod_metadata: bool,
+    scrape: &ScrapeSettings,
 ) -> Result<Vec<Event>> {
     use http_body::Body as _;
     use hyper::{Body, Request};
@@ -485,13 +469,13 @@ async fn scrape_endpoint(
     let mut request_builder = Request::get(uri);
 
     // Apply authentication if configured
-    if let Some(ref auth_config) = auth {
+    if let Some(ref auth_config) = scrape.auth {
         request_builder = apply_auth_headers(request_builder, auth_config)?;
     }
 
     let request = request_builder.body(Body::empty())?;
 
-    let response = tokio::time::timeout(timeout, client.request(request))
+    let response = tokio::time::timeout(scrape.timeout, client.request(request))
         .await
         .map_err(|_| format!("Request timeout: {}", endpoint.url))?
         .map_err(|e| {
@@ -526,7 +510,7 @@ async fn scrape_endpoint(
         .map_err(|e| format!("Invalid UTF-8 in response body: {}", e))?;
 
     // Parse Prometheus metrics
-    let events = parser::parse_text(body_str)
+    let events = parser::parse_scraped_text(body_str, scrape.group_metrics)
         .map_err(|error| {
             emit!(PrometheusParseError {
                 error,
@@ -540,22 +524,22 @@ async fn scrape_endpoint(
         .unwrap_or_default();
 
     // Add pod metadata tags if configured
-    let events: Vec<Event> = if emit_pod_metadata {
+    let events: Vec<Event> = if scrape.emit_pod_metadata {
         events
             .into_iter()
             .map(|mut event| {
                 if let Event::Metric(ref mut metric) = event {
                     // Use pod name and namespace from the Endpoint struct
-                    if let Some(ref tag) = pod_name_tag {
-                        if honor_labels && metric.tags().and_then(|t| t.get(tag)).is_some() {
+                    if let Some(ref tag) = scrape.pod_name_tag {
+                        if scrape.honor_labels && metric.tags().and_then(|t| t.get(tag)).is_some() {
                             // Skip if honor_labels is true and tag already exists
                         } else {
                             metric.replace_tag(tag.clone(), endpoint.name.clone());
                         }
                     }
 
-                    if let Some(ref tag) = pod_namespace_tag {
-                        if honor_labels && metric.tags().and_then(|t| t.get(tag)).is_some() {
+                    if let Some(ref tag) = scrape.pod_namespace_tag {
+                        if scrape.honor_labels && metric.tags().and_then(|t| t.get(tag)).is_some() {
                             // Skip if honor_labels is true and tag already exists
                         } else {
                             metric.replace_tag(tag.clone(), endpoint.namespace.clone());
@@ -563,7 +547,7 @@ async fn scrape_endpoint(
                     }
 
                     for (label_name, value) in &endpoint.extra_labels {
-                        if honor_labels
+                        if scrape.honor_labels
                             && metric
                                 .tags()
                                 .and_then(|t| t.get(label_name.as_str()))
@@ -705,6 +689,20 @@ mod http_client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scrape settings matching the source's defaults, with a 5s timeout.
+    fn test_scrape_settings() -> ScrapeSettings {
+        ScrapeSettings {
+            interval: default_scrape_interval(),
+            timeout: Duration::from_secs(5),
+            auth: None,
+            pod_name_tag: Some("pod_name".to_string()),
+            pod_namespace_tag: Some("pod_namespace".to_string()),
+            honor_labels: false,
+            emit_pod_metadata: true,
+            group_metrics: true,
+        }
+    }
     use hyper::{
         Body, Response, Server,
         service::{make_service_fn, service_fn},
@@ -809,17 +807,7 @@ test_gauge 3.14
             namespace: "test-namespace".to_string(),
             extra_labels: BTreeMap::new(),
         };
-        let result = scrape_endpoint(
-            endpoint.clone(),
-            client,
-            Duration::from_secs(5),
-            None,
-            Some("pod_name".to_string()),
-            Some("pod_namespace".to_string()),
-            false,
-            true,
-        )
-        .await;
+        let result = scrape_endpoint(endpoint.clone(), client, &test_scrape_settings()).await;
 
         // Shutdown server
         tx.send(()).ok();
@@ -880,12 +868,13 @@ test_gauge 3.14
         let result = scrape_endpoint(
             endpoint,
             client,
-            Duration::from_millis(100), // Very short timeout
-            None,
-            None,
-            None,
-            false,
-            false,
+            &ScrapeSettings {
+                timeout: Duration::from_millis(100),
+                pod_name_tag: None,
+                pod_namespace_tag: None,
+                emit_pod_metadata: false,
+                ..test_scrape_settings()
+            },
         )
         .await;
 
@@ -932,12 +921,10 @@ test_gauge 3.14
         let result = scrape_endpoint(
             endpoint,
             client,
-            Duration::from_secs(5),
-            None,
-            Some("pod_name".to_string()),
-            Some("pod_namespace".to_string()),
-            false,
-            false, // emit_pod_metadata = false
+            &ScrapeSettings {
+                emit_pod_metadata: false,
+                ..test_scrape_settings()
+            },
         )
         .await;
 
@@ -997,12 +984,11 @@ test_gauge 3.14
         let result = scrape_endpoint(
             endpoint,
             client,
-            Duration::from_secs(5),
-            None,
-            Some("pod_name".to_string()),
-            None,
-            true, // honor_labels = true
-            true,
+            &ScrapeSettings {
+                pod_namespace_tag: None,
+                honor_labels: true,
+                ..test_scrape_settings()
+            },
         )
         .await;
 
@@ -1060,17 +1046,7 @@ http_requests_total{method="GET",status="200"} 1234
             namespace: "test-namespace".to_string(),
             extra_labels: BTreeMap::new(),
         };
-        let result = scrape_endpoint(
-            endpoint.clone(),
-            client,
-            Duration::from_secs(5),
-            None,
-            Some("pod_name".to_string()),
-            Some("pod_namespace".to_string()),
-            false,
-            true, // emit_pod_metadata = true
-        )
-        .await;
+        let result = scrape_endpoint(endpoint.clone(), client, &test_scrape_settings()).await;
 
         tx.send(()).ok();
 
@@ -1154,12 +1130,10 @@ http_requests_total{method="POST",status="201"} 5678
         let result = scrape_endpoint(
             endpoint,
             client,
-            Duration::from_secs(5),
-            None,
-            Some("pod_name".to_string()),
-            Some("pod_namespace".to_string()),
-            false,
-            false, // emit_pod_metadata = false
+            &ScrapeSettings {
+                emit_pod_metadata: false,
+                ..test_scrape_settings()
+            },
         )
         .await;
 
@@ -1281,12 +1255,7 @@ http_requests_total{method="POST",status="201"} 5678
         let result = scrape_endpoint(
             endpoint_with_labels(addr, &[]),
             client,
-            Duration::from_secs(5),
-            None,
-            Some("pod_name".to_string()),
-            Some("pod_namespace".to_string()),
-            false,
-            true,
+            &test_scrape_settings(),
         )
         .await;
 
@@ -1326,17 +1295,7 @@ http_requests_total{method="POST",status="201"} 5678
         let client = http_client::build_client(&tls, &proxy).unwrap();
 
         let endpoint = endpoint_with_labels(addr, &[("tenant", "alpha")]);
-        let result = scrape_endpoint(
-            endpoint,
-            client,
-            Duration::from_secs(5),
-            None,
-            Some("pod_name".to_string()),
-            Some("pod_namespace".to_string()),
-            false,
-            true,
-        )
-        .await;
+        let result = scrape_endpoint(endpoint, client, &test_scrape_settings()).await;
 
         tx.send(()).ok();
 
@@ -1368,17 +1327,7 @@ http_requests_total{method="POST",status="201"} 5678
         let client = http_client::build_client(&tls, &proxy).unwrap();
 
         let endpoint = endpoint_with_labels(addr, &[]);
-        let result = scrape_endpoint(
-            endpoint,
-            client,
-            Duration::from_secs(5),
-            None,
-            Some("pod_name".to_string()),
-            Some("pod_namespace".to_string()),
-            false,
-            true,
-        )
-        .await;
+        let result = scrape_endpoint(endpoint, client, &test_scrape_settings()).await;
 
         tx.send(()).ok();
 
@@ -1411,12 +1360,12 @@ http_requests_total{method="POST",status="201"} 5678
         let result = scrape_endpoint(
             endpoint,
             client,
-            Duration::from_secs(5),
-            None,
-            None,
-            None,
-            true, // honor_labels
-            true,
+            &ScrapeSettings {
+                pod_name_tag: None,
+                pod_namespace_tag: None,
+                honor_labels: true,
+                ..test_scrape_settings()
+            },
         )
         .await;
 
@@ -1453,12 +1402,10 @@ http_requests_total{method="POST",status="201"} 5678
         let result = scrape_endpoint(
             endpoint,
             client,
-            Duration::from_secs(5),
-            None,
-            Some("pod_name".to_string()),
-            Some("pod_namespace".to_string()),
-            false,
-            false, // emit_pod_metadata = false
+            &ScrapeSettings {
+                emit_pod_metadata: false,
+                ..test_scrape_settings()
+            },
         )
         .await;
 
@@ -1496,17 +1443,7 @@ http_requests_total{method="POST",status="201"} 5678
             addr,
             &[("tenant", "alpha"), ("svc", "checkout"), ("ver", "1.2.3")],
         );
-        let result = scrape_endpoint(
-            endpoint,
-            client,
-            Duration::from_secs(5),
-            None,
-            Some("pod_name".to_string()),
-            Some("pod_namespace".to_string()),
-            false,
-            true,
-        )
-        .await;
+        let result = scrape_endpoint(endpoint, client, &test_scrape_settings()).await;
 
         tx.send(()).ok();
 
@@ -1520,5 +1457,57 @@ http_requests_total{method="POST",status="201"} 5678
                 assert_eq!(tags.get("ver"), Some("1.2.3"));
             }
         }
+    }
+
+    #[test]
+    fn test_group_metrics_defaults_to_true() {
+        let config: PrometheusK8sScrapeConfig = toml::from_str("").unwrap();
+        assert!(config.group_metrics);
+        assert!(PrometheusK8sScrapeConfig::default().group_metrics);
+    }
+
+    #[tokio::test]
+    async fn test_scrape_endpoint_ungrouped_histogram_family() {
+        let (tx, rx) = oneshot::channel();
+        let make_svc = make_service_fn(|_conn| async {
+            Ok::<_, Infallible>(service_fn(|_req| async {
+                let body = "# TYPE latency histogram\nlatency_bucket{le=\"+Inf\"} 9\nlatency_sum 1.25\nlatency_count 9\n";
+                Ok::<_, Infallible>(Response::new(Body::from(body)))
+            }))
+        });
+        let server = Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(make_svc);
+        let addr = server.local_addr();
+        tokio::spawn(server.with_graceful_shutdown(async {
+            rx.await.ok();
+        }));
+
+        let client =
+            http_client::build_client(&TlsSettings::default(), &ProxyConfig::default()).unwrap();
+        let endpoint = Endpoint {
+            url: format!("http://{}/metrics", addr),
+            name: "test-pod".to_string(),
+            namespace: "test-namespace".to_string(),
+            extra_labels: BTreeMap::new(),
+        };
+        let events = scrape_endpoint(
+            endpoint,
+            client,
+            &ScrapeSettings {
+                pod_name_tag: None,
+                pod_namespace_tag: None,
+                emit_pod_metadata: false,
+                group_metrics: false,
+                ..test_scrape_settings()
+            },
+        )
+        .await
+        .unwrap();
+        tx.send(()).ok();
+
+        let names: Vec<&str> = events
+            .iter()
+            .map(|event| event.as_metric().name())
+            .collect();
+        assert_eq!(names, ["latency_bucket", "latency_sum", "latency_count"]);
     }
 }

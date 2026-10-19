@@ -27,6 +27,26 @@ pub(super) fn parse_text(packet: &str) -> Result<Vec<Event>, ParserError> {
         .map(|group| reparse_groups(group, vec![], false, false))
 }
 
+/// Like [`parse_text`], but each histogram/summary sample is its own absolute gauge.
+#[cfg(any(test, feature = "sources-prometheus-scrape"))]
+pub(super) fn parse_text_ungrouped(packet: &str) -> Result<Vec<Event>, ParserError> {
+    vector_lib::prometheus::parser::parse_text_ungrouped(packet)
+        .map(|group| reparse_groups(group, vec![], false, false))
+}
+
+/// Parses per the scrape sources' `group_metrics` option.
+#[cfg(any(test, feature = "sources-prometheus-scrape"))]
+pub(super) fn parse_scraped_text(
+    packet: &str,
+    group_metrics: bool,
+) -> Result<Vec<Event>, ParserError> {
+    if group_metrics {
+        parse_text(packet)
+    } else {
+        parse_text_ungrouped(packet)
+    }
+}
+
 #[cfg(any(test, feature = "sources-prometheus-pushgateway"))]
 pub(super) fn parse_text_with_overrides(
     packet: &str,
@@ -51,6 +71,58 @@ pub(super) fn parse_request(
 ) -> Result<Vec<Event>, ParserError> {
     vector_lib::prometheus::parser::parse_request(request, metadata_conflict_strategy.into())
         .map(|group| reparse_groups(group, vec![], false, skip_nan_values))
+}
+
+/// One absolute gauge per sample, without metric-family grouping. Matches [`parse_request`] for
+/// requests without metadata, except duplicate (labels, timestamp) samples aren't collapsed.
+#[cfg(feature = "sources-prometheus-remote-write")]
+pub(super) fn parse_request_flat(
+    request: proto::WriteRequest,
+    skip_nan_values: bool,
+) -> Result<Vec<Event>, ParserError> {
+    let start = Utc::now();
+    let mut result = Vec::with_capacity(request.timeseries.len());
+
+    for timeseries in request.timeseries {
+        let mut name = None;
+        let mut tags = MetricTags::default();
+        for label in timeseries.labels {
+            if label.name == vector_lib::prometheus::parser::METRIC_NAME_LABEL {
+                name = Some(label.value);
+            } else {
+                // Last value wins for duplicate label names, as in the grouped path.
+                tags.replace(label.name, label.value);
+            }
+        }
+        let mut name = name.ok_or(ParserError::RequestNoNameLabel)?;
+
+        let mut samples = timeseries.samples.into_iter().peekable();
+        while let Some(sample) = samples.next() {
+            if skip_nan_values && sample.value.is_nan() {
+                continue;
+            }
+            // Move into the last sample; remote write usually sends one per series.
+            let (name, tags) = if samples.peek().is_some() {
+                (name.clone(), tags.clone())
+            } else {
+                (std::mem::take(&mut name), std::mem::take(&mut tags))
+            };
+            result.push(
+                Metric::new(
+                    name,
+                    MetricKind::Absolute,
+                    MetricValue::Gauge {
+                        value: sample.value,
+                    },
+                )
+                .with_timestamp(Some(utc_timestamp(Some(sample.timestamp), start)))
+                .with_tags(tags.as_option())
+                .into(),
+            );
+        }
+    }
+
+    Ok(result)
 }
 
 fn reparse_groups(
@@ -1520,5 +1592,162 @@ mod test {
 
         let result = events_to_metrics(parse_text_with_nan_filtering(exp)).unwrap();
         assert_eq!(result.len(), 2); // Both should be preserved
+    }
+
+    #[cfg(feature = "sources-prometheus-remote-write")]
+    mod flat {
+        use similar_asserts::assert_eq;
+
+        use super::*;
+
+        fn series(
+            name: &str,
+            labels: &[(&str, &str)],
+            samples: &[(f64, i64)],
+        ) -> proto::TimeSeries {
+            proto::TimeSeries {
+                labels: std::iter::once(("__name__", name))
+                    .chain(labels.iter().copied())
+                    .map(|(name, value)| proto::Label {
+                        name: name.into(),
+                        value: value.into(),
+                    })
+                    .collect(),
+                samples: samples
+                    .iter()
+                    .map(|&(value, timestamp)| proto::Sample { value, timestamp })
+                    .collect(),
+            }
+        }
+
+        fn request() -> proto::WriteRequest {
+            proto::WriteRequest {
+                metadata: vec![],
+                timeseries: vec![
+                    series(
+                        "up",
+                        &[("job", "a"), ("instance", "x")],
+                        &[(1.0, 1_700_000_000_000)],
+                    ),
+                    // Base name shared with the suffixed series below.
+                    series("rpc", &[("job", "a")], &[(2.0, 1_700_000_000_000)]),
+                    series("rpc_count", &[("job", "a")], &[(3.0, 1_700_000_000_000)]),
+                    series("rpc_sum", &[("job", "a")], &[(4.0, 1_700_000_000_000)]),
+                    series(
+                        "lat_bucket",
+                        &[("le", "0.5")],
+                        &[(5.0, 1_700_000_000_000), (6.0, 1_700_000_001_000)],
+                    ),
+                    series("lat_bucket", &[("le", "+Inf")], &[(7.0, 1_700_000_000_000)]),
+                    series("no_labels", &[], &[(8.0, 1_700_000_000_000)]),
+                    series("nan", &[("job", "b")], &[(f64::NAN, 1_700_000_000_000)]),
+                ],
+            }
+        }
+
+        fn sorted(events: Vec<Event>) -> Vec<String> {
+            events
+                .into_iter()
+                // Skip metadata: it carries a random `source_event_id`.
+                .map(|event| {
+                    let metric = event.into_metric();
+                    format!("{:?} {:?}", metric.series(), metric.data())
+                })
+                .sorted()
+                .collect()
+        }
+
+        #[test]
+        fn matches_grouped_without_metadata() {
+            for skip_nan_values in [false, true] {
+                let grouped =
+                    parse_request(request(), MetadataConflictStrategy::Ignore, skip_nan_values)
+                        .unwrap();
+                let flat = parse_request_flat(request(), skip_nan_values).unwrap();
+                assert_eq!(grouped.len(), flat.len());
+                assert_eq!(sorted(grouped), sorted(flat));
+            }
+        }
+
+        #[test]
+        fn emits_untyped_absolute_gauges() {
+            let metrics = events_to_metrics(parse_request_flat(request(), true)).unwrap();
+            assert_eq!(metrics.len(), 8);
+            assert!(metrics.iter().all(|m| m.kind() == MetricKind::Absolute
+                && matches!(m.value(), MetricValue::Gauge { .. })));
+            let up = metrics.iter().find(|m| m.name() == "up").unwrap();
+            assert_eq!(
+                up.tags(),
+                Some(&metric_tags!("job" => "a", "instance" => "x"))
+            );
+            let no_labels = metrics.iter().find(|m| m.name() == "no_labels").unwrap();
+            assert_eq!(no_labels.tags(), None);
+        }
+
+        #[test]
+        fn missing_name_label_is_an_error() {
+            let request = proto::WriteRequest {
+                metadata: vec![],
+                timeseries: vec![proto::TimeSeries {
+                    labels: vec![proto::Label {
+                        name: "job".into(),
+                        value: "a".into(),
+                    }],
+                    samples: vec![proto::Sample {
+                        value: 1.0,
+                        timestamp: 1_700_000_000_000,
+                    }],
+                }],
+            };
+            assert!(matches!(
+                parse_request_flat(request, false),
+                Err(ParserError::RequestNoNameLabel)
+            ));
+        }
+    }
+
+    mod ungrouped {
+        use similar_asserts::assert_eq;
+
+        use super::*;
+
+        #[test]
+        fn histogram_and_summary_samples_become_absolute_gauges() {
+            let exposition = r#"
+                # TYPE http_requests_total counter
+                http_requests_total 1027
+                # TYPE latency histogram
+                latency_bucket{le="+Inf"} 9
+                latency_sum 1.25
+                latency_count 9
+                # TYPE rpc summary
+                rpc{quantile="0.5"} 4773
+                "#;
+            let gauge = |name: &str, tags: Option<MetricTags>, value| {
+                Metric::new(name, MetricKind::Absolute, MetricValue::Gauge { value })
+                    .with_tags(tags)
+            };
+
+            let metrics: Vec<Metric> = events_to_metrics(parse_scraped_text(exposition, false))
+                .unwrap()
+                .into_iter()
+                .map(|metric| metric.with_timestamp(None))
+                .collect();
+
+            assert_eq!(
+                metrics,
+                vec![
+                    Metric::new(
+                        "http_requests_total",
+                        MetricKind::Absolute,
+                        MetricValue::Counter { value: 1027.0 },
+                    ),
+                    gauge("latency_bucket", Some(metric_tags!("le" => "+Inf")), 9.0),
+                    gauge("latency_sum", None, 1.25),
+                    gauge("latency_count", None, 9.0),
+                    gauge("rpc", Some(metric_tags!("quantile" => "0.5")), 4773.0),
+                ]
+            );
+        }
     }
 }

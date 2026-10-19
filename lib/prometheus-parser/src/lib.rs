@@ -296,6 +296,19 @@ fn matching_group<T: Default>(values: &mut MetricMap<T>, group: GroupKey) -> &mu
 /// Parse the given text input, and group the result into higher-level
 /// metric types based on the declared types in the text.
 pub fn parse_text(input: &str) -> Result<Vec<MetricGroup>, ParserError> {
+    parse_text_with_family_grouping(input, true)
+}
+
+/// Like [`parse_text`], but histogram and summary samples stay separate untyped series, as if
+/// their family had no `# TYPE` line. Their validation (e.g. `le` on buckets) is skipped.
+pub fn parse_text_ungrouped(input: &str) -> Result<Vec<MetricGroup>, ParserError> {
+    parse_text_with_family_grouping(input, false)
+}
+
+fn parse_text_with_family_grouping(
+    input: &str,
+    group_histograms_and_summaries: bool,
+) -> Result<Vec<MetricGroup>, ParserError> {
     let mut groups = Vec::new();
 
     for line in input.lines() {
@@ -305,7 +318,16 @@ pub fn parse_text(input: &str) -> Result<Vec<MetricGroup>, ParserError> {
         if let Some(line) = line {
             match line {
                 Line::Header(header) => {
-                    groups.push(MetricGroup::new(header.metric_name, header.kind));
+                    let kind = match header.kind {
+                        // Suffixed samples then open their own untyped groups.
+                        MetricKind::Histogram | MetricKind::Summary
+                            if !group_histograms_and_summaries =>
+                        {
+                            MetricKind::Untyped
+                        }
+                        kind => kind,
+                    };
+                    groups.push(MetricGroup::new(header.metric_name, kind));
                 }
                 Line::Metric(metric) => {
                     let metric = match groups.last_mut() {
@@ -967,5 +989,58 @@ mod test {
             err,
             ParserError::MultipleMetricKinds { name } if name == "go_memstats_alloc_bytes"
         ));
+    }
+
+    const MIXED_FAMILIES: &str = r#"
+        # TYPE http_requests_total counter
+        http_requests_total{method="post"} 1027 1395066363000
+        # TYPE http_request_duration_seconds histogram
+        http_request_duration_seconds_bucket{method="get",le="0.1"} 5 1395066363000
+        http_request_duration_seconds_bucket{method="get",le="+Inf"} 9 1395066363000
+        http_request_duration_seconds_sum{method="get"} 1.25 1395066363000
+        http_request_duration_seconds_count{method="get"} 9 1395066363000
+        # TYPE go_goroutines gauge
+        go_goroutines 42
+        # TYPE rpc_duration_seconds summary
+        rpc_duration_seconds{quantile="0.5"} 4773
+        rpc_duration_seconds_sum 1.7560473e+07
+        rpc_duration_seconds_count 2693
+        untyped_sample 7
+        "#;
+
+    /// Skips the empty groups the ungrouped parse leaves behind for histogram `# TYPE` lines.
+    fn non_empty_groups(groups: &[MetricGroup]) -> Vec<String> {
+        groups
+            .iter()
+            .filter(|group| match &group.metrics {
+                GroupKind::Summary(metrics) => !metrics.is_empty(),
+                GroupKind::Histogram(metrics) => !metrics.is_empty(),
+                GroupKind::Gauge(metrics)
+                | GroupKind::Counter(metrics)
+                | GroupKind::Untyped(metrics) => !metrics.is_empty(),
+            })
+            .map(|group| format!("{group:?}"))
+            .collect()
+    }
+
+    #[test]
+    fn parse_text_ungrouped_matches_input_without_histogram_and_summary_types() {
+        let without_types: String = MIXED_FAMILIES
+            .lines()
+            .filter(|line| !line.ends_with(" histogram") && !line.ends_with(" summary"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+
+        assert_eq!(
+            non_empty_groups(&parse_text_ungrouped(MIXED_FAMILIES).unwrap()),
+            non_empty_groups(&parse_text(&without_types).unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_text_ungrouped_skips_histogram_validation() {
+        let input = "# TYPE latency histogram\nlatency_bucket 3\n";
+        assert_eq!(parse_text(input).unwrap_err(), ParserError::ExpectedLeTag);
+        assert!(parse_text_ungrouped(input).is_ok());
     }
 }

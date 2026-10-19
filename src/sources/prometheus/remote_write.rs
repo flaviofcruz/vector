@@ -83,6 +83,14 @@ pub struct PrometheusRemoteWriteConfig {
     #[configurable(metadata(docs::advanced))]
     #[serde(default)]
     skip_nan_values: bool,
+
+    /// Whether to group samples into metric families using request metadata.
+    ///
+    /// When disabled, each sample is emitted as an absolute gauge and metadata is ignored. Faster
+    /// for senders that send no metadata.
+    #[configurable(metadata(docs::advanced))]
+    #[serde(default = "crate::serde::default_true")]
+    group_metrics: bool,
 }
 
 impl PrometheusRemoteWriteConfig {
@@ -97,6 +105,7 @@ impl PrometheusRemoteWriteConfig {
             acknowledgements: false.into(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         }
     }
 }
@@ -116,6 +125,7 @@ impl GenerateConfig for PrometheusRemoteWriteConfig {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         })
         .unwrap()
     }
@@ -128,6 +138,7 @@ impl SourceConfig for PrometheusRemoteWriteConfig {
         let source = RemoteWriteSource {
             metadata_conflict_strategy: self.metadata_conflict_strategy,
             skip_nan_values: self.skip_nan_values,
+            group_metrics: self.group_metrics,
         };
         source.run(
             self.address,
@@ -156,6 +167,7 @@ impl SourceConfig for PrometheusRemoteWriteConfig {
 struct RemoteWriteSource {
     metadata_conflict_strategy: MetadataConflictStrategy,
     skip_nan_values: bool,
+    group_metrics: bool,
 }
 
 impl RemoteWriteSource {
@@ -169,11 +181,15 @@ impl RemoteWriteSource {
                 format!("Could not decode write request: {error}"),
             )
         })?;
-        parser::parse_request(
-            request,
-            self.metadata_conflict_strategy,
-            self.skip_nan_values,
-        )
+        if self.group_metrics {
+            parser::parse_request(
+                request,
+                self.metadata_conflict_strategy,
+                self.skip_nan_values,
+            )
+        } else {
+            parser::parse_request_flat(request, self.skip_nan_values)
+        }
         .map_err(|error| {
             ErrorMessage::new(
                 StatusCode::BAD_REQUEST,
@@ -223,6 +239,13 @@ mod test {
         crate::test_util::test_generate_config::<PrometheusRemoteWriteConfig>();
     }
 
+    #[test]
+    fn group_metrics_defaults_to_true() {
+        let config: PrometheusRemoteWriteConfig =
+            toml::from_str(r#"address = "127.0.0.1:9090""#).unwrap();
+        assert!(config.group_metrics);
+    }
+
     #[tokio::test]
     async fn receives_metrics_over_http() {
         receives_metrics(None).await;
@@ -249,6 +272,7 @@ mod test {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         };
         let source = source
             .build(SourceContext::new_test(tx, None))
@@ -283,6 +307,63 @@ mod test {
         output.sort_unstable_by_key(|event| event.as_metric().name().to_owned());
 
         vector_lib::assert_event_data_eq!(events, output);
+    }
+
+    #[tokio::test]
+    async fn receives_metrics_without_grouping() {
+        let (_guard, address) = test_util::addr::next_addr();
+        let (tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        let source = PrometheusRemoteWriteConfig {
+            group_metrics: false,
+            ..PrometheusRemoteWriteConfig::from_address(address)
+        };
+        tokio::spawn(
+            source
+                .build(SourceContext::new_test(tx, None))
+                .await
+                .unwrap(),
+        );
+        wait_for_tcp(address).await;
+
+        let sink = RemoteWriteConfig {
+            endpoint: format!("http://localhost:{}/", address.port()),
+            ..Default::default()
+        };
+        let (sink, _) = sink.build(SinkContext::default()).await.unwrap();
+        // Histograms and summaries expand into several series on the wire; compare the rest 1:1.
+        let events: Vec<Event> = make_events()
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e.as_metric().value(),
+                    MetricValue::Counter { .. } | MetricValue::Gauge { .. }
+                )
+            })
+            .collect();
+        let events_copy = events.clone();
+        let mut output = test_util::spawn_collect_ready(
+            async move { sink.run_events(events_copy).await.unwrap() },
+            rx,
+            1,
+        )
+        .await;
+        output.sort_unstable_by_key(|event| event.as_metric().name().to_owned());
+
+        // Same series and values, every sample an absolute gauge.
+        let summarize = |metric: &Metric| {
+            let value = match metric.value() {
+                MetricValue::Counter { value } | MetricValue::Gauge { value } => *value,
+                other => unreachable!("{other:?}"),
+            };
+            (metric.name().to_owned(), metric.tags().cloned(), value)
+        };
+        let sent: Vec<_> = events.iter().map(|e| summarize(e.as_metric())).collect();
+        let received: Vec<_> = output.iter().map(|e| summarize(e.as_metric())).collect();
+        assert_eq!(sent, received);
+        assert!(output.iter().all(|e| matches!(
+            (e.as_metric().kind(), e.as_metric().value()),
+            (MetricKind::Absolute, MetricValue::Gauge { .. })
+        )));
     }
 
     fn make_events() -> Vec<Event> {
@@ -445,6 +526,7 @@ mod test {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         };
         let source = source
             .build(SourceContext::new_test(tx, None))
@@ -517,6 +599,7 @@ mod test {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: true,
+            group_metrics: true,
         };
         let source = source
             .build(SourceContext::new_test(tx, None))
@@ -588,6 +671,7 @@ mod test {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         };
         let source = source
             .build(SourceContext::new_test(tx, None))
@@ -673,6 +757,7 @@ mod test {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         };
         let source = source
             .build(SourceContext::new_test(tx, None))
@@ -722,6 +807,7 @@ mod test {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         };
         let source = source
             .build(SourceContext::new_test(tx, None))
@@ -762,6 +848,7 @@ mod test {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         };
         let source = source
             .build(SourceContext::new_test(tx, None))
@@ -796,6 +883,7 @@ mod test {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: true,
+            group_metrics: true,
         };
         let source = source
             .build(SourceContext::new_test(tx, None))
@@ -836,6 +924,7 @@ mod test {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         };
         let source = source
             .build(SourceContext::new_test(tx, None))
@@ -877,6 +966,7 @@ mod test {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         };
         let source = source
             .build(SourceContext::new_test(tx, None))
@@ -932,6 +1022,7 @@ mod integration_tests {
             acknowledgements: SourceAcknowledgementsConfig::default(),
             keepalive: KeepaliveConfig::default(),
             skip_nan_values: false,
+            group_metrics: true,
         };
 
         let events = run_and_assert_source_compliance(

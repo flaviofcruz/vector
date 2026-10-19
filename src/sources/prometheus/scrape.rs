@@ -95,6 +95,14 @@ pub struct PrometheusScrapeConfig {
     #[configurable(metadata(docs::examples = "query_example()"))]
     query: QueryParameters,
 
+    /// Whether to group each histogram and summary family into one aggregated metric.
+    ///
+    /// When disabled, each `_bucket`, `_sum`, `_count`, and quantile sample is emitted as its own
+    /// absolute gauge, as if the family had no `# TYPE` line. Counters and gauges are unaffected.
+    #[serde(default = "crate::serde::default_true")]
+    #[configurable(metadata(docs::advanced))]
+    group_metrics: bool,
+
     #[configurable(derived)]
     tls: Option<TlsConfig>,
 
@@ -122,6 +130,7 @@ impl GenerateConfig for PrometheusScrapeConfig {
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: false,
             query: HashMap::new(),
+            group_metrics: true,
             tls: None,
             auth: None,
         })
@@ -145,6 +154,7 @@ impl SourceConfig for PrometheusScrapeConfig {
             honor_labels: self.honor_labels,
             instance_tag: self.instance_tag.clone(),
             endpoint_tag: self.endpoint_tag.clone(),
+            group_metrics: self.group_metrics,
         };
 
         warn_if_interval_too_low(self.timeout, self.interval);
@@ -199,6 +209,7 @@ struct PrometheusScrapeBuilder {
     honor_labels: bool,
     instance_tag: Option<String>,
     endpoint_tag: Option<String>,
+    group_metrics: bool,
 }
 
 impl HttpClientBuilder for PrometheusScrapeBuilder {
@@ -230,6 +241,7 @@ impl HttpClientBuilder for PrometheusScrapeBuilder {
         PrometheusScrapeContext {
             instance_info,
             endpoint_info,
+            group_metrics: self.group_metrics,
         }
     }
 }
@@ -238,6 +250,7 @@ impl HttpClientBuilder for PrometheusScrapeBuilder {
 struct PrometheusScrapeContext {
     instance_info: Option<InstanceInfo>,
     endpoint_info: Option<EndpointInfo>,
+    group_metrics: bool,
 }
 
 impl HttpClientContext for PrometheusScrapeContext {
@@ -303,7 +316,7 @@ impl HttpClientContext for PrometheusScrapeContext {
 
         let body = String::from_utf8_lossy(&decoded);
 
-        match parser::parse_text(&body) {
+        match parser::parse_scraped_text(&body, self.group_metrics) {
             Ok(events) => Some(events),
             Err(error) => {
                 if url.path() == "/" {
@@ -383,6 +396,7 @@ mod test {
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: true,
             query: HashMap::new(),
+            group_metrics: true,
             auth: None,
             tls: None,
         };
@@ -394,6 +408,50 @@ mod test {
         )
         .await;
         assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn group_metrics_defaults_to_true() {
+        let config: PrometheusScrapeConfig =
+            toml::from_str(r#"endpoints = ["http://localhost:9090/metrics"]"#).unwrap();
+        assert!(config.group_metrics);
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_ungrouped_histogram_family() {
+        let (_guard, in_addr) = next_addr();
+        let dummy_endpoint = warp::path!("metrics").map(|| {
+            "# TYPE latency histogram\nlatency_bucket{le=\"+Inf\"} 9\nlatency_sum 1.25\nlatency_count 9\n"
+        });
+        tokio::spawn(warp::serve(dummy_endpoint).run(in_addr));
+        wait_for_tcp(in_addr).await;
+
+        let config = PrometheusScrapeConfig {
+            endpoints: vec![format!("http://{}/metrics", in_addr)],
+            interval: Duration::from_secs(1),
+            timeout: default_timeout(),
+            instance_tag: None,
+            endpoint_tag: None,
+            honor_labels: false,
+            query: HashMap::new(),
+            group_metrics: false,
+            auth: None,
+            tls: None,
+        };
+        let events = run_and_assert_source_compliance(
+            config,
+            Duration::from_secs(3),
+            &HTTP_PULL_SOURCE_TAGS,
+        )
+        .await;
+
+        // Events arrive in exposition order; the first three are one scrape.
+        let names: Vec<String> = events
+            .into_iter()
+            .take(3)
+            .map(|event| event.into_metric().name().to_string())
+            .collect();
+        assert_eq!(names, ["latency_bucket", "latency_sum", "latency_count"]);
     }
 
     // A gzip-encoded scrape response (Content-Encoding: gzip) is transparently
@@ -424,6 +482,7 @@ mod test {
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: true,
             query: HashMap::new(),
+            group_metrics: true,
             auth: None,
             tls: None,
         };
@@ -461,6 +520,7 @@ mod test {
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: true,
             query: HashMap::new(),
+            group_metrics: true,
             auth: None,
             tls: None,
         };
@@ -513,6 +573,7 @@ mod test {
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: false,
             query: HashMap::new(),
+            group_metrics: true,
             auth: None,
             tls: None,
         };
@@ -579,6 +640,7 @@ mod test {
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: true,
             query: HashMap::new(),
+            group_metrics: true,
             auth: None,
             tls: None,
         };
@@ -648,6 +710,7 @@ mod test {
                     ]),
                 ),
             ]),
+            group_metrics: true,
             auth: None,
             tls: None,
         };
@@ -751,6 +814,7 @@ mod test {
                 interval: Duration::from_secs(1),
                 timeout: default_timeout(),
                 tls: None,
+                group_metrics: true,
                 auth: None,
             },
         );
@@ -842,6 +906,7 @@ mod integration_tests {
             endpoint_tag: Some("endpoint".to_string()),
             honor_labels: false,
             query: HashMap::new(),
+            group_metrics: true,
             auth: None,
             tls: None,
         };
