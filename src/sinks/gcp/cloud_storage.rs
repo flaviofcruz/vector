@@ -3,7 +3,7 @@ use std::{collections::HashMap, convert::TryFrom, io};
 use bytes::Bytes;
 use chrono::{FixedOffset, Utc};
 use http::{
-    Uri,
+    StatusCode, Uri,
     header::{HeaderName, HeaderValue},
 };
 use indoc::indoc;
@@ -335,6 +335,16 @@ impl GcsSinkConfig {
     }
 }
 
+#[derive(Debug, Snafu)]
+#[snafu(display("GCS upload failed with HTTP status {status} after retries settled"))]
+struct GcsUploadError {
+    status: StatusCode,
+}
+
+/// Builds the GCS upload service, including retries and terminal failure classification.
+/// Non-2xx responses become errors only after retries settle so the Driver rejects and
+/// counts discarded events, matching terminal SDK errors in S3 and Azure Blob.
+/// This policy is independent of the request's memory or disk batching implementation.
 fn build_gcs_inner_service(
     client: HttpClient,
     base_url: String,
@@ -345,9 +355,21 @@ fn build_gcs_inner_service(
 + Send
 + 'static {
     ServiceBuilder::new()
+        // Keep this outside retries: GcsRetryLogic must see raw HTTP responses to
+        // distinguish retryable statuses from permanent failures such as 403 and 501.
+        .map_result(|result: Result<GcsResponse, crate::Error>| {
+            result.and_then(|response| {
+                let status = response.inner.status();
+                if status.is_success() {
+                    Ok(response)
+                } else {
+                    Err(GcsUploadError { status }.into())
+                }
+            })
+        })
         .settings(request, GcsRetryLogic::default())
         // This mapper is inside the retry layer, so it runs once per HTTP attempt.
-        // Return the same result so retry and driver behavior are unchanged.
+        // Return the same result so retry decisions still use the raw response.
         .map_result(move |result: Result<GcsResponse, _>| {
             if let Ok(response) = &result
                 && response.inner.status().is_success()
@@ -582,6 +604,7 @@ mod tests {
     use futures_util::{future::ready, stream};
     use http::StatusCode;
     use hyper::{Body, Response};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
     use std::{
         convert::Infallible,
         sync::{
@@ -590,6 +613,7 @@ mod tests {
         },
         time::Duration,
     };
+    use tokio::sync::{mpsc, oneshot};
     use tower::ServiceExt;
     use vector_common::internal_event::vector_event::VectorSinkEventMetadata;
     use vector_lib::{
@@ -600,12 +624,12 @@ mod tests {
         },
         partition::Partitioner,
         request_metadata::GroupedCountByteSize,
-        stream::DriverResponse,
+        stream::{Driver, DriverResponse},
     };
 
     use super::*;
     use crate::{
-        event::LogEvent,
+        event::{BatchNotifier, BatchStatus, LogEvent},
         sinks::util::vector_event_log::test_util::VelEventCapture,
         test_util::{
             addr::next_addr,
@@ -645,6 +669,13 @@ mod tests {
     }
 
     async fn spawn_status_server(statuses: Vec<StatusCode>) -> (Uri, Arc<AtomicUsize>) {
+        spawn_status_server_with_gate(statuses, None).await
+    }
+
+    async fn spawn_status_server_with_gate(
+        statuses: Vec<StatusCode>,
+        response_gate: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
+    ) -> (Uri, Arc<AtomicUsize>) {
         assert!(!statuses.is_empty());
         let statuses = Arc::new(statuses);
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -652,7 +683,13 @@ mod tests {
         let endpoint = spawn_blackhole_http_server(move |_| {
             let statuses = Arc::clone(&statuses);
             let attempt = handler_count.fetch_add(1, Ordering::SeqCst);
+            let response_gate = response_gate.clone();
             async move {
+                if let Some(response_gate) = response_gate {
+                    let (release, held) = oneshot::channel();
+                    response_gate.send(release).unwrap();
+                    held.await.unwrap();
+                }
                 let status = statuses
                     .get(attempt)
                     .copied()
@@ -778,9 +815,14 @@ mod tests {
         let (response, terminal_event_log, capture) =
             call_gcs_service(endpoint.to_string(), 2, true).await;
 
-        let response = response.unwrap();
-        assert_eq!(response.inner.status(), StatusCode::FORBIDDEN);
-        assert_eq!(response.event_status(), crate::event::EventStatus::Rejected);
+        assert_eq!(
+            response
+                .unwrap_err()
+                .downcast_ref::<GcsUploadError>()
+                .unwrap()
+                .status,
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert_vel_terminal_counts(&terminal_event_log, &capture, 0, 0, 1, 0, 1);
     }
@@ -795,14 +837,14 @@ mod tests {
             let (response, terminal_event_log, capture) =
                 call_gcs_service(endpoint.to_string(), 2, true).await;
 
-            let response = response.unwrap();
-            assert_eq!(response.inner.status(), status);
-            let expected_status = if status.is_server_error() {
-                crate::event::EventStatus::Errored
-            } else {
-                crate::event::EventStatus::Rejected
-            };
-            assert_eq!(response.event_status(), expected_status);
+            assert_eq!(
+                response
+                    .unwrap_err()
+                    .downcast_ref::<GcsUploadError>()
+                    .unwrap()
+                    .status,
+                status
+            );
             assert_eq!(request_count.load(Ordering::SeqCst), 3);
             assert_vel_terminal_counts(&terminal_event_log, &capture, 0, 0, 1, 0, 1);
         }
@@ -810,8 +852,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn gcs_vel_separates_per_attempt_upload_from_terminal_delivery() {
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-
         let (endpoint, request_count) = spawn_status_server(vec![
             StatusCode::TOO_MANY_REQUESTS,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -879,11 +919,289 @@ mod tests {
         let (response, terminal_event_log, capture) =
             call_gcs_service(endpoint.to_string(), 2, false).await;
 
-        let response = response.unwrap();
-        assert_eq!(response.inner.status(), StatusCode::FORBIDDEN);
-        assert_eq!(response.event_status(), crate::event::EventStatus::Rejected);
+        assert_eq!(
+            response
+                .unwrap_err()
+                .downcast_ref::<GcsUploadError>()
+                .unwrap()
+                .status,
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert_vel_terminal_counts(&terminal_event_log, &capture, 0, 0, 0, 0, 0);
+    }
+
+    #[test]
+    fn gcs_raw_response_and_retry_semantics_are_unchanged() {
+        use crate::{event::EventStatus, sinks::util::retries::RetryLogic};
+
+        let (request, _) = gcs_test_request();
+        let retry = GcsRetryLogic::<GcsRequest>::default();
+        for (status, event_status, should_retry) in [
+            (StatusCode::OK, EventStatus::Delivered, false),
+            (StatusCode::FORBIDDEN, EventStatus::Rejected, false),
+            (StatusCode::TOO_MANY_REQUESTS, EventStatus::Rejected, true),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                EventStatus::Errored,
+                true,
+            ),
+            (StatusCode::NOT_IMPLEMENTED, EventStatus::Errored, false),
+        ] {
+            let response = GcsResponse {
+                inner: Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .unwrap(),
+                // Deliberately distinct sizes: this PR must not switch the raw
+                // response's byte-count convention used by other consumers.
+                metadata: RequestMetadata::new(1, 23, 17, 9, GroupedCountByteSize::default()),
+                event_log_metadata: request.event_log_metadata.clone(),
+            };
+            assert_eq!(response.event_status(), event_status);
+            assert_eq!(response.bytes_sent(), Some(17));
+            assert_eq!(
+                retry.should_retry_response(&response).is_retryable(),
+                should_retry
+            );
+            assert_eq!(
+                retry.should_retry_response(&response).is_successful(),
+                status.is_success()
+            );
+        }
+    }
+
+    fn counter_value(snapshotter: &Snapshotter, name: &str, labels: &[(&str, &str)]) -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| {
+                if key.key().name() == name
+                    && labels.iter().all(|(name, value)| {
+                        key.key()
+                            .labels()
+                            .any(|label| label.key() == *name && label.value() == *value)
+                    })
+                    && let DebugValue::Counter(count) = value
+                {
+                    return Some(count);
+                }
+                None
+            })
+            .sum()
+    }
+
+    // Exercise the production request builder, HTTP service, retry stack, VEL wrapper,
+    // and Driver together. Holding every response also checks that retries cannot
+    // prematurely finalize or count a batch as sent/discarded.
+    async fn assert_gcs_terminal_upload(
+        statuses: Vec<StatusCode>,
+        expected_attempts: usize,
+        expected_status: BatchStatus,
+        enable_logs: bool,
+    ) {
+        let (gates_tx, mut gates_rx) = mpsc::unbounded_channel();
+        let (endpoint, request_count) =
+            spawn_status_server_with_gate(statuses, Some(gates_tx)).await;
+        let config = default_config(
+            (
+                Some(NewlineDelimitedEncoderConfig::new()),
+                JsonSerializerConfig::default(),
+            )
+                .into(),
+        );
+        let builder = request_settings(&config, SinkContext::default());
+        let (notifier, mut receiver) = BatchNotifier::new_with_receiver();
+        let events = ["first event", "second event", "third event"]
+            .into_iter()
+            .map(|message| Event::Log(LogEvent::from(message).with_batch_notifier(&notifier)))
+            .collect();
+        drop(notifier);
+        let (metadata, metadata_builder, events) = builder.split_input(("test/".into(), events));
+        let payload = builder.encode_events(events).unwrap();
+        let request_metadata = metadata_builder.build(&payload);
+        let event_count = request_metadata.event_count() as u64;
+        let encoded_bytes = request_metadata.request_encoded_size() as u64;
+        let event_bytes = request_metadata
+            .events_estimated_json_encoded_byte_size()
+            .size()
+            .unwrap()
+            .1
+            .get() as u64;
+        assert_eq!(event_count, 3);
+        assert!(encoded_bytes > 0);
+        let request = builder.build_request(metadata, request_metadata, payload);
+        assert_eq!(request.finalizers.len(), 3);
+        let terminal_event_log = request.metadata.event_log_metadata().clone();
+        let service = EventLoggingService {
+            inner: build_gcs_inner_service(
+                gcs_test_client(),
+                endpoint.to_string(),
+                GcpAuthenticator::None,
+                gcs_test_tower_settings(2),
+                "test-bucket".to_owned(),
+            ),
+            enable_logs,
+        };
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        let capture = VelEventCapture::default();
+        let succeeded = expected_status == BatchStatus::Delivered;
+
+        capture.capture(async {
+            let driver = Driver::new(stream::iter([request]), service).protocol("http").run();
+            tokio::pin!(driver);
+            for attempt in 1..=expected_attempts {
+                let gate = tokio::select! {
+                    result = &mut driver => panic!("Driver finished before attempt {attempt}: {result:?}"),
+                    gate = gates_rx.recv() => gate.expect("HTTP server closed before expected attempt"),
+                };
+                assert_eq!(request_count.load(Ordering::SeqCst), attempt);
+                assert!(matches!(receiver.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+                for metric in [
+                    "component_discarded_events_total",
+                    "component_errors_total",
+                    "component_sent_events_total",
+                    "component_sent_event_bytes_total",
+                    "component_sent_bytes_total",
+                ] {
+                    assert_eq!(counter_value(&snapshotter, metric, &[]), 0, "{metric} before response {attempt}");
+                }
+                assert_vel_terminal_counts(&terminal_event_log, &capture, 0, 0, usize::from(enable_logs), 0, 0);
+                gate.send(()).unwrap();
+            }
+            tokio::select! {
+                result = &mut driver => result.unwrap(),
+                gate = gates_rx.recv() => panic!("Unexpected HTTP retry after the terminal response: {}", gate.is_some()),
+            }
+            assert_eq!(receiver.await, expected_status);
+        }).await;
+
+        assert_eq!(request_count.load(Ordering::SeqCst), expected_attempts);
+        assert_eq!(
+            counter_value(
+                &snapshotter,
+                "component_discarded_events_total",
+                &[("intentional", "false")]
+            ),
+            if succeeded { 0 } else { event_count }
+        );
+        assert_eq!(
+            counter_value(
+                &snapshotter,
+                "component_errors_total",
+                &[("error_type", "request_failed"), ("stage", "sending")]
+            ),
+            u64::from(!succeeded)
+        );
+        for (metric, expected) in [
+            ("component_sent_events_total", event_count),
+            ("component_sent_event_bytes_total", event_bytes),
+            ("component_sent_bytes_total", encoded_bytes),
+        ] {
+            assert_eq!(
+                counter_value(&snapshotter, metric, &[]),
+                if succeeded { expected } else { 0 },
+                "{metric}"
+            );
+        }
+        for (metric, failure_label) in [
+            ("blob_sink_file_uploads_total", "failure"),
+            ("sink_requests_completed_total", "failed"),
+        ] {
+            assert_eq!(
+                counter_value(&snapshotter, metric, &[("status", "success")]),
+                u64::from(succeeded)
+            );
+            assert_eq!(
+                counter_value(&snapshotter, metric, &[("status", failure_label)]),
+                expected_attempts as u64 - u64::from(succeeded)
+            );
+        }
+        assert_vel_terminal_counts(
+            &terminal_event_log,
+            &capture,
+            usize::from(succeeded),
+            u32::from(succeeded && enable_logs),
+            usize::from(enable_logs),
+            usize::from(succeeded && enable_logs),
+            usize::from(!succeeded && enable_logs),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gcs_terminal_driver_delivers_2xx() {
+        for status in [StatusCode::OK, StatusCode::CREATED, StatusCode::NO_CONTENT] {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                assert_gcs_terminal_upload(vec![status], 1, BatchStatus::Delivered, true),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gcs_terminal_driver_retries_429_and_500_before_delivery() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            assert_gcs_terminal_upload(
+                vec![
+                    StatusCode::TOO_MANY_REQUESTS,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::OK,
+                ],
+                3,
+                BatchStatus::Delivered,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gcs_terminal_driver_rejects_403_and_501_without_retry() {
+        for status in [StatusCode::FORBIDDEN, StatusCode::NOT_IMPLEMENTED] {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                assert_gcs_terminal_upload(vec![status], 1, BatchStatus::Rejected, true),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gcs_terminal_driver_rejects_exhausted_429_and_500() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                assert_gcs_terminal_upload(vec![status], 3, BatchStatus::Rejected, true),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gcs_terminal_driver_rejection_does_not_depend_on_vel() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            assert_gcs_terminal_upload(
+                vec![StatusCode::INTERNAL_SERVER_ERROR],
+                3,
+                BatchStatus::Rejected,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
