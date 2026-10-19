@@ -17,6 +17,7 @@ use prost_reflect::{
 };
 use tracing::Instrument;
 use vector_lib::{
+    EstimatedJsonEncodedSizeOf,
     config::clone_input_definitions,
     configurable::configurable_component,
     internal_event::{ComponentEventsDropped, Count, INTENTIONAL, InternalEventHandle, Registered},
@@ -82,6 +83,18 @@ pub enum EnforceMode {
     Selected,
     /// Drop every over-quota `(topic, system)`.
     All,
+}
+
+/// What each passed-through log charges against its quota.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaUnit {
+    /// One per log.
+    #[default]
+    Events,
+    /// The log's size in bytes. Needs a sidecar that understands the request's `unit`.
+    Bytes,
 }
 
 /// How the transform enforces over-quota drops. Replaces the earlier flat `enforce` bool +
@@ -219,6 +232,16 @@ pub struct DynamicRlsThrottleConfig {
     /// unaffected.
     #[serde(default = "default_emit_inflow_metric")]
     pub emit_inflow_metric: bool,
+
+    /// What each passed-through log charges against its quota: `events` (default) or `bytes`.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub quota_unit: QuotaUnit,
+
+    /// With `quota_unit = bytes`, the event field holding the log's size in bytes. Unset, or not
+    /// a non-negative integer on an event, charges the event's estimated JSON-encoded size.
+    #[serde(default)]
+    pub bytes_field: Option<String>,
 }
 
 impl Default for DynamicRlsThrottleConfig {
@@ -233,6 +256,8 @@ impl Default for DynamicRlsThrottleConfig {
             system_field: default_system_field(),
             enforce: EnforceConfig::default(),
             emit_inflow_metric: default_emit_inflow_metric(),
+            quota_unit: QuotaUnit::default(),
+            bytes_field: None,
         }
     }
 }
@@ -275,6 +300,14 @@ impl TransformConfig for DynamicRlsThrottleConfig {
             .map_err(|e| format!("invalid `topic_field` path {:?}: {e}", self.topic_field))?;
         let system_path = parse_target_path(&self.system_field)
             .map_err(|e| format!("invalid `system_field` path {:?}: {e}", self.system_field))?;
+        let bytes_path = self
+            .bytes_field
+            .as_deref()
+            .map(|field| {
+                parse_target_path(field)
+                    .map_err(|e| format!("invalid `bytes_field` path {field:?}: {e}"))
+            })
+            .transpose()?;
 
         // Load the gRPC transport (client + endpoint + runtime descriptor). MUST FAIL OPEN: any
         // failure here (bad descriptor OR unparseable endpoint) disables throttling rather than
@@ -300,6 +333,7 @@ impl TransformConfig for DynamicRlsThrottleConfig {
             transport,
             topic_path,
             system_path,
+            bytes_path,
         )))
     }
 
@@ -491,6 +525,7 @@ pub struct DynamicRlsThrottle {
     /// Pre-compiled key field paths, parsed once at build time (see `build`).
     topic_path: OwnedTargetPath,
     system_path: OwnedTargetPath,
+    bytes_path: Option<OwnedTargetPath>,
     events_dropped: Registered<ComponentEventsDropped<'static, INTENTIONAL>>,
 }
 
@@ -500,6 +535,7 @@ impl DynamicRlsThrottle {
         transport: Option<GrpcTransport>,
         topic_path: OwnedTargetPath,
         system_path: OwnedTargetPath,
+        bytes_path: Option<OwnedTargetPath>,
     ) -> Self {
         Self {
             config,
@@ -510,6 +546,7 @@ impl DynamicRlsThrottle {
             }),
             topic_path,
             system_path,
+            bytes_path,
             events_dropped: register!(ComponentEventsDropped::<INTENTIONAL>::from(
                 "Topic/system is over its online quota."
             )),
@@ -528,6 +565,7 @@ impl TaskTransform<Event> for DynamicRlsThrottle {
             shared,
             topic_path,
             system_path,
+            bytes_path,
             events_dropped,
         } = *self;
 
@@ -547,6 +585,7 @@ impl TaskTransform<Event> for DynamicRlsThrottle {
         let enforce_mode = config.enforce.mode;
         let enforce_systems = config.enforce.systems.clone();
         let emit_inflow_metric = config.emit_inflow_metric;
+        let quota_unit = config.quota_unit;
 
         // The reporter runs concurrently so the hot path never blocks on the sidecar. It is
         // aborted when the input stream ends (the returned guard's `Drop`).
@@ -594,8 +633,11 @@ impl TaskTransform<Event> for DynamicRlsThrottle {
                             }
                         } else {
                             // Under quota: count the passed-through log and forward it.
+                            let amount = charge(quota_unit, bytes_path.as_ref(), &event);
                             if let Ok(mut counts) = shared.counts.lock() {
-                                *counts.entry(key).or_insert(0) += 1;
+                                let count = counts.entry(key).or_insert(0);
+                                // Capped at i64::MAX: the report's `count` is a proto int64.
+                                *count = count.saturating_add(amount).min(i64::MAX as u64);
                             }
                             yield event;
                         }
@@ -626,6 +668,17 @@ fn event_key(
         .map(|v| v.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())?;
     Some((topic, system))
+}
+
+/// What one passed-through log charges against its quota, in `quota_unit`.
+fn charge(quota_unit: QuotaUnit, bytes_path: Option<&OwnedTargetPath>, event: &Event) -> u64 {
+    match quota_unit {
+        QuotaUnit::Events => 1,
+        QuotaUnit::Bytes => bytes_path
+            .and_then(|path| event.maybe_as_log()?.get(path)?.as_integer())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or_else(|| event.estimated_json_encoded_size_of().get() as u64),
+    }
 }
 
 /// Owns the background reporting task and aborts it on drop.
@@ -722,6 +775,21 @@ impl ReportError {
     }
 }
 
+/// The proto3-JSON `ReportCountsRequest` for one window. `unit` is only set for bytes, so an
+/// events request is unchanged and still matches a descriptor that predates the field.
+fn report_request_json(quota_unit: QuotaUnit, snapshot: HashMap<Key, u64>) -> serde_json::Value {
+    let counts: Vec<_> = snapshot
+        .into_iter()
+        .map(|((topic, system), count)| {
+            serde_json::json!({ "topic": topic, "system": system, "count": count.to_string() })
+        })
+        .collect();
+    match quota_unit {
+        QuotaUnit::Events => serde_json::json!({ "counts": counts }),
+        QuotaUnit::Bytes => serde_json::json!({ "counts": counts, "unit": "QUOTA_UNIT_BYTES" }),
+    }
+}
+
 /// Report one window's counts to the sidecar's gRPC `ReportCounts` and return the over-limit set.
 async fn report(
     config: &DynamicRlsThrottleConfig,
@@ -733,13 +801,7 @@ async fn report(
     // Build the request as proto3-JSON, then deserialize into a DynamicMessage against the
     // descriptor (int64 `count` as a string, per proto-JSON). An empty window still sends an empty
     // `counts` list so the sidecar's count-of-0 recheck runs and over-quota combos can recover.
-    let counts: Vec<_> = snapshot
-        .into_iter()
-        .map(|((topic, system), count)| {
-            serde_json::json!({ "topic": topic, "system": system, "count": count.to_string() })
-        })
-        .collect();
-    let request_json = serde_json::json!({ "counts": counts });
+    let request_json = report_request_json(config.quota_unit, snapshot);
     let opts = DeserializeOptions::new().deny_unknown_fields(true);
     let request_msg = DynamicMessage::deserialize_with_options(request_desc, &request_json, &opts)
         .map_err(|e| {
@@ -1206,6 +1268,61 @@ mod tests {
         assert_eq!(out.next().await, None);
     }
 
+    // --- Quota unit ------------------------------------------------------------------------------
+
+    #[test]
+    fn quota_unit_defaults_to_events() {
+        let config = toml::from_str::<DynamicRlsThrottleConfig>("").unwrap();
+        assert_eq!(config.quota_unit, QuotaUnit::Events);
+        assert_eq!(config.bytes_field, None);
+
+        let config = toml::from_str::<DynamicRlsThrottleConfig>(
+            "quota_unit = \"bytes\"\nbytes_field = \".rls_bytes\"",
+        )
+        .unwrap();
+        assert_eq!(config.quota_unit, QuotaUnit::Bytes);
+        assert_eq!(config.bytes_field.as_deref(), Some(".rls_bytes"));
+    }
+
+    #[test]
+    fn charge_is_one_per_log_for_events_and_the_log_size_for_bytes() {
+        let bytes_path = parse_target_path(".rls_bytes").unwrap();
+        let mut sized = log_with("t", "s");
+        sized.as_mut_log().insert("rls_bytes", 1500_i64);
+        let mut negative = log_with("t", "s");
+        negative.as_mut_log().insert("rls_bytes", -5_i64);
+        let unsized_event = log_with("t", "s");
+        let estimated = unsized_event.estimated_json_encoded_size_of().get() as u64;
+
+        assert_eq!(charge(QuotaUnit::Events, Some(&bytes_path), &sized), 1);
+        assert_eq!(charge(QuotaUnit::Bytes, Some(&bytes_path), &sized), 1500);
+        // No usable size field: charge the event's estimated size rather than nothing.
+        assert_eq!(
+            charge(QuotaUnit::Bytes, Some(&bytes_path), &unsized_event),
+            estimated
+        );
+        assert_eq!(
+            charge(QuotaUnit::Bytes, Some(&bytes_path), &negative),
+            negative.estimated_json_encoded_size_of().get() as u64
+        );
+        assert_eq!(charge(QuotaUnit::Bytes, None, &unsized_event), estimated);
+        assert!(estimated > 0);
+    }
+
+    #[test]
+    fn report_request_sets_unit_only_for_bytes() {
+        let snapshot = || HashMap::from([(("t".to_string(), "s".to_string()), 7)]);
+        let events = report_request_json(QuotaUnit::Events, snapshot());
+        let bytes = report_request_json(QuotaUnit::Bytes, snapshot());
+
+        assert_eq!(
+            events,
+            serde_json::json!({ "counts": [{ "topic": "t", "system": "s", "count": "7" }] })
+        );
+        assert_eq!(bytes["unit"], "QUOTA_UNIT_BYTES");
+        assert_eq!(bytes["counts"], events["counts"]);
+    }
+
     // --- Test config + construction helpers ------------------------------------------------------
 
     /// Build a log event with the default topic/system paths populated.
@@ -1248,14 +1365,20 @@ mod tests {
         let transport = test_transport(&config.sidecar_endpoint);
         let topic_path = parse_target_path(&config.topic_field).unwrap();
         let system_path = parse_target_path(&config.system_field).unwrap();
-        DynamicRlsThrottle::new(config.clone(), Some(transport), topic_path, system_path)
+        DynamicRlsThrottle::new(
+            config.clone(),
+            Some(transport),
+            topic_path,
+            system_path,
+            None,
+        )
     }
 
     /// Construct a DISABLED transform (no transport) — models the descriptor-load fail-open state.
     fn build_throttle_no_transport(config: &DynamicRlsThrottleConfig) -> DynamicRlsThrottle {
         let topic_path = parse_target_path(&config.topic_field).unwrap();
         let system_path = parse_target_path(&config.system_field).unwrap();
-        DynamicRlsThrottle::new(config.clone(), None, topic_path, system_path)
+        DynamicRlsThrottle::new(config.clone(), None, topic_path, system_path, None)
     }
 
     fn throttle_with_over_limit(
