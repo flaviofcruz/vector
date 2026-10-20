@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use metrics::counter;
+use metrics::{Counter, counter};
 use tokio::time::interval;
 use tracing::{Instrument, Span};
 use vector_common::internal_event::emit;
@@ -19,6 +19,32 @@ use crate::{
 /// Since none of the values used with atomic operations are used to protect other values, we can
 /// always used a "relaxed" ordering when updating them.
 const ORDERING: Ordering = Ordering::Relaxed;
+
+fn register_buffer_counter_handles(buffer_id: &str, stage_idx: usize) -> [Counter; 4] {
+    let stage = stage_idx.to_string();
+    [
+        counter!(
+            "buffer_received_events_total",
+            "buffer_id" => buffer_id.to_owned(),
+            "stage" => stage.clone(),
+        ),
+        counter!(
+            "buffer_received_bytes_total",
+            "buffer_id" => buffer_id.to_owned(),
+            "stage" => stage.clone(),
+        ),
+        counter!(
+            "buffer_sent_events_total",
+            "buffer_id" => buffer_id.to_owned(),
+            "stage" => stage.clone(),
+        ),
+        counter!(
+            "buffer_sent_bytes_total",
+            "buffer_id" => buffer_id.to_owned(),
+            "stage" => stage,
+        ),
+    ]
+}
 
 fn increment_counter(counter: &AtomicU64, delta: u64) {
     counter
@@ -295,29 +321,7 @@ impl BufferUsage {
             .stages
             .into_iter()
             .map(|stage| {
-                let stage_label = stage.idx.to_string();
-                let counter_handles = (
-                    counter!(
-                        "buffer_received_events_total",
-                        "buffer_id" => buffer_id.clone(),
-                        "stage" => stage_label.clone(),
-                    ),
-                    counter!(
-                        "buffer_received_bytes_total",
-                        "buffer_id" => buffer_id.clone(),
-                        "stage" => stage_label.clone(),
-                    ),
-                    counter!(
-                        "buffer_sent_events_total",
-                        "buffer_id" => buffer_id.clone(),
-                        "stage" => stage_label.clone(),
-                    ),
-                    counter!(
-                        "buffer_sent_bytes_total",
-                        "buffer_id" => buffer_id.clone(),
-                        "stage" => stage_label,
-                    ),
-                );
+                let counter_handles = register_buffer_counter_handles(&buffer_id, stage.idx);
                 (stage, counter_handles)
             })
             .collect();
