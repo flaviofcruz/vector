@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use metrics::counter;
 use tokio::time::interval;
 use tracing::{Instrument, Span};
 use vector_common::internal_event::emit;
@@ -290,7 +291,36 @@ impl BufferUsage {
     pub fn install(self, buffer_id: &str) {
         let buffer_id = buffer_id.to_string();
         let span = self.span;
-        let stages = self.stages;
+        let stages: Vec<_> = self
+            .stages
+            .into_iter()
+            .map(|stage| {
+                let stage_label = stage.idx.to_string();
+                let counter_handles = (
+                    counter!(
+                        "buffer_received_events_total",
+                        "buffer_id" => buffer_id.clone(),
+                        "stage" => stage_label.clone(),
+                    ),
+                    counter!(
+                        "buffer_received_bytes_total",
+                        "buffer_id" => buffer_id.clone(),
+                        "stage" => stage_label.clone(),
+                    ),
+                    counter!(
+                        "buffer_sent_events_total",
+                        "buffer_id" => buffer_id.clone(),
+                        "stage" => stage_label.clone(),
+                    ),
+                    counter!(
+                        "buffer_sent_bytes_total",
+                        "buffer_id" => buffer_id.clone(),
+                        "stage" => stage_label,
+                    ),
+                );
+                (stage, counter_handles)
+            })
+            .collect();
         let task_name = format!("buffer usage reporter ({buffer_id})");
 
         let task = async move {
@@ -298,7 +328,7 @@ impl BufferUsage {
             loop {
                 interval.tick().await;
 
-                for stage in &stages {
+                for (stage, _counter_handles) in &stages {
                     let max_size = stage.max_size.get();
                     emit(BufferCreated {
                         buffer_id: buffer_id.clone(),

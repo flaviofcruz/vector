@@ -190,7 +190,7 @@ async fn disabled_reader_watchdog_waits_for_notification() {
 }
 
 #[tokio::test]
-async fn reader_watchdog_stays_asleep_without_published_progress() {
+async fn reader_watchdog_rechecks_without_published_progress() {
     with_temp_dir(|dir| {
         let data_dir = dir.to_path_buf();
 
@@ -206,11 +206,8 @@ async fn reader_watchdog_stays_asleep_without_published_progress() {
                 spawn(reader.wait_for_writer_progress(expected_next_record_id, writer_file_id));
             assert_pending!(wait_for_progress.poll());
 
-            tokio::time::advance(Duration::from_secs(60)).await;
-            assert_pending!(wait_for_progress.poll());
-
-            tokio::time::advance(Duration::from_secs(60)).await;
-            assert_pending!(wait_for_progress.poll());
+            tokio::time::advance(Duration::from_secs(61)).await;
+            assert_ready!(wait_for_progress.poll());
 
             tokio::time::resume();
         }

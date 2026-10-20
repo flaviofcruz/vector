@@ -352,11 +352,20 @@ where
                 }
 
                 // Otherwise the writer is still on this file and may be mid-write: park on the
-                // writer notification (cancellable, zero CPU) instead of busy-spinning on
-                // `fill_buf`, preserving the payload bytes already accumulated in `aligned_buf`. On
-                // wake we loop back, re-read the current file, and re-check the writer file id -- so
-                // a subsequent writer roll is observed and turned into the `PartialWrite` above.
-                ledger.wait_for_writer().await;
+                // writer notification or watchdog timeout (cancellable, zero CPU) instead of
+                // busy-spinning on `fill_buf`, preserving the payload bytes already accumulated in
+                // `aligned_buf`. On wake we loop back, re-read the current file, and re-check the
+                // writer file id -- so a subsequent writer roll is observed and turned into the
+                // `PartialWrite` above.
+                if wait_for_writer_or_timeout(ledger).await {
+                    trace!(
+                        reader_file_id,
+                        current_writer_file_id = ledger.get_current_writer_file_id(),
+                        record_len,
+                        payload_bytes_read = self.aligned_buf.len(),
+                        "Reader progress watchdog expired while reading a record; retrying."
+                    );
+                }
                 continue;
             }
 
@@ -445,6 +454,21 @@ where
     _t: PhantomData<T>,
 }
 
+/// Waits for writer notification, falling back to a periodic retry when configured.
+///
+/// Returns `true` when the watchdog expired and `false` when the writer notified us. When the
+/// watchdog is disabled, this waits indefinitely for a notification and always returns `false`.
+async fn wait_for_writer_or_timeout<FS: Filesystem>(ledger: &Ledger<FS>) -> bool {
+    let Some(recheck_interval) = ledger.config().reader_progress_recheck_interval else {
+        ledger.wait_for_writer().await;
+        return false;
+    };
+
+    tokio::time::timeout(recheck_interval, ledger.wait_for_writer())
+        .await
+        .is_err()
+}
+
 impl<T, FS> BufferReader<T, FS>
 where
     T: Bufferable,
@@ -482,44 +506,28 @@ where
         self.flush_signal.clone()
     }
 
-    /// Waits until the writer signals us or its published state indicates that retrying the read
-    /// could make progress. The periodic state check recovers from a missed notification without
-    /// polling the data file while the buffer is idle.
+    /// Waits until the writer signals us or the periodic reader watchdog expires.
+    ///
+    /// The timeout is an unconditional retry: notifications are hints rather than a correctness
+    /// boundary, and a retry that still finds no readable data simply waits again.
     pub(super) async fn wait_for_writer_progress(
         &self,
         expected_next_record_id: u64,
         observed_writer_file_id: u16,
     ) {
-        let Some(recheck_interval) = self.ledger.config().reader_progress_recheck_interval else {
-            self.ledger.wait_for_writer().await;
-            return;
-        };
-
-        loop {
-            if tokio::time::timeout(recheck_interval, self.ledger.wait_for_writer())
-                .await
-                .is_ok()
-            {
-                return;
-            }
-
+        if wait_for_writer_or_timeout(&self.ledger).await {
             let published_next_record_id = self.ledger.state().get_next_writer_record_id();
             let current_writer_file_id = self.ledger.get_current_writer_file_id();
 
-            if published_next_record_id != expected_next_record_id
-                || current_writer_file_id != observed_writer_file_id
-                || self.ledger.has_pending_acks()
-                || self.ledger.is_writer_done()
-            {
-                debug!(
-                    expected_next_record_id,
-                    published_next_record_id,
-                    observed_writer_file_id,
-                    current_writer_file_id,
-                    "Rechecking disk buffer after observing published progress."
-                );
-                return;
-            }
+            trace!(
+                expected_next_record_id,
+                published_next_record_id,
+                observed_writer_file_id,
+                current_writer_file_id,
+                pending_acks = self.ledger.has_pending_acks(),
+                writer_done = self.ledger.is_writer_done(),
+                "Reader progress watchdog expired; retrying disk buffer read."
+            );
         }
     }
 
@@ -888,7 +896,17 @@ where
                                 data_file_path = data_file_path.to_string_lossy().as_ref(),
                                 "Data file does not yet exist. Waiting for writer to create."
                             );
-                            self.ledger.wait_for_writer().await;
+                            if wait_for_writer_or_timeout(&self.ledger).await {
+                                trace!(
+                                    data_file_path = data_file_path.to_string_lossy().as_ref(),
+                                    reader_file_id,
+                                    writer_file_id,
+                                    current_writer_file_id =
+                                        self.ledger.get_current_writer_file_id(),
+                                    "Reader progress watchdog expired while waiting for a data \
+                                     file; retrying."
+                                );
+                            }
                         } else {
                             self.ledger.increment_acked_reader_file_id();
                         }
@@ -1294,4 +1312,66 @@ pub(crate) fn decode_record_payload<T: Bufferable>(
 
     // Now we can finally try decoding.
     T::decode(metadata, record.payload()).context(DecodeSnafu)
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use std::time::Duration;
+
+    use crate::{
+        test::{SizedRecord, with_temp_dir},
+        variants::disk_v2::tests::create_buffer_v2_with_reader_progress_recheck_interval,
+    };
+
+    #[tokio::test]
+    async fn missing_file_retries_after_watchdog_timeout_without_notification() {
+        with_temp_dir(|dir| {
+            let data_dir = dir.to_path_buf();
+
+            async move {
+                let (_writer, mut reader, ledger) =
+                    create_buffer_v2_with_reader_progress_recheck_interval::<_, SizedRecord>(
+                        data_dir,
+                        Some(Duration::from_millis(100)),
+                    )
+                    .await;
+
+                // Buffer initialization leaves the current file open in the reader. Reset that
+                // handle and remove the file so `ensure_ready_for_read` takes its NotFound wait.
+                reader.reset();
+                let data_file_path = ledger.get_current_reader_data_file_path();
+                tokio::fs::remove_file(&data_file_path)
+                    .await
+                    .expect("removing current data file should succeed");
+
+                let ensure_task = tokio::spawn(async move {
+                    let result = reader.ensure_ready_for_read().await;
+                    (reader, result)
+                });
+                tokio::task::yield_now().await;
+                assert!(
+                    !ensure_task.is_finished(),
+                    "reader should be waiting for the missing data file"
+                );
+
+                // Recreate the file without notifying the reader. It must remain asleep until the
+                // watchdog expires, then retry the open and complete.
+                tokio::fs::File::create(&data_file_path)
+                    .await
+                    .expect("recreating current data file should succeed");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                assert!(
+                    !ensure_task.is_finished(),
+                    "recreating the file alone must not wake the reader"
+                );
+
+                let (_reader, result) = tokio::time::timeout(Duration::from_secs(2), ensure_task)
+                    .await
+                    .expect("reader did not retry the missing file after the watchdog timeout")
+                    .expect("reader task should not panic");
+                result.expect("reader should open the recreated data file");
+            }
+        })
+        .await;
+    }
 }
