@@ -1289,7 +1289,8 @@ impl Source {
             insert_namespace_fields,
             extract_databricks_logs,
             hostpath_logging_annotation_key,
-        );
+        )
+        .with_shared_listing_cache(glob_minimum_cooldown);
         let annotator = PodMetadataAnnotator::new(pod_state, pod_fields_spec, log_namespace);
         let ns_annotator =
             NamespaceMetadataAnnotator::new(ns_state, namespace_fields_spec, log_namespace);

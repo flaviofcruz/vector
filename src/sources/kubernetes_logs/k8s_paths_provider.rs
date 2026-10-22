@@ -2,7 +2,12 @@
 
 #![deny(missing_docs)]
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 /// Default container name used when container name extraction is disabled.
 /// Choosing something obvious to make debugging easier when container name is invalid
@@ -18,6 +23,12 @@ use super::{
 };
 use crate::kubernetes::pod_manager_logic::extract_static_pod_config_hashsum;
 
+mod listing_cache;
+mod listing_matcher;
+
+use listing_cache::ListingCache;
+use listing_matcher::ListingScanRootMatcher;
+
 /// A paths provider implementation that uses the state obtained from the
 /// the k8s API.
 pub struct K8sPathsProvider {
@@ -32,6 +43,9 @@ pub struct K8sPathsProvider {
     /// When set, the annotation key to read for hostPath-based log directory discovery.
     /// None = use emptyDir-based discovery only.
     hostpath_logging_annotation_key: Option<String>,
+    /// Directory listings shared with other sources and the listing age this source accepts.
+    /// None = read the filesystem on every pass.
+    listing_cache: Option<(Arc<ListingCache>, Duration)>,
 }
 
 /// Extracts container name from a log file path.
@@ -96,14 +110,34 @@ impl K8sPathsProvider {
             insert_namespace_fields,
             extract_databricks_logs,
             hostpath_logging_annotation_key,
+            listing_cache: None,
         }
     }
-}
 
-impl PathsProvider for K8sPathsProvider {
-    type IntoIter = Vec<(Option<LogFileInfo>, PathBuf)>;
+    /// Share directory listings with every other source in the process. A listing may be reused
+    /// for up to `min(glob_minimum_cooldown / 2, 2s)`, which adds at most that much to new-file
+    /// discovery delay.
+    pub fn with_shared_listing_cache(mut self, glob_minimum_cooldown: Duration) -> Self {
+        self.listing_cache = Some((
+            ListingCache::shared(),
+            listing_cache::max_age_for_cooldown(glob_minimum_cooldown),
+        ));
+        self
+    }
 
-    fn paths(&self) -> Self::IntoIter {
+    fn matcher(&self) -> ListingScanRootMatcher {
+        match &self.listing_cache {
+            Some((cache, max_age)) => {
+                ListingScanRootMatcher::with_cache(Arc::clone(cache), *max_age)
+            }
+            None => ListingScanRootMatcher::default(),
+        }
+    }
+
+    fn paths_with<M: ScanRootMatcher>(
+        &self,
+        matcher: &mut M,
+    ) -> Vec<(Option<LogFileInfo>, PathBuf)> {
         let state = self.pod_state.state();
 
         state
@@ -131,13 +165,14 @@ impl PathsProvider for K8sPathsProvider {
             })
             .flat_map(|pod| {
                 trace!(message = "Providing log paths for pod.", pod = ?pod.metadata.name);
-                let paths_iter = list_pod_log_paths(
-                    real_glob,
+                let paths_iter = list_pod_log_paths_with(
+                    matcher,
                     self.pod_logs_glob_patterns.as_slice(),
                     pod.as_ref(),
                     self.extract_databricks_logs,
                     self.hostpath_logging_annotation_key.as_deref(),
-                );
+                )
+                .into_iter();
                 filter_paths(
                     filter_paths(paths_iter, &self.include_paths, true),
                     &self.exclude_paths,
@@ -168,6 +203,14 @@ impl PathsProvider for K8sPathsProvider {
                 .collect::<Vec<_>>()
             })
             .collect()
+    }
+}
+
+impl PathsProvider for K8sPathsProvider {
+    type IntoIter = Vec<(Option<LogFileInfo>, PathBuf)>;
+
+    fn paths(&self) -> Self::IntoIter {
+        self.paths_with(&mut self.matcher())
     }
 }
 
@@ -571,7 +614,22 @@ const VALID_LOG_VOLUME_NAMES: &[&str] = &[
     "event-logs",
     "payload-logs",
 ];
+#[cfg(test)]
 fn get_databricks_pod_logs_directories(
+    pod: &Pod,
+    empty_dir_pod_logs_directory: Option<PathBuf>,
+    hostpath_logging_annotation_key: Option<&str>,
+) -> Vec<PathBuf> {
+    get_databricks_pod_logs_directories_with(
+        existing_subdirs_by_stat,
+        pod,
+        empty_dir_pod_logs_directory,
+        hostpath_logging_annotation_key,
+    )
+}
+
+fn get_databricks_pod_logs_directories_with(
+    mut existing_subdirs: impl FnMut(&Path, &[&str]) -> Vec<PathBuf>,
     pod: &Pod,
     empty_dir_pod_logs_directory: Option<PathBuf>,
     hostpath_logging_annotation_key: Option<&str>,
@@ -582,12 +640,10 @@ fn get_databricks_pod_logs_directories(
         // Configured glob patterns are volume-relative (e.g. `*/access.log*` for the file
         // `logs/<dir>/access.log`), so globbing the base too would resolve each pattern one
         // segment short of its intended volume and match unintended files.
-        log_dirs.extend(
-            VALID_LOG_VOLUME_NAMES
-                .iter()
-                .map(|volume| empty_dir_pod_logs_directory.join(volume))
-                .filter(|dir| dir.is_dir()),
-        );
+        log_dirs.extend(existing_subdirs(
+            &empty_dir_pod_logs_directory,
+            VALID_LOG_VOLUME_NAMES,
+        ));
     }
     // If a hostpath annotation key is configured, resolve the annotation and include its directory.
     if let Some(annotation_key) = hostpath_logging_annotation_key
@@ -599,8 +655,58 @@ fn get_databricks_pod_logs_directories(
     log_dirs
 }
 
+/// The filesystem queries discovery makes per pod. Production uses [`ListingScanRootMatcher`];
+/// tests swap in the per-pattern glob reference and remap paths onto temporary trees.
+trait ScanRootMatcher {
+    /// `base.join(name)` for each of `names`, in order, that is an existing directory.
+    fn existing_subdirs(&mut self, base: &Path, names: &[&str]) -> Vec<PathBuf> {
+        existing_subdirs_by_stat(base, names)
+    }
+
+    /// All paths matched by `<dir>/<pattern>` for each pattern, concatenated in pattern order.
+    fn match_root(&mut self, dir: &str, patterns: &[String]) -> Vec<PathBuf>;
+}
+
+fn existing_subdirs_by_stat(base: &Path, names: &[&str]) -> Vec<PathBuf> {
+    names
+        .iter()
+        .map(|name| base.join(name))
+        .filter(|dir| dir.is_dir())
+        .collect()
+}
+
+/// One `glob_impl` call per `<dir>/<pattern>`, concatenated in pattern order. With `real_glob`
+/// this is the reference behavior that [`ListingScanRootMatcher`] reproduces.
+fn glob_scan_root<G, GI>(mut glob_impl: G, dir: &str, patterns: &[String]) -> Vec<PathBuf>
+where
+    G: FnMut(&str) -> GI,
+    GI: Iterator<Item = PathBuf>,
+{
+    let globs = patterns
+        .iter()
+        .map(|pattern| glob_impl(&[dir, pattern].join("/")))
+        .collect::<Vec<_>>();
+    globs.into_iter().flatten().collect()
+}
+
+/// Runs `glob_scan_root` with a (mock or real) glob function.
+#[cfg(test)]
+struct GlobScanRootMatcher<G>(G);
+
+#[cfg(test)]
+impl<G, GI> ScanRootMatcher for GlobScanRootMatcher<G>
+where
+    G: FnMut(&str) -> GI,
+    GI: Iterator<Item = PathBuf>,
+{
+    fn match_root(&mut self, dir: &str, patterns: &[String]) -> Vec<PathBuf> {
+        glob_scan_root(&mut self.0, dir, patterns)
+    }
+}
+
+#[cfg(test)]
 fn list_pod_log_paths<'a, G, GI>(
-    mut glob_impl: G,
+    glob_impl: G,
     pod_logs_glob_patterns: &'a [String],
     pod: &'a Pod,
     extract_databricks_logs: bool,
@@ -610,13 +716,31 @@ where
     G: FnMut(&str) -> GI + 'a,
     GI: Iterator<Item = PathBuf> + 'a,
 {
+    list_pod_log_paths_with(
+        &mut GlobScanRootMatcher(glob_impl),
+        pod_logs_glob_patterns,
+        pod,
+        extract_databricks_logs,
+        hostpath_logging_annotation_key,
+    )
+    .into_iter()
+}
+
+fn list_pod_log_paths_with<M: ScanRootMatcher>(
+    matcher: &mut M,
+    pod_logs_glob_patterns: &[String],
+    pod: &Pod,
+    extract_databricks_logs: bool,
+    hostpath_logging_annotation_key: Option<&str>,
+) -> Vec<PathBuf> {
     // Extract log file paths from the pod logs directory of the logging empty-dir volume associated
     // with the pod.
     // If hostpath_logging_annotation_key is set, also extract log file paths from
     // the hostPath logging annotation and merge the two sets of paths.
     let log_dirs = if extract_databricks_logs {
         let empty_dir_pod_logs_directory = extract_databricks_pod_logs_directory(pod);
-        get_databricks_pod_logs_directories(
+        get_databricks_pod_logs_directories_with(
+            |base, names| matcher.existing_subdirs(base, names),
             pod,
             empty_dir_pod_logs_directory,
             hostpath_logging_annotation_key,
@@ -626,60 +750,47 @@ where
             .into_iter()
             .collect::<Vec<_>>()
     };
-    log_dirs.into_iter().flat_map(move |dir| {
-        let dir = dir
-            .to_str()
-            .expect("non-utf8 path to pod logs dir is not supported");
+    let pod_name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
+    log_dirs
+        .into_iter()
+        .flat_map(|dir| {
+            let dir = dir
+                .to_str()
+                .expect("non-utf8 path to pod logs dir is not supported");
 
-        let pod_name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
-        trace!(
-            message = "Resolved pod logs directory.",
-            %pod_name,
-            pod_logs_directory = %dir,
-        );
+            trace!(
+                message = "Resolved pod logs directory.",
+                %pod_name,
+                pod_logs_directory = %dir,
+            );
 
-        // Build the full glob patterns for logging.
-        let full_glob_patterns: Vec<String> = pod_logs_glob_patterns
-            .iter()
-            .map(|pattern| [dir, pattern].join("/"))
-            .collect();
+            trace!(
+                message = "Applying glob patterns to pod logs directory.",
+                %pod_name,
+                pod_logs_directory = %dir,
+                glob_patterns = ?pod_logs_glob_patterns,
+            );
 
-        trace!(
-            message = "Applying glob patterns to pod logs directory.",
-            %pod_name,
-            glob_patterns = ?full_glob_patterns,
-        );
+            let found_paths = matcher.match_root(dir, pod_logs_glob_patterns);
 
-        // Run the glob to get a list of unfiltered paths.
-        let pod_logs_glob_patterns_globs = full_glob_patterns
-            .iter()
-            .map(|pattern| glob_impl(pattern))
-            .collect::<Vec<_>>();
+            trace!(
+                message = "Files found by glob patterns.",
+                %pod_name,
+                pod_logs_directory = %dir,
+                files_found = ?found_paths,
+                count = found_paths.len(),
+            );
 
-        // Combine the paths for the user-specified glob patterns.
-        // Collect to a Vec so we can log the found paths.
-        let found_paths: Vec<PathBuf> =
-            pod_logs_glob_patterns_globs.into_iter().flatten().collect();
+            // Extract the containers to exclude, then build patterns from them
+            // and cache the results into a Vec.
+            let excluded_containers = extract_excluded_containers_for_pod(pod);
+            let exclusion_patterns: Vec<_> =
+                build_container_exclusion_patterns(dir, excluded_containers).collect();
 
-        trace!(
-            message = "Files found by glob patterns.",
-            %pod_name,
-            pod_logs_directory = %dir,
-            files_found = ?found_paths,
-            count = found_paths.len(),
-        );
-
-        let path_iter = found_paths.into_iter();
-
-        // Extract the containers to exclude, then build patterns from them
-        // and cache the results into a Vec.
-        let excluded_containers = extract_excluded_containers_for_pod(pod);
-        let exclusion_patterns: Vec<_> =
-            build_container_exclusion_patterns(dir, excluded_containers).collect();
-
-        // Return paths filtered with container exclusion.
-        filter_paths(path_iter, exclusion_patterns, false)
-    })
+            // Return paths filtered with container exclusion.
+            filter_paths(found_paths.into_iter(), exclusion_patterns, false).collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn real_glob(pattern: &str) -> impl Iterator<Item = PathBuf> + use<> {
@@ -712,6 +823,9 @@ fn filter_paths<'a>(
         if include { m } else { !m }
     })
 }
+
+#[cfg(test)]
+mod equivalence_tests;
 
 #[cfg(test)]
 mod tests {

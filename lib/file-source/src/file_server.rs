@@ -426,6 +426,23 @@ where
                     }
                 }
                 stats.record("discovery", start.elapsed());
+
+                let pass_end = time::Instant::now();
+                let scheduled = next_glob_time;
+                next_glob_time = next_discovery_time(
+                    now_time,
+                    pass_end,
+                    next_glob_time,
+                    self.glob_minimum_cooldown,
+                );
+                if next_glob_time > scheduled {
+                    debug!(
+                        message = "Slow discovery pass; delaying the next one.",
+                        pass_duration_ms = pass_end.duration_since(now_time).as_millis() as u64,
+                        extra_delay_ms =
+                            next_glob_time.duration_since(scheduled).as_millis() as u64,
+                    );
+                }
             }
 
             const DELETE_KNOWN_SMALL_FILES: bool = false;
@@ -1140,6 +1157,37 @@ impl Default for TimingStats {
     }
 }
 
+/// Upper bound on the rest after a slow discovery pass, as a multiple of `glob_minimum_cooldown`.
+const DISCOVERY_MAX_REST_COOLDOWNS: u32 = 3;
+
+/// When the discovery pass that ran from `pass_start` to `pass_end` may next run.
+///
+/// `scheduled` is the usual `pass_start + cooldown`. Once a pass takes longer than the cooldown,
+/// that time has already passed and, without a floor, discovery would run back-to-back. Sources
+/// run their passes on separate blocking threads, so they contend with one another, get slower,
+/// and stay back-to-back after the load that triggered them goes away. The floor rests the source
+/// for as long as the pass took (capped at `DISCOVERY_MAX_REST_COOLDOWNS × cooldown`), keeping it
+/// busy at most about half the time so the contention can clear.
+///
+/// While `pass_duration ≤ cooldown / 2` the floor is not later than `scheduled`, so normal passes
+/// keep their schedule exactly. Under overload a new file is found at most
+/// `pass_duration + 3 × cooldown` after the previous pass ended, plus the read-loop backoff. A
+/// cooldown of 0 disables the floor.
+fn next_discovery_time(
+    pass_start: time::Instant,
+    pass_end: time::Instant,
+    scheduled: time::Instant,
+    cooldown: Duration,
+) -> time::Instant {
+    let rest = pass_end
+        .saturating_duration_since(pass_start)
+        .min(cooldown.saturating_mul(DISCOVERY_MAX_REST_COOLDOWNS));
+    match pass_end.checked_add(rest) {
+        Some(floor) => scheduled.max(floor),
+        None => scheduled,
+    }
+}
+
 #[derive(Debug)]
 pub struct Line {
     pub text: Bytes,
@@ -1155,7 +1203,8 @@ mod tests {
         collections::HashMap,
         io::Error,
         path::{Path, PathBuf},
-        time::Duration,
+        sync::{Arc, Mutex},
+        time::{self, Duration},
     };
 
     use bytes::{Bytes, BytesMut};
@@ -1168,7 +1217,7 @@ mod tests {
 
     use crate::{
         FileTTLAction, FileTTLRemovalConfig,
-        file_server::{FileServer, Line},
+        file_server::{FileServer, Line, next_discovery_time},
         paths_provider::PathsProvider,
     };
 
@@ -1283,6 +1332,164 @@ mod tests {
                 .iter()
                 .map(|p| (None, p.clone()))
                 .collect()
+        }
+    }
+
+    #[test]
+    fn next_discovery_time_keeps_schedule_for_normal_passes() {
+        let cooldown = Duration::from_secs(10);
+        let start = time::Instant::now();
+        let scheduled = start + cooldown;
+        for pass_ms in [0, 1, 50, 1_000, 4_999, 5_000] {
+            let end = start + Duration::from_millis(pass_ms);
+            assert_eq!(
+                next_discovery_time(start, end, scheduled, cooldown),
+                scheduled,
+                "pass of {pass_ms}ms"
+            );
+        }
+        // Passes of 1 ms against the 10 ms cooldown the existing tests use.
+        let cooldown = Duration::from_millis(10);
+        let end = start + Duration::from_millis(1);
+        assert_eq!(
+            next_discovery_time(start, end, start + cooldown, cooldown),
+            start + cooldown
+        );
+        // A zero cooldown keeps passing on every loop iteration.
+        let end = start + Duration::from_secs(5);
+        assert_eq!(next_discovery_time(start, end, start, Duration::ZERO), end);
+    }
+
+    #[test]
+    fn next_discovery_time_rests_after_slow_passes_up_to_the_cap() {
+        let cooldown = Duration::from_secs(10);
+        let start = time::Instant::now();
+        let scheduled = start + cooldown;
+        // Just over half the cooldown: rest for the pass's duration.
+        let end = start + Duration::from_millis(5_001);
+        assert_eq!(
+            next_discovery_time(start, end, scheduled, cooldown),
+            end + Duration::from_millis(5_001)
+        );
+        // Longer than the cooldown: no longer back-to-back.
+        let end = start + Duration::from_secs(25);
+        assert_eq!(
+            next_discovery_time(start, end, scheduled, cooldown),
+            end + Duration::from_secs(25)
+        );
+        // Rest is capped at 3 cooldowns.
+        let end = start + Duration::from_secs(120);
+        assert_eq!(
+            next_discovery_time(start, end, scheduled, cooldown),
+            end + Duration::from_secs(30)
+        );
+        // An end before the start (not possible with a monotonic clock) adds no rest.
+        assert_eq!(
+            next_discovery_time(end, start, scheduled, cooldown),
+            scheduled
+        );
+        // Huge cooldowns saturate instead of overflowing.
+        assert_eq!(
+            next_discovery_time(start, end, scheduled, Duration::MAX),
+            end + Duration::from_secs(120)
+        );
+    }
+
+    // PathsProvider that takes `delay` per call and records when each call ran.
+    struct SlowPathsProvider {
+        delay: Duration,
+        calls: Arc<Mutex<Vec<(time::Instant, time::Instant)>>>,
+    }
+
+    impl PathsProvider for SlowPathsProvider {
+        type IntoIter = Vec<(Option<crate::paths_provider::LogFileInfo>, PathBuf)>;
+
+        fn paths(&self) -> Self::IntoIter {
+            let start = time::Instant::now();
+            std::thread::sleep(self.delay);
+            self.calls
+                .lock()
+                .unwrap()
+                .push((start, time::Instant::now()));
+            Vec::new()
+        }
+    }
+
+    async fn discovery_passes(
+        delay: Duration,
+        cooldown: Duration,
+        run_for: Duration,
+    ) -> Vec<(time::Instant, time::Instant)> {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let base = make_file_server(Vec::new(), data_dir.clone(), false);
+        let file_server = FileServer {
+            paths_provider: SlowPathsProvider {
+                delay,
+                calls: Arc::clone(&calls),
+            },
+            max_read_bytes: base.max_read_bytes,
+            ignore_checkpoints: base.ignore_checkpoints,
+            read_from: base.read_from,
+            ignore_before: base.ignore_before,
+            start_reading_at: base.start_reading_at,
+            max_line_bytes: base.max_line_bytes,
+            line_delimiter: base.line_delimiter,
+            data_dir: base.data_dir,
+            glob_minimum_cooldown: cooldown,
+            idle_read_interval: base.idle_read_interval,
+            fingerprinter: base.fingerprinter,
+            oldest_first: base.oldest_first,
+            remove_after: base.remove_after,
+            emitter: base.emitter,
+            rotate_wait: base.rotate_wait,
+            ttl_removal_config: base.ttl_removal_config,
+            source_context: base.source_context,
+            file_to_pod_map: base.file_to_pod_map,
+            drain_on_shutdown: base.drain_on_shutdown,
+            archive_extensions: base.archive_extensions,
+            source_type: base.source_type,
+            read_loop_min_backoff: base.read_loop_min_backoff,
+        };
+        let (tx, _rx) = mpsc::channel::<Vec<Line>>(16);
+        let shutdown = Box::pin(tokio::time::sleep(run_for));
+        let checkpointer = Checkpointer::new(&data_dir);
+        file_server
+            .run(tx, shutdown, futures::future::ready(()), checkpointer)
+            .await
+            .unwrap();
+        // The first call is the startup scan, which the loop's first pass follows immediately.
+        calls.lock().unwrap().iter().skip(1).copied().collect()
+    }
+
+    #[tokio::test]
+    async fn fast_discovery_passes_run_once_per_cooldown() {
+        let cooldown = Duration::from_millis(100);
+        let calls = discovery_passes(Duration::ZERO, cooldown, Duration::from_millis(1_000)).await;
+        assert!(calls.len() >= 3, "only {} passes", calls.len());
+        for pair in calls.windows(2) {
+            assert!(pair[1].0.duration_since(pair[0].0) >= cooldown);
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_discovery_passes_do_not_run_back_to_back() {
+        // Each pass takes longer than the cooldown. Before the rest floor, the next pass started
+        // one read-loop backoff (1, 2, 4, ... ms) after the previous one ended.
+        let delay = Duration::from_millis(150);
+        let cooldown = Duration::from_millis(100);
+        let calls = discovery_passes(delay, cooldown, Duration::from_millis(1_500)).await;
+        assert!(calls.len() >= 3, "only {} passes", calls.len());
+        for pair in calls.windows(2) {
+            let (prev_start, prev_end) = pair[0];
+            let rest = pair[1].0.duration_since(prev_end);
+            assert!(
+                rest >= prev_end.duration_since(prev_start),
+                "rested {rest:?} after a {:?} pass",
+                prev_end.duration_since(prev_start)
+            );
         }
     }
 
