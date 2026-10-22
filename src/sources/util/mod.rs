@@ -31,6 +31,12 @@ pub mod multiline_config;
 #[cfg(any(feature = "sources-utils-net-tcp", feature = "sources-utils-net-udp"))]
 pub mod net;
 pub mod object_storage_compression;
+#[cfg(any(
+    feature = "sources-aws_s3",
+    feature = "sources-azure_blob",
+    feature = "sources-gcp_gcs"
+))]
+pub mod object_storage_drain_gate;
 pub mod object_storage_rate_limit;
 #[cfg(all(
     unix,

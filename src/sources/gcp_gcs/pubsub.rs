@@ -36,6 +36,7 @@ use crate::{
     },
     shutdown::ShutdownSignal,
     sources::ingestion_callback::IngestionCallbackClient,
+    sources::util::object_storage_drain_gate::{DrainGate, GateState},
     sources::util::object_storage_rate_limit::{ByteCounter, ObjectStorageRateLimiter},
 };
 
@@ -498,6 +499,7 @@ struct State {
     callback_client: Option<IngestionCallbackClient>,
     message_format: MessageFormat,
     rate_limiter: ObjectStorageRateLimiter,
+    drain_gate: Option<DrainGate>,
 }
 
 /// Resolves a Google API base endpoint: the configured override with any trailing
@@ -561,9 +563,19 @@ impl Ingestor {
             callback_client,
             message_format,
             rate_limiter,
+            drain_gate: None,
         });
 
         Ok(Self { state, downloader })
+    }
+
+    /// Acknowledges pulled messages without fetching objects while `gate` reports the
+    /// table disabled.
+    pub(super) fn with_drain_gate(mut self, gate: Option<DrainGate>) -> Self {
+        Arc::get_mut(&mut self.state)
+            .expect("state is not shared before run")
+            .drain_gate = gate;
+        self
     }
 
     pub(super) async fn run(
@@ -772,6 +784,13 @@ impl IngestorProcess {
             return;
         }
 
+        if let Some(gate) = &self.state.drain_gate
+            && gate.state() == GateState::Disabled
+        {
+            self.drain_messages(gate, messages).await;
+            return;
+        }
+
         let mut ack_ids: Vec<String> = Vec::new();
 
         for msg in messages {
@@ -830,6 +849,24 @@ impl IngestorProcess {
         // Pace between pulls: the batch is fully processed and its messages are
         // acked, so nothing is in flight while we wait to honor the byte rate.
         self.state.rate_limiter.pace(self.byte_counter.take()).await;
+    }
+
+    /// Acknowledges a pulled batch without fetching any objects (the table is disabled).
+    async fn drain_messages(&self, gate: &DrainGate, messages: Vec<ReceivedMessage>) {
+        if !self.state.acknowledge_message {
+            return;
+        }
+        let ack_ids: Vec<String> = messages.into_iter().map(|msg| msg.ack_id).collect();
+        match self.acknowledge_messages(&ack_ids).await {
+            Ok(true) => gate.record_drained(ack_ids.len()),
+            // Already logged by acknowledge_messages; the messages will be redelivered.
+            Ok(false) => {}
+            Err(err) => error!(
+                message = "Failed to acknowledge drained Pub/Sub messages.",
+                error = %err,
+                count = %ack_ids.len(),
+            ),
+        }
     }
 
     /// Decodes and dispatches a single Pub/Sub message according to the configured format.
@@ -1101,7 +1138,8 @@ impl IngestorProcess {
     }
 
     /// Acknowledges a batch of messages by their ack IDs.
-    async fn acknowledge_messages(&self, ack_ids: &[String]) -> Result<(), HttpError> {
+    /// Returns whether Pub/Sub accepted the acknowledgement.
+    async fn acknowledge_messages(&self, ack_ids: &[String]) -> Result<bool, HttpError> {
         let url = format!(
             "{}/v1/{}:acknowledge",
             self.state.endpoint, self.state.subscription_resource_name
@@ -1118,7 +1156,8 @@ impl IngestorProcess {
 
         let response = self.state.client.send(request).await?;
 
-        if !response.status().is_success() {
+        let acked = response.status().is_success();
+        if !acked {
             // Log a warning but do not return an error. A failed ack means the
             // messages will be redelivered after the subscription's ack deadline,
             // which is safer than surfacing the error and potentially skipping
@@ -1130,7 +1169,7 @@ impl IngestorProcess {
             );
         }
 
-        Ok(())
+        Ok(acked)
     }
 }
 
@@ -1605,5 +1644,212 @@ mod tests {
             reason: "missing `eventType` attribute".into(),
         };
         assert!(!err.is_retriable());
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use std::sync::Arc;
+
+    use base64::Engine as _;
+    use vector_lib::codecs::{NewlineDelimitedDecoderConfig, decoding::FramingConfig};
+    use vector_lib::config::LogNamespace;
+    use vrl::value::Value;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path_regex},
+    };
+
+    use super::*;
+    use crate::{
+        codecs::DecodingConfig,
+        config::ProxyConfig,
+        serde::default_decoding,
+        sources::util::object_storage_drain_gate::test_util::{
+            ENABLED_LIST_KEY, gate, with_drained_count,
+        },
+        tls::TlsSettings,
+    };
+
+    /// One pull returning a single INGEST message; any GCS GET 404s.
+    async fn mock_pubsub_and_gcs() -> MockServer {
+        mock_pubsub_and_gcs_with(200).await
+    }
+
+    /// Like `mock_pubsub_and_gcs`, with `ack_status` as the `:acknowledge` response status.
+    async fn mock_pubsub_and_gcs_with(ack_status: u16) -> MockServer {
+        let server = MockServer::start().await;
+        let data = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"kind": "INGEST", "bucket": "b", "key": "k.log", "file_id": "f1"}"#);
+        Mock::given(method("POST"))
+            .and(path_regex(":pull$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "receivedMessages": [{"ackId": "ack-1", "message": {"data": data, "messageId": "m1"}}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(":acknowledge$"))
+            .respond_with(ResponseTemplate::new(ack_status).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn run_once_with(server: &MockServer, drain_gate: Option<DrainGate>) {
+        run_once_configured(server, drain_gate, true).await;
+    }
+
+    async fn run_once_configured(
+        server: &MockServer,
+        drain_gate: Option<DrainGate>,
+        acknowledge_message: bool,
+    ) {
+        let client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default())
+            .expect("HttpClient must build");
+        let decoder = DecodingConfig::new(
+            FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig::default()),
+            default_decoding(),
+            LogNamespace::Legacy,
+        )
+        .build()
+        .expect("decoder must build");
+        let downloader = Arc::new(
+            GcsDownloader::new(
+                client.clone(),
+                GcpAuthenticator::None,
+                super::super::Compression::Auto,
+                decoder,
+                None,
+                "test-project".into(),
+                Some(server.uri()),
+            )
+            .expect("downloader must build"),
+        );
+        let config = Config {
+            subscription: "test-sub".into(),
+            endpoint: Some(server.uri()),
+            acknowledge_message,
+            ..Default::default()
+        };
+        let ingestor = Ingestor::new(
+            "test-project".into(),
+            client,
+            GcpAuthenticator::None,
+            config,
+            Arc::clone(&downloader),
+            None,
+            MessageFormat::DirectIngest,
+            ObjectStorageRateLimiter::new(&Default::default()),
+        )
+        .await
+        .expect("ingestor must build")
+        .with_drain_gate(drain_gate);
+        let (out, _rx) = SourceSender::new_test();
+        let mut process = IngestorProcess::new(
+            Arc::clone(&ingestor.state),
+            downloader,
+            out,
+            ShutdownSignal::noop(),
+            LogNamespace::Legacy,
+            false,
+        );
+        process.run_once().await;
+    }
+
+    async fn requests(server: &MockServer) -> (usize, Vec<String>) {
+        let received = server.received_requests().await.expect("recording enabled");
+        let gets = received
+            .iter()
+            .filter(|r| r.method.as_str() == "GET")
+            .count();
+        let acks = received
+            .iter()
+            .filter(|r| r.url.path().ends_with(":acknowledge"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        (gets, acks)
+    }
+
+    fn disabled_gate() -> DrainGate {
+        gate("span", false, &[(ENABLED_LIST_KEY, Value::from("qpl"))])
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_table_acks_without_fetching() {
+        let server = mock_pubsub_and_gcs().await;
+        let ((), drained) =
+            with_drained_count("span", run_once_with(&server, Some(disabled_gate())));
+        let (gets, acks) = requests(&server).await;
+        assert_eq!(gets, 0, "a disabled table must not fetch objects");
+        assert_eq!(acks.len(), 1);
+        assert!(acks[0].contains("ack-1"));
+        assert_eq!(drained, 1, "the acknowledged message is counted as drained");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_table_without_acknowledge_message_does_not_ack() {
+        let server = mock_pubsub_and_gcs().await;
+        let ((), drained) = with_drained_count(
+            "span",
+            run_once_configured(&server, Some(disabled_gate()), false),
+        );
+        let (gets, acks) = requests(&server).await;
+        assert_eq!(gets, 0, "a disabled table must not fetch objects");
+        assert!(
+            acks.is_empty(),
+            "acknowledge_message = false leaves the message unacked"
+        );
+        assert_eq!(drained, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_ack_is_not_counted_as_drained() {
+        let server = mock_pubsub_and_gcs_with(500).await;
+        let ((), drained) =
+            with_drained_count("span", run_once_with(&server, Some(disabled_gate())));
+        let (gets, acks) = requests(&server).await;
+        assert_eq!(gets, 0, "a disabled table must not fetch objects");
+        assert_eq!(acks.len(), 1, "the ack is still attempted");
+        assert_eq!(
+            drained, 0,
+            "a message Pub/Sub rejected the ack for is not drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_table_fetches() {
+        let server = mock_pubsub_and_gcs().await;
+        let gate = gate(
+            "span",
+            false,
+            &[(ENABLED_LIST_KEY, Value::from("qpl,span"))],
+        );
+        run_once_with(&server, Some(gate)).await;
+        assert!(
+            requests(&server).await.0 > 0,
+            "an enabled table fetches its object"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_flags_fetch() {
+        let server = mock_pubsub_and_gcs().await;
+        run_once_with(&server, Some(gate("span", false, &[]))).await;
+        assert!(
+            requests(&server).await.0 > 0,
+            "unreadable flags must process normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_gate_fetches() {
+        let server = mock_pubsub_and_gcs().await;
+        run_once_with(&server, None).await;
+        assert!(requests(&server).await.0 > 0);
     }
 }

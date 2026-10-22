@@ -14,6 +14,7 @@ use vrl::value::Kind;
 
 use super::util::MultilineConfig;
 pub use super::util::object_storage_compression::Compression;
+use super::util::object_storage_drain_gate::{DrainWhenDisabledConfig, build_drain_gate};
 use super::util::object_storage_rate_limit::{
     ObjectStorageRateLimitConfig, ObjectStorageRateLimiter,
 };
@@ -133,6 +134,17 @@ pub struct GcpGcsConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub rate_limit: ObjectStorageRateLimitConfig,
+
+    /// Acknowledge Pub/Sub messages without fetching their objects while this source's
+    /// table is explicitly disabled in a flag enrichment table.
+    ///
+    /// Unset (the default) leaves the source unchanged. When set, the flags are read once
+    /// per pull; if they can't be read, the source processes normally.
+    ///
+    /// Drained messages skip the ingestion callback: no success or failure is reported for them.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub drain_when_disabled: Option<DrainWhenDisabledConfig>,
 }
 
 const fn default_framing() -> FramingConfig {
@@ -159,9 +171,11 @@ impl SourceConfig for GcpGcsConfig {
             Strategy::PubSubCustomPoll => pubsub::MessageFormat::DirectIngest,
             Strategy::GcsNativeNotifications => pubsub::MessageFormat::GcsNative,
         };
+        let drain_gate = build_drain_gate(self.drain_when_disabled.as_ref(), &cx.enrichment_tables);
         Ok(Box::pin(
             self.create_pubsub_ingestor(multiline_config, log_namespace, &cx.proxy, message_format)
                 .await?
+                .with_drain_gate(drain_gate)
                 .run(cx, self.acknowledgements, log_namespace),
         ))
     }

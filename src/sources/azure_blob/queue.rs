@@ -55,6 +55,7 @@ use crate::{
     sources::azure_blob::AzureBlobConfig,
     sources::ingestion_callback::IngestionCallbackClient,
     sources::util::TolerateTrailingEof,
+    sources::util::object_storage_drain_gate::{DrainGate, GateState},
     sources::util::object_storage_rate_limit::{ByteCounter, ObjectStorageRateLimiter},
     tls::TlsConfig,
 };
@@ -339,6 +340,8 @@ pub struct State {
     extra_blob_clients: HashMap<String, BlobServiceClient>,
     /// Byte-rate pacer shared across polling workers
     rate_limiter: ObjectStorageRateLimiter,
+    /// Drains the queue without fetching blobs while the table is disabled
+    drain_gate: Option<DrainGate>,
 }
 
 impl State {
@@ -433,9 +436,19 @@ impl Ingestor {
             callback_client,
             extra_blob_clients,
             rate_limiter,
+            drain_gate: None,
         });
 
         Ok(Ingestor { state })
+    }
+
+    /// Deletes received messages without fetching blobs while `gate` reports the table
+    /// disabled.
+    pub(super) fn with_drain_gate(mut self, gate: Option<DrainGate>) -> Self {
+        Arc::get_mut(&mut self.state)
+            .expect("state is not shared before run")
+            .drain_gate = gate;
+        self
     }
 
     /// Starts the ingestor process with the specified number of concurrent tasks
@@ -632,6 +645,17 @@ impl IngestorProcess {
             })
             .unwrap_or_default();
 
+        // A disabled table drains without fetching blobs, and skips the post-poll sleep so a
+        // backlog empties at the queue API's pace rather than `poll_secs`.
+        let state = Arc::clone(&self.state);
+        if !messages.is_empty()
+            && let Some(gate) = &state.drain_gate
+            && gate.state() == GateState::Disabled
+        {
+            self.drain_messages(gate, messages).await;
+            return;
+        }
+
         let mut delete_messages = Vec::new();
 
         // Process each message
@@ -739,6 +763,31 @@ impl IngestorProcess {
 
         // Wait for next poll interval
         tokio::time::sleep(Duration::from_secs(self.state.poll_secs)).await;
+    }
+
+    /// Deletes a received batch without fetching any blobs (the table is disabled).
+    async fn drain_messages(&mut self, gate: &DrainGate, messages: Vec<Message>) {
+        if !self.state.delete_message {
+            return;
+        }
+        let mut deleted_count: u64 = 0;
+        for message in messages {
+            match self.delete_message(&message).await {
+                Ok(()) => deleted_count += 1,
+                Err(err) => error!(
+                    message = "Failed to delete drained message from queue.",
+                    message_id = %message.message_id,
+                    error = ?err,
+                ),
+            }
+        }
+        if deleted_count > 0 {
+            emit!(QueueMessageDeleteSucceeded {
+                count: deleted_count,
+                cloud: CLOUD_PROVIDER,
+            });
+            gate.record_drained(deleted_count as usize);
+        }
     }
 
     /// Dispatches a single queue message to the appropriate handler based on its content.
@@ -2281,5 +2330,227 @@ mod tests {
             parsed.server,
             "Windows-Azure-Queue/1.0 Microsoft-HTTPAPI/2.0"
         );
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use std::sync::Arc;
+
+    use azure_storage::CloudLocation;
+    use azure_storage_queues::QueueServiceClientBuilder;
+    use base64::Engine as _;
+    use vector_lib::codecs::{NewlineDelimitedDecoderConfig, decoding::FramingConfig};
+    use vector_lib::config::LogNamespace;
+    use vrl::value::Value;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path_regex},
+    };
+
+    use super::*;
+    use crate::{
+        codecs::DecodingConfig,
+        serde::default_decoding,
+        sources::util::object_storage_drain_gate::test_util::{
+            ENABLED_LIST_KEY, gate, with_drained_count,
+        },
+        sources::util::object_storage_rate_limit::ObjectStorageRateLimitConfig,
+    };
+
+    fn storage_headers(template: ResponseTemplate) -> ResponseTemplate {
+        template
+            .insert_header("x-ms-request-id", "abcdef01-2345-6789-abcd-ef0123456789")
+            .insert_header("x-ms-version", "2021-08-06")
+            .insert_header("date", "Fri, 17 Oct 2026 00:00:00 GMT")
+    }
+
+    /// The queue returns one INGEST message; deletes succeed; any blob GET 404s.
+    async fn mock_queue_and_blob() -> MockServer {
+        mock_queue_and_blob_with(204).await
+    }
+
+    /// Like `mock_queue_and_blob`, with `delete_status` as the queue-message DELETE response
+    /// (404 is not retried by the SDK, so it fails the delete immediately).
+    async fn mock_queue_and_blob_with(delete_status: u16) -> MockServer {
+        let server = MockServer::start().await;
+        let text = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"kind": "INGEST", "container": "c", "blob": "k.log", "file_id": "f1"}"#);
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><QueueMessagesList><QueueMessage>\
+             <MessageId>m1</MessageId>\
+             <InsertionTime>Fri, 17 Oct 2026 00:00:00 GMT</InsertionTime>\
+             <ExpirationTime>Fri, 24 Oct 2026 00:00:00 GMT</ExpirationTime>\
+             <PopReceipt>pop-1</PopReceipt>\
+             <TimeNextVisible>Fri, 17 Oct 2026 00:10:00 GMT</TimeNextVisible>\
+             <DequeueCount>1</DequeueCount>\
+             <MessageText>{text}</MessageText>\
+             </QueueMessage></QueueMessagesList>"
+        );
+        Mock::given(method("GET"))
+            .and(path_regex("^/q/messages$"))
+            .respond_with(storage_headers(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/xml")
+                    .set_body_string(body),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex("^/q/messages/m1$"))
+            .respond_with(storage_headers(ResponseTemplate::new(delete_status)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/c/"))
+            .respond_with(storage_headers(ResponseTemplate::new(404)))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn run_once_with(server: &MockServer, drain_gate: Option<DrainGate>) {
+        run_once_configured(server, drain_gate, true).await;
+    }
+
+    async fn run_once_configured(
+        server: &MockServer,
+        drain_gate: Option<DrainGate>,
+        delete_message: bool,
+    ) {
+        let location = || CloudLocation::Custom {
+            account: "devstoreaccount1".to_string(),
+            uri: server.uri(),
+        };
+        let creds = StorageCredentials::anonymous();
+        let blob_client =
+            ClientBuilder::with_location(location(), creds.clone()).blob_service_client();
+        let queue_client = QueueServiceClientBuilder::with_location(location(), creds).build();
+        let decoder = DecodingConfig::new(
+            FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig::default()),
+            default_decoding(),
+            LogNamespace::Legacy,
+        )
+        .build()
+        .expect("decoder must build");
+        let config = Config {
+            queue_name: "q".to_string(),
+            poll_secs: 0,
+            process_custom_message: true,
+            delete_message,
+            ..Default::default()
+        };
+        let ingestor = Ingestor::new(
+            blob_client,
+            queue_client,
+            config,
+            super::super::Compression::Auto,
+            None,
+            decoder,
+            None,
+            None,
+            Vec::new(),
+            ObjectStorageRateLimiter::new(&ObjectStorageRateLimitConfig::default()),
+        )
+        .await
+        .expect("ingestor must build")
+        .with_drain_gate(drain_gate);
+        let (out, _rx) = SourceSender::new_test();
+        let mut process = IngestorProcess::new(
+            Arc::clone(&ingestor.state),
+            out,
+            ShutdownSignal::noop(),
+            LogNamespace::Legacy,
+            false,
+        );
+        process.run_once().await;
+    }
+
+    /// (blob GETs, queue-message DELETEs)
+    async fn requests(server: &MockServer) -> (usize, usize) {
+        let received = server.received_requests().await.expect("recording enabled");
+        let blob_gets = received
+            .iter()
+            .filter(|r| r.method.as_str() == "GET" && r.url.path().starts_with("/c/"))
+            .count();
+        let deletes = received
+            .iter()
+            .filter(|r| {
+                r.method.as_str() == "DELETE" && r.url.query().unwrap_or_default().contains("pop-1")
+            })
+            .count();
+        (blob_gets, deletes)
+    }
+
+    fn disabled_gate() -> DrainGate {
+        gate("span", false, &[(ENABLED_LIST_KEY, Value::from("qpl"))])
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_table_deletes_without_fetching() {
+        let server = mock_queue_and_blob().await;
+        let ((), drained) =
+            with_drained_count("span", run_once_with(&server, Some(disabled_gate())));
+        assert_eq!(requests(&server).await, (0, 1));
+        assert_eq!(drained, 1, "the deleted message is counted as drained");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_table_without_delete_message_does_not_delete() {
+        let server = mock_queue_and_blob().await;
+        let ((), drained) = with_drained_count(
+            "span",
+            run_once_configured(&server, Some(disabled_gate()), false),
+        );
+        assert_eq!(
+            requests(&server).await,
+            (0, 0),
+            "delete_message = false leaves the message queued"
+        );
+        assert_eq!(drained, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_delete_is_not_counted_as_drained() {
+        let server = mock_queue_and_blob_with(404).await;
+        let ((), drained) =
+            with_drained_count("span", run_once_with(&server, Some(disabled_gate())));
+        assert_eq!(
+            requests(&server).await,
+            (0, 1),
+            "the delete is still attempted"
+        );
+        assert_eq!(
+            drained, 0,
+            "a message the queue failed to delete is not drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_table_fetches() {
+        let server = mock_queue_and_blob().await;
+        let gate = gate("span", false, &[(ENABLED_LIST_KEY, Value::from("span"))]);
+        run_once_with(&server, Some(gate)).await;
+        assert!(
+            requests(&server).await.0 > 0,
+            "an enabled table fetches its blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_flags_fetch() {
+        let server = mock_queue_and_blob().await;
+        run_once_with(&server, Some(gate("span", false, &[]))).await;
+        assert!(
+            requests(&server).await.0 > 0,
+            "unreadable flags must process normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_gate_fetches() {
+        let server = mock_queue_and_blob().await;
+        run_once_with(&server, None).await;
+        assert!(requests(&server).await.0 > 0);
     }
 }

@@ -1,5 +1,5 @@
 use metrics::{counter, gauge, histogram};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use vector_lib::emit;
 use vector_lib::internal_event::{InternalEvent, NamedInternalEvent};
 
@@ -362,5 +362,35 @@ mod tests {
 
         let duration = calculate_duration_seconds(start_time, end_time);
         assert_eq!(duration, Some(-5.0));
+    }
+}
+
+/// Queue messages deleted/acknowledged without fetching their objects because the
+/// source's table is disabled (see `drain_when_disabled`). The objects are not ingested.
+#[derive(Debug)]
+pub struct ObjectStorageMessagesDrained<'a> {
+    pub table: &'a str,
+    pub count: usize,
+}
+
+impl NamedInternalEvent for ObjectStorageMessagesDrained<'_> {
+    fn name(&self) -> &'static str {
+        "ObjectStorageMessagesDrained"
+    }
+}
+
+impl InternalEvent for ObjectStorageMessagesDrained<'_> {
+    fn emit(self) {
+        info!(
+            message = "Table is disabled; draining queue messages without fetching objects.",
+            table = %self.table,
+            count = %self.count,
+            internal_log_rate_limit = true,
+        );
+        counter!(
+            "lp_blob_source_drained_messages_total",
+            "table" => self.table.to_string(),
+        )
+        .increment(self.count as u64);
     }
 }

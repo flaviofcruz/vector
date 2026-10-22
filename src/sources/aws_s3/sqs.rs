@@ -65,6 +65,7 @@ use crate::{
     shutdown::ShutdownSignal,
     sources::aws_s3::AwsS3Config,
     sources::ingestion_callback::IngestionCallbackClient,
+    sources::util::object_storage_drain_gate::{DrainGate, GateState},
     sources::util::object_storage_rate_limit::{ByteCounter, ObjectStorageRateLimiter},
     tls::TlsConfig,
 };
@@ -345,6 +346,7 @@ pub struct State {
     process_custom_message: bool,
     callback_client: Option<IngestionCallbackClient>,
     rate_limiter: ObjectStorageRateLimiter,
+    drain_gate: Option<DrainGate>,
 }
 
 pub(super) struct Ingestor {
@@ -395,9 +397,18 @@ impl Ingestor {
             process_custom_message: config.process_custom_message,
             callback_client,
             rate_limiter,
+            drain_gate: None,
         });
 
         Ok(Ingestor { state })
+    }
+
+    /// Drains the queue without fetching objects while `gate` reports the table disabled.
+    pub(super) fn with_drain_gate(mut self, gate: Option<DrainGate>) -> Self {
+        Arc::get_mut(&mut self.state)
+            .expect("state is not shared before run")
+            .drain_gate = gate;
+        self
     }
 
     pub(super) async fn run(
@@ -582,6 +593,14 @@ impl IngestorProcess {
                 return Err(());
             }
         };
+
+        let state = Arc::clone(&self.state);
+        if let Some(gate) = &state.drain_gate
+            && gate.state() == GateState::Disabled
+        {
+            self.drain_messages(gate, messages).await;
+            return Ok(());
+        }
 
         let mut delete_entries = Vec::new();
         let mut deferred_entries = Vec::new();
@@ -787,6 +806,48 @@ impl IngestorProcess {
         self.state.rate_limiter.pace(self.byte_counter.take()).await;
 
         Ok(())
+    }
+
+    /// Deletes a received batch without fetching any objects (the table is disabled).
+    async fn drain_messages(&mut self, gate: &DrainGate, messages: Vec<Message>) {
+        let entries: Vec<_> = messages
+            .into_iter()
+            .filter_map(|message| {
+                let receipt_handle = message.receipt_handle?;
+                Some(
+                    DeleteMessageBatchRequestEntry::builder()
+                        .id(message.message_id.unwrap_or_else(|| receipt_handle.clone()))
+                        .receipt_handle(receipt_handle)
+                        .build()
+                        .expect("all required builder params specified"),
+                )
+            })
+            .collect();
+        if entries.is_empty() || !self.state.delete_message {
+            return;
+        }
+        let cloned_entries = entries.clone();
+        match self.delete_messages(entries).await {
+            Ok(result) => {
+                gate.record_drained(result.successful.len());
+                if !result.successful.is_empty() {
+                    emit!(SqsMessageDeleteSucceeded {
+                        message_ids: result.successful,
+                    });
+                }
+                if !result.failed.is_empty() {
+                    emit!(SqsMessageDeletePartialError {
+                        entries: result.failed
+                    });
+                }
+            }
+            Err(err) => {
+                emit!(SqsMessageDeleteBatchError {
+                    entries: cloned_entries,
+                    error: err,
+                });
+            }
+        }
     }
 
     /// Dispatches a single SQS message to the appropriate handler based on its content.
@@ -2291,4 +2352,234 @@ fn test_approximate_number_of_messages() {
     // No attributes map at all.
     let output = GetQueueAttributesOutput::builder().build();
     assert_eq!(approximate_number_of_messages(&output), None);
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use std::sync::Arc;
+
+    use aws_credential_types::Credentials;
+    use vector_lib::codecs::{NewlineDelimitedDecoderConfig, decoding::FramingConfig};
+    use vector_lib::config::LogNamespace;
+    use vrl::value::Value;
+    use wiremock::{
+        Mock, MockServer, Request, ResponseTemplate,
+        matchers::{header, method},
+    };
+
+    use super::*;
+    use crate::{
+        codecs::DecodingConfig,
+        serde::default_decoding,
+        sources::util::object_storage_drain_gate::test_util::{
+            ENABLED_LIST_KEY, gate, with_drained_count,
+        },
+        sources::util::object_storage_rate_limit::ObjectStorageRateLimitConfig,
+    };
+
+    const S3_EVENT: &str = r#"{"Records": [{"eventVersion": "2.1", "eventSource": "aws:s3",
+        "awsRegion": "us-east-1", "eventName": "ObjectCreated:Put",
+        "eventTime": "2026-10-17T00:00:00.000Z",
+        "s3": {"bucket": {"name": "b"}, "object": {"key": "k.log", "size": 3}}}]}"#;
+
+    /// SQS (AWS JSON protocol) returns one message; any S3 GET 404s.
+    async fn mock_sqs_and_s3() -> MockServer {
+        mock_sqs_and_s3_with(false).await
+    }
+
+    /// Like `mock_sqs_and_s3`, but DeleteMessageBatch reports `m1` as failed when `delete_fails`.
+    async fn mock_sqs_and_s3_with(delete_fails: bool) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "AmazonSQS.ReceiveMessage"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-amz-json-1.0")
+                    .set_body_json(serde_json::json!({
+                        "Messages": [{"MessageId": "m1", "ReceiptHandle": "rh-1", "Body": S3_EVENT}]
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "AmazonSQS.DeleteMessageBatch"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-amz-json-1.0")
+                    .set_body_json(if delete_fails {
+                        serde_json::json!({"Successful": [], "Failed": [{
+                            "Id": "m1", "SenderFault": false, "Code": "InternalError"
+                        }]})
+                    } else {
+                        serde_json::json!({"Successful": [{"Id": "m1"}], "Failed": []})
+                    }),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn run_once_with(server: &MockServer, drain_gate: Option<DrainGate>) {
+        run_once_configured(server, drain_gate, true).await;
+    }
+
+    async fn run_once_configured(
+        server: &MockServer,
+        drain_gate: Option<DrainGate>,
+        delete_message: bool,
+    ) {
+        let region = Region::new("us-east-1");
+        let credentials = Credentials::new("akid", "secret", None, None, "test");
+        let sqs_client = SqsClient::from_conf(
+            aws_sdk_sqs::Config::builder()
+                .behavior_version_latest()
+                .region(region.clone())
+                .credentials_provider(credentials.clone())
+                .endpoint_url(server.uri())
+                .build(),
+        );
+        let s3_client = S3Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version_latest()
+                .region(region.clone())
+                .credentials_provider(credentials)
+                .endpoint_url(server.uri())
+                .force_path_style(true)
+                .build(),
+        );
+        let decoder = DecodingConfig::new(
+            FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig::default()),
+            default_decoding(),
+            LogNamespace::Legacy,
+        )
+        .build()
+        .expect("decoder must build");
+        let config = Config {
+            queue_url: format!("{}/123456789012/q", server.uri()),
+            delete_message,
+            ..Default::default()
+        };
+        let ingestor = Ingestor::new(
+            region,
+            sqs_client,
+            s3_client,
+            config,
+            super::super::Compression::Auto,
+            None,
+            decoder,
+            None,
+            ObjectStorageRateLimiter::new(&ObjectStorageRateLimitConfig::default()),
+        )
+        .await
+        .expect("ingestor must build")
+        .with_drain_gate(drain_gate);
+        let (out, _rx) = SourceSender::new_test();
+        let mut process = IngestorProcess::new(
+            Arc::clone(&ingestor.state),
+            out,
+            ShutdownSignal::noop(),
+            LogNamespace::Legacy,
+            false,
+        );
+        process.run_once().await.expect("receive succeeds");
+    }
+
+    fn target(request: &Request) -> String {
+        request
+            .headers
+            .get("x-amz-target")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// (S3 GETs, DeleteMessageBatch bodies)
+    async fn requests(server: &MockServer) -> (usize, Vec<String>) {
+        let received = server.received_requests().await.expect("recording enabled");
+        let gets = received
+            .iter()
+            .filter(|r| r.method.as_str() == "GET")
+            .count();
+        let deletes = received
+            .iter()
+            .filter(|r| target(r) == "AmazonSQS.DeleteMessageBatch")
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        (gets, deletes)
+    }
+
+    fn disabled_gate() -> DrainGate {
+        gate("span", false, &[(ENABLED_LIST_KEY, Value::from("qpl"))])
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_table_deletes_without_fetching() {
+        let server = mock_sqs_and_s3().await;
+        let ((), drained) =
+            with_drained_count("span", run_once_with(&server, Some(disabled_gate())));
+        let (gets, deletes) = requests(&server).await;
+        assert_eq!(gets, 0, "a disabled table must not fetch objects");
+        assert_eq!(deletes.len(), 1);
+        assert!(deletes[0].contains("rh-1"));
+        assert_eq!(drained, 1, "the deleted message is counted as drained");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_table_without_delete_message_does_not_delete() {
+        let server = mock_sqs_and_s3().await;
+        let ((), drained) = with_drained_count(
+            "span",
+            run_once_configured(&server, Some(disabled_gate()), false),
+        );
+        let (gets, deletes) = requests(&server).await;
+        assert_eq!(gets, 0, "a disabled table must not fetch objects");
+        assert!(
+            deletes.is_empty(),
+            "delete_message = false leaves the message queued"
+        );
+        assert_eq!(drained, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_delete_is_not_counted_as_drained() {
+        let server = mock_sqs_and_s3_with(true).await;
+        let ((), drained) =
+            with_drained_count("span", run_once_with(&server, Some(disabled_gate())));
+        let (gets, deletes) = requests(&server).await;
+        assert_eq!(gets, 0, "a disabled table must not fetch objects");
+        assert_eq!(deletes.len(), 1, "the delete is still attempted");
+        assert_eq!(drained, 0, "a message SQS failed to delete is not drained");
+    }
+
+    #[tokio::test]
+    async fn enabled_table_fetches() {
+        let server = mock_sqs_and_s3().await;
+        let gate = gate("span", false, &[(ENABLED_LIST_KEY, Value::from("span"))]);
+        run_once_with(&server, Some(gate)).await;
+        assert!(
+            requests(&server).await.0 > 0,
+            "an enabled table fetches its object"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_flags_fetch() {
+        let server = mock_sqs_and_s3().await;
+        run_once_with(&server, Some(gate("span", false, &[]))).await;
+        assert!(
+            requests(&server).await.0 > 0,
+            "unreadable flags must process normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_gate_fetches() {
+        let server = mock_sqs_and_s3().await;
+        run_once_with(&server, None).await;
+        assert!(requests(&server).await.0 > 0);
+    }
 }
