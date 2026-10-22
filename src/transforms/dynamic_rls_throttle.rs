@@ -599,12 +599,18 @@ impl TaskTransform<Event> for DynamicRlsThrottle {
             while let Some(event) = input_rx.next().await {
                 match event_key(&topic_path, &system_path, &event) {
                     Some(key) => {
+                        // A byte quota's size, computed once and reused for the metrics and the
+                        // charge. Event-count throttles skip it.
+                        let bytes = (quota_unit == QuotaUnit::Bytes)
+                            .then(|| charge(quota_unit, bytes_path.as_ref(), &event));
+
                         // Inflow: every keyed log, pre-decision (stable across shadow/enforce).
                         // Highest-cardinality metric, so it's suppressible via `emit_inflow_metric`.
                         if emit_inflow_metric {
                             emit!(DynamicRlsThrottleInflow {
                                 topic: key.0.clone(),
                                 system: key.1.clone(),
+                                bytes,
                             });
                         }
 
@@ -623,6 +629,7 @@ impl TaskTransform<Event> for DynamicRlsThrottle {
                                 topic: key.0,
                                 system: key.1,
                                 mode: effective_mode,
+                                bytes,
                             });
                             match effective_mode {
                                 ThrottleMode::Enforce => {
@@ -633,7 +640,8 @@ impl TaskTransform<Event> for DynamicRlsThrottle {
                             }
                         } else {
                             // Under quota: count the passed-through log and forward it.
-                            let amount = charge(quota_unit, bytes_path.as_ref(), &event);
+                            let amount = bytes
+                                .unwrap_or_else(|| charge(quota_unit, bytes_path.as_ref(), &event));
                             if let Ok(mut counts) = shared.counts.lock() {
                                 let count = counts.entry(key).or_insert(0);
                                 // Capped at i64::MAX: the report's `count` is a proto int64.

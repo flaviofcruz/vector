@@ -6,14 +6,24 @@ use crate::transforms::dynamic_rls_throttle::ThrottleMode;
 
 /// Every keyed log, emitted before the drop decision so the per-`(topic, system)` baseline is
 /// stable across shadow and enforce. Excludes keyless logs (attributable inflow, not total ingress).
+/// `bytes` is set under `quota_unit = bytes`, so byte quotas can be compared with what arrives.
 #[derive(Debug, NamedInternalEvent)]
 pub(crate) struct DynamicRlsThrottleInflow {
     pub topic: String,
     pub system: String,
+    pub bytes: Option<u64>,
 }
 
 impl InternalEvent for DynamicRlsThrottleInflow {
     fn emit(self) {
+        if let Some(bytes) = self.bytes {
+            counter!(
+                "dynamic_rls_throttle_inflow_bytes_total",
+                "topic" => self.topic.clone(),
+                "system" => self.system.clone(),
+            )
+            .increment(bytes);
+        }
         counter!(
             "dynamic_rls_throttle_inflow_total",
             "topic" => self.topic,
@@ -25,16 +35,26 @@ impl InternalEvent for DynamicRlsThrottleInflow {
 
 /// An over-quota log. The `mode` tag says what happened: `shadow` = forwarded but would drop,
 /// `enforce` = dropped. Carries the per-`(topic, system)` breakdown `component_discarded_events_total`
-/// (tagged only by `intentional`) cannot.
+/// (tagged only by `intentional`) cannot. `bytes` is set under `quota_unit = bytes`.
 #[derive(Debug, NamedInternalEvent)]
 pub(crate) struct DynamicRlsThrottleOverLimit {
     pub topic: String,
     pub system: String,
     pub mode: ThrottleMode,
+    pub bytes: Option<u64>,
 }
 
 impl InternalEvent for DynamicRlsThrottleOverLimit {
     fn emit(self) {
+        if let Some(bytes) = self.bytes {
+            counter!(
+                "dynamic_rls_throttle_over_limit_bytes_total",
+                "topic" => self.topic.clone(),
+                "system" => self.system.clone(),
+                "mode" => self.mode.as_str(),
+            )
+            .increment(bytes);
+        }
         counter!(
             "dynamic_rls_throttle_over_limit_total",
             "topic" => self.topic,
@@ -150,5 +170,143 @@ pub(crate) struct DynamicRlsThrottleOperational {
 impl InternalEvent for DynamicRlsThrottleOperational {
     fn emit(self) {
         gauge!("dynamic_rls_throttle_operational").set(if self.operational { 1.0 } else { 0.0 });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    use super::*;
+
+    /// Every counter recorded while `f` runs, as `(name, sorted labels, value)`.
+    fn counters(f: impl FnOnce()) -> Vec<(String, Vec<(String, String)>, u64)> {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, f);
+        let mut out: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| match value {
+                DebugValue::Counter(v) => {
+                    let mut labels: Vec<_> = key
+                        .key()
+                        .labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect();
+                    labels.sort();
+                    Some((key.key().name().to_string(), labels, v))
+                }
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn inflow_counts_bytes_only_when_sized() {
+        let got = counters(|| {
+            DynamicRlsThrottleInflow {
+                topic: "t".into(),
+                system: "s".into(),
+                bytes: Some(1500),
+            }
+            .emit();
+            DynamicRlsThrottleInflow {
+                topic: "t".into(),
+                system: "s".into(),
+                bytes: Some(500),
+            }
+            .emit();
+            DynamicRlsThrottleInflow {
+                topic: "t".into(),
+                system: "events".into(),
+                bytes: None,
+            }
+            .emit();
+        });
+        let ts = labels(&[("system", "s"), ("topic", "t")]);
+        let te = labels(&[("system", "events"), ("topic", "t")]);
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "dynamic_rls_throttle_inflow_bytes_total".into(),
+                    ts.clone(),
+                    2000
+                ),
+                ("dynamic_rls_throttle_inflow_total".into(), te, 1),
+                ("dynamic_rls_throttle_inflow_total".into(), ts, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn over_limit_counts_bytes_per_mode_only_when_sized() {
+        let got = counters(|| {
+            DynamicRlsThrottleOverLimit {
+                topic: "t".into(),
+                system: "s".into(),
+                mode: ThrottleMode::Enforce,
+                bytes: Some(1500),
+            }
+            .emit();
+            DynamicRlsThrottleOverLimit {
+                topic: "t".into(),
+                system: "s".into(),
+                mode: ThrottleMode::Shadow,
+                bytes: Some(700),
+            }
+            .emit();
+            DynamicRlsThrottleOverLimit {
+                topic: "t".into(),
+                system: "events".into(),
+                mode: ThrottleMode::Shadow,
+                bytes: None,
+            }
+            .emit();
+        });
+        let at = |mode: &str, system: &str| {
+            labels(&[("mode", mode), ("system", system), ("topic", "t")])
+        };
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "dynamic_rls_throttle_over_limit_bytes_total".into(),
+                    at("enforce", "s"),
+                    1500
+                ),
+                (
+                    "dynamic_rls_throttle_over_limit_bytes_total".into(),
+                    at("shadow", "s"),
+                    700
+                ),
+                (
+                    "dynamic_rls_throttle_over_limit_total".into(),
+                    at("enforce", "s"),
+                    1
+                ),
+                (
+                    "dynamic_rls_throttle_over_limit_total".into(),
+                    at("shadow", "events"),
+                    1
+                ),
+                (
+                    "dynamic_rls_throttle_over_limit_total".into(),
+                    at("shadow", "s"),
+                    1
+                ),
+            ]
+        );
     }
 }
