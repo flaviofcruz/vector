@@ -1,7 +1,7 @@
 //! The `enforce_metadata_shape` VRL function: shape-enforces the Lumberjack `_log_metadata` envelope
 //! on the Lumberjack Prime write path. It is the LP port of Scala `LogMetadataShapeEnforcer`, which
-//! classic Lumberjack applies as a Spark UDF in `CentralizationBase`; the field -> shape policy lives
-//! in this module, while the canonical validators are called through `vector_redaction_executor`.
+//! classic Lumberjack applies as a Spark UDF in `CentralizationBase`. The field -> shape policy and the
+//! validators both live in Universe and are called through `vector_redaction_executor`.
 //!
 //! Given the `_log_metadata` object, each declared string field is kept iff it is empty, the literal
 //! `"unknown"`, or matches one of its declared `DataShape`s; otherwise it is set to `null`. Absent
@@ -9,91 +9,7 @@
 //! nulled), so the stage cannot reduce completeness. Fallible: errors if `metadata` is not an object.
 
 use vector_redaction_executor as executor;
-use vector_redaction_executor::DataShape;
 use vrl::prelude::*;
-
-const SERVICE_METADATA_SHAPES: &[(&str, &[i32])] = &[
-    ("branch_name", &[DataShape::BranchName as i32]),
-    ("system_uri", &[DataShape::SystemUri as i32]),
-    (
-        "shard_name",
-        &[
-            DataShape::ShardName as i32,
-            DataShape::KubeContext as i32,
-            DataShape::CloudRegion as i32,
-        ],
-    ),
-    (
-        "request_id",
-        &[DataShape::Uuid as i32, DataShape::Ulid as i32],
-    ),
-    (
-        "traceparent",
-        &[DataShape::W3cTraceparent as i32, DataShape::Hex32 as i32],
-    ),
-    ("trace_id", &[DataShape::Hex32 as i32]),
-    ("account_id", &[DataShape::Uuid as i32]),
-    ("pod_uid", &[DataShape::Uuid as i32]),
-];
-
-const DATA_PLANE_METADATA_SHAPES: &[(&str, &[i32])] = &[
-    ("cluster_id", &[DataShape::DbrClusterId as i32]),
-    ("cluster_creator", &[DataShape::ClusterCreator as i32]),
-    ("spark_image_label", &[DataShape::DbrImageLabel as i32]),
-    (
-        "spark_version",
-        &[
-            DataShape::DbrImageLabel as i32,
-            DataShape::VersionNumber as i32,
-        ],
-    ),
-    ("cluster_size_type", &[DataShape::ClusterSizeType as i32]),
-    (
-        "cluster_node_type",
-        &[
-            DataShape::CloudInstanceType as i32,
-            DataShape::ServerlessNodeTypeId as i32,
-        ],
-    ),
-    (
-        "cluster_unity_catalog_mode",
-        &[DataShape::ClusterUnityCatalogMode as i32],
-    ),
-    ("dbsql_channel", &[DataShape::PlatformChannel as i32]),
-    (
-        "internal_cluster_id",
-        &[DataShape::InternalClusterId as i32],
-    ),
-];
-
-const LOG_DAEMON_METADATA_SHAPES: &[(&str, &[i32])] = &[
-    (
-        "shard_name",
-        &[DataShape::ShardName as i32, DataShape::KubeContext as i32],
-    ),
-    (
-        "stream_guid",
-        &[
-            DataShape::Uuid as i32,
-            DataShape::LoggingFileId as i32,
-            DataShape::Hex32 as i32,
-        ],
-    ),
-    ("plane", &[DataShape::Plane as i32]),
-    ("cluster_type", &[DataShape::ClusterType as i32]),
-    ("spark_image_label", &[DataShape::DbrImageLabel as i32]),
-    ("org_id", &[DataShape::Numeric as i32]),
-    ("region", &[DataShape::CloudRegion as i32]),
-    (
-        "unp_node_id",
-        &[
-            DataShape::Uuid as i32,
-            DataShape::AwsEc2InstanceId as i32,
-            DataShape::GcpComputeInstanceId as i32,
-            DataShape::GoogleCloudHex32Id as i32,
-        ],
-    ),
-];
 
 #[derive(Clone, Copy, Debug)]
 pub struct EnforceMetadataShape;
@@ -149,27 +65,24 @@ struct EnforceMetadataShapeFn {
     metadata: Box<dyn Expression>,
 }
 
-/// Nulls every field of `value` (when it is an object) whose present string value does not conform to
-/// its declared shapes. Two passes to satisfy the borrow checker: collect the non-conforming keys,
-/// then null them.
-fn enforce_fields(value: &mut Value, fields: &[(&str, &[i32])]) -> Result<(), ExpressionError> {
+/// Nulls every string field of `value` (when it is an object) that the policy for `section` rejects.
+/// Two passes to satisfy the borrow checker: collect the non-conforming keys, then null them.
+fn enforce_fields(value: &mut Value, section: &str) -> Result<(), ExpressionError> {
     let obj = match value {
         Value::Object(obj) => obj,
         _ => return Ok(()),
     };
-    let mut to_null: Vec<&str> = Vec::new();
-    for &(field, shapes) in fields {
-        if let Some(Value::Bytes(bytes)) = obj.get(field) {
-            let string = String::from_utf8_lossy(bytes);
-            if !executor::field_value_conforms(shapes, &string)
+    let mut to_null = Vec::new();
+    for (field, value) in obj.iter() {
+        if let Value::Bytes(bytes) = value
+            && !executor::metadata_field_conforms(section, field, bytes)
                 .map_err(|error| format!("enforce_metadata_shape: {error}"))?
-            {
-                to_null.push(field);
-            }
+        {
+            to_null.push(field.clone());
         }
     }
     for field in to_null {
-        obj.insert(field.into(), Value::Null);
+        obj.insert(field, Value::Null);
     }
     Ok(())
 }
@@ -183,16 +96,16 @@ impl FunctionExpression for EnforceMetadataShapeFn {
         };
 
         if let Some(service) = root.get_mut("service_metadata") {
-            enforce_fields(service, SERVICE_METADATA_SHAPES)?;
+            enforce_fields(service, "service_metadata")?;
             // data_plane_metadata is nested inside service_metadata (matches the Scala tree).
             if let Value::Object(service_obj) = service
                 && let Some(data_plane) = service_obj.get_mut("data_plane_metadata")
             {
-                enforce_fields(data_plane, DATA_PLANE_METADATA_SHAPES)?;
+                enforce_fields(data_plane, "service_metadata.data_plane_metadata")?;
             }
         }
         if let Some(daemon) = root.get_mut("log_daemon_metadata") {
-            enforce_fields(daemon, LOG_DAEMON_METADATA_SHAPES)?;
+            enforce_fields(daemon, "log_daemon_metadata")?;
         }
 
         Ok(value)

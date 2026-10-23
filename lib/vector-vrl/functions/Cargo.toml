@@ -13,13 +13,22 @@ enrichment = { path = "../../enrichment" }
 vector-redaction-executor = { path = "../../vector-redaction-executor", optional = true }
 dnstap-parser = { path = "../../dnstap-parser", optional = true }
 vector-vrl-metrics = { path = "../../vector-vrl-metrics", optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The `apply_redaction` / resolver tests build a `RedactionPlanSet` to serialize as a plan file.
 prost = { workspace = true, features = ["derive"] }
+# The `lp_splice_metadata` parity tests decode the encoded message against the fat descriptor and
+# build timestamp event values.
+prost-reflect.workspace = true
+chrono.workspace = true
 
 [features]
 default = []
-databricks-redaction = ["dep:vector-redaction-executor", "vector-redaction-executor/static-executor"]
+databricks-redaction = [
+  "dep:vector-redaction-executor",
+  "vector-redaction-executor/static-executor",
+  "dep:serde_json",
+]
 dnstap = ["dep:dnstap-parser"]
 vrl-metrics = ["dep:vector-vrl-metrics"]

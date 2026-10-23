@@ -18,6 +18,8 @@ pub mod apply_redaction;
 pub mod enforce_metadata_shape;
 pub mod get_secret;
 #[cfg(feature = "databricks-redaction")]
+pub mod lp_splice_metadata;
+#[cfg(feature = "databricks-redaction")]
 pub mod redaction;
 pub mod remove_secret;
 pub mod set_secret;
@@ -48,6 +50,7 @@ pub fn redaction_functions() -> Vec<Box<dyn Function>> {
     vec![
         Box::new(apply_redaction::ApplyRedaction) as _,
         Box::new(enforce_metadata_shape::EnforceMetadataShape) as _,
+        Box::new(lp_splice_metadata::LpSpliceMetadata) as _,
     ]
 }
 

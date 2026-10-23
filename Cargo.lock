@@ -14297,10 +14297,13 @@ dependencies = [
 name = "vector-vrl-functions"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dnstap-parser",
  "enrichment",
  "indoc",
  "prost 0.12.6",
+ "prost-reflect 0.15.3",
+ "serde_json",
  "vector-redaction-executor",
  "vector-vrl-metrics",
  "vrl",

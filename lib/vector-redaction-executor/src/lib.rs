@@ -161,6 +161,28 @@ unsafe extern "C" {
         value_len: usize,
         out_conforms: *mut u8,
     ) -> i32;
+    fn db_redactor_metadata_field_conforms(
+        section: ForeignStringView,
+        field: ForeignStringView,
+        value: ForeignStringView,
+        out_conforms: *mut u8,
+    ) -> i32;
+    fn db_redactor_lp_splice_register(
+        descriptor_file: ForeignStringView,
+        message_type: ForeignStringView,
+        out_handle: *mut u64,
+        out_inputs: *mut ForeignBuffer,
+        out_error: *mut ForeignBuffer,
+    ) -> i32;
+    fn db_redactor_lp_splice_encode(
+        handle: u64,
+        inputs: *const ForeignSpliceInput,
+        inputs_len: usize,
+        enforce_shape: u8,
+        out_record: *mut ForeignBuffer,
+        out_error: *mut ForeignBuffer,
+    ) -> i32;
+    fn db_redactor_lp_splice_release(handle: u64);
     fn db_redactor_release_plan(handle: u64);
     fn db_redactor_buffer_free(buffer: *mut ForeignBuffer);
 }
@@ -427,6 +449,212 @@ pub fn field_value_conforms(shapes: &[i32], value: &str) -> Result<bool, RedactE
         value => Err(RedactError::InvalidArgument(format!(
             "executor returned invalid conformance flag {value}"
         ))),
+    }
+}
+
+/// Whether `value` may stay in the `_log_metadata` field `section.field` (`section` is the
+/// sub-message path under `_log_metadata`, e.g. `service_metadata.data_plane_metadata`) under the
+/// canonical metadata shape policy. Fields the policy does not declare always conform.
+#[cfg(feature = "static-executor")]
+pub fn metadata_field_conforms(
+    section: &str,
+    field: &str,
+    value: &[u8],
+) -> Result<bool, RedactError> {
+    ensure_abi_version()?;
+    let mut conforms = 0;
+    // SAFETY: Every view borrows a slice that stays live for the call, and out_conforms points to
+    // a distinct, aligned, initialized local.
+    let status = unsafe {
+        db_redactor_metadata_field_conforms(
+            string_view(section.as_bytes()),
+            string_view(field.as_bytes()),
+            string_view(value),
+            &mut conforms,
+        )
+    };
+    status_result(status, &ForeignBuffer::EMPTY)?;
+    match conforms {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(RedactError::InvalidArgument(format!(
+            "executor returned invalid conformance flag {value}"
+        ))),
+    }
+}
+
+/// How [`LpSplice`] expects one input to be read off the event.
+#[cfg(feature = "static-executor")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpliceInputMode {
+    /// The value as-is.
+    Value,
+    /// The value through VRL `encode_json`, passed as [`SpliceInput::Bytes`].
+    Json,
+    /// The value through VRL `to_int` (missing reads as null), passed as [`SpliceInput::Integer`];
+    /// a failed coercion fails the record.
+    ToInt,
+}
+
+/// One event value passed to [`LpSplice::encode`].
+#[cfg(feature = "static-executor")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpliceInput<'a> {
+    Missing,
+    Null,
+    Bytes(&'a [u8]),
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+    /// Epoch microseconds.
+    Timestamp(i64),
+    /// An object, array or other value with no scalar reading.
+    Other,
+}
+
+#[cfg(feature = "static-executor")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ForeignSpliceInput {
+    kind: u8,
+    integer: i64,
+    float_value: f64,
+    bytes: ForeignStringView,
+}
+
+#[cfg(feature = "static-executor")]
+impl From<&SpliceInput<'_>> for ForeignSpliceInput {
+    fn from(input: &SpliceInput<'_>) -> Self {
+        let scalar = |kind, integer| Self {
+            kind,
+            integer,
+            float_value: 0.0,
+            bytes: ForeignStringView::EMPTY,
+        };
+        match *input {
+            SpliceInput::Missing => scalar(0, 0),
+            SpliceInput::Null => scalar(1, 0),
+            SpliceInput::Bytes(bytes) => Self {
+                bytes: string_view(bytes),
+                ..scalar(2, 0)
+            },
+            SpliceInput::Integer(integer) => scalar(3, integer),
+            SpliceInput::Float(float_value) => Self {
+                float_value,
+                ..scalar(4, 0)
+            },
+            SpliceInput::Boolean(boolean) => scalar(5, i64::from(boolean)),
+            SpliceInput::Timestamp(micros) => scalar(6, micros),
+            SpliceInput::Other => scalar(7, 0),
+        }
+    }
+}
+
+/// A Lumberjack Prime splice mapping registered with the canonical executor. The mapping, its
+/// derivations and the encoding live in Universe; the caller only reads the [`LpSplice::inputs`]
+/// paths off each event. Released on drop.
+#[cfg(feature = "static-executor")]
+#[derive(Debug)]
+pub struct LpSplice {
+    handle: u64,
+    inputs: Vec<(SpliceInputMode, String)>,
+}
+
+#[cfg(feature = "static-executor")]
+impl LpSplice {
+    /// Resolves the splice mapping against `message_type` in the descriptor-set file.
+    pub fn register(descriptor_file: &str, message_type: &str) -> Result<Self, RedactError> {
+        ensure_abi_version()?;
+        let mut handle = 0;
+        let mut inputs = ForeignBuffer::EMPTY;
+        let mut error = ForeignBuffer::EMPTY;
+        // SAFETY: Both views borrow strings that stay live for the call. The output pointers
+        // reference distinct, aligned, initialized locals and do not alias either input.
+        let status = unsafe {
+            db_redactor_lp_splice_register(
+                string_view(descriptor_file.as_bytes()),
+                string_view(message_type.as_bytes()),
+                &mut handle,
+                &mut inputs,
+                &mut error,
+            )
+        };
+        status_result(status, &error)?;
+        // Owns the handle from here on, so a malformed input list below still releases it.
+        let mut splice = Self {
+            handle,
+            inputs: Vec::new(),
+        };
+        let lines = std::str::from_utf8(inputs.as_ref()).map_err(|_| {
+            RedactError::InvalidArgument("executor returned non-UTF-8 splice inputs".to_owned())
+        })?;
+        splice.inputs = lines
+            .lines()
+            .map(|line| {
+                let (mode, path) = line.split_once(' ').ok_or_else(|| {
+                    RedactError::InvalidArgument(format!("malformed splice input {line:?}"))
+                })?;
+                let mode = match mode {
+                    "value" => SpliceInputMode::Value,
+                    "json" => SpliceInputMode::Json,
+                    "to_int" => SpliceInputMode::ToInt,
+                    _ => {
+                        return Err(RedactError::InvalidArgument(format!(
+                            "unknown splice input mode {mode:?}"
+                        )))
+                    }
+                };
+                Ok((mode, path.to_owned()))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(splice)
+    }
+
+    /// The event paths [`LpSplice::encode`] takes, in order, as VRL paths rooted at the event.
+    pub fn inputs(&self) -> &[(SpliceInputMode, String)] {
+        &self.inputs
+    }
+
+    /// Encodes one record's injected-columns message. `inputs` must line up with
+    /// [`LpSplice::inputs`].
+    pub fn encode(
+        &self,
+        inputs: &[SpliceInput<'_>],
+        enforce_shape: bool,
+    ) -> Result<Bytes, RedactError> {
+        let foreign: Vec<ForeignSpliceInput> = inputs.iter().map(Into::into).collect();
+        let mut record = ForeignBuffer::EMPTY;
+        let mut error = ForeignBuffer::EMPTY;
+        // SAFETY: `foreign` and every slice its views borrow (owned by `inputs`) stay live for the
+        // call. The output pointers reference distinct, aligned, initialized locals.
+        let status = unsafe {
+            db_redactor_lp_splice_encode(
+                self.handle,
+                foreign.as_ptr(),
+                foreign.len(),
+                u8::from(enforce_shape),
+                &mut record,
+                &mut error,
+            )
+        };
+        status_result(status, &error)?;
+        Ok(record.into_bytes())
+    }
+}
+
+#[cfg(feature = "static-executor")]
+impl Drop for LpSplice {
+    fn drop(&mut self) {
+        // SAFETY: Handles are opaque integers and release accepts unknown or zero handles.
+        unsafe { db_redactor_lp_splice_release(self.handle) };
+    }
+}
+
+#[cfg(feature = "static-executor")]
+fn string_view(bytes: &[u8]) -> ForeignStringView {
+    ForeignStringView {
+        data: bytes.as_ptr(),
+        len: bytes.len(),
     }
 }
 

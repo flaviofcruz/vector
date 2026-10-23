@@ -1,0 +1,167 @@
+# Reference for the lp_splice_metadata parity test: the injected-columns build from universe's
+# TransformLumberjackPrimeSpliceCodeFile, verbatim from `meta = {}` through its encode_proto! call.
+# The test substitutes {DESCRIPTOR} and {MESSAGE_TYPE} per table.
+meta = {}
+
+# _event_time as int64 epoch-millis (codec coerces to Timestamp micros).
+event_time_ms = 0
+if exists(._lp_log_entry.log_time) {
+  seconds = to_int!(._lp_log_entry.log_time.seconds)
+  nanos = to_int!(._lp_log_entry.log_time.nanos)
+  event_time_ms = seconds * 1000 + to_int(nanos / 1000000)
+} else {
+  event_time_ms = to_unix_timestamp(now(), unit: "milliseconds")
+}
+meta._event_time = event_time_ms
+event_time = from_unix_timestamp(event_time_ms, unit: "milliseconds") ?? now()
+meta._partition_date = format_timestamp(event_time, "%F") ?? ""
+meta._partition_hour = to_int(format_timestamp!(event_time, "%H")) ?? 0
+meta._partition_backfill_version = "streaming"
+meta._shard_name = if is_null(._lp_log_entry.shard_name) { "" } else { ._lp_log_entry.shard_name }
+meta._project_name = if is_null(._lp_log_entry.project_name) { "" } else { ._lp_log_entry.project_name }
+
+# Initialize the nested _log_metadata object tree before deep assignment. VRL does not
+# auto-vivify multi-level paths on a fresh local object (`meta = {}`), so writing
+# meta._log_metadata.service_metadata.* directly fails to compile (E642: parent path segment
+# resolves to undefined). Establishing the intermediate objects up front fixes that. (The
+# arrow_stream path assigns onto the `.` root event, which Vector pre-populates as an object,
+# so it never hit this.)
+meta._log_metadata = {}
+meta._log_metadata.service_metadata = {}
+meta._log_metadata.service_metadata.data_plane_metadata = {}
+meta._log_metadata.service_metadata.location_metadata = {}
+meta._log_metadata.etl_metadata = {}
+meta._log_metadata.vector_metadata = {}
+meta._log_metadata.vector_metadata.location_metadata = {}
+meta._log_metadata.agent_metadata = {}
+meta._log_metadata.agent_metadata.location_metadata = {}
+meta._log_metadata.log_daemon_metadata = {}
+
+# _log_metadata.service_metadata (from LogEntry)
+meta._log_metadata.service_metadata.log_timestamp_ms = event_time_ms
+meta._log_metadata.service_metadata.project_name = ._lp_log_entry.project_name
+meta._log_metadata.service_metadata.branch_name = ._lp_log_entry.branch_name
+meta._log_metadata.service_metadata.shard_name = ._lp_log_entry.shard_name
+meta._log_metadata.service_metadata.request_id = ._lp_log_entry.request_id
+meta._log_metadata.service_metadata.event_id = if is_null(._lp_log_entry.event_id_uuid) {
+  if !is_null(._lp_log_entry.event_id) { encode_json(._lp_log_entry.event_id) } else { null }
+} else { ._lp_log_entry.event_id_uuid }
+meta._log_metadata.service_metadata.parent_event_id = ._lp_log_entry.parent_event_id
+meta._log_metadata.service_metadata.traceparent = ._lp_log_entry.traceparent
+meta._log_metadata.service_metadata.trace_id = ._lp_log_entry.trace_id
+meta._log_metadata.service_metadata.server_uuid = ._lp_log_entry.server_uuid
+meta._log_metadata.service_metadata.message_sequence_number = ._lp_log_entry.message_sequence_number
+meta._log_metadata.service_metadata.pod_name = ._lp_log_entry.pod_name
+meta._log_metadata.service_metadata.pod_uid = ._lp_log_entry.pod_uid
+meta._log_metadata.service_metadata.system_uri = ._lp_log_entry.system_uri
+# Top-level _system column, parity with the arrow_stream path (derived from system_uri's
+# "system:" prefix). The fat descriptor declares _system (--add-system), so the codec pairs
+# it to the UC column by name.
+if !is_null(._lp_log_entry.system_uri) && starts_with(string!(._lp_log_entry.system_uri), "system:") {
+  meta._system = slice!(string!(._lp_log_entry.system_uri), 7)
+}
+meta._log_metadata.service_metadata.workspace_id = ._lp_log_entry.workspace_id
+meta._log_metadata.service_metadata.account_id = ._lp_log_entry.account_id
+meta._log_metadata.service_metadata.workload_id = ._lp_log_entry.workload_id
+meta._log_metadata.service_metadata.sampling_rate = ._lp_log_entry.sampling_rate
+if !is_null(._lp_log_entry.policy) {
+  meta._log_metadata.service_metadata.policy = encode_json(._lp_log_entry.policy)
+}
+meta._log_metadata.service_metadata.client_version = ._lp_log_entry.logging_client_version
+meta._log_metadata.service_metadata.workload_class = if is_null(._lp_log_entry.workload_class) { "WORKLOAD_CLASS_UNSPECIFIED" } else { ._lp_log_entry.workload_class }
+if exists(._lp_log_entry.data_plane_metadata) {
+  meta._log_metadata.service_metadata.data_plane_metadata.cluster_id = ._lp_log_entry.data_plane_metadata.cluster_id
+  meta._log_metadata.service_metadata.data_plane_metadata.spark_version = ._lp_log_entry.data_plane_metadata.spark_version
+  meta._log_metadata.service_metadata.data_plane_metadata.cluster_creator = ._lp_log_entry.data_plane_metadata.cluster_creator
+  meta._log_metadata.service_metadata.data_plane_metadata.spark_image_label = ._lp_log_entry.data_plane_metadata.spark_image_label
+  meta._log_metadata.service_metadata.data_plane_metadata.cluster_node_type = ._lp_log_entry.data_plane_metadata.cluster_node_type
+  meta._log_metadata.service_metadata.data_plane_metadata.cluster_size_type = ._lp_log_entry.data_plane_metadata.cluster_size_type
+  meta._log_metadata.service_metadata.data_plane_metadata.cluster_unity_catalog_mode = ._lp_log_entry.data_plane_metadata.cluster_unity_catalog_mode
+  meta._log_metadata.service_metadata.data_plane_metadata.dbsql_channel = ._lp_log_entry.data_plane_metadata.dbsql_channel
+  meta._log_metadata.service_metadata.data_plane_metadata.internal_cluster_id = ._lp_log_entry.data_plane_metadata.internal_cluster_id
+}
+if exists(._lp_log_entry.whereami) && exists(._lp_log_entry.whereami.kubernetes_location) {
+  meta._log_metadata.service_metadata.location_metadata.cloud_provider = ._lp_log_entry.whereami.kubernetes_location.cloud_provider
+  meta._log_metadata.service_metadata.location_metadata.cloud_provider_region = ._lp_log_entry.whereami.kubernetes_location.cloud_provider_region
+  meta._log_metadata.service_metadata.location_metadata.kubernetes_cluster_type = ._lp_log_entry.whereami.kubernetes_location.kubernetes_cluster_type
+  meta._log_metadata.service_metadata.location_metadata.regulatory_domain = ._lp_log_entry.whereami.kubernetes_location.regulatory_domain
+  meta._log_metadata.service_metadata.location_metadata.environment = ._lp_log_entry.whereami.kubernetes_location.environment
+  meta._log_metadata.service_metadata.location_metadata.kubernetes_cluster_uri = ._lp_log_entry.whereami.kubernetes_location.kubernetes_cluster_uri
+}
+
+# _log_metadata.vector_metadata
+meta._log_metadata.vector_metadata.host_name = get_hostname() ?? ""
+meta._log_metadata.vector_metadata.timestamp_ms = to_unix_timestamp(now(), unit: "milliseconds")
+
+# _log_metadata.etl_metadata: the LP path never runs the classic ETL that stamps
+# ingestion_timestamp_ms, so this VA VRL stage is the equivalent ingestion moment.
+meta._log_metadata.etl_metadata.ingestion_timestamp_ms = to_unix_timestamp(now(), unit: "milliseconds")
+meta._log_metadata.vector_metadata.location_metadata.cloud_provider = get_env_var("CLOUD_PROVIDER") ?? ""
+meta._log_metadata.vector_metadata.location_metadata.cloud_provider_region = get_env_var("CLOUD_REGION") ?? ""
+meta._log_metadata.vector_metadata.location_metadata.kubernetes_cluster_type = get_env_var("K8S_CLUSTER_TYPE") ?? ""
+meta._log_metadata.vector_metadata.location_metadata.regulatory_domain = get_env_var("REGULATORY_DOMAIN") ?? ""
+meta._log_metadata.vector_metadata.location_metadata.environment = get_env_var("ENVIRONMENT") ?? ""
+meta._log_metadata.vector_metadata.location_metadata.kubernetes_cluster_uri = get_env_var("K8S_CLUSTER_URI") ?? ""
+
+# _log_metadata.agent_metadata
+meta._log_metadata.agent_metadata.agent_host_name = .metadata.agent_host_name
+meta._log_metadata.agent_metadata.agent_timestamp_ms = .metadata.agent_timestamp_ms
+meta._log_metadata.agent_metadata.location_metadata.cloud_provider = .metadata.agent_cloud_provider
+meta._log_metadata.agent_metadata.location_metadata.cloud_provider_region = .metadata.agent_cloud_region
+meta._log_metadata.agent_metadata.location_metadata.kubernetes_cluster_type = .metadata.agent_k8s_cluster_type
+meta._log_metadata.agent_metadata.location_metadata.regulatory_domain = .metadata.agent_regulatory_domain
+meta._log_metadata.agent_metadata.location_metadata.environment = .metadata.agent_environment
+meta._log_metadata.agent_metadata.location_metadata.kubernetes_cluster_uri = .metadata.agent_k8s_cluster_uri
+
+# _log_metadata.log_daemon_metadata (from the LogDaemonWrapper)
+meta._log_metadata.log_daemon_metadata.shard_name = ._lp_log_daemon_wrapper.shard_name
+meta._log_metadata.log_daemon_metadata.instance_id = ._lp_log_daemon_wrapper.instance_id
+meta._log_metadata.log_daemon_metadata.stream_offset = ._lp_log_daemon_wrapper.stream_offset
+meta._log_metadata.log_daemon_metadata.upload_timestamp_ms = ._lp_log_daemon_wrapper.upload_time
+meta._log_metadata.log_daemon_metadata.length = ._lp_log_daemon_wrapper.length
+meta._log_metadata.log_daemon_metadata.stream_guid = ._lp_log_daemon_wrapper.stream_GUID
+meta._log_metadata.log_daemon_metadata.workspace_id = ._lp_log_daemon_wrapper.workspace_id
+meta._log_metadata.log_daemon_metadata.is_delivered_by_logging_agent = if is_null(._lp_log_daemon_wrapper.is_delivered_by_logging_agent) { false } else { ._lp_log_daemon_wrapper.is_delivered_by_logging_agent }
+meta._log_metadata.log_daemon_metadata.is_diskless = if is_null(._lp_log_daemon_wrapper.is_diskless) { false } else { ._lp_log_daemon_wrapper.is_diskless }
+if ._lp_log_daemon_wrapper.plane == "CONTROL" {
+  meta._log_metadata.log_daemon_metadata.plane = "PLANE_CONTROL"
+} else if ._lp_log_daemon_wrapper.plane == "DATA" {
+  meta._log_metadata.log_daemon_metadata.plane = "PLANE_DATA"
+}
+if exists(._lp_log_daemon_wrapper.metadata) {
+  meta._log_metadata.log_daemon_metadata.pod_id = ._lp_log_daemon_wrapper.metadata.pod_id
+  meta._log_metadata.log_daemon_metadata.cluster_type = ._lp_log_daemon_wrapper.metadata.cluster_type
+  meta._log_metadata.log_daemon_metadata.vm_id = ._lp_log_daemon_wrapper.metadata.vm_id
+  meta._log_metadata.log_daemon_metadata.public_host_name = ._lp_log_daemon_wrapper.metadata.public_host_name
+  meta._log_metadata.log_daemon_metadata.container_name = ._lp_log_daemon_wrapper.metadata.container_name
+  meta._log_metadata.log_daemon_metadata.spark_image_label = ._lp_log_daemon_wrapper.metadata.spark_image_label
+  meta._log_metadata.log_daemon_metadata.org_id = ._lp_log_daemon_wrapper.metadata.org_id
+  meta._log_metadata.log_daemon_metadata.kubernetes_cluster_uri = ._lp_log_daemon_wrapper.metadata.k8s_context
+}
+
+# Metadata-envelope shape enforcement (LP port of classic Lumberjack's LogMetadataShapeEnforcer).
+# Runs on the injected _log_metadata object BEFORE encode_proto! because apply_redaction! below
+# redacts only the target payload's own wire bytes, never these framework-built metadata columns.
+# enforce_metadata_shape nulls each declared _log_metadata string field whose value does not match
+# its declared shape, matching classic's per-field enforcement so both write paths null the same
+# values. Gated at RUNTIME by ._lp_enforce_metadata_shape (stamped per-table by the non-baked
+# metadata-shape marker stage, from the catalog enforce_metadata_shape field); where the marker is
+# absent the field is null and this is inert. Bang form is fail-CLOSED, matching the payload
+# apply_redaction! below (a shaping failure drops the row rather than emitting unverified metadata).
+#
+# REQUIRES a vector image carrying the `enforce_metadata_shape` VRL function (vector#692): VRL
+# compiles the whole baked program at load, so this line fails to compile — crash-looping the VA
+# (EX_CONFIG) — on any image without the function, even with the runtime gate false. This config
+# MUST NOT deploy before that image ships. Same prerequisite-image posture as enforce_shapes (#677).
+if ._lp_enforce_metadata_shape == true {
+  meta._log_metadata = enforce_metadata_shape!(meta._log_metadata)
+}
+
+# Encode the injected-columns message and splice: metadata bytes ++ raw target bytes.
+# Both are proto wire bytes for the SAME message type (the generated fat ServiceHealthEvent),
+# so concatenation yields a single valid message the wire_to_arrow codec can decode. Metadata
+# is placed FIRST so that, on any unexpected tag collision, proto last-wins semantics keep the
+# raw source value (the raw bytes are the source of truth). The injected columns and the raw
+# target fields occupy disjoint tag ranges, so order is not otherwise significant.
+metadata_bytes = encode_proto!(meta, "{DESCRIPTOR}", "{MESSAGE_TYPE}")
+metadata_bytes
