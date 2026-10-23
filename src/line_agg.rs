@@ -67,7 +67,21 @@ pub struct Config {
     ///
     /// Once this timeout is reached, the buffered message is guaranteed to be flushed, even if incomplete.
     pub timeout: Duration,
+
+    /// The maximum size, in bytes, of a single aggregated message (counting the `\n`
+    /// separators that `merge` inserts between lines).
+    ///
+    /// When appending the next line would push the aggregate past this size, the
+    /// already-accumulated message is flushed and a fresh aggregate is started, seeded
+    /// with the [`SPLIT_CONTINUATION_MARKER`] line so downstream consumers can tell the
+    /// message was split. `None` disables the cap (default), preserving the prior
+    /// timeout-only behavior.
+    pub max_bytes: Option<usize>,
 }
+
+/// Marker line prepended to the continuation aggregate when a message is split for
+/// exceeding [`Config::max_bytes`].
+pub const SPLIT_CONTINUATION_MARKER: &[u8] = b"SPLIT LONG MESSAGE CONTINUE...";
 
 impl Config {
     /// Build `Config` from legacy `file` source line aggregator configuration
@@ -83,6 +97,7 @@ impl Config {
             condition_pattern,
             mode,
             timeout,
+            max_bytes: None,
         }
     }
 }
@@ -332,10 +347,44 @@ where
 
                 match decision {
                     Decision::Continue => {
-                        let buffered = entry.get_mut();
-                        self.timeouts.reset(&buffered.0, self.config.timeout);
-                        buffered.1.add_next_line(line, context);
-                        None
+                        // Would appending this line push the aggregate past the
+                        // configured byte cap? Only split an aggregate that already
+                        // holds more than a single seed line; splitting a freshly
+                        // seeded aggregate could loop forever when one line alone
+                        // exceeds the cap (and `max_line_bytes` already bounds a
+                        // single physical line upstream).
+                        let split = match self.config.max_bytes {
+                            Some(max) => {
+                                entry.get().1.projected_bytes_with(&line) > max
+                                    && entry.get().1.lines.len() > 1
+                            }
+                            None => false,
+                        };
+
+                        if split {
+                            let (src, (key, buffered)) = entry.remove_entry();
+                            self.timeouts.remove(&key);
+                            let merged_old = buffered.merge();
+
+                            // Start a fresh continuation aggregate seeded with the
+                            // marker line (which counts toward its size), then append
+                            // the incoming line. The incoming context becomes the new
+                            // aggregate's `initial_context`.
+                            let mut continuation = Aggregate::new(
+                                Bytes::from_static(SPLIT_CONTINUATION_MARKER),
+                                context,
+                            );
+                            continuation.push_line_no_context(line);
+                            let new_key = self.timeouts.insert(src.clone(), self.config.timeout);
+                            self.buffers.insert(src.clone(), (new_key, continuation));
+
+                            Some((src, Emit::One(merged_old)))
+                        } else {
+                            let buffered = entry.get_mut();
+                            self.timeouts.reset(&buffered.0, self.config.timeout);
+                            buffered.1.add_next_line(line, context);
+                            None
+                        }
                     }
                     Decision::EndInclude => {
                         let (src, (key, mut buffered)) = entry.remove_entry();
@@ -373,11 +422,17 @@ struct Aggregate<C> {
     lines: Vec<Bytes>,
     initial_context: C,
     last_context: Option<C>,
+    /// Running size, in bytes, of the merged message: the sum of all line
+    /// lengths plus one `\n` separator per line after the first. Mirrors the
+    /// capacity computed in [`Aggregate::merge`] so [`Config::max_bytes`] can be
+    /// enforced without re-walking `lines`.
+    total_bytes: usize,
 }
 
 impl<C> Aggregate<C> {
     fn new(first_line: Bytes, initial_context: C) -> Self {
         Self {
+            total_bytes: first_line.len(),
             lines: vec![first_line],
             initial_context,
             last_context: None,
@@ -386,7 +441,21 @@ impl<C> Aggregate<C> {
 
     fn add_next_line(&mut self, line: Bytes, context: C) {
         self.last_context = Some(context);
+        self.total_bytes += line.len() + 1;
         self.lines.push(line);
+    }
+
+    /// Append a line without an associated context, leaving `last_context`
+    /// untouched. Used when seeding a split continuation aggregate, where the
+    /// single available context is consumed as the aggregate's `initial_context`.
+    fn push_line_no_context(&mut self, line: Bytes) {
+        self.total_bytes += line.len() + 1;
+        self.lines.push(line);
+    }
+
+    /// Number of bytes the merged message would occupy if `next_line` were appended.
+    const fn projected_bytes_with(&self, next_line: &Bytes) -> usize {
+        self.total_bytes + next_line.len() + 1
     }
 
     fn merge(self) -> (Bytes, C, Option<C>) {
@@ -432,6 +501,7 @@ mod tests {
             condition_pattern: Regex::new("^[\\s]+").unwrap(),
             mode: Mode::ContinueThrough,
             timeout: Duration::from_millis(10),
+            max_bytes: None,
         };
         let expected = vec![
             ("some usual line", 0, None),
@@ -471,6 +541,7 @@ mod tests {
             condition_pattern: Regex::new("\\\\$").unwrap(),
             mode: Mode::ContinuePast,
             timeout: Duration::from_millis(10),
+            max_bytes: None,
         };
         let expected = vec![
             ("some usual line", 0, None),
@@ -510,6 +581,7 @@ mod tests {
             condition_pattern: Regex::new("^(INFO|ERROR) ").unwrap(),
             mode: Mode::HaltBefore,
             timeout: Duration::from_millis(10),
+            max_bytes: None,
         };
         let expected = vec![
             ("INFO some usual line", 0, None),
@@ -549,6 +621,7 @@ mod tests {
             condition_pattern: Regex::new(";$").unwrap(),
             mode: Mode::HaltWith,
             timeout: Duration::from_millis(10),
+            max_bytes: None,
         };
         let expected = vec![
             ("some usual line;", 0, None),
@@ -583,6 +656,7 @@ mod tests {
             condition_pattern: Regex::new("^[\\s]+at").unwrap(),
             mode: Mode::ContinueThrough,
             timeout: Duration::from_millis(10),
+            max_bytes: None,
         };
         let expected = vec![(
             concat!(
@@ -609,6 +683,7 @@ mod tests {
             condition_pattern: Regex::new("^[\\s]+from").unwrap(),
             mode: Mode::ContinueThrough,
             timeout: Duration::from_millis(10),
+            max_bytes: None,
         };
         let expected = vec![(
             concat!(
@@ -647,6 +722,7 @@ mod tests {
             condition_pattern: Regex::new("^\\s").unwrap(),
             mode: Mode::ContinueThrough,
             timeout: Duration::from_millis(10),
+            max_bytes: None,
         };
         let expected = vec![
             ("not merged 1", 0, None),
@@ -685,6 +761,7 @@ mod tests {
             condition_pattern: Regex::new("^START ").unwrap(),
             mode: Mode::HaltBefore,
             timeout: Duration::from_millis(10),
+            max_bytes: None,
         };
         let expected = vec![
             ("part 0.1\npart 0.2", 0, Some(1)),
@@ -760,6 +837,7 @@ mod tests {
             condition_pattern: Regex::new("^START ").unwrap(),
             mode: Mode::HaltBefore,
             timeout: Duration::from_millis(10),
+            max_bytes: None,
         };
 
         let mut expected = "START msg 1".to_string();
@@ -840,5 +918,65 @@ mod tests {
         let line_agg = LineAgg::new(stream, logic);
         let results = line_agg.collect().await;
         assert_results(results, expected);
+    }
+
+    #[tokio::test]
+    async fn max_bytes_splits_long_aggregate() {
+        // Header opens a `ContinueThrough` group; the indented lines continue it.
+        // `max_bytes` is set above the marker length (30) so a freshly-seeded
+        // continuation aggregate has room to accumulate. The 4th line would push
+        // the running aggregate past the cap, triggering one split.
+        //
+        // Byte accounting (a line's contribution is len + 1 for the `\n` joiner):
+        //   "header"      = 6                          -> total 6
+        //   " aaaaaaaa"   = 9  -> proj 6+9+1 = 16      -> total 16
+        //   " bbbbbbbb"   = 9  -> proj 16+9+1 = 26     -> total 26
+        //   " cccccccc"   = 9  -> proj 26+9+1 = 36     -> total 36
+        //   " dddddddd"   = 9  -> proj 36+9+1 = 46 > 40 => SPLIT
+        let lines = vec!["header", " aaaaaaaa", " bbbbbbbb", " cccccccc", " dddddddd"];
+        let config = Config {
+            start_pattern: Regex::new("^[^\\s]").unwrap(),
+            condition_pattern: Regex::new("^[\\s]+").unwrap(),
+            mode: Mode::ContinueThrough,
+            timeout: Duration::from_millis(10),
+            max_bytes: Some(40),
+        };
+
+        let marker = String::from_utf8(SPLIT_CONTINUATION_MARKER.to_vec()).unwrap();
+        // First event: head accumulated up to the split point (36 bytes).
+        let first = "header\n aaaaaaaa\n bbbbbbbb\n cccccccc";
+        // Second event: marker-seeded continuation plus the post-split line,
+        // flushed at end-of-stream (30 + 1 + 9 = 40 bytes).
+        let second = format!("{marker}\n dddddddd");
+
+        let stream = stream_from_lines(&lines);
+        let logic = Logic::new(config);
+        let line_agg = LineAgg::new(stream, logic);
+        let results: Vec<_> = line_agg.collect().await;
+
+        assert_eq!(results.len(), 2, "expected exactly one split: {results:?}");
+        assert_eq!(results[0].1, Bytes::copy_from_slice(first.as_bytes()));
+        assert_eq!(results[1].1, Bytes::copy_from_slice(second.as_bytes()));
+
+        // No emitted event exceeds the cap (the marker counts toward the new aggregate).
+        for (_, line, _, _) in &results {
+            assert!(line.len() <= 40, "emitted line over cap: {line:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn max_bytes_none_is_unchanged() {
+        // With no cap, behavior is identical to the plain ContinueThrough case:
+        // the whole group aggregates into a single event.
+        let lines = vec!["header", " aaaa", " bbbb", " cccc", " dddd"];
+        let config = Config {
+            start_pattern: Regex::new("^[^\\s]").unwrap(),
+            condition_pattern: Regex::new("^[\\s]+").unwrap(),
+            mode: Mode::ContinueThrough,
+            timeout: Duration::from_millis(10),
+            max_bytes: None,
+        };
+        let expected = vec![("header\n aaaa\n bbbb\n cccc\n dddd", 0, Some(4))];
+        run_and_assert(&lines, config, &expected).await;
     }
 }

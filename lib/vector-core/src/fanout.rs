@@ -482,6 +482,7 @@ mod tests {
     use tracing::Span;
     use vector_buffers::{
         WhenFull,
+        config::MemoryBufferSize,
         topology::{
             builder::TopologyBuilder,
             channel::{BufferReceiver, BufferSender},
@@ -500,7 +501,9 @@ mod tests {
         capacity: usize,
     ) -> (BufferSender<EventArray>, BufferReceiver<EventArray>) {
         TopologyBuilder::standalone_memory(
-            NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
+            MemoryBufferSize::MaxEvents(
+                NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
+            ),
             WhenFull::Block,
             &Span::current(),
             None,

@@ -782,6 +782,33 @@ mod tests {
     }
 
     #[test]
+    fn byte_limited_buffer_accepts_single_oversized_item_when_empty() {
+        let msg = Sample::new_with_heap_allocated_values(50);
+        let msg_size = msg.allocated_bytes();
+        let max_allowed_bytes = msg_size / 2;
+        assert!(max_allowed_bytes > 0);
+        assert!(msg_size > max_allowed_bytes);
+
+        let limit = MemoryBufferSize::MaxSize(NonZeroUsize::new(max_allowed_bytes).unwrap());
+        let (mut tx, mut rx) = limited(limit, None, None);
+
+        assert_eq!(max_allowed_bytes, tx.available_capacity());
+
+        let mut send = spawn(async { tx.send(msg).await });
+        assert_eq!(Ok(()), assert_ready!(send.poll()));
+        drop(send);
+
+        assert_eq!(0, tx.available_capacity());
+
+        let mut recv = spawn(async { rx.next().await });
+        let value = assert_ready!(recv.poll()).expect("oversized item should be received");
+        assert_eq!(value.allocated_bytes(), msg_size);
+        drop(recv);
+
+        assert_eq!(max_allowed_bytes, tx.available_capacity());
+    }
+
+    #[test]
     fn sender_waits_for_more_capacity_when_none_available() {
         let limit = MemoryBufferSize::MaxEvents(NonZeroUsize::new(1).unwrap());
         let (mut tx, mut rx) = limited(limit, None, None);

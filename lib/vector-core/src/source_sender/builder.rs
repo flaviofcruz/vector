@@ -1,14 +1,14 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, num::NonZeroUsize, time::Duration};
 
 use metrics::{Histogram, histogram};
-use vector_buffers::topology::channel::LimitedReceiver;
+use vector_buffers::{config::MemoryBufferSize, topology::channel::LimitedReceiver};
 use vector_common::internal_event::DEFAULT_OUTPUT;
 
 use super::{CHUNK_SIZE, LAG_TIME_NAME, Output, SourceSender, SourceSenderItem};
 use crate::config::{ComponentKey, OutputId, SourceOutput};
 
 pub struct Builder {
-    buf_size: usize,
+    buf_size: MemoryBufferSize,
     default_output: Option<Output>,
     named_outputs: HashMap<String, Output>,
     lag_time: Option<Histogram>,
@@ -19,7 +19,9 @@ pub struct Builder {
 impl Default for Builder {
     fn default() -> Self {
         Self {
-            buf_size: *CHUNK_SIZE,
+            buf_size: MemoryBufferSize::MaxEvents(
+                NonZeroUsize::new(*CHUNK_SIZE).expect("CHUNK_SIZE must be non-zero"),
+            ),
             default_output: None,
             named_outputs: Default::default(),
             lag_time: Some(histogram!(LAG_TIME_NAME)),
@@ -31,8 +33,8 @@ impl Default for Builder {
 
 impl Builder {
     #[must_use]
-    pub fn with_buffer(mut self, n: usize) -> Self {
-        self.buf_size = n;
+    pub fn with_buffer(mut self, size: MemoryBufferSize) -> Self {
+        self.buf_size = size;
         self
     }
 

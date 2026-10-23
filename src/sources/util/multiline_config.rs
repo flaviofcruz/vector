@@ -43,6 +43,19 @@ pub struct MultilineConfig {
     #[configurable(metadata(docs::examples = 600000))]
     #[configurable(metadata(docs::human_name = "Timeout"))]
     pub timeout_ms: Duration,
+
+    /// The maximum size, in bytes, of a single aggregated message.
+    ///
+    /// When appending the next line would push the aggregated message past this size, the
+    /// message accumulated so far is flushed and a new aggregation is started, seeded with a
+    /// `SPLIT LONG MESSAGE CONTINUE...` marker line so a split message is recognizable
+    /// downstream. This bounds the memory a single (possibly mis-configured) aggregation can
+    /// consume. If not specified, there is no size limit and aggregation is bounded only by
+    /// `timeout_ms`.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = 1048576))]
+    #[configurable(metadata(docs::human_name = "Max Bytes"))]
+    pub max_bytes: Option<usize>,
 }
 
 impl TryFrom<&MultilineConfig> for line_agg::Config {
@@ -54,6 +67,7 @@ impl TryFrom<&MultilineConfig> for line_agg::Config {
             condition_pattern,
             mode,
             timeout_ms,
+            max_bytes,
         } = config;
 
         let start_pattern = Regex::new(start_pattern)
@@ -67,6 +81,7 @@ impl TryFrom<&MultilineConfig> for line_agg::Config {
             condition_pattern,
             mode: *mode,
             timeout,
+            max_bytes: *max_bytes,
         })
     }
 }

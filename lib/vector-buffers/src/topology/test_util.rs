@@ -10,6 +10,7 @@ use super::builder::TopologyBuilder;
 use crate::{
     Bufferable, EventCount, WhenFull,
     buffer_usage_data::BufferUsageHandle,
+    config::MemoryBufferSize,
     encoding::FixedEncodable,
     topology::channel::{BufferReceiver, BufferSender},
 };
@@ -151,13 +152,17 @@ pub(crate) fn build_buffer(
         WhenFull::Overflow => {
             let overflow_mode = overflow_mode.expect("overflow mode cannot be empty");
             let (overflow_sender, overflow_receiver) = TopologyBuilder::standalone_memory_test(
-                NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
+                MemoryBufferSize::MaxEvents(
+                    NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
+                ),
                 overflow_mode,
                 handle.clone(),
                 None,
             );
             let (mut base_sender, mut base_receiver) = TopologyBuilder::standalone_memory_test(
-                NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
+                MemoryBufferSize::MaxEvents(
+                    NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
+                ),
                 WhenFull::Overflow,
                 handle.clone(),
                 None,
@@ -168,7 +173,9 @@ pub(crate) fn build_buffer(
             (base_sender, base_receiver)
         }
         m => TopologyBuilder::standalone_memory_test(
-            NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
+            MemoryBufferSize::MaxEvents(
+                NonZeroUsize::new(capacity).expect("capacity must be nonzero"),
+            ),
             m,
             handle.clone(),
             None,

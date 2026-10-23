@@ -1,6 +1,5 @@
 use std::{
     fmt,
-    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -109,7 +108,7 @@ impl fmt::Debug for Output {
 
 impl Output {
     pub(super) fn new_with_buffer(
-        n: usize,
+        limit: MemoryBufferSize,
         output: String,
         lag_time: Option<Histogram>,
         log_definition: Option<Arc<Definition>>,
@@ -117,7 +116,6 @@ impl Output {
         timeout: Option<Duration>,
         ewma_alpha: Option<f64>,
     ) -> (Self, LimitedReceiver<SourceSenderItem>) {
-        let limit = MemoryBufferSize::MaxEvents(NonZeroUsize::new(n).unwrap());
         let metrics = ChannelMetricMetadata::new(UTILIZATION_METRIC_PREFIX, Some(output.clone()));
         let (tx, rx) = channel::limited(limit, Some(metrics), ewma_alpha);
         (

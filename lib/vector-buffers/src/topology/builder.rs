@@ -1,4 +1,4 @@
-use std::{error::Error, num::NonZeroUsize};
+use std::error::Error;
 
 use async_trait::async_trait;
 use snafu::{ResultExt, Snafu};
@@ -187,16 +187,22 @@ impl<T: Bufferable> TopologyBuilder<T> {
     ///
     #[allow(clippy::print_stderr)]
     pub fn standalone_memory(
-        max_events: NonZeroUsize,
+        limit: MemoryBufferSize,
         when_full: WhenFull,
         receiver_span: &Span,
         metadata: Option<ChannelMetricMetadata>,
         ewma_alpha: Option<f64>,
     ) -> (BufferSender<T>, BufferReceiver<T>) {
         let usage_handle = BufferUsageHandle::noop();
-        usage_handle.set_buffer_limits(None, Some(max_events.get()));
+        match limit {
+            MemoryBufferSize::MaxEvents(max_events) => {
+                usage_handle.set_buffer_limits(None, Some(max_events.get()));
+            }
+            MemoryBufferSize::MaxSize(max_size) => {
+                usage_handle.set_buffer_limits(Some(max_size.get() as u64), None);
+            }
+        }
 
-        let limit = MemoryBufferSize::MaxEvents(max_events);
         let (sender, receiver) = limited(limit, metadata, ewma_alpha);
 
         let mode = match when_full {
@@ -225,14 +231,20 @@ impl<T: Bufferable> TopologyBuilder<T> {
     /// create the stage, installing buffer usage metrics that aren't required, and so on.
     #[cfg(test)]
     pub fn standalone_memory_test(
-        max_events: NonZeroUsize,
+        limit: MemoryBufferSize,
         when_full: WhenFull,
         usage_handle: BufferUsageHandle,
         metadata: Option<ChannelMetricMetadata>,
     ) -> (BufferSender<T>, BufferReceiver<T>) {
-        usage_handle.set_buffer_limits(None, Some(max_events.get()));
+        match limit {
+            MemoryBufferSize::MaxEvents(max_events) => {
+                usage_handle.set_buffer_limits(None, Some(max_events.get()));
+            }
+            MemoryBufferSize::MaxSize(max_size) => {
+                usage_handle.set_buffer_limits(Some(max_size.get() as u64), None);
+            }
+        }
 
-        let limit = MemoryBufferSize::MaxEvents(max_events);
         let (sender, receiver) = limited(limit, metadata, None);
 
         let mode = match when_full {

@@ -21,6 +21,7 @@ use vector_lib::{
     EstimatedJsonEncodedSizeOf,
     buffers::{
         BufferType, WhenFull,
+        config::MemoryBufferSize,
         topology::{
             builder::TopologyBuilder,
             channel::{BufferReceiver, BufferSender, ChannelMetricMetadata},
@@ -60,18 +61,92 @@ static ENRICHMENT_TABLES: LazyLock<vector_lib::enrichment::TableRegistry> =
     LazyLock::new(vector_lib::enrichment::TableRegistry::default);
 static METRICS_STORAGE: LazyLock<MetricsStorage> = LazyLock::new(MetricsStorage::default);
 
-pub(crate) static SOURCE_SENDER_BUFFER_SIZE: LazyLock<usize> =
-    LazyLock::new(|| *TRANSFORM_CONCURRENCY_LIMIT * *CHUNK_SIZE);
+/// Resolve a buffer size from a mutually-exclusive pair of environment variables: one
+/// expressing the limit in events, the other in bytes. Exactly one (at most) may be set.
+///
+/// - neither set -> `MaxEvents(default_events)` (unchanged legacy behavior)
+/// - only `event_var` set -> `MaxEvents(value)`
+/// - only `byte_var` set -> `MaxSize(value)` (byte-bounded buffer)
+/// - both set -> panic at startup with a clear message (mirrors the sink buffer config,
+///   which rejects specifying `max_events` and `max_size` together)
+fn resolve_buffer_size(event_var: &str, byte_var: &str, default_events: usize) -> MemoryBufferSize {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+    };
+    resolve_buffer_size_from(read(event_var), read(byte_var), default_events).unwrap_or_else(|| {
+        panic!(
+            "`{event_var}` (events) and `{byte_var}` (bytes) are mutually exclusive; set at most one"
+        )
+    })
+}
+
+/// Pure resolution of an event/byte buffer-size pair, factored out for testing.
+///
+/// Returns `None` when both an event count and a byte size are supplied (the caller
+/// turns this into a startup error), mirroring the sink buffer config which rejects
+/// specifying `max_events` and `max_size` together.
+const fn resolve_buffer_size_from(
+    events: Option<usize>,
+    bytes: Option<usize>,
+    default_events: usize,
+) -> Option<MemoryBufferSize> {
+    match (events, bytes) {
+        (Some(_), Some(_)) => None,
+        (_, Some(bytes)) => Some(MemoryBufferSize::MaxSize(
+            NonZeroUsize::new(bytes).expect("filtered to > 0 above"),
+        )),
+        (Some(events), None) => Some(MemoryBufferSize::MaxEvents(
+            NonZeroUsize::new(events).expect("filtered to > 0 above"),
+        )),
+        (None, None) => Some(MemoryBufferSize::MaxEvents(
+            NonZeroUsize::new(default_events).expect("default must be non-zero"),
+        )),
+    }
+}
+
+/// Event-count of a `MemoryBufferSize`, for tests/accounting that reason in events.
+/// Panics if the buffer is byte-sized (`MaxSize`), which those callers never configure.
+#[cfg(test)]
+pub(crate) fn memory_buffer_size_events(size: MemoryBufferSize) -> usize {
+    match size {
+        MemoryBufferSize::MaxEvents(n) => n.get(),
+        MemoryBufferSize::MaxSize(_) => {
+            panic!("expected an event-count buffer size, found a byte-sized one")
+        }
+    }
+}
+
+pub(crate) static SOURCE_SENDER_BUFFER_SIZE: LazyLock<MemoryBufferSize> = LazyLock::new(|| {
+    // `VECTOR_CHUNK_SIZE` already governs the per-source event-count default
+    // (`TRANSFORM_CONCURRENCY_LIMIT * CHUNK_SIZE`). `VECTOR_CHUNK_BYTE_SIZE` is the
+    // mutually-exclusive byte-bounded alternative.
+    let default_events = *TRANSFORM_CONCURRENCY_LIMIT * *CHUNK_SIZE;
+    let bytes = std::env::var("VECTOR_CHUNK_BYTE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0);
+    match bytes {
+        Some(bytes) => {
+            MemoryBufferSize::MaxSize(NonZeroUsize::new(bytes).expect("filtered to > 0 above"))
+        }
+        None => MemoryBufferSize::MaxEvents(
+            NonZeroUsize::new(default_events).expect("default must be non-zero"),
+        ),
+    }
+});
 
 static READY_ARRAY_CAPACITY: LazyLock<NonZeroUsize> =
     LazyLock::new(|| NonZeroUsize::new(*CHUNK_SIZE * 4).expect("CHUNK_SIZE * 4 must be > 0"));
 
-pub(crate) static TOPOLOGY_BUFFER_SIZE: LazyLock<NonZeroUsize> = LazyLock::new(|| {
-    std::env::var("VECTOR_TOPOLOGY_BUFFER_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .and_then(NonZeroUsize::new)
-        .unwrap_or(NonZeroUsize::new(100).unwrap())
+pub(crate) static TOPOLOGY_BUFFER_SIZE: LazyLock<MemoryBufferSize> = LazyLock::new(|| {
+    resolve_buffer_size(
+        "VECTOR_TOPOLOGY_BUFFER_SIZE",
+        "VECTOR_TOPOLOGY_BUFFER_BYTE_SIZE",
+        100,
+    )
 });
 const TRANSFORM_CHANNEL_METRIC_PREFIX: &str = "transform_buffer";
 
@@ -1303,4 +1378,48 @@ fn build_task_transform(
     let task = Task::new(key.clone(), typetag, transform);
 
     (task, outputs)
+}
+
+#[cfg(test)]
+mod buffer_size_tests {
+    use std::num::NonZeroUsize;
+
+    use vector_lib::buffers::config::MemoryBufferSize;
+
+    use super::resolve_buffer_size_from;
+
+    fn events(n: usize) -> MemoryBufferSize {
+        MemoryBufferSize::MaxEvents(NonZeroUsize::new(n).unwrap())
+    }
+    fn bytes(n: usize) -> MemoryBufferSize {
+        MemoryBufferSize::MaxSize(NonZeroUsize::new(n).unwrap())
+    }
+
+    #[test]
+    fn neither_set_uses_event_default() {
+        assert_eq!(resolve_buffer_size_from(None, None, 100), Some(events(100)));
+    }
+
+    #[test]
+    fn only_events_set_uses_max_events() {
+        assert_eq!(
+            resolve_buffer_size_from(Some(42), None, 100),
+            Some(events(42))
+        );
+    }
+
+    #[test]
+    fn only_bytes_set_uses_max_size() {
+        assert_eq!(
+            resolve_buffer_size_from(None, Some(4096), 100),
+            Some(bytes(4096))
+        );
+    }
+
+    #[test]
+    fn both_set_is_rejected() {
+        // The caller turns `None` into a startup panic; here we just assert the
+        // mutually-exclusive pair is refused.
+        assert_eq!(resolve_buffer_size_from(Some(42), Some(4096), 100), None);
+    }
 }

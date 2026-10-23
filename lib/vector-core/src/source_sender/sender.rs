@@ -113,7 +113,9 @@ impl SourceSender {
             port: None,
         };
         let (default_output, rx) = Output::new_with_buffer(
-            n,
+            vector_buffers::config::MemoryBufferSize::MaxEvents(
+                std::num::NonZeroUsize::new(n).expect("test buffer size must be non-zero"),
+            ),
             DEFAULT_OUTPUT.to_owned(),
             lag_time,
             None,
@@ -192,8 +194,17 @@ impl SourceSender {
             component: "test".to_string().into(),
             port: Some(name.clone()),
         };
-        let (output, recv) =
-            Output::new_with_buffer(100, name.clone(), None, None, output_id, None, None);
+        let (output, recv) = Output::new_with_buffer(
+            vector_buffers::config::MemoryBufferSize::MaxEvents(
+                std::num::NonZeroUsize::new(100).unwrap(),
+            ),
+            name.clone(),
+            None,
+            None,
+            output_id,
+            None,
+            None,
+        );
         let recv = recv.into_stream().map(move |mut item| {
             item.events.iter_events_mut().for_each(|mut event| {
                 let metadata = event.metadata_mut();

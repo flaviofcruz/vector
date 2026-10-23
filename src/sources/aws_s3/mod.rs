@@ -752,6 +752,7 @@ mod integration_tests {
                 mode: line_agg::Mode::HaltWith,
                 condition_pattern: "geh".to_owned(),
                 timeout_ms: Duration::from_millis(1000),
+                max_bytes: None,
             }),
             logs.join("\n").into_bytes(),
             vec!["abc\ndef\ngeh".to_owned()],

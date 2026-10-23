@@ -867,6 +867,7 @@ mod integration_tests {
                     condition_pattern: "^[\\s]+at".to_owned(),
                     mode: line_agg::Mode::ContinueThrough,
                     timeout_ms: Duration::from_millis(10),
+                    max_bytes: None,
                 }),
                 log_namespace: Some(true),
                 ..DockerLogsConfig::default()
@@ -938,6 +939,7 @@ mod integration_tests {
                     condition_pattern: "^[\\s]+at".to_owned(),
                     mode: line_agg::Mode::ContinueThrough,
                     timeout_ms: Duration::from_millis(10),
+                    max_bytes: None,
                 }),
                 ..DockerLogsConfig::default()
             };
