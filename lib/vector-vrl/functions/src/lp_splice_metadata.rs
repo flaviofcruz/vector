@@ -519,6 +519,34 @@ mod tests {
     }
 
     #[test]
+    fn environment_cloud_type_follows_vector_cloud_type() {
+        // Both sides read the process environment; scripts/test-databricks-redaction.sh sets it.
+        let Ok(cloud_type) = std::env::var("VECTOR_CLOUD_TYPE") else {
+            return;
+        };
+        let event = http_path_event(false, "le-request-id");
+        assert_parity(event.clone());
+        let descriptor = get_message_descriptor(Path::new(DESCRIPTOR), MESSAGE_TYPE).unwrap();
+        let Value::Bytes(bytes) = native(&event).unwrap() else {
+            unreachable!()
+        };
+        let message = DynamicMessage::decode(descriptor, bytes).unwrap();
+        let environment = message
+            .get_field_by_name("_environment")
+            .unwrap()
+            .as_message()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            environment
+                .get_field_by_name("cloud_type")
+                .unwrap()
+                .as_str(),
+            Some(cloud_type.as_str())
+        );
+    }
+
+    #[test]
     fn non_true_enforce_shape_is_off() {
         let mut event = http_path_event(false, "not-a-uuid");
         let encode = |marker: &str, event: &Value| {

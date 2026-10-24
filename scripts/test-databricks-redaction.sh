@@ -10,7 +10,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture_dir="${repo_root}/lib/vector-redaction-executor/tests/fixtures/linux-x86_64"
 
 cd "${repo_root}"
-exec env DATABRICKS_VECTOR_REDACTOR_LIB_DIR="${fixture_dir}" \
+# VECTOR_CLOUD_TYPE feeds the splice's _environment.cloud_type, so the lp_splice_metadata parity
+# tests cover it set.
+exec env DATABRICKS_VECTOR_REDACTOR_LIB_DIR="${fixture_dir}" VECTOR_CLOUD_TYPE="${VECTOR_CLOUD_TYPE:-AWS}" \
   cargo test --locked \
     -p vector-redaction-executor \
     -p vector-vrl-functions \

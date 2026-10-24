@@ -19,6 +19,9 @@ meta._partition_hour = to_int(format_timestamp!(event_time, "%H")) ?? 0
 meta._partition_backfill_version = "streaming"
 meta._shard_name = if is_null(._lp_log_entry.shard_name) { "" } else { ._lp_log_entry.shard_name }
 meta._project_name = if is_null(._lp_log_entry.project_name) { "" } else { ._lp_log_entry.project_name }
+# _environment.cloud_type, parity with the arrow_stream path (the fat descriptor declares
+# _environment, so the codec pairs it to the UC column by name).
+meta._environment = { "cloud_type": get_env_var("VECTOR_CLOUD_TYPE") ?? null }
 
 # Initialize the nested _log_metadata object tree before deep assignment. VRL does not
 # auto-vivify multi-level paths on a fresh local object (`meta = {}`), so writing
