@@ -55,7 +55,7 @@ use crate::{
     sources::azure_blob::AzureBlobConfig,
     sources::ingestion_callback::IngestionCallbackClient,
     sources::util::TolerateTrailingEof,
-    sources::util::object_storage_drain_gate::{DrainGate, GateState},
+    sources::util::object_storage_drain_gate::{GateDecision, ObjectStorageGate},
     sources::util::object_storage_rate_limit::{ByteCounter, ObjectStorageRateLimiter},
     tls::TlsConfig,
 };
@@ -341,7 +341,7 @@ pub struct State {
     /// Byte-rate pacer shared across polling workers
     rate_limiter: ObjectStorageRateLimiter,
     /// Drains the queue without fetching blobs while the table is disabled
-    drain_gate: Option<DrainGate>,
+    gate: Option<ObjectStorageGate>,
 }
 
 impl State {
@@ -436,18 +436,17 @@ impl Ingestor {
             callback_client,
             extra_blob_clients,
             rate_limiter,
-            drain_gate: None,
+            gate: None,
         });
 
         Ok(Ingestor { state })
     }
 
-    /// Deletes received messages without fetching blobs while `gate` reports the table
-    /// disabled.
-    pub(super) fn with_drain_gate(mut self, gate: Option<DrainGate>) -> Self {
+    /// Applies `pause_when_listed` / `drain_when_disabled` to every receive.
+    pub(super) fn with_gate(mut self, gate: Option<ObjectStorageGate>) -> Self {
         Arc::get_mut(&mut self.state)
             .expect("state is not shared before run")
-            .drain_gate = gate;
+            .gate = gate;
         self
     }
 
@@ -617,6 +616,12 @@ impl IngestorProcess {
     /// 3. Deletes successfully processed messages if configured
     /// 4. Logs any errors that occur
     async fn run_once(&mut self) {
+        if let Some(gate) = &self.state.gate
+            && gate.skip_paused_poll(self.state.poll_secs).await
+        {
+            return;
+        }
+
         // Receive messages from queue
         let messages = self.receive_messages().await;
         let messages = messages
@@ -649,11 +654,16 @@ impl IngestorProcess {
         // backlog empties at the queue API's pace rather than `poll_secs`.
         let state = Arc::clone(&self.state);
         if !messages.is_empty()
-            && let Some(gate) = &state.drain_gate
-            && gate.state() == GateState::Disabled
+            && let Some(gate) = &state.gate
         {
-            self.drain_messages(gate, messages).await;
-            return;
+            match gate.decide_batch(messages.len()) {
+                GateDecision::Process => {}
+                GateDecision::Drain => {
+                    self.drain_messages(gate, messages).await;
+                    return;
+                }
+                GateDecision::Pause(_) => return,
+            }
         }
 
         let mut delete_messages = Vec::new();
@@ -766,7 +776,7 @@ impl IngestorProcess {
     }
 
     /// Deletes a received batch without fetching any blobs (the table is disabled).
-    async fn drain_messages(&mut self, gate: &DrainGate, messages: Vec<Message>) {
+    async fn drain_messages(&mut self, gate: &ObjectStorageGate, messages: Vec<Message>) {
         if !self.state.delete_message {
             return;
         }
@@ -2353,8 +2363,10 @@ mod drain_tests {
         codecs::DecodingConfig,
         serde::default_decoding,
         sources::util::object_storage_drain_gate::test_util::{
-            ENABLED_LIST_KEY, gate, with_drained_count,
+            ENABLED_LIST_KEY, PAUSED_LIST_KEY, gate, object_gate, pause_gate, pause_gate_sequence,
+            with_drained_count, with_paused_count,
         },
+        sources::util::object_storage_drain_gate::{DrainGate, PauseGate},
         sources::util::object_storage_rate_limit::ObjectStorageRateLimitConfig,
     };
 
@@ -2410,12 +2422,13 @@ mod drain_tests {
     }
 
     async fn run_once_with(server: &MockServer, drain_gate: Option<DrainGate>) {
-        run_once_configured(server, drain_gate, true).await;
+        run_once_configured(server, drain_gate, None, true).await;
     }
 
     async fn run_once_configured(
         server: &MockServer,
         drain_gate: Option<DrainGate>,
+        pause_gate: Option<PauseGate>,
         delete_message: bool,
     ) {
         let location = || CloudLocation::Custom {
@@ -2454,7 +2467,7 @@ mod drain_tests {
         )
         .await
         .expect("ingestor must build")
-        .with_drain_gate(drain_gate);
+        .with_gate(object_gate(drain_gate, pause_gate));
         let (out, _rx) = SourceSender::new_test();
         let mut process = IngestorProcess::new(
             Arc::clone(&ingestor.state),
@@ -2500,7 +2513,7 @@ mod drain_tests {
         let server = mock_queue_and_blob().await;
         let ((), drained) = with_drained_count(
             "span",
-            run_once_configured(&server, Some(disabled_gate()), false),
+            run_once_configured(&server, Some(disabled_gate()), None, false),
         );
         assert_eq!(
             requests(&server).await,
@@ -2552,5 +2565,64 @@ mod drain_tests {
         let server = mock_queue_and_blob().await;
         run_once_with(&server, None).await;
         assert!(requests(&server).await.0 > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_table_leaves_queue_untouched() {
+        let server = mock_queue_and_blob().await;
+        // Pause wins over drain: the table is also disabled, yet nothing is received or deleted.
+        let paused = pause_gate("span", &[(PAUSED_LIST_KEY, Value::from("span"))]);
+        let ((), polls) = with_paused_count(
+            "span",
+            run_once_configured(&server, Some(disabled_gate()), Some(paused), true),
+        );
+        let received = server.received_requests().await.expect("recording enabled");
+        assert!(
+            received.is_empty(),
+            "a paused source makes no queue or object requests"
+        );
+        assert_eq!(polls, 1, "the skipped poll is counted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_set_during_receive_leaves_batch_on_queue() {
+        let server = mock_queue_and_blob().await;
+        // Unpaused when the poll starts, paused by the time the batch arrives. The table is
+        // also disabled, which must not drain the in-flight batch.
+        let paused = pause_gate_sequence(
+            "span",
+            &[(PAUSED_LIST_KEY, vec![Value::from(""), Value::from("span")])],
+        );
+        let ((), polls) = with_paused_count(
+            "span",
+            run_once_configured(&server, Some(disabled_gate()), Some(paused), true),
+        );
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .is_empty(),
+            "the poll received a batch"
+        );
+        let (gets, deletes) = requests(&server).await;
+        assert_eq!(gets, 0, "a paused batch is not fetched");
+        assert_eq!(deletes, 0, "a paused batch is not deleted");
+        assert_eq!(polls, 0, "the poll itself was not skipped");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpaused_table_processes_normally() {
+        let server = mock_queue_and_blob().await;
+        let unpaused = pause_gate("span", &[(PAUSED_LIST_KEY, Value::from("qpl"))]);
+        let ((), polls) = with_paused_count(
+            "span",
+            run_once_configured(&server, None, Some(unpaused), true),
+        );
+        assert!(
+            requests(&server).await.0 > 0,
+            "an unpaused table fetches its object"
+        );
+        assert_eq!(polls, 0);
     }
 }

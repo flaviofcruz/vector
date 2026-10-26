@@ -29,7 +29,9 @@ use vrl::value::{Kind, kind::Collection};
 // Local imports
 use super::util::MultilineConfig;
 pub use super::util::object_storage_compression::Compression;
-use super::util::object_storage_drain_gate::{DrainWhenDisabledConfig, build_drain_gate};
+use super::util::object_storage_drain_gate::{
+    DrainWhenDisabledConfig, ObjectStorageGate, PauseWhenListedConfig,
+};
 use super::util::object_storage_rate_limit::{
     ObjectStorageRateLimitConfig, ObjectStorageRateLimiter,
 };
@@ -173,6 +175,17 @@ pub struct AzureBlobConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub drain_when_disabled: Option<DrainWhenDisabledConfig>,
+
+    /// Stop receiving from the queue while this source's table is listed in a pause flag.
+    ///
+    /// Unset (the default) leaves the source unchanged. When set, the flag is read before
+    /// every receive and again on each received batch; while the table is listed, or the
+    /// served flag can't be read, the source leaves its queue untouched (nothing is fetched
+    /// or deleted) and waits one poll interval. A flag the enrichment table doesn't serve
+    /// pauses nothing. Takes precedence over `drain_when_disabled`.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub pause_when_listed: Option<PauseWhenListedConfig>,
 }
 
 /// Default framing configuration for backward compatibility.
@@ -213,11 +226,15 @@ impl SourceConfig for AzureBlobConfig {
             .transpose()?;
 
         // Create and run the queue ingestor
-        let drain_gate = build_drain_gate(self.drain_when_disabled.as_ref(), &cx.enrichment_tables);
+        let gate = ObjectStorageGate::build(
+            self.drain_when_disabled.as_ref(),
+            self.pause_when_listed.as_ref(),
+            &cx.enrichment_tables,
+        )?;
         Ok(Box::pin(
             self.create_queue_ingestor(multiline_config, log_namespace, &cx.proxy)
                 .await?
-                .with_drain_gate(drain_gate)
+                .with_gate(gate)
                 .run(cx, self.acknowledgements, log_namespace),
         ))
     }

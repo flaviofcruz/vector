@@ -394,3 +394,60 @@ impl InternalEvent for ObjectStorageMessagesDrained<'_> {
         .increment(self.count as u64);
     }
 }
+
+/// One poll skipped because the source's table is paused (see `pause_when_listed`). Its
+/// queue messages are left in place.
+#[derive(Debug)]
+pub struct ObjectStorageSourcePaused<'a> {
+    pub table: &'a str,
+    /// `listed`, or `flag_unavailable` when the pause list couldn't be read and the source
+    /// failed closed.
+    pub reason: &'static str,
+}
+
+impl NamedInternalEvent for ObjectStorageSourcePaused<'_> {
+    fn name(&self) -> &'static str {
+        "ObjectStorageSourcePaused"
+    }
+}
+
+impl InternalEvent for ObjectStorageSourcePaused<'_> {
+    fn emit(self) {
+        info!(
+            message = "Table is paused; leaving queue messages in place.",
+            table = %self.table,
+            reason = %self.reason,
+            internal_log_rate_limit = true,
+        );
+        counter!(
+            "lp_blob_source_paused_polls_total",
+            "table" => self.table.to_string(),
+            "reason" => self.reason,
+        )
+        .increment(1);
+    }
+}
+
+/// Whether the source's table is paused (1) or polling (0), set on every pause check so
+/// autoscaling can exclude a paused source's queue backlog.
+#[derive(Debug)]
+pub struct ObjectStorageSourcePauseState<'a> {
+    pub table: &'a str,
+    pub paused: bool,
+}
+
+impl NamedInternalEvent for ObjectStorageSourcePauseState<'_> {
+    fn name(&self) -> &'static str {
+        "ObjectStorageSourcePauseState"
+    }
+}
+
+impl InternalEvent for ObjectStorageSourcePauseState<'_> {
+    fn emit(self) {
+        gauge!("lp_blob_source_paused", "table" => self.table.to_string()).set(if self.paused {
+            1.0
+        } else {
+            0.0
+        });
+    }
+}

@@ -65,7 +65,7 @@ use crate::{
     shutdown::ShutdownSignal,
     sources::aws_s3::AwsS3Config,
     sources::ingestion_callback::IngestionCallbackClient,
-    sources::util::object_storage_drain_gate::{DrainGate, GateState},
+    sources::util::object_storage_drain_gate::{GateDecision, ObjectStorageGate},
     sources::util::object_storage_rate_limit::{ByteCounter, ObjectStorageRateLimiter},
     tls::TlsConfig,
 };
@@ -346,7 +346,7 @@ pub struct State {
     process_custom_message: bool,
     callback_client: Option<IngestionCallbackClient>,
     rate_limiter: ObjectStorageRateLimiter,
-    drain_gate: Option<DrainGate>,
+    gate: Option<ObjectStorageGate>,
 }
 
 pub(super) struct Ingestor {
@@ -397,17 +397,17 @@ impl Ingestor {
             process_custom_message: config.process_custom_message,
             callback_client,
             rate_limiter,
-            drain_gate: None,
+            gate: None,
         });
 
         Ok(Ingestor { state })
     }
 
-    /// Drains the queue without fetching objects while `gate` reports the table disabled.
-    pub(super) fn with_drain_gate(mut self, gate: Option<DrainGate>) -> Self {
+    /// Applies `pause_when_listed` / `drain_when_disabled` to every receive.
+    pub(super) fn with_gate(mut self, gate: Option<ObjectStorageGate>) -> Self {
         Arc::get_mut(&mut self.state)
             .expect("state is not shared before run")
-            .drain_gate = gate;
+            .gate = gate;
         self
     }
 
@@ -581,6 +581,14 @@ impl IngestorProcess {
     }
 
     async fn run_once(&mut self) -> Result<(), ()> {
+        if let Some(gate) = &self.state.gate
+            && gate
+                .skip_paused_poll(self.state.poll_secs.max(0) as u64)
+                .await
+        {
+            return Ok(());
+        }
+
         let messages = match self.receive_messages().await {
             Ok(messages) => {
                 emit!(SqsMessageReceiveSucceeded {
@@ -595,11 +603,17 @@ impl IngestorProcess {
         };
 
         let state = Arc::clone(&self.state);
-        if let Some(gate) = &state.drain_gate
-            && gate.state() == GateState::Disabled
+        if !messages.is_empty()
+            && let Some(gate) = &state.gate
         {
-            self.drain_messages(gate, messages).await;
-            return Ok(());
+            match gate.decide_batch(messages.len()) {
+                GateDecision::Process => {}
+                GateDecision::Drain => {
+                    self.drain_messages(gate, messages).await;
+                    return Ok(());
+                }
+                GateDecision::Pause(_) => return Ok(()),
+            }
         }
 
         let mut delete_entries = Vec::new();
@@ -809,7 +823,7 @@ impl IngestorProcess {
     }
 
     /// Deletes a received batch without fetching any objects (the table is disabled).
-    async fn drain_messages(&mut self, gate: &DrainGate, messages: Vec<Message>) {
+    async fn drain_messages(&mut self, gate: &ObjectStorageGate, messages: Vec<Message>) {
         let entries: Vec<_> = messages
             .into_iter()
             .filter_map(|message| {
@@ -2372,8 +2386,10 @@ mod drain_tests {
         codecs::DecodingConfig,
         serde::default_decoding,
         sources::util::object_storage_drain_gate::test_util::{
-            ENABLED_LIST_KEY, gate, with_drained_count,
+            ENABLED_LIST_KEY, PAUSED_LIST_KEY, gate, object_gate, pause_gate, pause_gate_sequence,
+            with_drained_count, with_paused_count,
         },
+        sources::util::object_storage_drain_gate::{DrainGate, PauseGate},
         sources::util::object_storage_rate_limit::ObjectStorageRateLimitConfig,
     };
 
@@ -2424,12 +2440,13 @@ mod drain_tests {
     }
 
     async fn run_once_with(server: &MockServer, drain_gate: Option<DrainGate>) {
-        run_once_configured(server, drain_gate, true).await;
+        run_once_configured(server, drain_gate, None, true).await;
     }
 
     async fn run_once_configured(
         server: &MockServer,
         drain_gate: Option<DrainGate>,
+        pause_gate: Option<PauseGate>,
         delete_message: bool,
     ) {
         let region = Region::new("us-east-1");
@@ -2461,6 +2478,7 @@ mod drain_tests {
         let config = Config {
             queue_url: format!("{}/123456789012/q", server.uri()),
             delete_message,
+            poll_secs: 0,
             ..Default::default()
         };
         let ingestor = Ingestor::new(
@@ -2476,7 +2494,7 @@ mod drain_tests {
         )
         .await
         .expect("ingestor must build")
-        .with_drain_gate(drain_gate);
+        .with_gate(object_gate(drain_gate, pause_gate));
         let (out, _rx) = SourceSender::new_test();
         let mut process = IngestorProcess::new(
             Arc::clone(&ingestor.state),
@@ -2533,7 +2551,7 @@ mod drain_tests {
         let server = mock_sqs_and_s3().await;
         let ((), drained) = with_drained_count(
             "span",
-            run_once_configured(&server, Some(disabled_gate()), false),
+            run_once_configured(&server, Some(disabled_gate()), None, false),
         );
         let (gets, deletes) = requests(&server).await;
         assert_eq!(gets, 0, "a disabled table must not fetch objects");
@@ -2581,5 +2599,64 @@ mod drain_tests {
         let server = mock_sqs_and_s3().await;
         run_once_with(&server, None).await;
         assert!(requests(&server).await.0 > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_table_leaves_queue_untouched() {
+        let server = mock_sqs_and_s3().await;
+        // Pause wins over drain: the table is also disabled, yet nothing is received or deleted.
+        let paused = pause_gate("span", &[(PAUSED_LIST_KEY, Value::from("span"))]);
+        let ((), polls) = with_paused_count(
+            "span",
+            run_once_configured(&server, Some(disabled_gate()), Some(paused), true),
+        );
+        let received = server.received_requests().await.expect("recording enabled");
+        assert!(
+            received.is_empty(),
+            "a paused source makes no queue or object requests"
+        );
+        assert_eq!(polls, 1, "the skipped poll is counted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_set_during_receive_leaves_batch_on_queue() {
+        let server = mock_sqs_and_s3().await;
+        // Unpaused when the poll starts, paused by the time the batch arrives. The table is
+        // also disabled, which must not drain the in-flight batch.
+        let paused = pause_gate_sequence(
+            "span",
+            &[(PAUSED_LIST_KEY, vec![Value::from(""), Value::from("span")])],
+        );
+        let ((), polls) = with_paused_count(
+            "span",
+            run_once_configured(&server, Some(disabled_gate()), Some(paused), true),
+        );
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .is_empty(),
+            "the poll received a batch"
+        );
+        let (gets, deletes) = requests(&server).await;
+        assert_eq!(gets, 0, "a paused batch is not fetched");
+        assert!(deletes.is_empty(), "a paused batch is not deleted");
+        assert_eq!(polls, 0, "the poll itself was not skipped");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpaused_table_processes_normally() {
+        let server = mock_sqs_and_s3().await;
+        let unpaused = pause_gate("span", &[(PAUSED_LIST_KEY, Value::from("qpl"))]);
+        let ((), polls) = with_paused_count(
+            "span",
+            run_once_configured(&server, None, Some(unpaused), true),
+        );
+        assert!(
+            requests(&server).await.0 > 0,
+            "an unpaused table fetches its object"
+        );
+        assert_eq!(polls, 0);
     }
 }

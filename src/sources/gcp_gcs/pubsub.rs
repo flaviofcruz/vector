@@ -36,7 +36,7 @@ use crate::{
     },
     shutdown::ShutdownSignal,
     sources::ingestion_callback::IngestionCallbackClient,
-    sources::util::object_storage_drain_gate::{DrainGate, GateState},
+    sources::util::object_storage_drain_gate::{GateDecision, ObjectStorageGate},
     sources::util::object_storage_rate_limit::{ByteCounter, ObjectStorageRateLimiter},
 };
 
@@ -499,7 +499,7 @@ struct State {
     callback_client: Option<IngestionCallbackClient>,
     message_format: MessageFormat,
     rate_limiter: ObjectStorageRateLimiter,
-    drain_gate: Option<DrainGate>,
+    gate: Option<ObjectStorageGate>,
 }
 
 /// Resolves a Google API base endpoint: the configured override with any trailing
@@ -563,18 +563,17 @@ impl Ingestor {
             callback_client,
             message_format,
             rate_limiter,
-            drain_gate: None,
+            gate: None,
         });
 
         Ok(Self { state, downloader })
     }
 
-    /// Acknowledges pulled messages without fetching objects while `gate` reports the
-    /// table disabled.
-    pub(super) fn with_drain_gate(mut self, gate: Option<DrainGate>) -> Self {
+    /// Applies `pause_when_listed` / `drain_when_disabled` to every receive.
+    pub(super) fn with_gate(mut self, gate: Option<ObjectStorageGate>) -> Self {
         Arc::get_mut(&mut self.state)
             .expect("state is not shared before run")
-            .drain_gate = gate;
+            .gate = gate;
         self
     }
 
@@ -763,6 +762,12 @@ impl IngestorProcess {
 
     /// Single iteration: pull messages, process each, ack successes, sleep if empty.
     async fn run_once(&mut self) {
+        if let Some(gate) = &self.state.gate
+            && gate.skip_paused_poll(self.state.poll_secs).await
+        {
+            return;
+        }
+
         let messages = match self.pull_messages().await {
             Ok(msgs) => {
                 emit!(PubSubMessageReceiveSucceeded { count: msgs.len() });
@@ -784,11 +789,15 @@ impl IngestorProcess {
             return;
         }
 
-        if let Some(gate) = &self.state.drain_gate
-            && gate.state() == GateState::Disabled
-        {
-            self.drain_messages(gate, messages).await;
-            return;
+        if let Some(gate) = &self.state.gate {
+            match gate.decide_batch(messages.len()) {
+                GateDecision::Process => {}
+                GateDecision::Drain => {
+                    self.drain_messages(gate, messages).await;
+                    return;
+                }
+                GateDecision::Pause(_) => return,
+            }
         }
 
         let mut ack_ids: Vec<String> = Vec::new();
@@ -852,7 +861,7 @@ impl IngestorProcess {
     }
 
     /// Acknowledges a pulled batch without fetching any objects (the table is disabled).
-    async fn drain_messages(&self, gate: &DrainGate, messages: Vec<ReceivedMessage>) {
+    async fn drain_messages(&self, gate: &ObjectStorageGate, messages: Vec<ReceivedMessage>) {
         if !self.state.acknowledge_message {
             return;
         }
@@ -1666,8 +1675,10 @@ mod drain_tests {
         config::ProxyConfig,
         serde::default_decoding,
         sources::util::object_storage_drain_gate::test_util::{
-            ENABLED_LIST_KEY, gate, with_drained_count,
+            ENABLED_LIST_KEY, PAUSED_LIST_KEY, gate, object_gate, pause_gate, pause_gate_sequence,
+            with_drained_count, with_paused_count,
         },
+        sources::util::object_storage_drain_gate::{DrainGate, PauseGate},
         tls::TlsSettings,
     };
 
@@ -1701,12 +1712,13 @@ mod drain_tests {
     }
 
     async fn run_once_with(server: &MockServer, drain_gate: Option<DrainGate>) {
-        run_once_configured(server, drain_gate, true).await;
+        run_once_configured(server, drain_gate, None, true).await;
     }
 
     async fn run_once_configured(
         server: &MockServer,
         drain_gate: Option<DrainGate>,
+        pause_gate: Option<PauseGate>,
         acknowledge_message: bool,
     ) {
         let client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default())
@@ -1734,6 +1746,7 @@ mod drain_tests {
             subscription: "test-sub".into(),
             endpoint: Some(server.uri()),
             acknowledge_message,
+            poll_secs: 0,
             ..Default::default()
         };
         let ingestor = Ingestor::new(
@@ -1748,7 +1761,7 @@ mod drain_tests {
         )
         .await
         .expect("ingestor must build")
-        .with_drain_gate(drain_gate);
+        .with_gate(object_gate(drain_gate, pause_gate));
         let (out, _rx) = SourceSender::new_test();
         let mut process = IngestorProcess::new(
             Arc::clone(&ingestor.state),
@@ -1796,7 +1809,7 @@ mod drain_tests {
         let server = mock_pubsub_and_gcs().await;
         let ((), drained) = with_drained_count(
             "span",
-            run_once_configured(&server, Some(disabled_gate()), false),
+            run_once_configured(&server, Some(disabled_gate()), None, false),
         );
         let (gets, acks) = requests(&server).await;
         assert_eq!(gets, 0, "a disabled table must not fetch objects");
@@ -1851,5 +1864,64 @@ mod drain_tests {
         let server = mock_pubsub_and_gcs().await;
         run_once_with(&server, None).await;
         assert!(requests(&server).await.0 > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_table_leaves_queue_untouched() {
+        let server = mock_pubsub_and_gcs().await;
+        // Pause wins over drain: the table is also disabled, yet nothing is received or deleted.
+        let paused = pause_gate("span", &[(PAUSED_LIST_KEY, Value::from("span"))]);
+        let ((), polls) = with_paused_count(
+            "span",
+            run_once_configured(&server, Some(disabled_gate()), Some(paused), true),
+        );
+        let received = server.received_requests().await.expect("recording enabled");
+        assert!(
+            received.is_empty(),
+            "a paused source makes no queue or object requests"
+        );
+        assert_eq!(polls, 1, "the skipped poll is counted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pause_set_during_receive_leaves_batch_on_queue() {
+        let server = mock_pubsub_and_gcs().await;
+        // Unpaused when the poll starts, paused by the time the batch arrives. The table is
+        // also disabled, which must not drain the in-flight batch.
+        let paused = pause_gate_sequence(
+            "span",
+            &[(PAUSED_LIST_KEY, vec![Value::from(""), Value::from("span")])],
+        );
+        let ((), polls) = with_paused_count(
+            "span",
+            run_once_configured(&server, Some(disabled_gate()), Some(paused), true),
+        );
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .expect("recording enabled")
+                .is_empty(),
+            "the poll received a batch"
+        );
+        let (gets, deletes) = requests(&server).await;
+        assert_eq!(gets, 0, "a paused batch is not fetched");
+        assert!(deletes.is_empty(), "a paused batch is not acknowledged");
+        assert_eq!(polls, 0, "the poll itself was not skipped");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpaused_table_processes_normally() {
+        let server = mock_pubsub_and_gcs().await;
+        let unpaused = pause_gate("span", &[(PAUSED_LIST_KEY, Value::from("qpl"))]);
+        let ((), polls) = with_paused_count(
+            "span",
+            run_once_configured(&server, None, Some(unpaused), true),
+        );
+        assert!(
+            requests(&server).await.0 > 0,
+            "an unpaused table fetches its object"
+        );
+        assert_eq!(polls, 0);
     }
 }
