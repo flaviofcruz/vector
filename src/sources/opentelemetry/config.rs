@@ -223,9 +223,16 @@ impl SourceConfig for OpentelemetryConfig {
             .add_service(metrics_service)
             .add_service(trace_service);
 
+        let http_tls_settings = MaybeTlsSettings::from_config(self.http.tls.as_ref(), true)?;
+        let protocol = http_tls_settings.http_protocol_name();
+
+        // Surface bind and TLS acceptor errors while the topology can still reject the build.
+        let grpc_listener = grpc_tls_settings.bind(&self.grpc.address).await?;
+        let http_listener = http_tls_settings.bind(&self.http.address).await?;
+
         let grpc_source = run_grpc_server_with_routes(
             self.grpc.address,
-            grpc_tls_settings,
+            grpc_listener,
             builder.routes(),
             cx.shutdown.clone(),
         )
@@ -233,8 +240,6 @@ impl SourceConfig for OpentelemetryConfig {
             error!(message = "Source future failed.", %error);
         });
 
-        let http_tls_settings = MaybeTlsSettings::from_config(self.http.tls.as_ref(), true)?;
-        let protocol = http_tls_settings.http_protocol_name();
         let bytes_received = register!(BytesReceived::from(Protocol::from(protocol)));
         let headers =
             build_param_matcher(&remove_duplicates(self.http.headers.clone(), "headers"))?;
@@ -253,7 +258,7 @@ impl SourceConfig for OpentelemetryConfig {
 
         let http_source = run_http_server(
             self.http.address,
-            http_tls_settings,
+            http_listener,
             filters,
             cx.shutdown,
             self.http.keepalive.clone(),

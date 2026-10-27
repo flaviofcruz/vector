@@ -403,6 +403,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_certificate_and_key_replacements_trigger_targeted_reload() {
+        let directory = temp_dir();
+        std::fs::create_dir(&directory).unwrap();
+        let certificate = directory.join("tls.crt");
+        let key = directory.join("tls.key");
+        let unrelated = directory.join("other.crt");
+        for path in [&certificate, &key, &unrelated] {
+            std::fs::write(path, b"initial").unwrap();
+        }
+        let source = ComponentKey::from("otel");
+        let (signal_tx, mut signal_rx) = broadcast::channel(128);
+        spawn_thread(
+            WatcherConfig::RecommendedWatcher,
+            signal_tx,
+            &[],
+            vec![
+                ComponentConfig::new(
+                    vec![certificate.clone(), key.clone()],
+                    source.clone(),
+                    ComponentType::Source,
+                ),
+                ComponentConfig::new(
+                    vec![unrelated],
+                    ComponentKey::from("unrelated_sink"),
+                    ComponentType::Sink,
+                ),
+            ],
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        drain_initial_reload(&mut signal_rx, Duration::from_secs(5)).await;
+        for path in [&certificate, &key, &certificate] {
+            atomic_replace(path, b"replacement");
+            assert!(
+                recv_signal_ref(
+                    crate::signal::SignalTo::ReloadComponents(HashSet::from([source.clone()])),
+                    Duration::from_secs(5),
+                    &mut signal_rx,
+                )
+                .await
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn component_update() {
         trace_init();
 
@@ -712,6 +757,15 @@ mod tests {
 
     #[tokio::test]
     async fn kubernetes_atomic_writer_rotations_trigger_component_update() {
+        atomic_writer_rotations(ComponentType::Sink).await;
+    }
+
+    #[tokio::test]
+    async fn kubernetes_atomic_writer_rotations_trigger_source_update() {
+        atomic_writer_rotations(ComponentType::Source).await;
+    }
+
+    async fn atomic_writer_rotations(component_type: ComponentType) {
         use std::os::unix::fs::symlink;
 
         trace_init();
@@ -736,7 +790,7 @@ mod tests {
         let component_config = ComponentConfig::new(
             vec![credential_path.clone()],
             http_component.clone(),
-            ComponentType::Sink,
+            component_type,
         );
 
         let (signal_tx, mut signal_rx) = broadcast::channel(128);

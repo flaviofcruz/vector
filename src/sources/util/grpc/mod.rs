@@ -19,7 +19,7 @@ use tracing::Span;
 use crate::{
     internal_events::{GrpcServerRequestReceived, GrpcServerResponseSent},
     shutdown::{ShutdownSignal, ShutdownSignalToken},
-    tls::MaybeTlsSettings,
+    tls::{MaybeTlsListener, MaybeTlsSettings},
 };
 
 mod decompression;
@@ -91,13 +91,12 @@ where
 // I just don't know how to convert the generic type with associated types into a Vec<Box<trait object>>.
 pub async fn run_grpc_server_with_routes(
     address: SocketAddr,
-    tls_settings: MaybeTlsSettings,
+    listener: MaybeTlsListener,
     routes: Routes,
     shutdown: ShutdownSignal,
 ) -> crate::Result<()> {
     let span = Span::current();
     let (tx, rx) = tokio::sync::oneshot::channel::<ShutdownSignalToken>();
-    let listener = tls_settings.bind(&address).await?;
     let stream = listener.accept_stream();
 
     info!(%address, "Building gRPC server.");

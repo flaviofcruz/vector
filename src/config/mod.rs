@@ -79,6 +79,7 @@ pub use vector_lib::{
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 // // This is not a comprehensive set; variants are added as needed.
 pub enum ComponentType {
+    Source,
     Transform,
     Sink,
     EnrichmentTable,

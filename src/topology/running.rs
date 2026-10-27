@@ -2129,6 +2129,58 @@ mod tests {
         test_util::mock::{basic_sink, basic_source},
     };
 
+    #[cfg(feature = "sources-prometheus-remote-write")]
+    #[tokio::test]
+    async fn topology_reload_selected_source_with_unchanged_config() {
+        use std::time::Duration;
+
+        use crate::{
+            sources::prometheus::PrometheusRemoteWriteConfig,
+            test_util::{addr::next_addr, start_topology, trace_init, wait_for_tcp},
+        };
+
+        trace_init();
+
+        let (_guard, address) = next_addr();
+        let (_other_guard, other_address) = next_addr();
+        let source = ComponentKey::from("receiver");
+        let other = ComponentKey::from("other");
+        let sink = ComponentKey::from("out");
+        let (_sink_rx, sink_config) = basic_sink(1);
+        let mut config = Config::builder();
+        config.add_source(
+            source.clone(),
+            PrometheusRemoteWriteConfig::from_address(address),
+        );
+        config.add_source(
+            other.clone(),
+            PrometheusRemoteWriteConfig::from_address(other_address),
+        );
+        config.add_sink(sink.clone(), &["receiver", "other"], sink_config);
+        let (mut topology, _crash) = start_topology(config.clone().build().unwrap(), false).await;
+        wait_for_tcp(address).await;
+        let source_task = topology.source_tasks[&source].id();
+        let other_task = topology.source_tasks[&other].id();
+        let sink_task = topology.tasks[&sink].id();
+
+        topology.extend_reload_set(HashSet::from([source.clone()]));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            topology.reload_config_and_respawn(config.build().unwrap(), Default::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_ne!(topology.source_tasks[&source].id(), source_task);
+        assert_eq!(topology.source_tasks[&other].id(), other_task);
+        assert_eq!(topology.tasks[&sink].id(), sink_task);
+        tokio::time::timeout(Duration::from_secs(5), wait_for_tcp(address))
+            .await
+            .unwrap();
+        topology.stop().await;
+    }
+
     #[test]
     fn signal_sink_flush_sets_every_signal() {
         let signals: Vec<(ComponentKey, FlushSignal)> = ["sink_a", "sink_b", "sink_c"]

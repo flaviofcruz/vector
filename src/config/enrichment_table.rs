@@ -88,6 +88,7 @@ where
                 key,
                 SourceOuter {
                     graph: self.graph.clone(),
+                    files_to_watch: vec![],
                     sink_acknowledgements: false,
                     proxy: Default::default(),
                     inner: source,

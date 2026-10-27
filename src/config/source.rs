@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, time::Duration};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use dyn_clone::DynClone;
@@ -61,6 +61,13 @@ pub struct SourceOuter {
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub graph: GraphConfig,
 
+    /// Files whose changes reload this source when `--watch-config` is enabled.
+    ///
+    /// Reloading restarts the source and its listeners; clients must reconnect and retry.
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub files_to_watch: Vec<PathBuf>,
+
     #[serde(default, skip)]
     pub sink_acknowledgements: bool,
 
@@ -74,6 +81,7 @@ impl SourceOuter {
         Self {
             proxy: Default::default(),
             graph: Default::default(),
+            files_to_watch: Vec::new(),
             sink_acknowledgements: false,
             inner: inner.into(),
         }
@@ -231,5 +239,39 @@ impl SourceContext {
             .or(self.schema.log_namespace)
             .unwrap_or(false)
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_watch_files_round_trip_and_default_to_empty() {
+        let config = serde_json::json!({
+            "type": "test_basic",
+            "files_to_watch": ["/credentials/tls.crt", "/credentials/tls.key"]
+        });
+        let source: SourceOuter = serde_json::from_value(config).unwrap();
+        assert_eq!(
+            source.files_to_watch,
+            vec![
+                PathBuf::from("/credentials/tls.crt"),
+                PathBuf::from("/credentials/tls.key"),
+            ]
+        );
+        let round_trip: SourceOuter =
+            serde_json::from_value(serde_json::to_value(&source).unwrap()).unwrap();
+        assert_eq!(round_trip.files_to_watch, source.files_to_watch);
+
+        let source: SourceOuter =
+            serde_json::from_value(serde_json::json!({"type": "test_basic"})).unwrap();
+        assert!(source.files_to_watch.is_empty());
+        assert!(
+            serde_json::to_value(source)
+                .unwrap()
+                .get("files_to_watch")
+                .is_none()
+        );
     }
 }

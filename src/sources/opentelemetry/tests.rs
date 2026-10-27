@@ -1409,3 +1409,128 @@ async fn http_logs_use_otlp_decoding_emits_metric() {
         _ => panic!("component_received_events_total should be a counter"),
     }
 }
+
+#[rstest::rstest]
+#[case::grpc(true)]
+#[case::http(false)]
+#[tokio::test]
+async fn build_rejects_occupied_listener(#[case] grpc: bool) {
+    test_util::trace_init();
+    let (_grpc_guard, grpc_addr) = next_addr();
+    let (_http_guard, http_addr) = next_addr();
+    let config = get_source_config_with_headers(grpc_addr, http_addr, false);
+    let occupied_addr = if grpc { grpc_addr } else { http_addr };
+    let available_addr = if grpc { http_addr } else { grpc_addr };
+    let _occupied_listener = net::TcpListener::bind(occupied_addr).unwrap();
+    let (sender, _output, _) = new_source(EventStatus::Delivered, LOGS.to_string());
+
+    assert!(
+        config
+            .build(SourceContext::new_test(sender, None))
+            .await
+            .is_err()
+    );
+    // A failure on the second listener must release the first listener too.
+    assert!(net::TcpListener::bind(available_addr).is_ok());
+}
+
+#[rstest::rstest]
+#[case::grpc(true)]
+#[case::http(false)]
+#[tokio::test]
+async fn build_rejects_mismatched_tls_identity(#[case] grpc: bool) {
+    use crate::tls::{MaybeTlsSettings, TEST_PEM_CLIENT_KEY_PATH, TlsEnableableConfig};
+
+    test_util::trace_init();
+    let (_grpc_guard, grpc_addr) = next_addr();
+    let (_http_guard, http_addr) = next_addr();
+    let mut config = get_source_config_with_headers(grpc_addr, http_addr, false);
+    let mut tls = TlsEnableableConfig::test_config();
+    tls.options.key_file = Some(TEST_PEM_CLIENT_KEY_PATH.into());
+    // Both PEM files parse; their incompatibility is detected when constructing the acceptor.
+    assert!(MaybeTlsSettings::from_config(Some(&tls), true).is_ok());
+    if grpc {
+        config.grpc.tls = Some(tls);
+    } else {
+        config.http.tls = Some(tls);
+    }
+    let (sender, _output, _) = new_source(EventStatus::Delivered, LOGS.to_string());
+
+    assert!(
+        config
+            .build(SourceContext::new_test(sender, None))
+            .await
+            .is_err()
+    );
+    assert!(net::TcpListener::bind(grpc_addr).is_ok());
+    assert!(net::TcpListener::bind(http_addr).is_ok());
+}
+
+#[tokio::test]
+async fn build_prepares_both_tls_listeners_before_the_source_is_polled() {
+    use crate::tls::TlsEnableableConfig;
+
+    test_util::trace_init();
+    let (_grpc_guard, grpc_addr) = next_addr();
+    let (_http_guard, http_addr) = next_addr();
+    let mut config = get_source_config_with_headers(grpc_addr, http_addr, false);
+    config.grpc.tls = Some(TlsEnableableConfig::test_config());
+    config.http.tls = Some(TlsEnableableConfig::test_config());
+    let (sender, _output, _) = new_source(EventStatus::Delivered, LOGS.to_string());
+    let source = config
+        .build(SourceContext::new_test(sender, None))
+        .await
+        .unwrap();
+
+    assert!(net::TcpListener::bind(grpc_addr).is_err());
+    assert!(net::TcpListener::bind(http_addr).is_err());
+    drop(source);
+    assert!(net::TcpListener::bind(grpc_addr).is_ok());
+    assert!(net::TcpListener::bind(http_addr).is_ok());
+}
+
+#[rstest::rstest]
+#[case::grpc(true)]
+#[case::http(false)]
+#[tokio::test]
+async fn reload_rejects_occupied_otlp_listener_and_restores_previous_source(#[case] grpc: bool) {
+    use std::time::Duration;
+
+    use crate::{
+        config::Config,
+        test_util::{mock::basic_sink, start_topology, wait_for_tcp},
+        topology::ReloadError,
+    };
+
+    test_util::trace_init();
+    let (_grpc_guard, grpc_addr) = next_addr();
+    let (_http_guard, http_addr) = next_addr();
+    let (_occupied_guard, occupied_addr) = next_addr();
+    let _occupied_listener = net::TcpListener::bind(occupied_addr).unwrap();
+    let mut source = get_source_config_with_headers(grpc_addr, http_addr, false);
+    let (_sink_rx, sink) = basic_sink(1);
+    let mut config = Config::builder();
+    config.add_source("in", source.clone());
+    config.add_sink("out", &["in.logs"], sink);
+    let (mut topology, _crash) = start_topology(config.clone().build().unwrap(), false).await;
+    wait_for_tcp(grpc_addr).await;
+    wait_for_tcp(http_addr).await;
+
+    if grpc {
+        source.grpc.address = occupied_addr;
+    } else {
+        source.http.address = occupied_addr;
+    }
+    config.add_source("in", source);
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        topology.reload_config_and_respawn(config.build().unwrap(), Default::default()),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result, Err(ReloadError::TopologyBuildFailed)));
+    wait_for_tcp(grpc_addr).await;
+    wait_for_tcp(http_addr).await;
+    topology.stop().await;
+}

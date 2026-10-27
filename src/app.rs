@@ -709,6 +709,14 @@ pub async fn load_configs(
     let mut watched_component_paths = Vec::new();
 
     if let Some(watcher_conf) = watcher_conf {
+        for (name, source) in config.sources() {
+            watched_component_paths.push(ComponentConfig::new(
+                source.files_to_watch.clone(),
+                name.clone(),
+                ComponentType::Source,
+            ));
+        }
+
         for (name, transform) in config.transforms() {
             let files = transform.inner.files_to_watch();
             let component_config = ComponentConfig::new(
