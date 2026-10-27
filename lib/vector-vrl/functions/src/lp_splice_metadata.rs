@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use vector_redaction_executor::{LpSplice, SpliceInput, SpliceInputMode};
 use vrl::compiler::conversion::Conversion;
-use vrl::path::{OwnedTargetPath, parse_target_path};
+use vrl::path::{OwnedSegment, OwnedTargetPath, parse_target_path};
 use vrl::prelude::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -100,18 +100,24 @@ impl Function for LpSpliceMetadata {
         )?;
         let splice = LpSplice::register(&descriptor_file, &message_type)
             .map_err(|error| compile_error(error.to_string()))?;
+        let mut parents: Vec<OwnedTargetPath> = Vec::new();
         let inputs = splice
             .inputs()
             .iter()
             .map(|(mode, path)| {
-                parse_target_path(&format!(".{path}"))
-                    .map(|path| (*mode, path))
-                    .map_err(|error| compile_error(format!("invalid input path {path}: {error}")))
+                let path = parse_target_path(&format!(".{path}")).map_err(|error| {
+                    compile_error(format!("invalid input path {path}: {error}"))
+                })?;
+                Ok(InputRead {
+                    mode: *mode,
+                    source: input_source(path, &mut parents),
+                })
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, Box<dyn DiagnosticMessage>>>()?;
         let enforce_shape = arguments.optional("enforce_shape");
         Ok(LpSpliceMetadataFn {
             splice: Arc::new(splice),
+            parents,
             inputs,
             enforce_shape,
         }
@@ -120,17 +126,82 @@ impl Function for LpSpliceMetadata {
 }
 
 #[derive(Clone, Debug)]
-struct LpSpliceMetadataFn {
-    splice: Arc<LpSplice>,
-    inputs: Vec<(SpliceInputMode, OwnedTargetPath)>,
-    enforce_shape: Option<Box<dyn Expression>>,
+struct InputRead {
+    mode: SpliceInputMode,
+    source: InputSource,
 }
 
-/// An input read off the event: borrowed, or converted for this record.
-enum Read<'a> {
+#[derive(Clone, Debug)]
+enum InputSource {
+    /// Field `leaf` of the object at `parents[parent]`. The ~60 inputs share a handful of parent
+    /// objects, so each record resolves every parent once instead of walking each input's full
+    /// path from the event root.
+    Leaf { parent: usize, leaf: KeyString },
+    /// A path whose last segment is not a field, read from the event root.
+    Path(OwnedTargetPath),
+}
+
+/// Groups `path` under its parent object, registering the parent in `parents` if new.
+fn input_source(path: OwnedTargetPath, parents: &mut Vec<OwnedTargetPath>) -> InputSource {
+    let mut parent = path.clone();
+    match parent.path.segments.pop() {
+        Some(OwnedSegment::Field(leaf)) => {
+            let parent = match parents.iter().position(|p| *p == parent) {
+                Some(index) => index,
+                None => {
+                    parents.push(parent);
+                    parents.len() - 1
+                }
+            };
+            InputSource::Leaf { parent, leaf }
+        }
+        // An index or coalesce leaf (or the event root) is read from the root, as `target_get`
+        // would.
+        _ => InputSource::Path(path),
+    }
+}
+
+/// One input after its VRL conversion. `Json` owns the encoded bytes so they outlive the encode
+/// call.
+#[derive(Debug)]
+enum Prepared<'a> {
     Value(Option<&'a Value>),
     Json(Vec<u8>),
     Integer(i64),
+}
+
+impl<'a> Prepared<'a> {
+    fn new(mode: SpliceInputMode, value: Option<&'a Value>) -> Result<Self, ExpressionError> {
+        Ok(match mode {
+            SpliceInputMode::Value => Self::Value(value),
+            // VRL `encode_json`, applied only where the template calls it on a non-null value;
+            // missing and null pass through as MISSING / NULL per the ABI.
+            SpliceInputMode::Json => match value.filter(|value| !value.is_null()) {
+                Some(value) => Self::Json(
+                    serde_json::to_vec(value)
+                        .map_err(|error| format!("lp_splice_metadata: {error}"))?,
+                ),
+                None => Self::Value(value),
+            },
+            SpliceInputMode::ToInt => Self::Integer(to_int(value)?),
+        })
+    }
+
+    fn splice_input(&self) -> SpliceInput<'_> {
+        match self {
+            Self::Value(value) => value_input(*value),
+            Self::Json(encoded) => SpliceInput::Bytes(encoded),
+            Self::Integer(integer) => SpliceInput::Integer(*integer),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LpSpliceMetadataFn {
+    splice: Arc<LpSplice>,
+    parents: Vec<OwnedTargetPath>,
+    inputs: Vec<InputRead>,
+    enforce_shape: Option<Box<dyn Expression>>,
 }
 
 impl FunctionExpression for LpSpliceMetadataFn {
@@ -140,15 +211,33 @@ impl FunctionExpression for LpSpliceMetadataFn {
             None => false,
         };
         let target = ctx.target();
-        let reads = self
+        let parents: Vec<Option<&ObjectMap>> = self
+            .parents
+            .iter()
+            .map(|path| {
+                target
+                    .target_get(path)
+                    .ok()
+                    .flatten()
+                    .and_then(Value::as_object)
+            })
+            .collect();
+        let value = |input: &InputRead| match &input.source {
+            InputSource::Leaf { parent, leaf } => {
+                parents[*parent].and_then(|parent| parent.get(leaf))
+            }
+            InputSource::Path(path) => target.target_get(path).ok().flatten(),
+        };
+        // Conversions run before the executor, in input order, so the first failing input fails
+        // the record without an encode.
+        let prepared = self
             .inputs
             .iter()
-            .map(|(mode, path)| read(*mode, target.target_get(path).ok().flatten()))
-            .collect::<Result<Vec<_>, ExpressionError>>()?;
-        let inputs: Vec<SpliceInput> = reads.iter().map(splice_input).collect();
+            .map(|input| Prepared::new(input.mode, value(input)))
+            .collect::<Result<Vec<_>, _>>()?;
         let bytes = self
             .splice
-            .encode(&inputs, enforce_shape)
+            .encode(prepared.iter().map(Prepared::splice_input), enforce_shape)
             .map_err(|error| format!("lp_splice_metadata: {error}"))?;
         Ok(Value::Bytes(bytes))
     }
@@ -158,36 +247,16 @@ impl FunctionExpression for LpSpliceMetadataFn {
     }
 }
 
-fn read(mode: SpliceInputMode, value: Option<&Value>) -> Result<Read<'_>, ExpressionError> {
-    Ok(match mode {
-        SpliceInputMode::Value => Read::Value(value),
-        // VRL `encode_json`, applied only where the template calls it on a non-null value; missing
-        // and null pass through as MISSING / NULL per the ABI.
-        SpliceInputMode::Json => match value {
-            None | Some(Value::Null) => Read::Value(value),
-            Some(value) => Read::Json(
-                serde_json::to_vec(value)
-                    .map_err(|error| format!("lp_splice_metadata: {error}"))?,
-            ),
-        },
-        SpliceInputMode::ToInt => Read::Integer(to_int(value)?),
-    })
-}
-
-fn splice_input<'a>(read: &'a Read<'a>) -> SpliceInput<'a> {
-    match read {
-        Read::Value(None) => SpliceInput::Missing,
-        Read::Value(Some(value)) => match value {
-            Value::Null => SpliceInput::Null,
-            Value::Bytes(bytes) => SpliceInput::Bytes(bytes),
-            Value::Integer(i) => SpliceInput::Integer(*i),
-            Value::Float(f) => SpliceInput::Float(f.into_inner()),
-            Value::Boolean(b) => SpliceInput::Boolean(*b),
-            Value::Timestamp(t) => SpliceInput::Timestamp(t.timestamp_micros()),
-            _ => SpliceInput::Other,
-        },
-        Read::Json(json) => SpliceInput::Bytes(json),
-        Read::Integer(i) => SpliceInput::Integer(*i),
+fn value_input(value: Option<&Value>) -> SpliceInput<'_> {
+    match value {
+        None => SpliceInput::Missing,
+        Some(Value::Null) => SpliceInput::Null,
+        Some(Value::Bytes(bytes)) => SpliceInput::Bytes(bytes),
+        Some(Value::Integer(i)) => SpliceInput::Integer(*i),
+        Some(Value::Float(f)) => SpliceInput::Float(f.into_inner()),
+        Some(Value::Boolean(b)) => SpliceInput::Boolean(*b),
+        Some(Value::Timestamp(t)) => SpliceInput::Timestamp(t.timestamp_micros()),
+        Some(_) => SpliceInput::Other,
     }
 }
 
@@ -507,15 +576,88 @@ mod tests {
 
     #[test]
     fn json_inputs_keep_missing_and_null_apart() {
+        for json in [None, Some(value!(null)), Some(value!({"id": "legacy"}))] {
+            let mut event = value!({
+                "_lp_log_entry": { "log_time": { "seconds": 1792244700, "nanos": 0 } },
+                "_lp_log_daemon_wrapper": {},
+            });
+            if let Some(json) = json {
+                event.insert(vrl::path!("_lp_log_entry", "event_id"), json.clone());
+                event.insert(vrl::path!("_lp_log_entry", "policy"), json);
+            }
+            assert_parity(event);
+        }
+        // Parity alone can't tell these apart: the reference VRL's `is_null` guard treats missing
+        // and null alike, so pin the ABI values directly.
         let object = value!({"id": "legacy"});
         for (value, expected) in [
             (None, SpliceInput::Missing),
             (Some(&Value::Null), SpliceInput::Null),
             (Some(&object), SpliceInput::Bytes(br#"{"id":"legacy"}"#)),
         ] {
-            let read = read(SpliceInputMode::Json, value).unwrap();
-            assert_eq!(splice_input(&read), expected, "{value:?}");
+            let prepared = Prepared::new(SpliceInputMode::Json, value).unwrap();
+            assert_eq!(prepared.splice_input(), expected, "{value:?}");
         }
+    }
+
+    #[test]
+    fn failed_to_int_fails_before_encode() {
+        let value = value!("soon");
+        assert!(Prepared::new(SpliceInputMode::ToInt, Some(&value)).is_err());
+        assert_eq!(
+            Prepared::new(SpliceInputMode::ToInt, None)
+                .unwrap()
+                .splice_input(),
+            SpliceInput::Integer(0)
+        );
+    }
+
+    #[test]
+    fn non_field_leaves_read_from_the_root() {
+        let mut parents = Vec::new();
+        let path = |p: &str| parse_target_path(p).unwrap();
+        assert!(matches!(
+            input_source(path("._lp_log_entry.shard_name"), &mut parents),
+            InputSource::Leaf { parent: 0, .. }
+        ));
+        assert!(matches!(
+            input_source(path("._lp_log_entry.project_name"), &mut parents),
+            InputSource::Leaf { parent: 0, .. }
+        ));
+        assert!(matches!(
+            input_source(path("._lp_log_entry.tags[0]"), &mut parents),
+            InputSource::Path(_)
+        ));
+        assert_eq!(parents, vec![path("._lp_log_entry")]);
+    }
+
+    #[test]
+    fn encode_rejects_mismatched_input_count() {
+        let splice = LpSplice::register(DESCRIPTOR, MESSAGE_TYPE).unwrap();
+        let count = splice.inputs().len();
+        for len in [count - 1, count + 1] {
+            let inputs = std::iter::repeat_n(SpliceInput::Missing, len);
+            assert!(splice.encode(inputs, false).is_err(), "{len} of {count}");
+        }
+        assert!(
+            splice
+                .encode(std::iter::repeat_n(SpliceInput::Missing, count), false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn non_object_parents_read_as_missing() {
+        assert_parity(value!({
+            "_lp_log_entry": {
+                "log_time": { "seconds": 1792244700, "nanos": 0 },
+                "shard_name": "le-shard",
+                "whereami": "not-an-object",
+                "data_plane_metadata": [1, 2],
+            },
+            "_lp_log_daemon_wrapper": { "instance_id": "ldw-instance", "metadata": 5 },
+            "metadata": "not-an-object",
+        }));
     }
 
     #[test]

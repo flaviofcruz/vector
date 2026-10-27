@@ -616,17 +616,29 @@ impl LpSplice {
     }
 
     /// Encodes one record's injected-columns message. `inputs` must line up with
-    /// [`LpSplice::inputs`].
-    pub fn encode(
+    /// [`LpSplice::inputs`]. Taken as an iterator so the caller needs no intermediate collection.
+    pub fn encode<'a>(
         &self,
-        inputs: &[SpliceInput<'_>],
+        inputs: impl IntoIterator<Item = SpliceInput<'a>>,
         enforce_shape: bool,
     ) -> Result<Bytes, RedactError> {
-        let foreign: Vec<ForeignSpliceInput> = inputs.iter().map(Into::into).collect();
+        let foreign: Vec<ForeignSpliceInput> = inputs
+            .into_iter()
+            .map(|input| ForeignSpliceInput::from(&input))
+            .collect();
+        // The executor reads inputs by position, so a short or long list would misalign every
+        // column after the gap.
+        if foreign.len() != self.inputs.len() {
+            return Err(RedactError::InvalidArgument(format!(
+                "expected {} splice inputs, got {}",
+                self.inputs.len(),
+                foreign.len()
+            )));
+        }
         let mut record = ForeignBuffer::EMPTY;
         let mut error = ForeignBuffer::EMPTY;
-        // SAFETY: `foreign` and every slice its views borrow (owned by `inputs`) stay live for the
-        // call. The output pointers reference distinct, aligned, initialized locals.
+        // SAFETY: `foreign` and every slice its views borrow (each borrowed for `'a`) stay live for
+        // the call. The output pointers reference distinct, aligned, initialized locals.
         let status = unsafe {
             db_redactor_lp_splice_encode(
                 self.handle,
