@@ -520,6 +520,7 @@ wiremock = "0.6.4"
 zstd = { version = "0.13.0", default-features = false }
 
 [patch.crates-io]
+aws-config = { path = "vendor/aws-config-1.8.13" }
 aws-sigv4 = { path = "vendor/aws-sigv4-1.3.8" }
 azure_storage = { path = "vendor/azure_storage-0.21.0" }
 nix = { git = "https://github.com/vectordotdev/nix.git", branch = "memfd/gnu/musl" }
