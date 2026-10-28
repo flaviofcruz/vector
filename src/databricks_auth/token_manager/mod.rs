@@ -13,8 +13,12 @@ mod jwt;
 mod manager;
 mod request;
 mod transport;
+mod uc;
 
-pub use config::{LoginServiceAuthConfig, LoginServiceConfig, UcPermissionEntry, UserAuthInfo};
+pub use config::{
+    LoginServiceAuthConfig, LoginServiceConfig, UcPermissionEntry, UnityCatalogServiceConfig,
+    UserAuthInfo,
+};
 pub use error::TokenManagerError;
 pub use manager::TokenManager;
 

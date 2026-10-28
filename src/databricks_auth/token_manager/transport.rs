@@ -1,20 +1,44 @@
-use bytes::Buf;
-use prost_reflect::{DynamicMessage, MessageDescriptor};
+use std::path::Path;
+
+use bytes::{Buf, BytesMut};
+use http::{HeaderMap, Request as HttpRequest, Uri};
+use hyper::Body;
+use hyper::body::HttpBody;
+use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, prost::Message};
 use snafu::ResultExt;
 
 use super::config::LoginServiceAuthConfig;
 use super::error::{
-    DecodeResponseSnafu, HttpsConnectorSnafu, IncompleteResponseMessageSnafu, LoadCaFileSnafu,
-    LoadClientCertSnafu, LoadClientKeySnafu, ResponseTooShortSnafu, SslBuilderSnafu,
-    TokenManagerError, UnexpectedCompressionSnafu,
+    BuildDescriptorPoolSnafu, BuildGrpcHttpRequestSnafu, DecodeDescriptorSetSnafu,
+    DecodeResponseSnafu, HttpsConnectorSnafu, IncompleteResponseMessageSnafu, InvalidGrpcUriSnafu,
+    LoadCaFileSnafu, LoadClientCertSnafu, LoadClientKeySnafu, ReadDescriptorSnafu,
+    ReadResponseBodySnafu, ResponseTooShortSnafu, SslBuilderSnafu, TokenManagerError,
+    TransportSnafu, UnexpectedCompressionSnafu,
 };
 
-/// Build a hyper-openssl client configured with the agent's mTLS cert + Login's
-/// SNI override (matching the bricklens_ingest sink pattern). The TCP connection
-/// goes to `endpoint`; SNI is set to `login_server_name` for the s2s-proxy sidecar
-/// to route correctly.
+/// HTTP client used for every gRPC call issued by the token manager.
+pub(super) type GrpcHttpClient =
+    hyper::Client<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>;
+
+/// Load a runtime-mounted `FileDescriptorSet` into a `DescriptorPool`.
+pub(super) async fn load_descriptor_pool(path: &Path) -> Result<DescriptorPool, TokenManagerError> {
+    let descriptor_bytes = tokio::fs::read(path).await.context(ReadDescriptorSnafu {
+        path: path.to_path_buf(),
+    })?;
+    let fds = prost_reflect::prost_types::FileDescriptorSet::decode(&descriptor_bytes[..])
+        .context(DecodeDescriptorSetSnafu)?;
+    DescriptorPool::from_file_descriptor_set(fds).context(BuildDescriptorPoolSnafu)
+}
+
+/// Build a hyper-openssl client configured with the agent's mTLS cert + an SNI
+/// override (matching the bricklens_ingest sink pattern). The TCP connection goes
+/// to the request URI; SNI is set to `server_name` for the s2s-proxy sidecar to
+/// route correctly. With `verify_hostname` false the certificate chain is still
+/// verified, but not its hostname.
 pub(super) fn build_hyper_openssl_client(
     config: &LoginServiceAuthConfig,
+    server_name: &str,
+    verify_hostname: bool,
 ) -> Result<
     hyper::Client<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>,
     TokenManagerError,
@@ -51,19 +75,98 @@ pub(super) fn build_hyper_openssl_client(
         hyper_openssl::HttpsConnector::with_connector(http_connector, ssl_builder)
             .context(HttpsConnectorSnafu)?;
 
-    let server_name = config.login_service.login_server_name.clone();
+    let server_name = server_name.to_string();
     https_connector.set_callback(move |connection, _uri| {
         // Endpoint is typically the s2s-proxy sidecar (e.g. 127.0.0.3); the SNI must
         // be set explicitly to the privileged DBNS hostname so the sidecar routes to
         // the right backend. This mirrors bricklens_ingest sink.rs.
         connection.set_use_server_name_indication(false);
         connection.set_hostname(&server_name)?;
+        connection.set_verify_hostname(verify_hostname);
         Ok(())
     });
 
     Ok(hyper::Client::builder()
         .http2_only(true)
         .build(https_connector))
+}
+
+/// Issue a unary gRPC call and return the decoded response message.
+///
+/// `extra_headers` are added verbatim; binary (`-bin`) header values must already be
+/// base64-encoded.
+pub(super) async fn grpc_unary_call(
+    client: &GrpcHttpClient,
+    uri: Uri,
+    extra_headers: &[(&str, String)],
+    request: &DynamicMessage,
+    output_desc: &MessageDescriptor,
+) -> Result<DynamicMessage, TokenManagerError> {
+    let mut builder = HttpRequest::builder()
+        .uri(uri)
+        .method("POST")
+        .header("content-type", "application/grpc+proto")
+        .header("te", "trailers")
+        .header("grpc-encoding", "identity");
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, value);
+    }
+    let http_req = builder
+        .body(Body::from(encode_grpc_message(request.encode_to_vec())))
+        .context(BuildGrpcHttpRequestSnafu)?;
+
+    let response = client.request(http_req).await.context(TransportSnafu)?;
+    let (parts, mut body) = response.into_parts();
+
+    // A trailers-only error response carries its status in the headers.
+    if let Some(error) = grpc_status_error(&parts.headers) {
+        return Err(error);
+    }
+
+    let mut data = BytesMut::new();
+    while let Some(chunk) = body.data().await {
+        data.extend_from_slice(&chunk.context(ReadResponseBodySnafu)?);
+    }
+
+    // Otherwise the status arrives in the trailers. Check it before parsing: a failed call
+    // has no message, which would otherwise surface as a misleading framing error.
+    let trailers = body.trailers().await.context(ReadResponseBodySnafu)?;
+    if let Some(error) = trailers.as_ref().and_then(grpc_status_error) {
+        return Err(error);
+    }
+
+    parse_grpc_response_message(data.freeze(), output_desc)
+}
+
+/// Return the error described by a non-zero `grpc-status` in `headers`, if any.
+pub(super) fn grpc_status_error(headers: &HeaderMap) -> Option<TokenManagerError> {
+    let status = headers
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|status| *status != 0)?;
+    let message = headers
+        .get("grpc-message")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown grpc error")
+        .to_string();
+    Some(TokenManagerError::GrpcStatus { status, message })
+}
+
+/// Build the request URI for `method` on `endpoint`.
+pub(super) fn grpc_method_uri(
+    endpoint: &Uri,
+    method: &prost_reflect::MethodDescriptor,
+) -> Result<Uri, TokenManagerError> {
+    let uri_str = format!(
+        "{}/{}/{}",
+        endpoint.to_string().trim_end_matches('/'),
+        method.parent_service().full_name(),
+        method.name()
+    );
+    uri_str
+        .parse::<Uri>()
+        .context(InvalidGrpcUriSnafu { uri: uri_str })
 }
 
 /// Wrap a serialized protobuf message with the 5-byte gRPC framing prefix

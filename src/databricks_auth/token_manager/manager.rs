@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use http::{Request as HttpRequest, Uri};
-use hyper::Body;
-use prost_reflect::{DescriptorPool, MethodDescriptor, Value, prost::Message};
+use base64::Engine;
+use http::Uri;
+use prost_reflect::{DynamicMessage, MethodDescriptor, Value};
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -11,18 +11,21 @@ use tracing::info;
 use super::cache::CachedToken;
 use super::config::{
     DEFAULT_TOKEN_LIFETIME, LoginServiceAuthConfig, MIN_TOKEN_VALIDITY, OAUTH_METHOD_NAME,
-    OAUTH_SERVICE_NAME,
+    OAUTH_SERVICE_NAME, PRINCIPAL_CONTEXT_HEADER, UC_GET_TABLE_METHOD_NAME, UC_SERVICE_NAME,
+    UnityCatalogServiceConfig,
 };
 use super::error::{
-    BuildDescriptorPoolSnafu, BuildGrpcHttpRequestSnafu, DecodeDescriptorSetSnafu,
-    InvalidGrpcUriSnafu, InvalidLoginEndpointSnafu, OauthFailedSnafu, ReadDescriptorSnafu,
-    ReadResponseBodySnafu, TokenManagerError, TokenTooShortLivedSnafu, TransportSnafu,
+    InvalidLoginEndpointSnafu, InvalidUcEndpointSnafu, OauthFailedSnafu, TokenManagerError,
+    TokenTooShortLivedSnafu,
 };
-use super::jwt::extract_jwt_expiry;
+use super::jwt::{extract_jwt_expiry, principal_context_from_jwt};
 use super::request::build_request_message;
 use super::transport::{
-    build_hyper_openssl_client, encode_grpc_message, parse_grpc_response_message,
+    GrpcHttpClient, build_hyper_openssl_client, grpc_method_uri, grpc_unary_call,
+    load_descriptor_pool,
 };
+use super::uc::uc_table_schema_from_response;
+use databricks_zerobus_ingest_sdk::schema::UcTableSchema;
 
 /// Manages internal OAuth token lifecycle: bootstrap and re-bootstrap on expiry.
 ///
@@ -37,9 +40,17 @@ use super::transport::{
 pub struct TokenManager {
     config: LoginServiceAuthConfig,
     method: MethodDescriptor,
-    client: hyper::Client<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>,
+    client: GrpcHttpClient,
     endpoint: Uri,
     token: Arc<RwLock<Option<CachedToken>>>,
+    unity_catalog: Option<UnityCatalogClient>,
+}
+
+/// gRPC client for the internal Unity Catalog `getTable` RPC.
+struct UnityCatalogClient {
+    method: MethodDescriptor,
+    client: GrpcHttpClient,
+    endpoint: Uri,
 }
 
 impl TokenManager {
@@ -55,17 +66,7 @@ impl TokenManager {
     /// is a one-time startup cost (not per-request) and not worth optimizing while only a single
     /// sink is configured.
     pub async fn new(config: LoginServiceAuthConfig) -> Result<Self, TokenManagerError> {
-        // Load the runtime-mounted FileDescriptorSet covering the OAuth service.
-        let descriptor_bytes = tokio::fs::read(&config.login_service.oauth_proto_descriptor_path)
-            .await
-            .context(ReadDescriptorSnafu {
-                path: config.login_service.oauth_proto_descriptor_path.clone(),
-            })?;
-        let fds = prost_reflect::prost_types::FileDescriptorSet::decode(&descriptor_bytes[..])
-            .context(DecodeDescriptorSetSnafu)?;
-        let pool =
-            DescriptorPool::from_file_descriptor_set(fds).context(BuildDescriptorPoolSnafu)?;
-
+        let pool = load_descriptor_pool(&config.login_service.oauth_proto_descriptor_path).await?;
         let svc = pool
             .get_service_by_name(OAUTH_SERVICE_NAME)
             .ok_or_else(|| TokenManagerError::OauthServiceNotFound {
@@ -89,7 +90,15 @@ impl TokenManager {
                     uri: config.login_service.login_endpoint.clone(),
                 })?;
 
-        let client = build_hyper_openssl_client(&config)?;
+        let client = build_hyper_openssl_client(
+            &config,
+            &config.login_service.login_server_name,
+            config.login_service.verify_hostname,
+        )?;
+        let unity_catalog = match &config.unity_catalog {
+            Some(uc) => Some(UnityCatalogClient::new(&config, uc).await?),
+            None => None,
+        };
 
         Ok(Self {
             config,
@@ -97,39 +106,14 @@ impl TokenManager {
             client,
             endpoint,
             token: Arc::new(RwLock::new(None)),
+            unity_catalog,
         })
-    }
-
-    /// Build the gRPC URI for the OAuth bootstrap RPC.
-    fn grpc_uri(&self) -> Result<Uri, TokenManagerError> {
-        let path = format!(
-            "/{}/{}",
-            self.method.parent_service().full_name(),
-            self.method.name()
-        );
-        let endpoint_str = self.endpoint.to_string();
-        let endpoint_base = endpoint_str.trim_end_matches('/');
-        let uri_str = format!("{}{}", endpoint_base, path);
-        uri_str
-            .parse::<Uri>()
-            .context(InvalidGrpcUriSnafu { uri: uri_str })
     }
 
     /// Bootstrap: call GenerateReauthenticatedAndReauthorizedInternalOAuthToken
     /// over hyper-openssl, decode the response, and return the cached token.
     async fn bootstrap(&self) -> Result<CachedToken, TokenManagerError> {
         let request_msg = build_request_message(&self.config, &self.method.input())?;
-        let request_bytes = request_msg.encode_to_vec();
-
-        let uri = self.grpc_uri()?;
-        let http_req = HttpRequest::builder()
-            .uri(uri)
-            .method("POST")
-            .header("content-type", "application/grpc+proto")
-            .header("te", "trailers")
-            .header("grpc-encoding", "identity")
-            .body(Body::from(encode_grpc_message(request_bytes)))
-            .context(BuildGrpcHttpRequestSnafu)?;
 
         info!(
             message = "Bootstrapping OAuth token from Login service.",
@@ -138,38 +122,14 @@ impl TokenManager {
             service_principal_type = self.config.user.service_principal_type,
         );
 
-        let response = self
-            .client
-            .request(http_req)
-            .await
-            .context(TransportSnafu)?;
-
-        // Inspect gRPC status (header-trailers; for unary calls the status is in the
-        // initial response or in trailers). Treat non-zero as error.
-        let status = response
-            .headers()
-            .get("grpc-status")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(0);
-        if status != 0 {
-            let message = response
-                .headers()
-                .get("grpc-message")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown grpc error")
-                .to_string();
-            return Err(TokenManagerError::GrpcStatus { status, message });
-        }
-
-        // Using hyper::body::to_bytes which is deprecated in favor of http_body_util.
-        // Vector's ecosystem is currently on hyper 0.14, mirroring bricklens_ingest sink.
-        #[allow(deprecated)]
-        let body = hyper::body::to_bytes(response.into_body())
-            .await
-            .context(ReadResponseBodySnafu)?;
-
-        let response_msg = parse_grpc_response_message(body, &self.method.output())?;
+        let response_msg = grpc_unary_call(
+            &self.client,
+            grpc_method_uri(&self.endpoint, &self.method)?,
+            &[],
+            &request_msg,
+            &self.method.output(),
+        )
+        .await?;
 
         // Defend against an empty / non-Success state. The proto enum value 1 is
         // SUCCESS; all others are failures. Use field-by-name access so we don't have
@@ -261,5 +221,77 @@ impl TokenManager {
         let token = new_token.access_token.clone();
         *guard = Some(new_token);
         Ok(token)
+    }
+
+    /// Fetch a table's schema from the internal Unity Catalog service, authenticating with
+    /// the Login-minted token and the principal context embedded in it.
+    pub async fn get_uc_table_schema(
+        &self,
+        full_name: &str,
+    ) -> Result<UcTableSchema, TokenManagerError> {
+        let uc = self
+            .unity_catalog
+            .as_ref()
+            .ok_or(TokenManagerError::UnityCatalogNotConfigured)?;
+        let token = self.get_token().await?;
+        let principal_context = principal_context_from_jwt(&token)?;
+        uc.get_table_schema(&token, &principal_context, full_name)
+            .await
+    }
+}
+
+impl UnityCatalogClient {
+    async fn new(
+        config: &LoginServiceAuthConfig,
+        uc: &UnityCatalogServiceConfig,
+    ) -> Result<Self, TokenManagerError> {
+        let pool = load_descriptor_pool(&uc.proto_descriptor_path).await?;
+        let method = pool
+            .get_service_by_name(UC_SERVICE_NAME)
+            .and_then(|svc| svc.methods().find(|m| m.name() == UC_GET_TABLE_METHOD_NAME))
+            .ok_or_else(|| TokenManagerError::UcMethodNotFound {
+                method: UC_GET_TABLE_METHOD_NAME.into(),
+                service: UC_SERVICE_NAME.into(),
+                path: uc.proto_descriptor_path.clone(),
+            })?;
+        let endpoint: Uri = uc.endpoint.parse().context(InvalidUcEndpointSnafu {
+            uri: uc.endpoint.clone(),
+        })?;
+        let client = build_hyper_openssl_client(config, &uc.server_name, uc.verify_hostname)?;
+        Ok(Self {
+            method,
+            client,
+            endpoint,
+        })
+    }
+
+    async fn get_table_schema(
+        &self,
+        token: &str,
+        principal_context: &[u8],
+        full_name: &str,
+    ) -> Result<UcTableSchema, TokenManagerError> {
+        let mut request = DynamicMessage::new(self.method.input());
+        request
+            .try_set_field_by_name("full_name_arg", Value::String(full_name.to_string()))
+            .map_err(|e| TokenManagerError::UcResponse {
+                message: format!("set full_name_arg on getTable request: {e}"),
+            })?;
+        let headers = [
+            ("authorization", format!("Bearer {token}")),
+            (
+                PRINCIPAL_CONTEXT_HEADER,
+                base64::engine::general_purpose::STANDARD_NO_PAD.encode(principal_context),
+            ),
+        ];
+        let response = grpc_unary_call(
+            &self.client,
+            grpc_method_uri(&self.endpoint, &self.method)?,
+            &headers,
+            &request,
+            &self.method.output(),
+        )
+        .await?;
+        uc_table_schema_from_response(&response)
     }
 }

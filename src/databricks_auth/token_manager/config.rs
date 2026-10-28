@@ -30,6 +30,14 @@ pub(super) const OAUTH_SERVICE_NAME: &str =
 pub(super) const OAUTH_METHOD_NAME: &str =
     "GenerateReauthenticatedAndReauthorizedInternalOAuthToken";
 
+/// Unity Catalog (managed-catalog) gRPC service and the method used to read a table's columns.
+pub(super) const UC_SERVICE_NAME: &str = "managedcatalog.UnityCatalogService";
+pub(super) const UC_GET_TABLE_METHOD_NAME: &str = "getTable";
+
+/// Unsigned principal-context header. UC's east-west ingress authorizes internal callers from
+/// this header (it rejects requests without one), so the bearer token alone is not enough.
+pub(super) const PRINCIPAL_CONTEXT_HEADER: &str = "s2s-principal-context-bin";
+
 /// Default token lifetime when the JWT `exp` claim cannot be parsed.
 pub(super) const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
 
@@ -119,6 +127,11 @@ pub struct LoginServiceConfig {
     #[serde(default)]
     pub tls_ca_file: Option<String>,
 
+    /// Verify the Login server certificate's hostname. Disable when dialing the DBNS host
+    /// directly: Login's certificate chain is valid but its SANs do not match that host.
+    #[serde(default = "default_verify_hostname")]
+    pub verify_hostname: bool,
+
     /// Path to a protobuf `FileDescriptorSet` covering Login's
     /// `InternalOAuthTokenService.GenerateReauthenticatedAndReauthorizedInternalOAuthToken`
     /// (and its transitively-referenced messages from `databricks.identity`).
@@ -143,6 +156,38 @@ pub struct LoginServiceAuthConfig {
 
     /// Login service connection parameters.
     pub login_service: LoginServiceConfig,
+
+    /// Internal Unity Catalog endpoint used to fetch the table schema with the Login-minted
+    /// token. Required by the `databricks_zerobus` sink.
+    #[serde(default)]
+    pub unity_catalog: Option<UnityCatalogServiceConfig>,
+}
+
+/// Connection parameters for the internal Unity Catalog (managed-catalog) gRPC service.
+///
+/// Reuses the Login service's mTLS client certificate.
+#[configurable_component]
+#[derive(Clone, Debug)]
+pub struct UnityCatalogServiceConfig {
+    /// Unity Catalog east-west endpoint (e.g., `https://managed-catalog--<cluster>.privileged.dev.dbns.databricks.com:443`).
+    pub endpoint: String,
+
+    /// TLS server name / SNI for the Unity Catalog DBNS hostname.
+    pub server_name: String,
+
+    /// Verify the Unity Catalog server certificate's hostname. Disable when dialing the DBNS
+    /// host directly: managed-catalog's certificate chain is valid but its SANs do not match
+    /// that host.
+    #[serde(default = "default_verify_hostname")]
+    pub verify_hostname: bool,
+
+    /// Path to a protobuf `FileDescriptorSet` covering `managedcatalog.UnityCatalogService.getTable`
+    /// (generated with `--include_imports`).
+    pub proto_descriptor_path: PathBuf,
+}
+
+const fn default_verify_hostname() -> bool {
+    true
 }
 
 const fn default_sp_type() -> i32 {

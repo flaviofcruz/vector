@@ -19,6 +19,7 @@ use super::{error::ZerobusSinkError, service::ZerobusService, sink::ZerobusSink}
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(tag = "strategy", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // config value built once; size irrelevant
 pub enum DatabricksAuthentication {
     /// Authenticate using OAuth 2.0 client credentials.
     #[serde(rename = "oauth")]
@@ -356,6 +357,12 @@ impl ZerobusSinkConfig {
                 if config.login_service.login_endpoint.is_empty() {
                     return Err(ZerobusSinkError::ConfigError {
                         message: "LoginService login_endpoint cannot be empty".to_string(),
+                    });
+                }
+                if config.unity_catalog.is_none() {
+                    return Err(ZerobusSinkError::ConfigError {
+                        message: "LoginService unity_catalog is required to fetch the table schema"
+                            .to_string(),
                     });
                 }
             }

@@ -2,13 +2,21 @@ use std::path::PathBuf;
 
 use snafu::Snafu;
 
+/// gRPC status codes treated as transient by [`TokenManagerError::is_retryable`].
+const GRPC_UNKNOWN: i32 = 2;
+const GRPC_DEADLINE_EXCEEDED: i32 = 4;
+const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
+const GRPC_ABORTED: i32 = 10;
+const GRPC_INTERNAL: i32 = 13;
+const GRPC_UNAVAILABLE: i32 = 14;
+
 /// Errors produced while bootstrapping or refreshing an OAuth token through the
 /// Databricks Login service.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
 pub enum TokenManagerError {
-    /// Reading the OAuth proto descriptor file from disk failed.
-    #[snafu(display("read OAuth proto descriptor at {}: {}", path.display(), source))]
+    /// Reading a proto descriptor file from disk failed.
+    #[snafu(display("read proto descriptor at {}: {}", path.display(), source))]
     ReadDescriptor {
         /// Path to the descriptor file that could not be read.
         path: PathBuf,
@@ -17,14 +25,14 @@ pub enum TokenManagerError {
     },
 
     /// The bytes loaded from the descriptor file did not parse as a `FileDescriptorSet`.
-    #[snafu(display("decode OAuth proto FileDescriptorSet: {}", source))]
+    #[snafu(display("decode proto FileDescriptorSet: {}", source))]
     DecodeDescriptorSet {
         /// Underlying protobuf decode error.
         source: prost_reflect::prost::DecodeError,
     },
 
     /// The decoded `FileDescriptorSet` was structurally invalid (e.g. dangling type refs).
-    #[snafu(display("build OAuth proto DescriptorPool: {}", source))]
+    #[snafu(display("build proto DescriptorPool: {}", source))]
     BuildDescriptorPool {
         /// Underlying descriptor-pool error.
         source: prost_reflect::DescriptorError,
@@ -62,7 +70,7 @@ pub enum TokenManagerError {
     },
 
     /// The derived gRPC request URI (endpoint + path) did not parse as an HTTP URI.
-    #[snafu(display("invalid OAuth gRPC URI `{}`: {}", uri, source))]
+    #[snafu(display("invalid gRPC URI `{}`: {}", uri, source))]
     InvalidGrpcUri {
         /// The constructed URI string that failed to parse.
         uri: String,
@@ -79,21 +87,21 @@ pub enum TokenManagerError {
     },
 
     /// `http::Request::builder()` rejected the built request.
-    #[snafu(display("build OAuth gRPC HTTP request: {}", source))]
+    #[snafu(display("build gRPC HTTP request: {}", source))]
     BuildGrpcHttpRequest {
         /// Underlying `http` builder error.
         source: http::Error,
     },
 
     /// The hyper transport failed while issuing or reading the request.
-    #[snafu(display("OAuth bootstrap request failed: {}", source))]
+    #[snafu(display("gRPC request failed: {}", source))]
     Transport {
         /// Underlying hyper error.
         source: hyper::Error,
     },
 
-    /// The OAuth response carried a non-zero gRPC status.
-    #[snafu(display("OAuth bootstrap gRPC error {}: {}", status, message))]
+    /// The response carried a non-zero gRPC status.
+    #[snafu(display("gRPC error {}: {}", status, message))]
     GrpcStatus {
         /// gRPC status code.
         status: i32,
@@ -102,29 +110,29 @@ pub enum TokenManagerError {
     },
 
     /// Reading the response body bytes from hyper failed mid-stream.
-    #[snafu(display("read OAuth response body: {}", source))]
+    #[snafu(display("read gRPC response body: {}", source))]
     ReadResponseBody {
         /// Underlying hyper error.
         source: hyper::Error,
     },
 
     /// The response body was shorter than the 5-byte gRPC framing header.
-    #[snafu(display("OAuth response too short for gRPC framing"))]
+    #[snafu(display("gRPC response too short for framing"))]
     ResponseTooShort,
 
     /// The gRPC framing indicated a compressed payload, which this client does not support.
-    #[snafu(display("compressed OAuth responses not supported (flag = {})", flag))]
+    #[snafu(display("compressed gRPC responses not supported (flag = {})", flag))]
     UnexpectedCompression {
         /// Compression flag from the gRPC framing prefix.
         flag: u8,
     },
 
     /// The response advertised more message bytes than were actually present.
-    #[snafu(display("incomplete OAuth response message"))]
+    #[snafu(display("incomplete gRPC response message"))]
     IncompleteResponseMessage,
 
     /// The framed message bytes failed to decode as the expected response type.
-    #[snafu(display("decode OAuth response: {}", source))]
+    #[snafu(display("decode gRPC response: {}", source))]
     DecodeResponse {
         /// Underlying protobuf decode error.
         source: prost_reflect::prost::DecodeError,
@@ -197,4 +205,75 @@ pub enum TokenManagerError {
         /// Underlying OpenSSL error stack.
         source: openssl::error::ErrorStack,
     },
+
+    /// A Unity Catalog schema fetch was requested but `unity_catalog` is not configured.
+    #[snafu(display("login_service auth has no `unity_catalog` endpoint configured"))]
+    UnityCatalogNotConfigured,
+
+    /// The Unity Catalog `getTable` method was not present in the descriptor.
+    #[snafu(display(
+        "Unity Catalog method `{}` not found in service `{}` in descriptor at {}",
+        method,
+        service,
+        path.display()
+    ))]
+    UcMethodNotFound {
+        /// Method name that was looked up.
+        method: String,
+        /// Service the method was expected to live in.
+        service: String,
+        /// Descriptor file the service was expected to live in.
+        path: PathBuf,
+    },
+
+    /// `unity_catalog.endpoint` from the config did not parse as an HTTP URI.
+    #[snafu(display("invalid unity_catalog endpoint `{}`: {}", uri, source))]
+    InvalidUcEndpoint {
+        /// The endpoint string that failed to parse.
+        uri: String,
+        /// Underlying URI parse error.
+        source: http::uri::InvalidUri,
+    },
+
+    /// The Unity Catalog `getTable` request or response did not have the expected shape.
+    #[snafu(display("Unity Catalog getTable: {}", message))]
+    UcResponse {
+        /// Description of the mismatch.
+        message: String,
+    },
+
+    /// The Login-minted token did not carry a usable `pctx` principal-context claim.
+    #[snafu(display("extract principal context from Login token: {}", message))]
+    PrincipalContext {
+        /// Why the claim could not be extracted.
+        message: String,
+    },
+}
+
+impl TokenManagerError {
+    /// Whether retrying the call that produced this error could succeed.
+    ///
+    /// Mirrors the HTTP policy of the OAuth schema fetch: transport failures and transient gRPC
+    /// statuses retry; configuration, authorization, and malformed-response errors do not, so a
+    /// missing table or a denied permission fails fast instead of retrying forever.
+    pub const fn is_retryable(&self) -> bool {
+        match self {
+            Self::GrpcStatus { status, .. } => matches!(
+                *status,
+                GRPC_UNKNOWN
+                    | GRPC_DEADLINE_EXCEEDED
+                    | GRPC_RESOURCE_EXHAUSTED
+                    | GRPC_ABORTED
+                    | GRPC_INTERNAL
+                    | GRPC_UNAVAILABLE
+            ),
+            Self::Transport { .. }
+            | Self::ReadResponseBody { .. }
+            | Self::ResponseTooShort
+            | Self::IncompleteResponseMessage
+            | Self::OauthFailed { .. }
+            | Self::TokenTooShortLived { .. } => true,
+            _ => false,
+        }
+    }
 }

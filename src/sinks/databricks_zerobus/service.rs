@@ -457,6 +457,7 @@ impl ZerobusService {
     pub async fn resolve_arrow_schema(
         config: &ZerobusSinkConfig,
         http_client: &HttpClient,
+        token_manager: Option<&Arc<TokenManager>>,
     ) -> Result<arrow::datatypes::Schema, ZerobusSinkError> {
         match &config.schema {
             super::config::SchemaSource::Path { .. } => Err(ZerobusSinkError::ConfigError {
@@ -464,29 +465,30 @@ impl ZerobusService {
                     .to_string(),
             }),
             super::config::SchemaSource::UnityCatalog => {
-                let (client_id, client_secret) = match &config.auth {
+                let uc_schema = match &config.auth {
                     super::config::DatabricksAuthentication::OAuth {
                         client_id,
                         client_secret,
-                    } => (client_id.inner(), client_secret.inner()),
-                    super::config::DatabricksAuthentication::LoginService(_) => {
-                        return Err(ZerobusSinkError::ConfigError {
-                            message:
-                                "LoginService auth does not support Unity Catalog schema fetch. \
-                                 Use schema type 'path' with a protobuf descriptor file instead."
-                                    .to_string(),
-                        });
-                    }
+                    } => unity_catalog_schema::fetch_table_schema(
+                        &config.unity_catalog_endpoint,
+                        &config.table_name,
+                        client_id.inner(),
+                        client_secret.inner(),
+                        http_client,
+                    )
+                    .await?
+                    .to_sdk_uc_schema(),
+                    super::config::DatabricksAuthentication::LoginService(_) => token_manager
+                        .ok_or_else(|| ZerobusSinkError::ConfigError {
+                            message: "LoginService auth requires a token manager".to_string(),
+                        })?
+                        .get_uc_table_schema(&config.table_name)
+                        .await
+                        .map_err(|e| ZerobusSinkError::SchemaError {
+                            message: format!("Failed to fetch table schema: {}", e),
+                            retryable: e.is_retryable(),
+                        })?,
                 };
-
-                let table_schema = unity_catalog_schema::fetch_table_schema(
-                    &config.unity_catalog_endpoint,
-                    &config.table_name,
-                    client_id,
-                    client_secret,
-                    http_client,
-                )
-                .await?;
 
                 // Mark VARIANT columns with `arrow.parquet.variant` so the batch
                 // encoders can detect them; without the marker they'd write all-null.
@@ -494,8 +496,7 @@ impl ZerobusService {
                     databricks_zerobus_ingest_sdk::schema::ArrowSchemaOptions::default();
                 options.annotate_variant_extension = true;
                 databricks_zerobus_ingest_sdk::schema::arrow_schema_from_uc_schema_with_options(
-                    &table_schema.to_sdk_uc_schema(),
-                    &options,
+                    &uc_schema, &options,
                 )
                 .map_err(|e| ZerobusSinkError::ConfigError {
                     message: format!("Failed to convert UC schema to Arrow: {}", e),
@@ -595,10 +596,22 @@ impl ZerobusService {
                 tokio::task::yield_now().await;
                 schema
             }
-            None => Self::resolve_arrow_schema(&self.config, &self.http_client).await?,
+            None => {
+                Self::resolve_arrow_schema(
+                    &self.config,
+                    &self.http_client,
+                    self.token_manager.as_ref(),
+                )
+                .await?
+            }
         };
         #[cfg(not(test))]
-        let arrow_schema = Self::resolve_arrow_schema(&self.config, &self.http_client).await?;
+        let arrow_schema = Self::resolve_arrow_schema(
+            &self.config,
+            &self.http_client,
+            self.token_manager.as_ref(),
+        )
+        .await?;
         let mut batch_encoding = self.config.batch_encoding.clone();
         match &mut batch_encoding {
             BatchSerializerConfig::ArrowStream(config) => {

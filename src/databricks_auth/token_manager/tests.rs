@@ -17,9 +17,10 @@ use super::config::{
     UcPermissionEntry, UserAuthInfo,
 };
 use super::error::TokenManagerError;
-use super::jwt::extract_jwt_expiry;
+use super::jwt::{extract_jwt_expiry, principal_context_from_jwt};
 use super::request::build_request_message;
-use super::transport::{encode_grpc_message, parse_grpc_response_message};
+use super::transport::{encode_grpc_message, grpc_status_error, parse_grpc_response_message};
+use super::uc::uc_table_schema_from_response;
 
 // ---- JWT expiry tests ----
 
@@ -367,8 +368,10 @@ fn cfg(workspace_id: i64, perms: Vec<UcPermissionEntry>) -> LoginServiceAuthConf
             tls_crt_file: "/dev/null".into(),
             tls_key_file: "/dev/null".into(),
             tls_ca_file: None,
+            verify_hostname: true,
             oauth_proto_descriptor_path: PathBuf::from("/dev/null"),
         },
+        unity_catalog: None,
     }
 }
 
@@ -693,4 +696,309 @@ fn cached_token_above_min_validity_is_accepted() {
         expires_at: now + MIN_TOKEN_VALIDITY + Duration::from_secs(1),
     };
     assert!(cached.has_remaining_lifetime(now, MIN_TOKEN_VALIDITY));
+}
+
+// ---- Principal context extraction ----
+
+/// Encode one protobuf length-delimited field (`tag = field << 3 | 2`); test values stay
+/// under 128 bytes so the tag and length each fit in a single varint byte.
+fn ld_field(field: u8, bytes: &[u8]) -> Vec<u8> {
+    assert!(bytes.len() < 128);
+    let mut out = vec![(field << 3) | 2, bytes.len() as u8];
+    out.extend_from_slice(bytes);
+    out
+}
+
+fn jwt_with_claims(claims: &str) -> String {
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    format!(
+        "{}.{}.sig",
+        b64(b"{\"alg\":\"RS256\"}"),
+        b64(claims.as_bytes())
+    )
+}
+
+#[test]
+fn principal_context_from_jwt_returns_wrapper_payload() {
+    let pc = b"principal-context-bytes";
+    // ProtectedMetadataWrapper: header (field 1) is skipped, payload (field 2) is returned.
+    let wrapper = [ld_field(1, b"header"), ld_field(2, pc)].concat();
+    let claim = ld_field(1, &wrapper);
+    let pctx = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&claim);
+    let jwt = jwt_with_claims(&format!("{{\"exp\":1,\"pctx\":\"{pctx}\"}}"));
+
+    assert_eq!(principal_context_from_jwt(&jwt).unwrap(), pc.to_vec());
+}
+
+#[test]
+fn principal_context_from_jwt_rejects_missing_claim() {
+    let jwt = jwt_with_claims("{\"exp\":1}");
+    assert!(matches!(
+        principal_context_from_jwt(&jwt),
+        Err(TokenManagerError::PrincipalContext { .. })
+    ));
+}
+
+#[test]
+fn principal_context_from_jwt_rejects_wrapper_without_payload() {
+    let claim = ld_field(1, &ld_field(1, b"header"));
+    let pctx = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&claim);
+    let jwt = jwt_with_claims(&format!("{{\"pctx\":\"{pctx}\"}}"));
+    assert!(matches!(
+        principal_context_from_jwt(&jwt),
+        Err(TokenManagerError::PrincipalContext { .. })
+    ));
+}
+
+// ---- Unity Catalog getTable response decoding ----
+
+fn uc_field(name: &str, number: i32, ty: field_descriptor_proto::Type) -> FieldDescriptorProto {
+    FieldDescriptorProto {
+        name: Some(name.into()),
+        number: Some(number),
+        label: Some(field_descriptor_proto::Label::Optional as i32),
+        r#type: Some(ty as i32),
+        ..Default::default()
+    }
+}
+
+fn uc_message_field(name: &str, number: i32, type_name: &str) -> FieldDescriptorProto {
+    FieldDescriptorProto {
+        type_name: Some(type_name.into()),
+        ..uc_field(name, number, field_descriptor_proto::Type::Message)
+    }
+}
+
+/// Subset of `managed-catalog/api/messages/{table,column}.proto` (proto2) with the real
+/// field numbers, including `nullable`'s `[default = true]`.
+fn uc_get_table_response_descriptor() -> MessageDescriptor {
+    use field_descriptor_proto::Type;
+    let column_info = DescriptorProto {
+        name: Some("ColumnInfo".into()),
+        field: vec![
+            uc_field("name", 1, Type::String),
+            uc_field("type_text", 2, Type::String),
+            uc_field("type_json", 3, Type::String),
+            FieldDescriptorProto {
+                type_name: Some(".managedcatalog.ColumnTypeName".into()),
+                ..uc_field("type_name", 4, Type::Enum)
+            },
+            uc_field("position", 8, Type::Int32),
+            FieldDescriptorProto {
+                default_value: Some("true".into()),
+                ..uc_field("nullable", 10, Type::Bool)
+            },
+        ],
+        ..Default::default()
+    };
+    let column_infos = DescriptorProto {
+        name: Some("ColumnInfos".into()),
+        field: vec![FieldDescriptorProto {
+            label: Some(field_descriptor_proto::Label::Repeated as i32),
+            ..uc_message_field("columns", 1, ".managedcatalog.ColumnInfo")
+        }],
+        ..Default::default()
+    };
+    let table_info = DescriptorProto {
+        name: Some("TableInfo".into()),
+        field: vec![
+            uc_field("name", 1, Type::String),
+            uc_field("catalog_name", 2, Type::String),
+            uc_field("schema_name", 3, Type::String),
+            uc_message_field("column_infos", 7, ".managedcatalog.ColumnInfos"),
+        ],
+        ..Default::default()
+    };
+    let get_table = DescriptorProto {
+        name: Some("GetTable".into()),
+        nested_type: vec![DescriptorProto {
+            name: Some("Response".into()),
+            field: vec![uc_message_field(
+                "table_info",
+                1,
+                ".managedcatalog.TableInfo",
+            )],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let column_type_name = EnumDescriptorProto {
+        name: Some("ColumnTypeName".into()),
+        value: vec![
+            EnumValueDescriptorProto {
+                name: Some("UNKNOWN_COLUMN_TYPE_NAME".into()),
+                number: Some(0),
+                ..Default::default()
+            },
+            EnumValueDescriptorProto {
+                name: Some("LONG".into()),
+                number: Some(5),
+                ..Default::default()
+            },
+            EnumValueDescriptorProto {
+                name: Some("STRING".into()),
+                number: Some(10),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let file = FileDescriptorProto {
+        name: Some("uc_test.proto".into()),
+        package: Some("managedcatalog".into()),
+        syntax: Some("proto2".into()),
+        message_type: vec![column_info, column_infos, table_info, get_table],
+        enum_type: vec![column_type_name],
+        ..Default::default()
+    };
+    DescriptorPool::from_file_descriptor_set(FileDescriptorSet { file: vec![file] })
+        .expect("uc test descriptor pool")
+        .get_message_by_name("managedcatalog.GetTable.Response")
+        .expect("GetTable.Response")
+}
+
+fn uc_column(
+    desc: &MessageDescriptor,
+    name: &str,
+    type_name: i32,
+    nullable: Option<bool>,
+) -> Value {
+    let mut column = DynamicMessage::new(desc.clone());
+    column.set_field_by_name("name", Value::String(name.into()));
+    column.set_field_by_name("type_text", Value::String(name.to_lowercase()));
+    column.set_field_by_name("type_name", Value::EnumNumber(type_name));
+    if let Some(nullable) = nullable {
+        column.set_field_by_name("nullable", Value::Bool(nullable));
+    }
+    Value::Message(column)
+}
+
+#[test]
+fn uc_table_schema_from_response_maps_columns() {
+    let response_desc = uc_get_table_response_descriptor();
+    let pool = response_desc.parent_pool();
+    let column_desc = pool
+        .get_message_by_name("managedcatalog.ColumnInfo")
+        .unwrap();
+
+    let mut column_infos = DynamicMessage::new(
+        pool.get_message_by_name("managedcatalog.ColumnInfos")
+            .unwrap(),
+    );
+    column_infos.set_field_by_name(
+        "columns",
+        Value::List(vec![
+            uc_column(&column_desc, "ID", 5, Some(false)),
+            uc_column(&column_desc, "MSG", 10, None),
+        ]),
+    );
+    let mut table_info = DynamicMessage::new(
+        pool.get_message_by_name("managedcatalog.TableInfo")
+            .unwrap(),
+    );
+    table_info.set_field_by_name("name", Value::String("t".into()));
+    table_info.set_field_by_name("catalog_name", Value::String("c".into()));
+    table_info.set_field_by_name("schema_name", Value::String("s".into()));
+    table_info.set_field_by_name("column_infos", Value::Message(column_infos));
+    let mut response = DynamicMessage::new(response_desc.clone());
+    response.set_field_by_name("table_info", Value::Message(table_info));
+
+    // Round-trip through the wire so this exercises what grpc_unary_call hands back.
+    let decoded = parse_grpc_response_message(
+        bytes::Bytes::from(encode_grpc_message(response.encode_to_vec())),
+        &response_desc,
+    )
+    .unwrap();
+    let schema = uc_table_schema_from_response(&decoded).unwrap();
+
+    assert_eq!(
+        (
+            schema.name.as_str(),
+            schema.catalog_name.as_str(),
+            schema.schema_name.as_str()
+        ),
+        ("t", "c", "s")
+    );
+    let columns: Vec<_> = schema
+        .columns
+        .iter()
+        .map(|c| (c.name.as_str(), c.type_name.as_str(), c.nullable))
+        .collect();
+    // An unset proto2 `nullable` reads back as its declared default (true).
+    assert_eq!(
+        columns,
+        vec![("ID", "LONG", false), ("MSG", "STRING", true)]
+    );
+}
+
+#[test]
+fn uc_table_schema_from_response_rejects_missing_table_info() {
+    let response = DynamicMessage::new(uc_get_table_response_descriptor());
+    assert!(matches!(
+        uc_table_schema_from_response(&response),
+        Err(TokenManagerError::UcResponse { .. })
+    ));
+}
+
+// ---- gRPC status and retryability ----
+
+fn grpc_headers(status: &str, message: Option<&str>) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("grpc-status", status.parse().unwrap());
+    if let Some(message) = message {
+        headers.insert("grpc-message", message.parse().unwrap());
+    }
+    headers
+}
+
+#[test]
+fn grpc_status_error_ignores_ok_and_missing_status() {
+    assert!(grpc_status_error(&http::HeaderMap::new()).is_none());
+    assert!(grpc_status_error(&grpc_headers("0", None)).is_none());
+}
+
+#[test]
+fn grpc_status_error_reports_status_and_message() {
+    let error = grpc_status_error(&grpc_headers("7", Some("no USE CATALOG"))).unwrap();
+    assert!(matches!(
+        error,
+        TokenManagerError::GrpcStatus { status: 7, ref message } if message == "no USE CATALOG"
+    ));
+}
+
+#[test]
+fn grpc_status_retryability_matches_transient_codes() {
+    let retryable = |status| {
+        TokenManagerError::GrpcStatus {
+            status,
+            message: String::new(),
+        }
+        .is_retryable()
+    };
+    // UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED, INTERNAL retry.
+    for status in [14, 4, 8, 13] {
+        assert!(retryable(status), "status {status} should retry");
+    }
+    // INVALID_ARGUMENT, NOT_FOUND, PERMISSION_DENIED, UNAUTHENTICATED fail fast.
+    for status in [3, 5, 7, 16] {
+        assert!(!retryable(status), "status {status} should not retry");
+    }
+}
+
+#[test]
+fn malformed_token_and_response_errors_are_not_retryable() {
+    assert!(
+        !TokenManagerError::PrincipalContext {
+            message: String::new()
+        }
+        .is_retryable()
+    );
+    assert!(
+        !TokenManagerError::UcResponse {
+            message: String::new()
+        }
+        .is_retryable()
+    );
+    assert!(!TokenManagerError::UnityCatalogNotConfigured.is_retryable());
+    assert!(TokenManagerError::ResponseTooShort.is_retryable());
 }
