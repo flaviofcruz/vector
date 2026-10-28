@@ -278,17 +278,13 @@ impl AwsAuthentication {
         }
     }
 
-    /// Create the AssumeRoleProviderBuilder, ensuring we create the HTTP client with
-    /// the correct proxy and TLS options.
     async fn assume_role_provider_builder(
-        proxy: &ProxyConfig,
-        tls_options: Option<&TlsConfig>,
+        connector: aws_types::sdk_config::SharedHttpClient,
         region: &Region,
         assume_role: &str,
         external_id: Option<&str>,
         session_name: Option<&str>,
-    ) -> crate::Result<AssumeRoleProviderBuilder> {
-        let connector = super::connector(proxy, tls_options)?;
+    ) -> AssumeRoleProviderBuilder {
         let config = assume_role_sdk_config(region, connector).await;
 
         let mut builder = AssumeRoleProviderBuilder::new(assume_role)
@@ -303,7 +299,7 @@ impl AwsAuthentication {
             builder = builder.session_name(session_name)
         }
 
-        Ok(builder)
+        builder
     }
 
     /// Returns the provider for the credentials based on the authentication mechanism chosen.
@@ -312,6 +308,18 @@ impl AwsAuthentication {
         service_region: Region,
         proxy: &ProxyConfig,
         tls_options: Option<&TlsConfig>,
+    ) -> crate::Result<SharedCredentialsProvider> {
+        self.credentials_provider_with_connector(service_region, || {
+            super::connector(proxy, tls_options)
+        })
+        .await
+    }
+
+    // Construct connectors lazily so static-key auth still needs no TLS setup.
+    pub(super) async fn credentials_provider_with_connector(
+        &self,
+        service_region: Region,
+        connector: impl Fn() -> crate::Result<aws_types::sdk_config::SharedHttpClient>,
     ) -> crate::Result<SharedCredentialsProvider> {
         match self {
             Self::AccessKey {
@@ -331,14 +339,13 @@ impl AwsAuthentication {
                 if let Some(assume_role) = assume_role {
                     let auth_region = region.clone().map(Region::new).unwrap_or(service_region);
                     let builder = Self::assume_role_provider_builder(
-                        proxy,
-                        tls_options,
+                        connector()?,
                         &auth_region,
                         assume_role,
                         external_id.as_deref(),
                         session_name.as_deref(),
                     )
-                    .await?;
+                    .await;
 
                     let provider = builder.build_from_provider(provider).await;
 
@@ -351,7 +358,7 @@ impl AwsAuthentication {
                 profile,
                 region,
             } => {
-                let connector = super::connector(proxy, tls_options)?;
+                let connector = connector()?;
 
                 // The SDK uses the default profile out of the box, but doesn't provide an optional
                 // type in the builder. We can just hardcode it so that everything works.
@@ -360,9 +367,7 @@ impl AwsAuthentication {
                     .build();
 
                 let auth_region = region.clone().map(Region::new).unwrap_or(service_region);
-                let provider_config = ProviderConfig::empty()
-                    .with_region(Option::from(auth_region))
-                    .with_http_client(connector);
+                let provider_config = credential_provider_config(auth_region, connector).await;
 
                 let profile_provider = ProfileFileCredentialsProvider::builder()
                     .profile_files(profile_files)
@@ -377,12 +382,10 @@ impl AwsAuthentication {
                 session_name,
                 region,
             } => {
-                let connector = super::connector(proxy, tls_options)?;
+                let connector = connector()?;
                 let auth_region = Region::new(region.clone());
 
-                let provider_config = ProviderConfig::empty()
-                    .with_http_client(connector)
-                    .with_region(Some(auth_region));
+                let provider_config = credential_provider_config(auth_region, connector).await;
 
                 let provider = WebIdentityTokenCredentialsProvider::builder()
                     .static_configuration(WebIdentityTokenStaticConfiguration {
@@ -405,19 +408,17 @@ impl AwsAuthentication {
             } => {
                 let auth_region = region.clone().map(Region::new).unwrap_or(service_region);
                 let builder = Self::assume_role_provider_builder(
-                    proxy,
-                    tls_options,
+                    connector()?,
                     &auth_region,
                     assume_role,
                     external_id.as_deref(),
                     session_name.as_deref(),
                 )
-                .await?;
+                .await;
 
                 let provider = builder
                     .build_from_provider(
-                        default_credentials_provider(auth_region, proxy, tls_options, *imds)
-                            .await?,
+                        default_credentials_provider(auth_region, connector()?, *imds).await,
                     )
                     .await;
 
@@ -426,11 +427,10 @@ impl AwsAuthentication {
             AwsAuthentication::Default { imds, region, .. } => Ok(SharedCredentialsProvider::new(
                 default_credentials_provider(
                     region.clone().map(Region::new).unwrap_or(service_region),
-                    proxy,
-                    tls_options,
+                    connector()?,
                     *imds,
                 )
-                .await?,
+                .await,
             )),
         }
     }
@@ -465,17 +465,25 @@ pub(super) async fn assume_role_sdk_config(
     builder.build()
 }
 
+async fn credential_provider_config(
+    region: Region,
+    connector: aws_types::sdk_config::SharedHttpClient,
+) -> ProviderConfig {
+    let config = ProviderConfig::empty()
+        .with_region(Some(region))
+        .with_http_client(connector);
+    // Credential providers build their own STS clients; configuring only the
+    // service client leaves the initial IRSA exchange on the standard endpoint.
+    let use_fips = aws_config::default_provider::use_fips::use_fips_provider(&config).await;
+    config.with_use_fips(use_fips)
+}
+
 async fn default_credentials_provider(
     region: Region,
-    proxy: &ProxyConfig,
-    tls_options: Option<&TlsConfig>,
+    connector: aws_types::sdk_config::SharedHttpClient,
     imds: ImdsAuthentication,
-) -> crate::Result<SharedCredentialsProvider> {
-    let connector = super::connector(proxy, tls_options)?;
-
-    let provider_config = ProviderConfig::empty()
-        .with_region(Some(region.clone()))
-        .with_http_client(connector);
+) -> SharedCredentialsProvider {
+    let provider_config = credential_provider_config(region.clone(), connector).await;
 
     let client = imds::Client::builder()
         .max_attempts(imds.max_attempts)
@@ -491,7 +499,7 @@ async fn default_credentials_provider(
         .build()
         .await;
 
-    Ok(SharedCredentialsProvider::new(credentials_provider))
+    SharedCredentialsProvider::new(credentials_provider)
 }
 
 #[cfg(test)]

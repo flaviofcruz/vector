@@ -311,7 +311,7 @@ impl ProviderConfig {
     }
 
     /// Override the `use_fips` setting.
-    pub(crate) fn with_use_fips(mut self, use_fips: Option<bool>) -> Self {
+    pub fn with_use_fips(mut self, use_fips: Option<bool>) -> Self {
         self.use_fips = use_fips;
         self
     }

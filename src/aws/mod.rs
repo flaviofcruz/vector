@@ -3,6 +3,9 @@ pub mod auth;
 pub mod region;
 pub mod timeout;
 
+#[cfg(test)]
+mod credential_tests;
+
 #[cfg(all(test, feature = "sinks-aws_s3", feature = "sinks-aws_kinesis_streams"))]
 mod endpoint_tests;
 #[cfg(all(
