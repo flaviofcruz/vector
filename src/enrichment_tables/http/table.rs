@@ -9,13 +9,14 @@
 //! serve data immediately instead of waiting for the first fetch.
 
 use std::{
+    borrow::{Borrow, Cow},
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use http::{Request, Uri};
 use http_body::Body as HttpBody;
 use hyper::Body;
@@ -91,7 +92,7 @@ impl HttpTable {
         // endpoint recovers. This mirrors the fail-open behavior of every other path in this
         // table (stale-cache fallback, keep-last-good on refresh failure) and the config-reload
         // path, which already logs and keeps serving rather than aborting.
-        let (rows, from_fresh_cache, started_empty) = match fresh_cache(
+        let (mut rows, from_fresh_cache, started_empty) = match fresh_cache(
             &config,
             cache_path.as_ref(),
         ) {
@@ -134,7 +135,7 @@ impl HttpTable {
             },
         };
 
-        let indexed = decode_indexed(&rows, &config.schema, timezone);
+        let indexed = decode_snapshot(&mut rows, &config.schema, timezone, cache_path.is_some());
         let shared = Arc::new(Shared {
             data: ArcSwap::from_pointee(indexed),
             index_specs: Mutex::new(Vec::new()),
@@ -217,6 +218,11 @@ impl Table for HttpTable {
             .lock()
             .expect("index_specs poisoned");
 
+        let current = self.shared.data.load();
+        if let Some(handle) = current.existing_index(case, fields)? {
+            return Ok(handle);
+        }
+
         // Delegate handle allocation entirely to `IndexedData::add_index` so there is a single
         // source of truth. Keep `index_specs` strictly 1:1 with the live `indexes` by mirroring
         // exactly what it did: a genuinely new index returns a handle at `indexes.len() - 1`
@@ -224,7 +230,7 @@ impl Table for HttpTable {
         // position; a reused handle (its own dedup by normalized column positions matched an
         // existing index) returns an in-range handle and we must NOT push, or `specs` would grow
         // past `indexes` and every later handle would shift after the next `reapply_indexes`.
-        let mut new = (**self.shared.data.load()).clone();
+        let mut new = (**current).clone();
         let handle = new.add_index(case, fields)?;
         self.shared.data.store(Arc::new(new));
 
@@ -275,8 +281,13 @@ async fn refresh_once(
     cache_path: Option<&std::path::PathBuf>,
 ) -> bool {
     match ctx.fetch_all_pages().await {
-        Ok(rows) => {
-            let mut new = decode_indexed(&rows, &config.schema, ctx.timezone);
+        Ok(mut rows) => {
+            let mut new = decode_snapshot(
+                &mut rows,
+                &config.schema,
+                ctx.timezone,
+                cache_path.is_some(),
+            );
             {
                 let specs = shared.index_specs.lock().expect("index_specs poisoned");
                 new.reapply_indexes(&specs);
@@ -394,9 +405,20 @@ impl FetchContext {
 
         for page in 0..self.config.limits.max_pages {
             let body = self.fetch_page(&extra_params).await?;
-            let items = extract_items(&body, &self.config.response.items_pointer)?;
+            // A cursor may live inside the items subtree; read it before taking ownership.
+            let next_token = match &self.config.pagination {
+                PaginationConfig::Cursor { token_pointer, .. } => {
+                    next_cursor_token(&body, token_pointer)
+                }
+                _ => None,
+            };
+            let items = extract_items(body, &self.config.response.items_pointer)?;
             let page_len = items.len();
-            rows.extend(items);
+            if rows.is_empty() {
+                rows = items;
+            } else {
+                rows.extend(items);
+            }
 
             if rows.len() >= self.config.limits.max_rows {
                 warn!(
@@ -410,10 +432,7 @@ impl FetchContext {
 
             match &self.config.pagination {
                 PaginationConfig::None => break,
-                PaginationConfig::Cursor {
-                    token_pointer,
-                    token_param,
-                } => match next_cursor_token(&body, token_pointer) {
+                PaginationConfig::Cursor { token_param, .. } => match next_token {
                     Some(token) => {
                         extra_params = vec![(token_param.clone(), token)];
                     }
@@ -513,7 +532,7 @@ impl FetchContext {
             return Err(format!("{} returned {}: {}", self.config.url, status, text));
         }
 
-        serde_json::from_reader(body_bytes.reader())
+        serde_json::from_slice(&body_bytes)
             .map_err(|e| format!("failed to parse JSON response: {e}"))
     }
 }
@@ -521,18 +540,18 @@ impl FetchContext {
 /// Extract the array of row objects from a response body using the configured JSON Pointer.
 /// An empty pointer means the whole body is the array.
 fn extract_items(
-    body: &serde_json::Value,
+    mut body: serde_json::Value,
     pointer: &str,
 ) -> Result<Vec<serde_json::Value>, String> {
     let target = if pointer.is_empty() {
-        body
+        &mut body
     } else {
-        body.pointer(pointer)
+        body.pointer_mut(pointer)
             .ok_or_else(|| format!("items_pointer '{pointer}' not found in response"))?
     };
 
     match target {
-        serde_json::Value::Array(arr) => Ok(arr.clone()),
+        serde_json::Value::Array(arr) => Ok(std::mem::take(arr)),
         _ => Err(format!(
             "expected a JSON array at items_pointer '{pointer}', found a different type"
         )),
@@ -596,16 +615,31 @@ fn build_uri(base: &str, extra_params: &[(String, String)]) -> Result<Uri, Strin
     url.parse().map_err(|e| format!("invalid url '{url}': {e}"))
 }
 
-/// Decode row objects into an indexed table body, applying schema-based type coercion.
-fn decode_indexed(
-    rows: &[serde_json::Value],
+// Preserve raw rows only for disk persistence, which must not delay snapshot publication.
+fn decode_snapshot(
+    rows: &mut Vec<serde_json::Value>,
     schema: &HashMap<String, String>,
     timezone: TimeZone,
+    retain_for_cache: bool,
 ) -> IndexedData {
+    if retain_for_cache {
+        decode_indexed(rows.as_slice(), schema, timezone)
+    } else {
+        decode_indexed(std::mem::take(rows), schema, timezone)
+    }
+}
+
+/// Decode row objects into an indexed table body, applying schema-based type coercion.
+/// Owned input frees the raw objects as each row is converted.
+fn decode_indexed<R>(rows: R, schema: &HashMap<String, String>, timezone: TimeZone) -> IndexedData
+where
+    R: AsRef<[serde_json::Value]> + IntoIterator,
+    R::Item: Borrow<serde_json::Value>,
+{
     // Column set is the union of object keys across all rows, in first-seen order. An empty
     // response has no row keys to discover, so expose the configured schema columns instead;
     // this lets callers register indexes before a later refresh supplies the first rows.
-    let mut columns = if rows.is_empty() {
+    let mut columns = if rows.as_ref().is_empty() {
         let mut configured = schema.keys().cloned().collect::<Vec<_>>();
         configured.sort();
         configured
@@ -613,10 +647,13 @@ fn decode_indexed(
         Vec::new()
     };
     let mut seen: HashSet<String> = HashSet::new();
-    for row in rows {
+    let mut row_count = 0;
+    for row in rows.as_ref() {
         if let Some(obj) = row.as_object() {
+            row_count += 1;
             for key in obj.keys() {
-                if seen.insert(key.clone()) {
+                if !seen.contains(key) {
+                    seen.insert(key.clone());
                     columns.push(key.clone());
                 }
             }
@@ -624,27 +661,27 @@ fn decode_indexed(
     }
 
     let null = serde_json::Value::Null;
-    let data = rows
-        .iter()
-        .filter_map(|row| row.as_object())
-        .map(|obj| {
-            columns
-                .iter()
-                .map(|col| coerce_cell(schema, timezone, col, obj.get(col).unwrap_or(&null)))
-                .collect::<Vec<Value>>()
-        })
-        .collect::<Vec<_>>();
+    let mut data = Vec::with_capacity(row_count * columns.len());
+    for row in rows {
+        if let serde_json::Value::Object(obj) = row.borrow() {
+            data.extend(
+                columns
+                    .iter()
+                    .map(|col| coerce_cell(schema, timezone, col, obj.get(col).unwrap_or(&null))),
+            );
+        }
+    }
 
-    IndexedData::new(columns, data)
+    IndexedData::from_flat_rows(columns, data, row_count)
 }
 
 /// Coerce a single JSON cell into a VRL [`Value`], honoring the configured schema type for the
 /// column. Non-schema columns use the natural JSON→VRL mapping.
 ///
 /// The schema type is applied to any scalar JSON value — string, number, or boolean — not just
-/// strings. A JSON number or boolean is rendered to its textual form and run through the same
-/// conversion a string would be, so (for example) a `string` schema on a numeric column yields
-/// `Bytes` rather than `Integer`. This matters because lookup keys are hashed from the VRL
+/// strings. Scalar coercion follows the same conversion semantics as textual input, so (for
+/// example) a `string` schema on a numeric column yields `Bytes` rather than `Integer`. This
+/// matters because lookup keys are hashed from the VRL
 /// value's type-specific encoding, so a mismatch between the declared and actual type would make
 /// lookups silently never match. `null` and non-scalar values (arrays/objects) cannot take a
 /// scalar schema type and keep the natural mapping. On conversion failure we fall back to the
@@ -659,11 +696,19 @@ fn coerce_cell(
         return json_to_vrl_value(value);
     };
 
+    // PUID snapshots contain int64 JSON numbers. Avoid a number -> string -> bytes -> number
+    // round trip, without routing large IDs through floating point.
+    if matches!(format.trim(), "integer" | "int")
+        && let Some(integer) = value.as_i64()
+    {
+        return Value::Integer(integer);
+    }
+
     // The textual form to feed the conversion, for scalar cells only.
     let text = match value {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::String(s) => Cow::Borrowed(s.as_str()),
+        serde_json::Value::Number(n) => Cow::Owned(n.to_string()),
+        serde_json::Value::Bool(b) => Cow::Owned(b.to_string()),
         // null / array / object: a scalar schema type doesn't apply — keep the natural mapping.
         _ => return json_to_vrl_value(value),
     };
@@ -879,6 +924,10 @@ async fn persist(
 }
 
 #[cfg(test)]
+#[path = "memory_test.rs"]
+mod memory_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -892,7 +941,7 @@ mod tests {
     #[test]
     fn decodes_array_of_objects_with_column_union() {
         let data = decode_indexed(
-            &rows(r#"[{"id": 1, "name": "a"}, {"id": 2, "team": "x"}]"#),
+            rows(r#"[{"id": 1, "name": "a"}, {"id": 2, "team": "x"}]"#),
             &HashMap::new(),
             TimeZone::default(),
         );
@@ -902,12 +951,107 @@ mod tests {
     }
 
     #[test]
+    fn decodes_only_object_rows_including_zero_column_rows() {
+        let data = decode_indexed(
+            rows(r#"[null, 10, "skip", [], {"id": 1}, {"value": 2}]"#),
+            &HashMap::new(),
+            TimeZone::default(),
+        );
+        let matches = data
+            .find_table_rows(Case::Sensitive, &[], None, None, None)
+            .unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].get("value"), Some(&Value::Null));
+        assert_eq!(matches[1].get("id"), Some(&Value::Null));
+
+        let empty_objects = decode_indexed(
+            rows(r#"[{}, null, {}]"#),
+            &HashMap::new(),
+            TimeZone::default(),
+        );
+        assert_eq!(empty_objects.len(), 2);
+        assert_eq!(
+            empty_objects
+                .find_table_rows(Case::Sensitive, &[], None, None, None)
+                .unwrap(),
+            vec![ObjectMap::new(), ObjectMap::new()]
+        );
+    }
+
+    #[test]
+    fn decode_snapshot_releases_raw_rows_only_when_persistence_is_disabled() {
+        let schema = HashMap::from([("id".to_owned(), "integer".to_owned())]);
+        for retain_for_cache in [false, true] {
+            let mut raw = rows(r#"[{"id":42}]"#);
+            let data = decode_snapshot(&mut raw, &schema, TimeZone::default(), retain_for_cache);
+            assert_eq!(raw.len(), usize::from(retain_for_cache));
+            let found = data
+                .find_table_row(
+                    Case::Sensitive,
+                    &[Condition::Equals {
+                        field: "id",
+                        value: Value::Integer(42),
+                    }],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(found["id"], Value::Integer(42));
+        }
+    }
+
+    #[test]
+    fn integer_schema_preserves_precision_and_existing_fallbacks() {
+        for format in ["integer", "int", " int "] {
+            let schema = HashMap::from([("id".to_owned(), format.to_owned())]);
+            for integer in [i64::MIN, -1, 0, 9_007_199_254_740_993, i64::MAX] {
+                assert_eq!(
+                    coerce_cell(
+                        &schema,
+                        TimeZone::default(),
+                        "id",
+                        &serde_json::json!(integer)
+                    ),
+                    Value::Integer(integer)
+                );
+            }
+            for value in [
+                serde_json::json!(u64::MAX),
+                serde_json::json!(1.5),
+                serde_json::json!("9223372036854775807"),
+                serde_json::json!("invalid"),
+                serde_json::json!(true),
+                serde_json::Value::Null,
+            ] {
+                let expected = match &value {
+                    serde_json::Value::String(s) => {
+                        parse_typed(format, TimeZone::default(), s).ok()
+                    }
+                    serde_json::Value::Number(n) => {
+                        parse_typed(format, TimeZone::default(), &n.to_string()).ok()
+                    }
+                    serde_json::Value::Bool(b) => {
+                        parse_typed(format, TimeZone::default(), &b.to_string()).ok()
+                    }
+                    _ => None,
+                }
+                .unwrap_or_else(|| json_to_vrl_value(&value));
+                assert_eq!(
+                    coerce_cell(&schema, TimeZone::default(), "id", &value),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn empty_response_uses_schema_columns_and_preserves_index_handle_after_refresh() {
         let schema = HashMap::from([
             ("puid".to_string(), "integer".to_string()),
             ("user_id".to_string(), "integer".to_string()),
         ]);
-        let mut table = table_from(decode_indexed(&[], &schema, TimeZone::default()));
+        let mut table = table_from(decode_indexed(Vec::new(), &schema, TimeZone::default()));
 
         assert_eq!(table.shared.data.load().headers(), &["puid", "user_id"]);
         let user_id_index = table
@@ -928,7 +1072,7 @@ mod tests {
         {
             let specs = table.shared.index_specs.lock().unwrap();
             let mut refreshed = decode_indexed(
-                &rows(r#"[{"user_id": 42, "puid": -7}]"#),
+                rows(r#"[{"user_id": 42, "puid": -7}]"#),
                 &schema,
                 TimeZone::default(),
             );
@@ -946,7 +1090,7 @@ mod tests {
     #[test]
     fn missing_keys_default_to_null() {
         let data = decode_indexed(
-            &rows(r#"[{"id": 1, "name": "a"}, {"id": 2}]"#),
+            rows(r#"[{"id": 1, "name": "a"}, {"id": 2}]"#),
             &HashMap::new(),
             TimeZone::default(),
         );
@@ -970,7 +1114,7 @@ mod tests {
         let mut schema = HashMap::new();
         schema.insert("count".to_string(), "integer".to_string());
         let data = decode_indexed(
-            &rows(r#"[{"id": "k", "count": "42"}]"#),
+            rows(r#"[{"id": "k", "count": "42"}]"#),
             &schema,
             TimeZone::default(),
         );
@@ -996,7 +1140,7 @@ mod tests {
         let mut schema = HashMap::new();
         schema.insert("id".to_string(), "string".to_string());
         let data = decode_indexed(
-            &rows(r#"[{"id": 42, "name": "a"}]"#),
+            rows(r#"[{"id": 42, "name": "a"}]"#),
             &schema,
             TimeZone::default(),
         );
@@ -1020,19 +1164,64 @@ mod tests {
     #[test]
     fn extract_items_whole_body() {
         let body = serde_json::json!([{"a": 1}]);
-        assert_eq!(extract_items(&body, "").unwrap().len(), 1);
+        assert_eq!(extract_items(body, "").unwrap().len(), 1);
     }
 
     #[test]
     fn extract_items_nested_pointer() {
         let body = serde_json::json!({"data": [{"a": 1}, {"a": 2}]});
-        assert_eq!(extract_items(&body, "/data").unwrap().len(), 2);
+        assert_eq!(extract_items(body, "/data").unwrap().len(), 2);
     }
 
     #[test]
     fn extract_items_wrong_type_errors() {
         let body = serde_json::json!({"data": 5});
-        assert!(extract_items(&body, "/data").is_err());
+        assert!(extract_items(body, "/data").is_err());
+    }
+
+    #[test]
+    fn extract_items_moves_the_existing_array_allocation() {
+        for pointer in ["", "/nested/items"] {
+            let mut body = serde_json::json!([{"id": 1}, {"id": 2}]);
+            if !pointer.is_empty() {
+                body = serde_json::json!({"nested": {"items": body}});
+            }
+            let allocation = body.pointer(pointer).unwrap().as_array().unwrap().as_ptr();
+            let items = extract_items(body, pointer).unwrap();
+            assert_eq!(items.as_ptr(), allocation, "row objects must not be cloned");
+            assert_eq!(items[1]["id"], 2);
+        }
+        assert!(extract_items(serde_json::json!({}), "/missing").is_err());
+    }
+
+    #[tokio::test]
+    async fn cursor_inside_items_is_read_before_the_array_is_consumed() {
+        let uri = crate::test_util::http::spawn_blackhole_http_server(|req| async move {
+            let body = match req.uri().query() {
+                None => r#"{"items":[{"id":1,"next":"second"}]}"#,
+                Some("cursor=second") => r#"{"items":[{"id":2}]}"#,
+                query => panic!("unexpected cursor query: {query:?}"),
+            };
+            Ok::<_, std::convert::Infallible>(http::Response::new(hyper::Body::from(body)))
+        })
+        .await;
+        let config = HttpConfig {
+            url: uri.to_string(),
+            response: super::super::config::ResponseConfig {
+                items_pointer: "/items".into(),
+            },
+            pagination: PaginationConfig::Cursor {
+                token_pointer: "/items/0/next".into(),
+                token_param: "cursor".into(),
+            },
+            persist: false,
+            ..Default::default()
+        };
+        let ctx = FetchContext::new(&config, TimeZone::default(), &ProxyConfig::default()).unwrap();
+        let fetched = ctx.fetch_all_pages().await.unwrap();
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[0]["id"], 1);
+        assert_eq!(fetched[1]["id"], 2);
     }
 
     #[test]
@@ -1338,15 +1527,17 @@ mod tests {
     #[test]
     fn add_index_keeps_specs_aligned_when_same_columns_registered_in_different_order() {
         let mut table = table_from(decode_indexed(
-            &rows(r#"[{"a": "1", "b": "2", "c": "3"}]"#),
+            rows(r#"[{"a": "1", "b": "2", "c": "3"}]"#),
             &HashMap::new(),
             TimeZone::default(),
         ));
 
         // ["a","b"] and ["b","a"] normalize to the same column positions → same handle.
         let h_ab = table.add_index(Case::Sensitive, &["a", "b"]).unwrap();
+        let original = table.shared.data.load_full();
         let h_ba = table.add_index(Case::Sensitive, &["b", "a"]).unwrap();
         assert_eq!(h_ab, h_ba, "same columns must dedup to the same handle");
+        assert!(Arc::ptr_eq(&original, &table.shared.data.load_full()));
 
         // specs must stay 1:1 with the live indexes (one entry, not two).
         assert_eq!(table.shared.index_specs.lock().unwrap().len(), 1);
@@ -1361,7 +1552,7 @@ mod tests {
         {
             let specs = table.shared.index_specs.lock().unwrap();
             let mut refreshed = decode_indexed(
-                &rows(r#"[{"a": "1", "b": "2", "c": "3"}]"#),
+                rows(r#"[{"a": "1", "b": "2", "c": "3"}]"#),
                 &HashMap::new(),
                 TimeZone::default(),
             );
@@ -1381,5 +1572,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row.get("a"), Some(&Value::from("1")));
+    }
+
+    #[tokio::test]
+    async fn refresh_replaces_data_atomically_and_failed_refresh_keeps_last_good() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let uri = crate::test_util::http::spawn_blackhole_http_server(move |_| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let (status, body) = match call {
+                    0 => (200, r#"[{"user_id":1,"puid":10}]"#),
+                    1 => (200, r#"[{"user_id":1,"puid":20},{"user_id":2,"puid":30}]"#),
+                    _ => (503, ""),
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .body(hyper::Body::from(body))
+                        .unwrap(),
+                )
+            }
+        })
+        .await;
+        let config = HttpConfig {
+            url: uri.to_string(),
+            schema: HashMap::from([
+                ("user_id".into(), "integer".into()),
+                ("puid".into(), "integer".into()),
+            ]),
+            persist: false,
+            refresh_interval_secs: None,
+            ..Default::default()
+        };
+        let globals = crate::config::GlobalOptions::default();
+        let mut table = HttpTable::new(config.clone(), &globals).await.unwrap();
+        let handle = table.add_index(Case::Sensitive, &["user_id"]).unwrap();
+        let old = table.shared.data.load_full();
+        let condition = [Condition::Equals {
+            field: "user_id",
+            value: Value::Integer(1),
+        }];
+        let ctx = FetchContext::new(&config, TimeZone::default(), &ProxyConfig::default()).unwrap();
+
+        assert!(refresh_once(&table.shared, &ctx, &config, None).await);
+        assert_eq!(
+            old.find_table_row(Case::Sensitive, &condition, None, None, Some(handle))
+                .unwrap()["puid"],
+            Value::Integer(10)
+        );
+        assert_eq!(
+            table
+                .find_table_row(Case::Sensitive, &condition, None, None, Some(handle))
+                .unwrap()["puid"],
+            Value::Integer(20)
+        );
+        let current = table.shared.data.load_full();
+        assert_eq!(current.len(), 2);
+
+        assert!(!refresh_once(&table.shared, &ctx, &config, None).await);
+        assert!(Arc::ptr_eq(&current, &table.shared.data.load_full()));
+        assert_eq!(
+            table
+                .find_table_row(Case::Sensitive, &condition, None, None, Some(handle))
+                .unwrap()["puid"],
+            Value::Integer(20)
+        );
     }
 }

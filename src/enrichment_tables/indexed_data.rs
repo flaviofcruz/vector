@@ -8,32 +8,61 @@
 //! date-range search (sequential scan). Enrichment tables embed an `IndexedData` and forward
 //! their `Table` methods to it, so the indexing/lookup engine lives in exactly one place.
 
-use std::{collections::HashMap, hash::Hasher};
+use std::{collections::HashMap, hash::Hasher, sync::Arc};
 
+use smallvec::SmallVec;
 use vector_lib::enrichment::{Case, Condition, IndexHandle};
 use vrl::value::{ObjectMap, Value};
 
+// Most exact-match keys identify one row. Keep that row inline without losing duplicate or
+// hash-collision candidates, which spill to the heap.
+type RowIndices = SmallVec<[usize; 1]>;
+type RowIndex = HashMap<u64, RowIndices, hash_hasher::HashBuildHasher>;
+
+enum Rows {
+    Nested(Vec<Vec<Value>>),
+    Flat(Vec<Value>),
+}
+
 /// An in-memory table body: ordered column headers, rows of values, and indexes built over
 /// exact-match fields.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct IndexedData {
     headers: Vec<String>,
-    data: Vec<Vec<Value>>,
-    indexes: Vec<(
-        Case,
-        Vec<usize>,
-        HashMap<u64, Vec<usize>, hash_hasher::HashBuildHasher>,
-    )>,
+    // Cloning a snapshot to register an index must not copy millions of immutable rows or
+    // previously built indexes. Flat rows also avoid an allocation and Vec header per row.
+    data: Arc<Rows>,
+    row_count: usize,
+    indexes: Vec<(Case, Vec<usize>, Arc<RowIndex>)>,
+}
+
+impl Default for IndexedData {
+    fn default() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
 }
 
 impl IndexedData {
     /// Creates a new [`IndexedData`] from column headers and rows. Rows are expected to be
     /// aligned with `headers` (one value per column, in header order). No indexes are built
     /// yet; callers register them via [`IndexedData::add_index`].
-    pub const fn new(headers: Vec<String>, data: Vec<Vec<Value>>) -> Self {
+    pub fn new(headers: Vec<String>, data: Vec<Vec<Value>>) -> Self {
+        let row_count = data.len();
         Self {
             headers,
-            data,
+            data: Arc::new(Rows::Nested(data)),
+            row_count,
+            indexes: Vec::new(),
+        }
+    }
+
+    /// Creates a table from contiguous, header-aligned rows without per-row allocations.
+    pub fn from_flat_rows(headers: Vec<String>, values: Vec<Value>, row_count: usize) -> Self {
+        assert_eq!(values.len(), headers.len() * row_count);
+        Self {
+            headers,
+            data: Arc::new(Rows::Flat(values)),
+            row_count,
             indexes: Vec::new(),
         }
     }
@@ -45,12 +74,12 @@ impl IndexedData {
 
     /// The number of rows held.
     pub const fn len(&self) -> usize {
-        self.data.len()
+        self.row_count
     }
 
     /// Whether the table holds no rows.
     pub const fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.row_count == 0
     }
 
     /// The number of indexes built.
@@ -60,6 +89,20 @@ impl IndexedData {
 
     fn column_index(&self, col: &str) -> Option<usize> {
         self.headers.iter().position(|header| header == col)
+    }
+
+    fn row(&self, index: usize) -> &[Value] {
+        match self.data.as_ref() {
+            Rows::Nested(rows) => &rows[index],
+            Rows::Flat(values) => {
+                let start = index * self.headers.len();
+                &values[start..start + self.headers.len()]
+            }
+        }
+    }
+
+    fn rows(&self) -> impl Iterator<Item = &[Value]> {
+        (0..self.row_count).map(|index| self.row(index))
     }
 
     /// Does the given row match all the conditions specified?
@@ -195,17 +238,13 @@ impl IndexedData {
     /// the index of the row in the data.
     ///
     /// Ensure fields that are searched via a comparison are not included in the index!
-    fn index_data(
-        &self,
-        fieldidx: &[usize],
-        case: Case,
-    ) -> Result<HashMap<u64, Vec<usize>, hash_hasher::HashBuildHasher>, String> {
+    fn index_data(&self, fieldidx: &[usize], case: Case) -> Result<RowIndex, String> {
         let mut index = HashMap::with_capacity_and_hasher(
-            self.data.len(),
+            self.row_count,
             hash_hasher::HashBuildHasher::default(),
         );
 
-        for (idx, row) in self.data.iter().enumerate() {
+        for (idx, row) in self.rows().enumerate() {
             let mut hash = seahash::SeaHasher::default();
 
             for idx in fieldidx {
@@ -214,7 +253,7 @@ impl IndexedData {
 
             let key = hash.finish();
 
-            let entry = index.entry(key).or_insert_with(Vec::new);
+            let entry = index.entry(key).or_insert_with(RowIndices::new);
             entry.push(idx);
         }
 
@@ -233,7 +272,7 @@ impl IndexedData {
         wildcard: Option<&'a Value>,
     ) -> impl Iterator<Item = ObjectMap> + 'a
     where
-        I: Iterator<Item = &'a Vec<Value>> + 'a,
+        I: Iterator<Item = &'a [Value]> + 'a,
     {
         data.filter_map(move |row| {
             if self.row_equals(case, condition, row, wildcard) {
@@ -249,7 +288,7 @@ impl IndexedData {
         case: Case,
         condition: &'a [Condition<'a>],
         handle: IndexHandle,
-    ) -> Result<Option<&'a Vec<usize>>, String> {
+    ) -> Result<Option<&'a RowIndices>, String> {
         // The index to use has been passed, we can use this to search the data.
         // We are assuming that the caller has passed an index that represents the fields
         // being passed in the condition.
@@ -282,7 +321,7 @@ impl IndexedData {
         wildcard: &'a Value,
         condition: &'a [Condition<'a>],
         handle: IndexHandle,
-    ) -> Result<Option<&'a Vec<usize>>, String> {
+    ) -> Result<Option<&'a RowIndices>, String> {
         if let Some(result) = self.indexed(case, condition, handle)? {
             return Ok(Some(result));
         }
@@ -319,7 +358,7 @@ impl IndexedData {
         match index {
             None => {
                 // No index has been passed so we need to do a Sequential Scan.
-                single_or_err(self.sequential(self.data.iter(), case, condition, select, wildcard))
+                single_or_err(self.sequential(self.rows(), case, condition, select, wildcard))
             }
             Some(handle) => {
                 let result = if let Some(wildcard) = wildcard {
@@ -329,7 +368,7 @@ impl IndexedData {
                 }
                 .ok_or_else(|| "no rows found in index".to_string())?
                 .iter()
-                .map(|idx| &self.data[*idx]);
+                .map(|idx| self.row(*idx));
 
                 // Perform a sequential scan over the indexed result.
                 single_or_err(self.sequential(result, case, condition, select, wildcard))
@@ -350,7 +389,7 @@ impl IndexedData {
             None => {
                 // No index has been passed so we need to do a Sequential Scan.
                 Ok(self
-                    .sequential(self.data.iter(), case, condition, select, wildcard)
+                    .sequential(self.rows(), case, condition, select, wildcard)
                     .collect())
             }
             Some(handle) => {
@@ -365,7 +404,7 @@ impl IndexedData {
                     .sequential(
                         indexed_result
                             .iter()
-                            .flat_map(|results| results.iter().map(|idx| &self.data[*idx])),
+                            .flat_map(|results| results.iter().map(|idx| self.row(*idx))),
                         case,
                         condition,
                         select,
@@ -379,23 +418,28 @@ impl IndexedData {
     /// Register an index over the given fields for the given case sensitivity, returning a
     /// handle to it. Reuses an existing matching index if one is already present.
     pub fn add_index(&mut self, case: Case, fields: &[&str]) -> Result<IndexHandle, String> {
+        if let Some(handle) = self.existing_index(case, fields)? {
+            return Ok(handle);
+        }
         let normalized = self.normalize_index_fields(fields)?;
-        match self
+        let index = self.index_data(&normalized, case)?;
+        self.indexes.push((case, normalized, Arc::new(index)));
+        // The returned index handle is the position of the index in our list of indexes.
+        Ok(IndexHandle(self.indexes.len() - 1))
+    }
+
+    /// Resolve an already registered index without copying the snapshot.
+    pub fn existing_index(
+        &self,
+        case: Case,
+        fields: &[&str],
+    ) -> Result<Option<IndexHandle>, String> {
+        let normalized = self.normalize_index_fields(fields)?;
+        Ok(self
             .indexes
             .iter()
             .position(|index| index.0 == case && index.1 == normalized)
-        {
-            Some(pos) => {
-                // This index already exists
-                Ok(IndexHandle(pos))
-            }
-            None => {
-                let index = self.index_data(&normalized, case)?;
-                self.indexes.push((case, normalized, index));
-                // The returned index handle is the position of the index in our list of indexes.
-                Ok(IndexHandle(self.indexes.len() - 1))
-            }
-        }
+            .map(IndexHandle))
     }
 
     /// Re-apply a set of index specifications (as returned by [`IndexedData::index_fields`])
@@ -422,9 +466,9 @@ impl IndexedData {
                 .normalize_index_fields(&refs)
                 .and_then(|normalized| {
                     let map = self.index_data(&normalized, *case)?;
-                    Ok((*case, normalized, map))
+                    Ok((*case, normalized, Arc::new(map)))
                 })
-                .unwrap_or_else(|_| (*case, Vec::new(), HashMap::default()));
+                .unwrap_or_else(|_| (*case, Vec::new(), Arc::new(HashMap::default())));
             self.indexes.push(entry);
         }
     }
@@ -460,6 +504,8 @@ fn hash_value(hasher: &mut seahash::SeaHasher, case: Case, value: &Value) -> Res
                     .as_bytes(),
             ),
         },
+        // Keep the same encoding as encode_as_bytes without allocating a Bytes buffer.
+        Value::Integer(integer) => hasher.write(&integer.to_le_bytes()),
         value => {
             let bytes: bytes::Bytes = value.encode_as_bytes()?;
             hasher.write(&bytes);
@@ -504,6 +550,112 @@ mod tests {
             field,
             value: Value::from(value),
         }]
+    }
+
+    #[test]
+    fn adding_an_index_shares_rows_and_preserves_existing_snapshot() {
+        let mut original = data(&["id", "value"], &[&["one", "a"], &["two", "b"]]);
+        let id = original.add_index(Case::Sensitive, &["id"]).unwrap();
+        let mut replacement = original.clone();
+        let value = replacement.add_index(Case::Sensitive, &["value"]).unwrap();
+
+        assert!(Arc::ptr_eq(&original.data, &replacement.data));
+        assert!(Arc::ptr_eq(
+            &original.indexes[0].2,
+            &replacement.indexes[0].2
+        ));
+        assert_eq!(original.index_count(), 1);
+        assert_eq!(replacement.index_count(), 2);
+        assert_eq!(
+            original.find_table_row(Case::Sensitive, &eq("id", "two"), None, None, Some(id)),
+            replacement.find_table_row(Case::Sensitive, &eq("value", "b"), None, None, Some(value))
+        );
+    }
+
+    #[test]
+    fn inline_index_candidates_spill_without_losing_duplicate_matches() {
+        assert_eq!(
+            std::mem::size_of::<RowIndices>(),
+            std::mem::size_of::<Vec<usize>>(),
+            "inline singleton storage must not enlarge each hash-map bucket"
+        );
+        let mut table = data(
+            &["id", "value"],
+            &[
+                &["same", "a"],
+                &["same", "b"],
+                &["same", "c"],
+                &["other", "d"],
+            ],
+        );
+        let handle = table.add_index(Case::Sensitive, &["id"]).unwrap();
+        let condition = eq("id", "same");
+        let matches = table
+            .find_table_rows(Case::Sensitive, &condition, None, None, Some(handle))
+            .unwrap();
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[2].get("value"), Some(&Value::from("c")));
+        assert!(
+            table
+                .find_table_row(Case::Sensitive, &condition, None, None, Some(handle))
+                .is_err()
+        );
+        assert_eq!(
+            table
+                .find_table_rows(
+                    Case::Sensitive,
+                    &eq("id", "missing"),
+                    None,
+                    None,
+                    Some(handle)
+                )
+                .unwrap(),
+            Vec::<ObjectMap>::new()
+        );
+        let index = &table.indexes[handle.0].2;
+        assert!(
+            index
+                .values()
+                .find(|rows| rows.len() == 3)
+                .unwrap()
+                .spilled()
+        );
+        assert!(
+            !index
+                .values()
+                .find(|rows| rows.len() == 1)
+                .unwrap()
+                .spilled()
+        );
+    }
+
+    #[test]
+    fn hash_collision_candidates_are_filtered_against_the_actual_row() {
+        let mut table = data(&["id"], &[&["one"], &["two"]]);
+        let handle = table.add_index(Case::Sensitive, &["id"]).unwrap();
+        // Inject a second candidate into the first row's bucket to reproduce a hash collision.
+        Arc::make_mut(&mut table.indexes[handle.0].2)
+            .values_mut()
+            .find(|rows| rows.as_slice() == [0])
+            .unwrap()
+            .push(1);
+        let row = table
+            .find_table_row(Case::Sensitive, &eq("id", "one"), None, None, Some(handle))
+            .unwrap();
+        assert_eq!(row.get("id"), Some(&Value::from("one")));
+    }
+
+    #[test]
+    fn zero_column_rows_retain_their_count_and_empty_matches() {
+        let table = data(&[], &[&[], &[]]);
+        assert_eq!(table.len(), 2);
+        assert!(!table.is_empty());
+        assert_eq!(
+            table
+                .find_table_rows(Case::Sensitive, &[], None, None, None)
+                .unwrap(),
+            vec![ObjectMap::new(), ObjectMap::new()]
+        );
     }
 
     // Regression test for the index-handle misalignment: when a refresh rebuilds indexes over
