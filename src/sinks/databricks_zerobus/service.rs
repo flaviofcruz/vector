@@ -5,7 +5,8 @@ use crate::databricks_auth::{LoginServiceHeadersProvider, TokenManager};
 use crate::event::Event;
 use crate::http::HttpClient;
 use crate::internal_events::{
-    SchemaReloadOutcome, ZerobusSchemaRefetchFailed, ZerobusSchemaReloadOutcome,
+    SchemaReloadOutcome, ZerobusRetryableError, ZerobusSchemaRefetchFailed,
+    ZerobusSchemaReloadOutcome,
 };
 use crate::sinks::util::retries::RetryLogic;
 use crate::tls::TlsSettings;
@@ -17,10 +18,11 @@ use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tower::{Layer, Service};
+use tower::{Layer, Service, timeout::error::Elapsed};
 use tracing::{info, warn};
 use vector_lib::codecs::encoding::{BatchEncoder, BatchOutput, BatchSerializerConfig};
 use vector_lib::finalization::{EventFinalizers, Finalizable};
+use vector_lib::internal_event::CodedError;
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 
@@ -487,6 +489,7 @@ impl ZerobusService {
                         .map_err(|e| ZerobusSinkError::SchemaError {
                             message: format!("Failed to fetch table schema: {}", e),
                             retryable: e.is_retryable(),
+                            status: None,
                         })?,
                 };
 
@@ -962,6 +965,10 @@ impl Service<ZerobusRequest> for ZerobusService {
                 .encoder
                 .encode_batch(&request.events)
                 .map_err(|e| ZerobusSinkError::EncodingError {
+                    schema_constraint: matches!(
+                        e,
+                        vector_lib::codecs::encoding::Error::SchemaConstraintViolation(_)
+                    ),
                     message: format!("Failed to encode batch: {}", e),
                 })?;
             let payload = ZerobusPayload(record_batch);
@@ -1145,7 +1152,22 @@ impl RetryLogic for ZerobusRetryLogic {
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
         error.is_retryable()
     }
+
+    fn on_retriable_error(&self, error: &Self::Error) {
+        emit!(ZerobusRetryableError {
+            error_code: error.error_code(),
+        });
+    }
+
+    fn on_retriable_timeout(&self) {
+        emit!(ZerobusRetryableError {
+            error_code: REQUEST_TIMEOUT_ERROR_CODE,
+        });
+    }
 }
+
+/// `error_code` for an attempt cut off by the Tower request timeout (`Elapsed`).
+const REQUEST_TIMEOUT_ERROR_CODE: &str = "request_timeout";
 
 /// Tower layer that converts retry-budget-exhausted retryable errors into a
 /// successful `ZerobusResponse` carrying `EventStatus::Errored`.
@@ -1155,7 +1177,8 @@ impl RetryLogic for ZerobusRetryLogic {
 /// - `Err(e)` where `e.is_retryable()` — convert to `Ok(ZerobusResponse::errored())`
 ///   so the driver marks finalizers `Errored` (transient — source / disk
 ///   buffer may replay) rather than `Rejected` (permanent drop).
-/// - `Err(e)` permanent — propagate so the driver maps to `Rejected`.
+/// - `Err(e)` permanent — propagate so the driver maps to `Rejected`, wrapped in a
+///   `CodedError` so the driver's error and discard metrics carry its `error_code`.
 ///
 /// Without this layer the driver maps every `Err` from `Service::call` to
 /// `EventStatus::Rejected`, which would drop transient-but-exhausted failures
@@ -1202,18 +1225,24 @@ where
                     // adaptive-concurrency). Downcast to inspect retryability;
                     // anything that isn't a `ZerobusSinkError` (e.g. a timeout
                     // `Elapsed`) is conservatively treated as transient.
-                    let retryable = match e.downcast_ref::<ZerobusSinkError>() {
-                        Some(zb) => zb.is_retryable(),
-                        None => true,
+                    let (retryable, error_code) = match e.downcast_ref::<ZerobusSinkError>() {
+                        Some(zb) => (zb.is_retryable(), zb.error_code()),
+                        None if e.is::<Elapsed>() => (true, REQUEST_TIMEOUT_ERROR_CODE),
+                        None => (true, "other"),
                     };
                     if retryable {
                         warn!(
                             message = "Zerobus retry budget exhausted on transient error; signaling Errored so source or buffer may replay.",
                             error = %e,
+                            error_code,
                         );
                         Ok(ZerobusResponse::errored())
                     } else {
-                        Err(e)
+                        Err(CodedError {
+                            code: error_code,
+                            error: e,
+                        }
+                        .into())
                     }
                 }
             }
@@ -1991,6 +2020,7 @@ mod tests {
             let err: crate::Error = Box::new(ZerobusSinkError::SchemaError {
                 message: "UC 503".to_string(),
                 retryable: true,
+                status: Some(503),
             });
             Err::<ZerobusResponse, _>(err)
         });
@@ -2005,12 +2035,113 @@ mod tests {
         assert_eq!(resp.status, vector_lib::event::EventStatus::Errored);
     }
 
+    fn retryable_error_counts() -> Vec<(Option<String>, vector_lib::event::MetricValue)> {
+        let mut counts: Vec<_> = vector_lib::metrics::Controller::get()
+            .unwrap()
+            .capture_metrics()
+            .into_iter()
+            .filter(|m| m.name() == "zerobus_retryable_errors_total")
+            .map(|m| {
+                let code = m.tags().and_then(|t| t.get("error_code")).map(String::from);
+                (code, m.value().clone())
+            })
+            .collect();
+        counts.sort_by(|a, b| a.0.cmp(&b.0));
+        counts
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retried_attempts_count_by_error_code() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        vector_lib::metrics::init_test();
+        vector_lib::metrics::Controller::get().unwrap().reset();
+
+        // Fails with a retryable UC error, then the request timeout, then succeeds.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let inner = tower::service_fn({
+            let attempts = Arc::clone(&attempts);
+            move |_req: ZerobusRequest| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match attempt {
+                        0 => Err::<ZerobusResponse, crate::Error>(Box::new(
+                            ZerobusSinkError::SchemaError {
+                                message: "UC 503".to_string(),
+                                retryable: true,
+                                status: Some(503),
+                            },
+                        )),
+                        1 => Err::<ZerobusResponse, crate::Error>(Box::new(Elapsed::new())),
+                        _ => Ok(ZerobusResponse::delivered(
+                            vector_lib::config::telemetry().create_request_count_byte_size(),
+                            None,
+                        )),
+                    }
+                }
+            }
+        });
+        let policy = crate::sinks::util::retries::FibonacciRetryPolicy::new(
+            5,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
+            ZerobusRetryLogic,
+            crate::sinks::util::retries::JitterMode::None,
+        );
+        let svc = tower::ServiceBuilder::new().retry(policy).service(inner);
+
+        let resp = svc.oneshot(dummy_request()).await.unwrap();
+        assert_eq!(resp.status, vector_lib::event::EventStatus::Delivered);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            retryable_error_counts(),
+            vec![
+                (
+                    Some(REQUEST_TIMEOUT_ERROR_CODE.to_string()),
+                    vector_lib::event::MetricValue::Counter { value: 1.0 }
+                ),
+                (
+                    Some("uc_server_error".to_string()),
+                    vector_lib::event::MetricValue::Counter { value: 1.0 }
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_errors_are_not_counted_as_retryable() {
+        use tower::ServiceExt;
+
+        vector_lib::metrics::init_test();
+        vector_lib::metrics::Controller::get().unwrap().reset();
+
+        let inner = tower::service_fn(|_req: ZerobusRequest| async move {
+            Err::<ZerobusResponse, crate::Error>(Box::new(ZerobusSinkError::EncodingError {
+                message: "bad".to_string(),
+                schema_constraint: false,
+            }))
+        });
+        let policy = crate::sinks::util::retries::FibonacciRetryPolicy::new(
+            5,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
+            ZerobusRetryLogic,
+            crate::sinks::util::retries::JitterMode::None,
+        );
+        let svc = tower::ServiceBuilder::new().retry(policy).service(inner);
+
+        assert!(svc.oneshot(dummy_request()).await.is_err());
+        assert!(retryable_error_counts().is_empty());
+    }
+
     #[tokio::test]
     async fn non_retryable_err_propagates() {
         use tower::ServiceExt;
         let inner = tower::service_fn(|_req: ZerobusRequest| async move {
             let err: crate::Error = Box::new(ZerobusSinkError::EncodingError {
                 message: "bad".to_string(),
+                schema_constraint: true,
             });
             Err::<ZerobusResponse, _>(err)
         });
@@ -2022,7 +2153,13 @@ mod tests {
             .call(dummy_request())
             .await
             .unwrap_err();
-        let zb = err.downcast_ref::<ZerobusSinkError>().unwrap();
+        // Wrapped so the driver labels its metrics with the error's code.
+        assert_eq!(
+            CodedError::code_of(&err),
+            Some("encoding_schema_constraint")
+        );
+        let coded = err.downcast_ref::<CodedError>().unwrap();
+        let zb = coded.error.downcast_ref::<ZerobusSinkError>().unwrap();
         assert!(matches!(zb, ZerobusSinkError::EncodingError { .. }));
     }
 

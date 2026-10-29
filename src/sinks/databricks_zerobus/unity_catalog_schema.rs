@@ -130,6 +130,7 @@ pub async fn fetch_table_schema(
         .map_err(|e| ZerobusSinkError::SchemaError {
             message: format!("Failed to fetch table schema: {}", e),
             retryable: true,
+            status: None,
         })?;
 
     let status = response.status();
@@ -147,6 +148,7 @@ pub async fn fetch_table_schema(
                 status, error_text
             ),
             retryable: status_is_retryable(status),
+            status: Some(status.as_u16()),
         });
     }
 
@@ -158,6 +160,7 @@ pub async fn fetch_table_schema(
         .map_err(|e| ZerobusSinkError::SchemaError {
             message: format!("Failed to read response body: {}", e),
             retryable: true,
+            status: None,
         })?;
 
     let schema: UnityCatalogTableSchema =
@@ -208,6 +211,7 @@ async fn get_oauth_token(
         .map_err(|e| ZerobusSinkError::SchemaError {
             message: format!("Failed to get OAuth token: {}", e),
             retryable: true,
+            status: None,
         })?;
 
     let status = response.status();
@@ -222,6 +226,7 @@ async fn get_oauth_token(
         return Err(ZerobusSinkError::SchemaError {
             message: format!("OAuth token request failed {}: {}", status, error_text),
             retryable: status_is_retryable(status),
+            status: Some(status.as_u16()),
         });
     }
 
@@ -233,6 +238,7 @@ async fn get_oauth_token(
         .map_err(|e| ZerobusSinkError::SchemaError {
             message: format!("Failed to read OAuth response body: {}", e),
             retryable: true,
+            status: None,
         })?;
 
     let token_response: OAuthTokenResponse =

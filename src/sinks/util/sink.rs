@@ -461,6 +461,7 @@ where
                             error,
                             request_id,
                             count,
+                            error_code: None,
                         });
                     }
                     _ => {} // do nothing

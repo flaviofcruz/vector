@@ -16,14 +16,16 @@ pub use bytes_received::{BytesReceived, BytesReceivedHandle};
 pub use bytes_sent::BytesSent;
 #[allow(clippy::module_name_repetitions)]
 pub use cached_event::{RegisterTaggedInternalEvent, RegisteredEventCache};
-pub use component_events_dropped::{ComponentEventsDropped, INTENTIONAL, UNINTENTIONAL};
+pub use component_events_dropped::{
+    ComponentEventsDropped, ComponentEventsDroppedWithCode, INTENTIONAL, UNINTENTIONAL,
+};
 pub use component_events_timed_out::ComponentEventsTimedOut;
 pub use events_received::{EventsReceived, EventsReceivedHandle};
 pub use events_sent::{DEFAULT_OUTPUT, EventsSent, TaggedEventsSent};
 pub use metrics::SharedString;
 pub use optional_tag::OptionalTag;
 pub use prelude::{error_stage, error_type};
-pub use service::{CallError, PollReadyError};
+pub use service::{CallError, CodedError, PollReadyError};
 pub use vector_event::delivery_event::{DeliveryEventSingleton, delivery_singleton};
 
 use crate::json_size::JsonSize;

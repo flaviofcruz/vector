@@ -36,6 +36,44 @@ impl<'a, const INTENTIONAL: bool> RegisterInternalEvent
                 "intentional" => if INTENTIONAL { "true" } else { "false" },
             ),
             reason: self.reason,
+            error_code: None,
+        }
+    }
+}
+
+/// [`ComponentEventsDropped`] for a drop whose cause has been classified, adding an
+/// `error_code` label to `component_discarded_events_total`.
+///
+/// `error_code` must come from a fixed set (a `match` on an error type), never from error
+/// text, so the label stays bounded. Drops that are not classified keep using
+/// [`ComponentEventsDropped`] and its unlabeled series.
+#[derive(Debug, NamedInternalEvent)]
+pub struct ComponentEventsDroppedWithCode<'a, const INTENTIONAL: bool> {
+    pub count: usize,
+    pub reason: &'a str,
+    pub error_code: &'static str,
+}
+
+impl<const INTENTIONAL: bool> InternalEvent for ComponentEventsDroppedWithCode<'_, INTENTIONAL> {
+    fn emit(self) {
+        let count = self.count;
+        self.register().emit(Count(count));
+    }
+}
+
+impl<'a, const INTENTIONAL: bool> RegisterInternalEvent
+    for ComponentEventsDroppedWithCode<'a, INTENTIONAL>
+{
+    type Handle = DroppedHandle<'a, INTENTIONAL>;
+    fn register(self) -> Self::Handle {
+        Self::Handle {
+            discarded_events: counter!(
+                "component_discarded_events_total",
+                "intentional" => if INTENTIONAL { "true" } else { "false" },
+                "error_code" => self.error_code,
+            ),
+            reason: self.reason,
+            error_code: Some(self.error_code),
         }
     }
 }
@@ -44,6 +82,7 @@ impl<'a, const INTENTIONAL: bool> RegisterInternalEvent
 pub struct DroppedHandle<'a, const INTENDED: bool> {
     discarded_events: Counter,
     reason: &'a str,
+    error_code: Option<&'static str>,
 }
 
 impl<const INTENDED: bool> InternalEventHandle for DroppedHandle<'_, INTENDED> {
@@ -56,6 +95,7 @@ impl<const INTENDED: bool> InternalEventHandle for DroppedHandle<'_, INTENDED> {
                 intentional = INTENDED,
                 count = data.0,
                 reason = self.reason,
+                error_code = self.error_code,
             );
         } else {
             error!(
@@ -63,6 +103,7 @@ impl<const INTENDED: bool> InternalEventHandle for DroppedHandle<'_, INTENDED> {
                 intentional = INTENDED,
                 count = data.0,
                 reason = self.reason,
+                error_code = self.error_code,
             );
         }
         self.discarded_events.increment(data.0 as u64);

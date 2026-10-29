@@ -79,3 +79,22 @@ impl InternalEvent for ZerobusSchemaRefetchFailed {
         .increment(1);
     }
 }
+
+/// A write attempt failed with a retryable error and will be retried.
+///
+/// Counts attempts, not batches: a batch retried three times counts three. Permanent failures
+/// are not counted here; they reach `component_errors_total` with their `error_code` instead.
+#[derive(Debug, NamedInternalEvent)]
+pub(crate) struct ZerobusRetryableError {
+    pub error_code: &'static str,
+}
+
+impl InternalEvent for ZerobusRetryableError {
+    fn emit(self) {
+        counter!(
+            "zerobus_retryable_errors_total",
+            "error_code" => self.error_code,
+        )
+        .increment(1);
+    }
+}

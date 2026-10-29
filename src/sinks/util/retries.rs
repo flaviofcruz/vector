@@ -48,6 +48,10 @@ pub trait RetryLogic: Clone + Send + Sync + 'static {
 
     /// Optional hook run when an error is determined to be retriable.
     fn on_retriable_error(&self, _error: &Self::Error) {}
+
+    /// Optional hook run when an attempt hit the request timeout and will be retried.
+    /// `on_retriable_error` doesn't see these: a timeout isn't a `Self::Error`.
+    fn on_retriable_timeout(&self) {}
 }
 
 /// The jitter mode to use for retry backoff behavior.
@@ -245,6 +249,7 @@ where
                     }
                 // Next attempt to cast the error into a timeout error
                 } else if error.downcast_ref::<Elapsed>().is_some() {
+                    self.logic.on_retriable_timeout();
                     warn!(
                         "Request timed out. If this happens often while the events are actually reaching their destination, try decreasing `batch.max_bytes` and/or using `compression` if applicable. Alternatively `request.timeout_secs` can be increased."
                     );
@@ -457,6 +462,44 @@ mod tests {
         assert_eq!(fut.await.unwrap(), "world");
     }
 
+    #[tokio::test]
+    async fn retriable_hooks_see_errors_and_timeouts() {
+        trace_init();
+
+        time::pause();
+
+        let logic = HookCountingRetryLogic::default();
+        let policy = FibonacciRetryPolicy::new(
+            5,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            logic.clone(),
+            JitterMode::None,
+        );
+
+        let (mut svc, mut handle) = mock::spawn_layer(RetryLayer::new(policy));
+
+        assert_ready_ok!(svc.poll_ready());
+
+        let mut fut = task::spawn(svc.call("hello"));
+        assert_request_eq!(handle, "hello").send_error(Error(true));
+        assert_pending!(fut.poll());
+        time::advance(Duration::from_secs(5)).await;
+        assert_pending!(fut.poll());
+
+        assert_request_eq!(handle, "hello").send_error(Elapsed::new());
+        assert_pending!(fut.poll());
+        time::advance(Duration::from_secs(5)).await;
+        assert_pending!(fut.poll());
+
+        assert_request_eq!(handle, "hello").send_error(Error(false));
+        assert_ready_err!(fut.poll());
+
+        // The non-retriable error reaches neither hook.
+        assert_eq!(logic.errors.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(logic.timeouts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn backoff_grows_to_max() {
         let mut policy = FibonacciRetryPolicy::new(
@@ -541,6 +584,32 @@ mod tests {
 
         fn is_retriable_error(&self, error: &Self::Error) -> bool {
             error.0
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct HookCountingRetryLogic {
+        errors: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        timeouts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RetryLogic for HookCountingRetryLogic {
+        type Error = Error;
+        type Request = &'static str;
+        type Response = &'static str;
+
+        fn is_retriable_error(&self, error: &Self::Error) -> bool {
+            error.0
+        }
+
+        fn on_retriable_error(&self, _error: &Self::Error) {
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn on_retriable_timeout(&self) {
+            self.timeouts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 

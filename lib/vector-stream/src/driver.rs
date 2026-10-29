@@ -6,8 +6,8 @@ use tower::Service;
 use tracing::Instrument;
 use vector_common::{
     internal_event::{
-        ByteSize, BytesSent, CallError, InternalEventHandle as _, PollReadyError, Registered,
-        RegisteredEventCache, SharedString, TaggedEventsSent, emit, register,
+        ByteSize, BytesSent, CallError, CodedError, InternalEventHandle as _, PollReadyError,
+        Registered, RegisteredEventCache, SharedString, TaggedEventsSent, emit, register,
     },
     request_metadata::{GroupedCountByteSize, MetaDescriptive},
 };
@@ -233,11 +233,15 @@ where
 
     /// Emit the `Error` and `EventsDropped` internal events.
     /// This scenario occurs after retries have been attempted.
+    ///
+    /// An error boxed as a [`CodedError`] labels both with its `error_code`.
     fn emit_call_error(error: Option<Svc::Error>, request_id: usize, count: usize) {
+        let error_code = error.as_ref().and_then(|error| CodedError::code_of(error));
         emit(CallError {
             error,
             request_id,
             count,
+            error_code,
         });
     }
 }
@@ -266,10 +270,12 @@ mod tests {
     use tower::Service;
     use vector_common::{
         finalization::{BatchNotifier, EventFinalizer, EventFinalizers, EventStatus, Finalizable},
-        internal_event::CountByteSize,
+        internal_event::{CodedError, CountByteSize},
         json_size::JsonSize,
         request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
     };
+
+    use vector_core::event::MetricValue;
 
     use super::{Driver, DriverResponse};
 
@@ -454,5 +460,95 @@ mod tests {
         // Make sure the final finalizer task runs.
         tokio::task::yield_now().await;
         assert_eq!(input_total, counter.load(Ordering::SeqCst));
+    }
+
+    /// Fails every call with the error its function builds.
+    struct FailingService(fn() -> vector_common::Error);
+
+    impl Service<DelayRequest> for FailingService {
+        type Response = DelayResponse;
+        type Error = vector_common::Error;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + Sync>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: DelayRequest) -> Self::Future {
+            let error = (self.0)();
+            Box::pin(async move { Err(error) })
+        }
+    }
+
+    /// Run two failing requests of three events each through the driver and return the
+    /// `(error_code, value)` of each `metric` series it produced.
+    async fn failing_driver_series(
+        make_error: fn() -> vector_common::Error,
+        metric: &str,
+    ) -> Vec<(Option<String>, f64)> {
+        vector_core::metrics::init_test();
+        let controller = vector_core::metrics::Controller::get().unwrap();
+        controller.reset();
+
+        let counter = Counter::default();
+        let input = stream::iter((0..2).map(|_| {
+            let mut req = DelayRequest::new(1, &counter);
+            req.1 = RequestMetadata::new(3, 0, 0, 0, GroupedCountByteSize::new_untagged());
+            req
+        }));
+        assert_eq!(
+            Driver::new(input, FailingService(make_error)).run().await,
+            Ok(())
+        );
+
+        controller
+            .capture_metrics()
+            .into_iter()
+            .filter(|m| m.name() == metric)
+            .map(|m| {
+                let code = m.tags().and_then(|t| t.get("error_code")).map(String::from);
+                let MetricValue::Counter { value } = m.value() else {
+                    panic!("{metric} should be a counter");
+                };
+                (code, *value)
+            })
+            .collect()
+    }
+
+    fn coded_error() -> vector_common::Error {
+        Box::new(CodedError {
+            code: "some_code",
+            error: "boom".into(),
+        })
+    }
+
+    fn plain_error() -> vector_common::Error {
+        "boom".into()
+    }
+
+    #[tokio::test]
+    async fn coded_error_labels_call_error_metrics() {
+        // Two failed requests of three events each.
+        assert_eq!(
+            failing_driver_series(coded_error, "component_discarded_events_total").await,
+            vec![(Some("some_code".to_string()), 6.0)]
+        );
+        assert_eq!(
+            failing_driver_series(coded_error, "component_errors_total").await,
+            vec![(Some("some_code".to_string()), 2.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn uncoded_error_keeps_unlabeled_series() {
+        assert_eq!(
+            failing_driver_series(plain_error, "component_discarded_events_total").await,
+            vec![(None, 6.0)]
+        );
+        assert_eq!(
+            failing_driver_series(plain_error, "component_errors_total").await,
+            vec![(None, 2.0)]
+        );
     }
 }
