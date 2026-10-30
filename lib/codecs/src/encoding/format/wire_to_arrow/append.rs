@@ -55,8 +55,9 @@ const VARIANT_MESSAGE_OPTS: prost_reflect::SerializeOptions =
 /// Decode a length-delimited VARIANT wire value that is a **nested proto
 /// message** into the Parquet Variant `(metadata, value)` binary pair: decode
 /// the sub-message with its descriptor, serialize it to a JSON value (see
-/// [`VARIANT_MESSAGE_OPTS`]), then build the Variant. Used for variant-marked
-/// columns whose proto field is a message rather than a JSON-text string.
+/// [`VARIANT_MESSAGE_OPTS`]), then build the Variant. This is the reference
+/// semantics for message-backed VARIANT columns; the direct encoder in
+/// `variant_message` falls back to it for inputs it does not handle.
 pub(super) fn encode_variant_from_message(
     desc: &prost_reflect::MessageDescriptor,
     wv: &WireValue,
@@ -72,27 +73,18 @@ pub(super) fn encode_variant_from_message(
 }
 
 /// Encode a VARIANT wire value into the Parquet Variant `(metadata, value)`
-/// binary pair, dispatching on the column's [`VariantSource`]. Shared by the
-/// scan hot path and the `validate_message` pre-pass so the variant *build* is
-/// byte-identical in both (the offset-counter overflow check in scan is a
-/// separate, cumulative-across-batch concern, not mirrored here).
+/// binary pair, dispatching on the column's [`VariantSource`]. Called once per
+/// value, by the `validate_message` pre-pass: the Parquet Variant build (which
+/// can fail on size/nesting/dictionary limits) must run before any builder is
+/// mutated so a failing row drops alone, and `scan_message` then appends the
+/// pre-pass output (see [`BuiltVariants`]) instead of building it again.
+///
+/// [`BuiltVariants`]: super::scan::BuiltVariants
 pub(super) fn encode_variant(source: &VariantSource, wv: &WireValue) -> Result<(Vec<u8>, Vec<u8>)> {
     match source {
         VariantSource::JsonText => encode_variant_from_wire(wv),
-        VariantSource::Message(desc) => encode_variant_from_message(desc, wv),
+        VariantSource::Message(plan) => plan.encode(wv),
     }
-}
-
-/// Validate a VARIANT wire value for the `validate_message` pre-pass by running
-/// the *full* [`encode_variant`] build and discarding the result. The Parquet
-/// Variant build (which can fail on size/nesting/dictionary limits) must be
-/// exercised here — validating parse-only would let a build-failing row pass the
-/// pre-pass and then error in scan, failing the whole batch instead of dropping
-/// that one row. Building twice (here and in scan) is the price of per-row
-/// isolation: Arrow `*Builder` types expose no rollback, so the offending row
-/// must be rejected before any builder is mutated.
-pub(super) fn validate_variant_from_wire(source: &VariantSource, wv: &WireValue) -> Result<()> {
-    encode_variant(source, wv).map(|_| ())
 }
 
 /// Proto wire type numeric code for a `WireValue`. Used for error reporting.

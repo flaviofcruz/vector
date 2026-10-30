@@ -50,6 +50,7 @@ mod errors;
 mod plan;
 mod scan;
 mod serializer;
+mod variant_message;
 
 #[cfg(test)]
 mod tests;

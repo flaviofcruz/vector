@@ -36,6 +36,7 @@ prost-reflect.workspace = true
 parquet-variant = { version = "59.2.0", optional = true }
 parquet-variant-json = { version = "59.2.0", optional = true }
 zeroparser = { path = "../zeroparser", optional = true }
+base64 = { workspace = true, features = ["std"], optional = true }
 rand.workspace = true
 regex.workspace = true
 serde.workspace = true
@@ -72,7 +73,7 @@ uuid.workspace = true
 vrl.workspace = true
 
 [features]
-arrow = ["dep:zeroparser", "dep:parquet-variant", "dep:parquet-variant-json"]
+arrow = ["dep:zeroparser", "dep:parquet-variant", "dep:parquet-variant-json", "dep:base64"]
 opentelemetry = ["dep:opentelemetry-proto"]
 syslog = ["dep:syslog_loose", "dep:strum", "dep:derive_more", "dep:serde-aux", "dep:toml"]
 test = []

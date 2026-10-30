@@ -16,7 +16,7 @@ use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 
 use super::append::append_proto3_default;
 use super::errors::{Result, WireToArrowError};
-use super::plan::{MessagePlan, PlanSlot, ScalarKind, VariantSource};
+use super::plan::{MessagePlan, PlanSlot, ScalarKind};
 
 /// Leaf builder: one Arrow primitive column. Type-specific, no dyn dispatch.
 pub enum TypedBuilder {
@@ -214,7 +214,6 @@ pub enum BuilderNode {
         value: LargeBinaryBuilder,
         fields: Fields,
         validity: Vec<bool>,
-        source: VariantSource,
     },
     /// `ARRAY<VARIANT>` -> Arrow `List<Struct<metadata, value>>`. Elements are
     /// flattened across rows into the two `LargeBinary` builders (proto repeated
@@ -227,7 +226,6 @@ pub enum BuilderNode {
         item_fields: Fields,
         offsets: Vec<i32>,
         current_offset: i32,
-        source: VariantSource,
     },
 }
 
@@ -324,7 +322,7 @@ impl BuilderNodeList {
                         entry_field,
                     }
                 }
-                PlanSlot::Variant(source) => {
+                PlanSlot::Variant(_) => {
                     let fields = match field.data_type() {
                         DataType::Struct(fs) => fs.clone(),
                         _ => {
@@ -338,10 +336,9 @@ impl BuilderNodeList {
                         value: LargeBinaryBuilder::with_capacity(capacity, 0),
                         fields,
                         validity: Vec::with_capacity(capacity),
-                        source: source.clone(),
                     }
                 }
-                PlanSlot::RepeatedVariant(source) => {
+                PlanSlot::RepeatedVariant(_) => {
                     let item_fields = match field.data_type() {
                         DataType::List(item) => match item.data_type() {
                             DataType::Struct(fs) => fs.clone(),
@@ -365,7 +362,6 @@ impl BuilderNodeList {
                         item_fields,
                         offsets,
                         current_offset: 0,
-                        source: source.clone(),
                     }
                 }
                 // No proto tag points here, so the slot is null-padded each
@@ -661,7 +657,6 @@ impl BuilderNodeList {
                     value,
                     fields,
                     validity,
-                    source: _,
                 } => {
                     let child_arrays: Vec<ArrayRef> =
                         vec![Arc::new(metadata.finish()), Arc::new(value.finish())];

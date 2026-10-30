@@ -2346,6 +2346,241 @@ fn variant_message_drops_undecodable_row() {
     );
 }
 
+/// Encode `msg` to wire bytes.
+fn encode_message(msg: &DynamicMessage) -> Vec<u8> {
+    let mut buf = Vec::new();
+    msg.encode(&mut buf).unwrap();
+    buf
+}
+
+/// A `KV` sub-message with `k` set and, when non-zero, `n`.
+fn kv_message(kv: &MessageDescriptor, k: &str, n: i64) -> DynamicMessage {
+    let mut sub = DynamicMessage::new(kv.clone());
+    sub.set_field_by_name("k", ProtoValue::String(k.into()));
+    if n != 0 {
+        sub.set_field_by_name("n", ProtoValue::I64(n));
+    }
+    sub
+}
+
+#[test]
+fn variant_row_dropped_after_its_variant_was_built_does_not_leak() {
+    // The pre-pass builds a row's VARIANT values before the row can still be
+    // dropped by a later field. Here the bad row's first `single` validates and
+    // is built, then its second `single` drops the row as a duplicate singular
+    // tag. The next row must read its own value, not the dropped row's.
+    let desc = message_variant_descriptor();
+    let kv = kv_descriptor(&desc);
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let single = |k: &str| {
+        let mut msg = DynamicMessage::new(desc.clone());
+        msg.set_field_by_name("single", ProtoValue::Message(kv_message(&kv, k, 0)));
+        encode_message(&msg)
+    };
+    // Concatenated encodings repeat the `single` tag on the wire.
+    let mut bad = single("dropped");
+    bad.extend(single("dropped-again"));
+
+    let batch = enc
+        .encode_batch(&[
+            Bytes::from(single("first")),
+            Bytes::from(bad),
+            Bytes::from(single("second")),
+        ])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 0),
+        serde_json::json!({"k": "first"})
+    );
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 1),
+        serde_json::json!({"k": "second"})
+    );
+}
+
+/// `message Outer { KV a = 1; repeated KV b = 2; Inner inner = 3; KV c = 4; }`,
+/// `message Inner { KV v = 1; string tag = 2; }`,
+/// `message KV { string k = 1; int64 n = 2; }` — VARIANT slots at the top
+/// level, in a repeated field and inside a nested struct.
+fn multi_variant_descriptor() -> MessageDescriptor {
+    let kv_field = |name: &str, number: i32, label: Label| FieldDescriptorProto {
+        name: Some(name.into()),
+        number: Some(number),
+        label: Some(label as i32),
+        r#type: Some(ProtoType::Message as i32),
+        type_name: Some(".wire_to_arrow_multi_variant_test.KV".into()),
+        ..Default::default()
+    };
+    let scalar_field = |name: &str, number: i32, ty: ProtoType| FieldDescriptorProto {
+        name: Some(name.into()),
+        number: Some(number),
+        label: Some(Label::Optional as i32),
+        r#type: Some(ty as i32),
+        ..Default::default()
+    };
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_multi_variant_test.proto".into()),
+        package: Some("wire_to_arrow_multi_variant_test".into()),
+        message_type: vec![
+            DescriptorProto {
+                name: Some("Outer".into()),
+                field: vec![
+                    kv_field("a", 1, Label::Optional),
+                    kv_field("b", 2, Label::Repeated),
+                    FieldDescriptorProto {
+                        name: Some("inner".into()),
+                        number: Some(3),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::Message as i32),
+                        type_name: Some(".wire_to_arrow_multi_variant_test.Inner".into()),
+                        ..Default::default()
+                    },
+                    kv_field("c", 4, Label::Optional),
+                ],
+                ..Default::default()
+            },
+            DescriptorProto {
+                name: Some("Inner".into()),
+                field: vec![
+                    kv_field("v", 1, Label::Optional),
+                    scalar_field("tag", 2, ProtoType::String),
+                ],
+                ..Default::default()
+            },
+            DescriptorProto {
+                name: Some("KV".into()),
+                field: vec![
+                    scalar_field("k", 1, ProtoType::String),
+                    scalar_field("n", 2, ProtoType::Int64),
+                ],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes).unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_multi_variant_test.Outer")
+        .unwrap()
+}
+
+#[test]
+fn variant_values_land_in_their_own_slots_across_columns_and_nesting() {
+    use arrow::array::{LargeStringArray, ListArray};
+
+    // The scan consumes the pre-pass's VARIANT values in order, so every slot
+    // kind -- top-level, repeated and inside a nested struct -- must be met in
+    // the same order by both passes. Fields are interleaved on the wire, out
+    // of field-number order, and every value is distinct, so any misalignment
+    // puts a value in the wrong column or row.
+    let desc = multi_variant_descriptor();
+    let kv = desc
+        .get_field_by_name("a")
+        .unwrap()
+        .kind()
+        .as_message()
+        .unwrap()
+        .clone();
+    let inner_desc = desc
+        .get_field_by_name("inner")
+        .unwrap()
+        .kind()
+        .as_message()
+        .unwrap()
+        .clone();
+    let schema = Schema::new(vec![
+        variant_arrow_field("a"),
+        Field::new(
+            "b",
+            DataType::List(Arc::new(variant_arrow_field("item"))),
+            true,
+        ),
+        Field::new(
+            "inner",
+            DataType::Struct(ArrowFields::from(vec![
+                variant_arrow_field("v"),
+                Field::new("tag", DataType::LargeUtf8, true),
+            ])),
+            true,
+        ),
+        variant_arrow_field("c"),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let field = |name: &str, value: ProtoValue| {
+        let mut msg = DynamicMessage::new(desc.clone());
+        msg.set_field_by_name(name, value);
+        encode_message(&msg)
+    };
+    let kv_value = |k: &str, n: i64| ProtoValue::Message(kv_message(&kv, k, n));
+    let b_value = |k: &str, n: i64| ProtoValue::List(vec![kv_value(k, n)]);
+    let inner_value = |k: &str, n: i64, tag: &str| {
+        let mut inner = DynamicMessage::new(inner_desc.clone());
+        inner.set_field_by_name("tag", ProtoValue::String(tag.into()));
+        inner.set_field_by_name("v", kv_value(k, n));
+        ProtoValue::Message(inner)
+    };
+    // Wire order c, b[0], inner, a, b[1]; values encode (row, slot).
+    let row = |r: i64| {
+        [
+            field("c", kv_value("c", r)),
+            field("b", b_value("b0", r)),
+            field("inner", inner_value("v", r, &format!("t{r}"))),
+            field("a", kv_value("a", r)),
+            field("b", b_value("b1", r)),
+        ]
+        .concat()
+    };
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(row(1)), Bytes::from(row(2))])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    let b = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let inner = batch.column(2).as_struct();
+    let tags = inner
+        .column(1)
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .unwrap();
+    for r in 0..2usize {
+        let n = r as i64 + 1;
+        assert_eq!(
+            decode_variant_wire(batch.column(0), r),
+            serde_json::json!({"k": "a", "n": n})
+        );
+        let items = b.value(r);
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            decode_variant_wire(&items, 0),
+            serde_json::json!({"k": "b0", "n": n})
+        );
+        assert_eq!(
+            decode_variant_wire(&items, 1),
+            serde_json::json!({"k": "b1", "n": n})
+        );
+        assert_eq!(
+            decode_variant_wire(inner.column(0), r),
+            serde_json::json!({"k": "v", "n": n})
+        );
+        assert_eq!(tags.value(r), format!("t{n}"));
+        assert_eq!(
+            decode_variant_wire(batch.column(3), r),
+            serde_json::json!({"k": "c", "n": n})
+        );
+    }
+}
+
 // -------------------------------------------------------------------------
 // Fuzz: random wire bytes through `encode_batch` must not panic. Any
 // `Result` outcome is acceptable — we only care that bad input is reported

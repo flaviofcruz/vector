@@ -10,6 +10,7 @@ use prost_reflect::{Cardinality, EnumDescriptor, Kind, MessageDescriptor};
 
 use super::builders::TypedBuilder;
 use super::errors::{Result, WireToArrowError};
+use super::variant_message::VariantMessagePlan;
 
 /// Maximum nesting depth permitted in a plan. Arrow schemas can in principle
 /// nest arbitrarily deep, but the build walk recurses 1:1 with structural
@@ -152,10 +153,11 @@ impl ScalarKind {
 pub enum VariantSource {
     /// A proto `string`/`bytes` field carrying UTF-8 JSON text; parsed as JSON.
     JsonText,
-    /// A nested proto message; decoded with its descriptor and serialized to a
-    /// JSON value (original field names, numeric 64-bit ints, all fields
-    /// present) to match the arrow_stream encoder's structured-value path.
-    Message(MessageDescriptor),
+    /// A nested proto message, encoded with the same semantics as decoding it
+    /// with its descriptor and serializing to a JSON value (original field
+    /// names, numeric 64-bit ints, present fields only); see
+    /// [`VariantMessagePlan`].
+    Message(Arc<VariantMessagePlan>),
 }
 
 /// One entry per Arrow field at this message level: describes how to route
@@ -439,7 +441,9 @@ impl MessagePlan {
                     (Kind::Message(inner_desc), DataType::Struct(_), false)
                         if crate::encoding::format::variant::is_variant_field(arrow_field) =>
                     {
-                        PlanSlot::Variant(VariantSource::Message(inner_desc.clone()))
+                        PlanSlot::Variant(VariantSource::Message(Arc::new(
+                            VariantMessagePlan::new(inner_desc),
+                        )))
                     }
                     // Singular proto enum -> STRING column: render the enum
                     // value *name* rather than its number. Enum + an integer
@@ -489,7 +493,9 @@ impl MessagePlan {
                     (Kind::Message(inner_desc), DataType::List(item_field), true)
                         if crate::encoding::format::variant::is_variant_field(item_field) =>
                     {
-                        PlanSlot::RepeatedVariant(VariantSource::Message(inner_desc.clone()))
+                        PlanSlot::RepeatedVariant(VariantSource::Message(Arc::new(
+                            VariantMessagePlan::new(inner_desc),
+                        )))
                     }
                     // Repeated nested message -> Arrow List<Struct>.
                     (Kind::Message(inner_desc), DataType::List(element_field), true) => {

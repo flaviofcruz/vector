@@ -12,7 +12,7 @@ use prost_reflect::MessageDescriptor;
 use super::builders::BuilderNodeList;
 use super::errors::{Result, WireToArrowError};
 use super::plan::MessagePlan;
-use super::scan::{scan_message, validate_message};
+use super::scan::{BuiltVariants, scan_message, validate_message};
 
 /// Streaming wire-format encoder. Build once per (proto message type,
 /// Arrow schema) pair, then call [`WireToArrowEncoder::encode_batch`]
@@ -62,14 +62,16 @@ impl WireToArrowEncoder {
         let mut builders = BuilderNodeList::with_capacity(&self.plan, capacity)?;
         let mut dropped = 0u64;
         let mut sample_err: Option<WireToArrowError> = None;
+        let mut variants = BuiltVariants::default();
 
         for msg_bytes in messages {
+            variants.clear();
             // Pre-validate so a malformed row drops without poisoning any
             // builder. Arrow `*Builder` has no public rollback API, and
             // nested-struct `finalize_row` calls inside `scan_message` are
             // not reversible, so an upfront validation pass is how we
             // isolate per-row decode failures.
-            if let Err(err) = validate_message(&self.plan, msg_bytes) {
+            if let Err(err) = validate_message(&self.plan, msg_bytes, &mut variants) {
                 dropped += 1;
                 if sample_err.is_none() {
                     sample_err = Some(err);
@@ -77,7 +79,7 @@ impl WireToArrowEncoder {
                 continue;
             }
             builders.reset_present();
-            scan_message(&self.plan, msg_bytes, &mut builders)?;
+            scan_message(&self.plan, msg_bytes, &mut builders, &mut variants)?;
             builders.finalize_row(&self.plan);
         }
 

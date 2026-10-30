@@ -2975,6 +2975,7 @@ dependencies = [
  "apache-avro 0.20.0",
  "arrow 59.2.0",
  "async-trait",
+ "base64 0.22.1",
  "bytes 1.11.1",
  "chrono",
  "csv-core",

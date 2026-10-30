@@ -13,7 +13,6 @@ use super::append::{
     append_enum_string_from_wire, append_repeated_enum_string, append_repeated_scalar,
     append_scalar_from_wire, encode_variant, expect_len, validate_enum_string_from_wire,
     validate_repeated_enum_string, validate_repeated_scalar, validate_scalar_from_wire,
-    validate_variant_from_wire,
 };
 use super::builders::{self, BuilderNodeList};
 use super::errors::{Result, WireToArrowError};
@@ -31,6 +30,7 @@ pub(super) fn scan_message(
     plan: &MessagePlan,
     mut bytes: &[u8],
     builders: &mut BuilderNodeList,
+    variants: &mut BuiltVariants,
 ) -> Result<()> {
     let dispatch_table = plan.slot_by_proto_field.as_slice();
     while !bytes.is_empty() {
@@ -59,12 +59,9 @@ pub(super) fn scan_message(
                 present[slot_idx] = true;
             }
             builders::BuilderNode::Variant {
-                metadata,
-                value,
-                source,
-                ..
+                metadata, value, ..
             } => {
-                let (m, v) = encode_variant(source, &field.value)?;
+                let (m, v) = variants.take()?;
                 metadata.append_value(&m);
                 value.append_value(&v);
                 present[slot_idx] = true;
@@ -73,10 +70,9 @@ pub(super) fn scan_message(
                 metadata,
                 value,
                 current_offset,
-                source,
                 ..
             } => {
-                let (m, v) = encode_variant(source, &field.value)?;
+                let (m, v) = variants.take()?;
                 metadata.append_value(&m);
                 value.append_value(&v);
                 *current_offset =
@@ -92,7 +88,7 @@ pub(super) fn scan_message(
             } => {
                 let sub_bytes = expect_len(&field.value)?;
                 children.reset_present();
-                scan_message(sub_plan, sub_bytes, children)?;
+                scan_message(sub_plan, sub_bytes, children, variants)?;
                 children.finalize_row(sub_plan);
                 present[slot_idx] = true;
             }
@@ -110,7 +106,7 @@ pub(super) fn scan_message(
             } => {
                 let sub_bytes = expect_len(&field.value)?;
                 children.reset_present();
-                scan_message(sub_plan, sub_bytes, children)?;
+                scan_message(sub_plan, sub_bytes, children, variants)?;
                 children.finalize_row(sub_plan);
                 // Cumulative across the batch — checked_add converts what
                 // would otherwise be a release-mode wrap + OffsetBuffer
@@ -167,7 +163,14 @@ pub(super) fn scan_message(
 /// clear signal of a code bug rather than user input.
 ///
 /// [`WireToArrowEncoder::encode_batch`]: super::encoder::WireToArrowEncoder::encode_batch
-pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<()> {
+///
+/// VARIANT values are fully built here and pushed onto `variants`, in wire
+/// order, for the scan to append.
+pub(super) fn validate_message(
+    plan: &MessagePlan,
+    mut bytes: &[u8],
+    variants: &mut BuiltVariants,
+) -> Result<()> {
     // Track which singular slots (Scalar / Struct) have been seen in this
     // message so a duplicate tag drops the row instead of corrupting
     // column-length alignment downstream in scan_message. Proto3 parsers
@@ -213,11 +216,11 @@ pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<(
                     });
                 }
                 let sub_bytes = expect_len(&field.value)?;
-                validate_message(sub_plan, sub_bytes)?;
+                validate_message(sub_plan, sub_bytes, variants)?;
             }
             PlanSlot::RepeatedMessage(sub_plan) | PlanSlot::Map(sub_plan) => {
                 let sub_bytes = expect_len(&field.value)?;
-                validate_message(sub_plan, sub_bytes)?;
+                validate_message(sub_plan, sub_bytes, variants)?;
             }
             PlanSlot::RepeatedScalar(sk) => validate_repeated_scalar(*sk, &field.value)?,
             PlanSlot::RepeatedEnumString(desc) => {
@@ -232,19 +235,21 @@ pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<(
                 validate_enum_string_from_wire(desc, &field.value)?;
             }
             // Singular field: dedup like Scalar/Struct, and run the full Variant
-            // build so a malformed-JSON *or* build-failing row is dropped
-            // identically to the scan path.
+            // build so a malformed-JSON *or* build-failing row is dropped before
+            // the scan appends it.
             PlanSlot::Variant(source) => {
                 if seen_singular.test_and_set(slot_idx) {
                     return Err(WireToArrowError::DuplicateSingularField {
                         field_number: field.field_num as u32,
                     });
                 }
-                validate_variant_from_wire(source, &field.value)?;
+                variants.push(encode_variant(source, &field.value)?);
             }
             // Repeated: no dedup (repeated fields legitimately recur), each
-            // occurrence fully built like the scan path.
-            PlanSlot::RepeatedVariant(source) => validate_variant_from_wire(source, &field.value)?,
+            // occurrence fully built.
+            PlanSlot::RepeatedVariant(source) => {
+                variants.push(encode_variant(source, &field.value)?)
+            }
             // No proto field number ever points at an Absent slot (Absent
             // slots are Arrow columns the proto descriptor lacks), so this
             // arm is unreachable in practice. Mirror `scan_message`'s
@@ -257,6 +262,39 @@ pub(super) fn validate_message(plan: &MessagePlan, mut bytes: &[u8]) -> Result<(
         }
     }
     Ok(())
+}
+
+/// VARIANT values of one row, built by [`validate_message`] and consumed by
+/// [`scan_message`]. Both walk the same wire bytes against the same plan, so
+/// the scan meets VARIANT slots in exactly the order the pre-pass pushed them;
+/// building once instead of in both passes halves the dominant cost of
+/// VARIANT columns.
+#[derive(Default)]
+pub(super) struct BuiltVariants {
+    values: Vec<(Vec<u8>, Vec<u8>)>,
+    next: usize,
+}
+
+impl BuiltVariants {
+    /// Reset for the next row, keeping the allocation.
+    pub(super) fn clear(&mut self) {
+        self.values.clear();
+        self.next = 0;
+    }
+
+    fn push(&mut self, built: (Vec<u8>, Vec<u8>)) {
+        self.values.push(built);
+    }
+
+    fn take(&mut self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let built = self.values.get_mut(self.next).map(std::mem::take).ok_or(
+            WireToArrowError::PlanBuilderMismatch {
+                site: "scan_message:variant_not_prebuilt",
+            },
+        )?;
+        self.next += 1;
+        Ok(built)
+    }
 }
 
 /// Bitset for tracking which singular slots have already been seen in one
