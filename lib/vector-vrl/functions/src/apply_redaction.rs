@@ -35,6 +35,11 @@ impl Function for ApplyRedaction {
             `plan_file` must be a literal path to a serialized `RedactionPlanSet`. It is read and
             registered once when the VRL program is compiled.
 
+            GENERATE_PUID actions use the indexed `puid_mapping` enrichment table. INT64 targets
+            receive native protobuf int64 values; STRING targets receive signed decimal text.
+            String targets must declare a shape that accepts decimal text when shape enforcement
+            is enabled. A missing mapping removes the source ID and omits the derived PUID.
+
             `enforce_shapes` is an optional literal boolean (default false) that gates data-shape
             enforcement: when true, `PassThroughString` fields are kept only if they match a declared
             shape; when false or absent, they pass through verbatim. It must be a literal so the
@@ -419,13 +424,20 @@ mod tests {
     }
 
     fn write_puid_plan(target_type: plan_proto::PuidTargetType) -> String {
+        write_puid_plan_with_string_shapes(target_type, vec![executor::DataShape::Numeric as i32])
+    }
+
+    fn write_puid_plan_with_string_shapes(
+        target_type: plan_proto::PuidTargetType,
+        string_shapes: Vec<i32>,
+    ) -> String {
         use plan_proto::field_action::Action;
 
-        let derived_shapes = (target_type == plan_proto::PuidTargetType::String).then(|| {
+        let derived_shapes = (target_type == plan_proto::PuidTargetType::String).then_some(
             plan_proto::redact_from::DerivedShapes {
-                shapes: vec![executor::DataShape::Numeric as i32],
-            }
-        });
+                shapes: string_shapes,
+            },
+        );
         let plan = plan_proto::RedactionPlanSet {
             plans: vec![plan_proto::MessageRedactionPlan {
                 actions: vec![
@@ -554,21 +566,102 @@ mod tests {
     }
 
     #[test]
-    fn string_puid_plan_fails_to_compile() {
-        let mut cctx = FunctionCompileContext::new(Span::new(0, 0), CompileConfig::default());
-        let args = func_args![
-            message: Bytes::from(record(7, 9)),
-            plan_file: write_puid_plan(plan_proto::PuidTargetType::String),
-        ];
-        let error = ApplyRedaction
-            .compile(&TypeState::default(), &mut cctx, args.into())
-            .expect_err("Vector must reject string PUID targets")
-            .message();
+    fn string_puid_plan_uses_index_and_preserves_signed_decimal_values() {
+        for mapped_puid in [0, 9_007_199_254_740_993, i64::MIN, i64::MAX] {
+            let table = TestPuidTable::new(vec![puid_row(Value::Integer(mapped_puid))]);
+            let indexes = table.indexes.clone();
+            let registry = registry_with_puid_table(table);
+            let mut config = CompileConfig::default();
+            config.set_custom(registry.clone());
+            let mut cctx = FunctionCompileContext::new(Span::new(0, 0), config);
+            let args = func_args![
+                message: Bytes::from(record(7, 9)),
+                plan_file: write_puid_plan(plan_proto::PuidTargetType::String),
+                enforce_shapes: true,
+            ];
+            let expr = ApplyRedaction
+                .compile(&TypeState::default(), &mut cctx, args.into())
+                .expect("string PUID plan should compile");
 
-        assert!(
-            error.contains("must be INT64"),
-            "unexpected diagnostic: {error}"
-        );
+            assert_eq!(
+                *indexes.lock().expect("indexes lock"),
+                vec![(Case::Sensitive, vec![USER_ID_FIELD.to_owned()])]
+            );
+            registry.finish_load();
+
+            let expected = mapped_puid.to_string();
+            let mut wire = vec![(2u8 << 3) | 2, expected.len() as u8];
+            wire.extend_from_slice(expected.as_bytes());
+            assert_eq!(
+                resolve_expression(expr).expect("string PUID redaction should resolve"),
+                Value::Bytes(Bytes::from(wire))
+            );
+        }
+    }
+
+    #[test]
+    fn string_puid_plan_preserves_shape_enforcement() {
+        let mapped_puid = i64::MIN;
+        for numeric_allowed in [false, true] {
+            let mut shapes = vec![executor::DataShape::Hex64 as i32];
+            if numeric_allowed {
+                shapes.push(executor::DataShape::Numeric as i32);
+            }
+            let registry = registry_with_puid_table(TestPuidTable::new(vec![puid_row(
+                Value::Integer(mapped_puid),
+            )]));
+            let mut config = CompileConfig::default();
+            config.set_custom(registry.clone());
+            let mut cctx = FunctionCompileContext::new(Span::new(0, 0), config);
+            let args = func_args![
+                message: Bytes::from(record_with_unrelated_field(7, 9, 11)),
+                plan_file: write_puid_plan_with_string_shapes(
+                    plan_proto::PuidTargetType::String, shapes
+                ),
+                enforce_shapes: true,
+            ];
+            let expr = ApplyRedaction
+                .compile(&TypeState::default(), &mut cctx, args.into())
+                .expect("string plan should compile regardless of shape compatibility");
+            registry.finish_load();
+
+            let mut wire = Vec::new();
+            if numeric_allowed {
+                let expected = mapped_puid.to_string();
+                wire.extend_from_slice(&[(2u8 << 3) | 2, expected.len() as u8]);
+                wire.extend_from_slice(expected.as_bytes());
+            }
+            wire.extend_from_slice(&[(3u8 << 3), 11]);
+            assert_eq!(
+                resolve_expression(expr).expect("shape mismatch should not drop the record"),
+                Value::Bytes(Bytes::from(wire))
+            );
+        }
+    }
+
+    #[test]
+    fn string_puid_miss_and_lookup_error_preserve_unrelated_fields() {
+        for rows in [Ok(Vec::new()), Err("lookup unavailable".to_owned())] {
+            let mut table = TestPuidTable::new(Vec::new());
+            table.rows = rows;
+            let registry = registry_with_puid_table(table);
+            let mut config = CompileConfig::default();
+            config.set_custom(registry.clone());
+            let mut cctx = FunctionCompileContext::new(Span::new(0, 0), config);
+            let args = func_args![
+                message: Bytes::from(record_with_unrelated_field(7, 9, 11)),
+                plan_file: write_puid_plan(plan_proto::PuidTargetType::String),
+                enforce_shapes: true,
+            ];
+            let expr = ApplyRedaction
+                .compile(&TypeState::default(), &mut cctx, args.into())
+                .expect("string PUID plan should compile");
+            registry.finish_load();
+            assert_eq!(
+                resolve_expression(expr).expect("lookup failure should retain the record"),
+                Value::Bytes(Bytes::from(vec![(3u8 << 3), 11]))
+            );
+        }
     }
 
     #[test]

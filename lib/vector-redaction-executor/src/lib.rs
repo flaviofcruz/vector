@@ -248,8 +248,8 @@ pub enum PuidLookupResult {
     Error,
 }
 
-/// Validates that every `GENERATE_PUID` action targets a native int64 and returns whether the plan
-/// needs the regional lookup. String PUIDs are a Classic-only legacy contract.
+/// Validates `GENERATE_PUID` target types before registering the regional lookup. The explicit
+/// target type determines whether the executor emits a native int64 or signed decimal text.
 #[cfg(feature = "static-executor")]
 pub fn plan_requires_puid_lookup(plan_bytes: &[u8]) -> Result<bool, RedactError> {
     use plan_proto::field_action::Action;
@@ -268,9 +268,14 @@ pub fn plan_requires_puid_lookup(plan_bytes: &[u8]) -> Result<bool, RedactError>
         if redact_from.transform != Some(plan_proto::RedactFromTransform::GeneratePuid as i32) {
             continue;
         }
-        if redact_from.puid_target_type != Some(plan_proto::PuidTargetType::Int64 as i32) {
+        if !matches!(
+            redact_from
+                .puid_target_type
+                .and_then(|value| plan_proto::PuidTargetType::try_from(value).ok()),
+            Some(plan_proto::PuidTargetType::String | plan_proto::PuidTargetType::Int64)
+        ) {
             return Err(RedactError::InvalidPlan(
-                "Vector GENERATE_PUID targets must be INT64".to_owned(),
+                "Vector GENERATE_PUID targets must be STRING or INT64".to_owned(),
             ));
         }
         requires_puid_lookup = true;
@@ -753,6 +758,14 @@ mod tests {
         output
     }
 
+    fn encode_string_field(field_number: u64, value: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        encode_varint((field_number << 3) | 2, &mut output);
+        encode_varint(value.len() as u64, &mut output);
+        output.extend_from_slice(value.as_bytes());
+        output
+    }
+
     fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
         while value >= 0x80 {
             output.push((value as u8) | 0x80);
@@ -862,19 +875,58 @@ mod tests {
 
     #[test]
     fn detects_puid_plan_requirement() {
-        assert!(
-            plan_requires_puid_lookup(&puid_plan(plan_proto::PuidTargetType::Int64))
-                .expect("plan should decode")
-        );
+        for target_type in [
+            plan_proto::PuidTargetType::String,
+            plan_proto::PuidTargetType::Int64,
+        ] {
+            assert!(plan_requires_puid_lookup(&puid_plan(target_type)).expect("plan should decode"));
+        }
         assert!(!plan_requires_puid_lookup(&[0x0a, 0x00]).expect("minimal plan should decode"));
     }
 
     #[test]
-    fn rejects_string_puid_targets() {
-        assert!(matches!(
-            plan_requires_puid_lookup(&puid_plan(plan_proto::PuidTargetType::String)),
-            Err(RedactError::InvalidPlan(_))
-        ));
+    fn rejects_missing_unspecified_and_unknown_puid_targets() {
+        use plan_proto::field_action::Action;
+
+        for target_type in [None, Some(0), Some(3), Some(i32::MAX)] {
+            let mut plan = plan_proto::RedactionPlanSet::decode(
+                puid_plan(plan_proto::PuidTargetType::Int64).as_slice(),
+            )
+            .expect("plan should decode");
+            let Some(Action::RedactFrom(action)) = plan.plans[0].actions[1]
+                .action
+                .as_mut()
+                .and_then(|action| action.action.as_mut())
+            else {
+                panic!("PUID plan must contain its derivation");
+            };
+            action.puid_target_type = target_type;
+            assert!(matches!(
+                plan_requires_puid_lookup(&plan.encode_to_vec()),
+                Err(RedactError::InvalidPlan(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn string_puid_lookup_preserves_full_signed_range_with_shape_enforcement() {
+        let handle = register_plan(&puid_plan(plan_proto::PuidTargetType::String))
+            .expect("string plan should register");
+        for puid in [0, 9_007_199_254_740_993, i64::MIN, i64::MAX] {
+            let output = redact_with_puid_lookup(
+                handle,
+                &[0x08, 0x07],
+                ShapeEnforcement::On,
+                KeepMode::Wipe,
+                &|user_id| {
+                    assert_eq!(user_id, 7);
+                    PuidLookupResult::Found(puid)
+                },
+            )
+            .expect("string target should redact");
+            assert_eq!(output.as_ref(), encode_string_field(2, &puid.to_string()));
+        }
+        release_plan(handle);
     }
 
     #[test]
