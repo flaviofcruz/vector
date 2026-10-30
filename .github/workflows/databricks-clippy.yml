@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify redaction test fixture
-        run: echo "a0c90e304e00c2bbd28cb1e46f25ea6cf5542c1997bcd98cdb1ecbca98d857a4  vector/lib/vector-redaction-executor/tests/fixtures/linux-x86_64/libvector_redactor.a" | sha256sum --check -
+        run: echo "05ec8a74d9b2b6621323ce294665b3c8b3a461cf612228800ba8bf601b1e6359  vector/lib/vector-redaction-executor/tests/fixtures/linux-x86_64/libvector_redactor.a" | sha256sum --check -
 
       - name: Set up Rust workspace
         uses: ./vector/.github/actions/setup-rust-workspace

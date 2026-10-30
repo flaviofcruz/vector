@@ -602,11 +602,28 @@ mod tests {
     #[test]
     fn string_puid_plan_preserves_shape_enforcement() {
         let mapped_puid = i64::MIN;
-        for numeric_allowed in [false, true] {
-            let mut shapes = vec![executor::DataShape::Hex64 as i32];
-            if numeric_allowed {
-                shapes.push(executor::DataShape::Numeric as i32);
-            }
+        let hex = "0000000000000000000000000000000000000000000000008000000000000000";
+        let numeric = "-9223372036854775808";
+        for (shapes, expected) in [
+            (vec![executor::DataShape::Hex64 as i32], Some(hex)),
+            (vec![executor::DataShape::Numeric as i32], Some(numeric)),
+            (
+                vec![
+                    executor::DataShape::Hex64 as i32,
+                    executor::DataShape::Numeric as i32,
+                ],
+                Some(hex),
+            ),
+            (
+                vec![
+                    executor::DataShape::Numeric as i32,
+                    executor::DataShape::Hex64 as i32,
+                ],
+                Some(hex),
+            ),
+            (vec![executor::DataShape::Uuid as i32], None),
+            (vec![], None),
+        ] {
             let registry = registry_with_puid_table(TestPuidTable::new(vec![puid_row(
                 Value::Integer(mapped_puid),
             )]));
@@ -626,8 +643,7 @@ mod tests {
             registry.finish_load();
 
             let mut wire = Vec::new();
-            if numeric_allowed {
-                let expected = mapped_puid.to_string();
+            if let Some(expected) = expected {
                 wire.extend_from_slice(&[(2u8 << 3) | 2, expected.len() as u8]);
                 wire.extend_from_slice(expected.as_bytes());
             }
