@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use base64::Engine;
 use http::Uri;
-use prost_reflect::{DynamicMessage, MethodDescriptor, Value};
+use prost_reflect::{DynamicMessage, MethodDescriptor};
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -11,20 +11,15 @@ use tracing::info;
 use super::cache::CachedPrincipalContext;
 use super::config::{
     DEFAULT_TOKEN_LIFETIME, LoginServiceAuthConfig, MIN_TOKEN_VALIDITY, PC_METHOD_NAME,
-    PC_SERVICE_NAME, PRINCIPAL_CONTEXT_HEADER, UC_GET_TABLE_METHOD_NAME, UC_SERVICE_NAME,
-    UnityCatalogServiceConfig,
+    PC_SERVICE_NAME,
 };
-use super::error::{
-    InvalidLoginEndpointSnafu, InvalidUcEndpointSnafu, TokenManagerError, TokenTooShortLivedSnafu,
-};
+use super::error::{InvalidLoginEndpointSnafu, TokenManagerError, TokenTooShortLivedSnafu};
 use super::request::build_request_message;
 use super::response::{message_field_bytes, principal_context_expiry};
 use super::transport::{
     GrpcHttpClient, build_hyper_openssl_client, grpc_method_uri, grpc_unary_call,
     load_descriptor_pool,
 };
-use super::uc::uc_table_schema_from_response;
-use databricks_zerobus_ingest_sdk::schema::UcTableSchema;
 
 /// Manages the principal-context lifecycle: bootstrap and re-bootstrap on expiry.
 ///
@@ -42,14 +37,6 @@ pub struct TokenManager {
     client: GrpcHttpClient,
     endpoint: Uri,
     context: Arc<RwLock<Option<Arc<CachedPrincipalContext>>>>,
-    unity_catalog: Option<UnityCatalogClient>,
-}
-
-/// gRPC client for the internal Unity Catalog `getTable` RPC.
-struct UnityCatalogClient {
-    method: MethodDescriptor,
-    client: GrpcHttpClient,
-    endpoint: Uri,
 }
 
 impl TokenManager {
@@ -94,10 +81,6 @@ impl TokenManager {
             &config.login_service.login_server_name,
             config.login_service.verify_hostname,
         )?;
-        let unity_catalog = match &config.unity_catalog {
-            Some(uc) => Some(UnityCatalogClient::new(&config, uc).await?),
-            None => None,
-        };
 
         Ok(Self {
             config,
@@ -105,7 +88,6 @@ impl TokenManager {
             client,
             endpoint,
             context: Arc::new(RwLock::new(None)),
-            unity_catalog,
         })
     }
 
@@ -206,70 +188,9 @@ impl TokenManager {
             .encode(&cached.signed_principal_context))
     }
 
-    /// Fetch a table's schema from the internal Unity Catalog service, authenticating with
-    /// the unsigned principal context.
-    pub async fn get_uc_table_schema(
-        &self,
-        full_name: &str,
-    ) -> Result<UcTableSchema, TokenManagerError> {
-        let uc = self
-            .unity_catalog
-            .as_ref()
-            .ok_or(TokenManagerError::UnityCatalogNotConfigured)?;
+    /// Serialized unsigned principal context for internal Unity Catalog requests.
+    pub async fn get_unsigned_principal_context(&self) -> Result<Vec<u8>, TokenManagerError> {
         let cached = self.get_principal_context().await?;
-        uc.get_table_schema(&cached.principal_context, full_name)
-            .await
-    }
-}
-
-impl UnityCatalogClient {
-    async fn new(
-        config: &LoginServiceAuthConfig,
-        uc: &UnityCatalogServiceConfig,
-    ) -> Result<Self, TokenManagerError> {
-        let pool = load_descriptor_pool(&uc.proto_descriptor_path).await?;
-        let method = pool
-            .get_service_by_name(UC_SERVICE_NAME)
-            .and_then(|svc| svc.methods().find(|m| m.name() == UC_GET_TABLE_METHOD_NAME))
-            .ok_or_else(|| TokenManagerError::UcMethodNotFound {
-                method: UC_GET_TABLE_METHOD_NAME.into(),
-                service: UC_SERVICE_NAME.into(),
-                path: uc.proto_descriptor_path.clone(),
-            })?;
-        let endpoint: Uri = uc.endpoint.parse().context(InvalidUcEndpointSnafu {
-            uri: uc.endpoint.clone(),
-        })?;
-        let client = build_hyper_openssl_client(config, &uc.server_name, uc.verify_hostname)?;
-        Ok(Self {
-            method,
-            client,
-            endpoint,
-        })
-    }
-
-    async fn get_table_schema(
-        &self,
-        principal_context: &[u8],
-        full_name: &str,
-    ) -> Result<UcTableSchema, TokenManagerError> {
-        let mut request = DynamicMessage::new(self.method.input());
-        request
-            .try_set_field_by_name("full_name_arg", Value::String(full_name.to_string()))
-            .map_err(|e| TokenManagerError::UcResponse {
-                message: format!("set full_name_arg on getTable request: {e}"),
-            })?;
-        let headers = [(
-            PRINCIPAL_CONTEXT_HEADER,
-            base64::engine::general_purpose::STANDARD_NO_PAD.encode(principal_context),
-        )];
-        let response = grpc_unary_call(
-            &self.client,
-            grpc_method_uri(&self.endpoint, &self.method)?,
-            &headers,
-            &request,
-            &self.method.output(),
-        )
-        .await?;
-        uc_table_schema_from_response(&response)
+        Ok(cached.principal_context.clone())
     }
 }

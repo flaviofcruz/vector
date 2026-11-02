@@ -11,3 +11,8 @@ pub use token_manager::{
     LoginServiceAuthConfig, LoginServiceConfig, TokenManager, TokenManagerError, UcPermissionEntry,
     UnityCatalogServiceConfig, UserAuthInfo,
 };
+
+pub(crate) use token_manager::{
+    GrpcHttpClient, build_hyper_openssl_client, grpc_method_uri, grpc_unary_call,
+    load_descriptor_pool,
+};

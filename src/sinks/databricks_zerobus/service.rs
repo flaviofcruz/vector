@@ -26,7 +26,10 @@ use vector_lib::internal_event::CodedError;
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 
-use super::{config::ZerobusSinkConfig, error::ZerobusSinkError, headers, unity_catalog_schema};
+use super::{
+    config::ZerobusSinkConfig, error::ZerobusSinkError, headers, uc_client::UnityCatalogClient,
+    unity_catalog_schema,
+};
 
 /// Build a connector factory that routes Zerobus gRPC traffic through
 /// Vector's configured proxy, honoring `no_proxy` rules.
@@ -379,6 +382,7 @@ pub struct ZerobusService {
     schema_resolve: Arc<Mutex<()>>,
     /// Optional token manager for Login service auth.
     token_manager: Option<Arc<TokenManager>>,
+    unity_catalog_client: Option<Arc<UnityCatalogClient>>,
     /// OAuth headers provider wrapping the SDK's, built once when `custom_headers`
     /// is set on the OAuth strategy. `None` otherwise, in which case `build_stream`
     /// uses the SDK's own `builder.oauth(...)` unchanged.
@@ -436,6 +440,13 @@ impl ZerobusService {
             _ => None,
         };
 
+        let unity_catalog_client = match (&config.auth, &token_manager) {
+            (super::config::DatabricksAuthentication::LoginService(auth), Some(manager)) => Some(
+                Arc::new(UnityCatalogClient::new(auth, Arc::clone(manager)).await?),
+            ),
+            _ => None,
+        };
+
         let custom_headers = headers::leak_custom_headers(&config);
         let oauth_provider = headers::build_oauth_provider(&config, custom_headers);
 
@@ -447,6 +458,7 @@ impl ZerobusService {
             schema: Arc::new(RwLock::new(None)),
             schema_resolve: Arc::new(Mutex::new(())),
             token_manager,
+            unity_catalog_client,
             oauth_provider,
             custom_headers,
             #[cfg(test)]
@@ -455,10 +467,10 @@ impl ZerobusService {
     }
 
     /// Resolve the Arrow schema for the configured Unity Catalog table.
-    pub async fn resolve_arrow_schema(
+    async fn resolve_arrow_schema(
         config: &ZerobusSinkConfig,
         http_client: &HttpClient,
-        token_manager: Option<&Arc<TokenManager>>,
+        unity_catalog_client: Option<&Arc<UnityCatalogClient>>,
     ) -> Result<arrow::datatypes::Schema, ZerobusSinkError> {
         match &config.schema {
             super::config::SchemaSource::Path { .. } => Err(ZerobusSinkError::ConfigError {
@@ -479,17 +491,16 @@ impl ZerobusService {
                     )
                     .await?
                     .to_sdk_uc_schema(),
-                    super::config::DatabricksAuthentication::LoginService(_) => token_manager
-                        .ok_or_else(|| ZerobusSinkError::ConfigError {
-                            message: "LoginService auth requires a token manager".to_string(),
-                        })?
-                        .get_uc_table_schema(&config.table_name)
-                        .await
-                        .map_err(|e| ZerobusSinkError::SchemaError {
-                            message: format!("Failed to fetch table schema: {}", e),
-                            retryable: e.is_retryable(),
-                            status: None,
-                        })?,
+                    super::config::DatabricksAuthentication::LoginService(_) => {
+                        unity_catalog_client
+                            .ok_or_else(|| ZerobusSinkError::ConfigError {
+                                message:
+                                    "LoginService auth requires an internal Unity Catalog client"
+                                        .to_string(),
+                            })?
+                            .get_table_schema(&config.table_name)
+                            .await?
+                    }
                 };
 
                 // Mark VARIANT columns with `arrow.parquet.variant` so the batch
@@ -602,7 +613,7 @@ impl ZerobusService {
                 Self::resolve_arrow_schema(
                     &self.config,
                     &self.http_client,
-                    self.token_manager.as_ref(),
+                    self.unity_catalog_client.as_ref(),
                 )
                 .await?
             }
@@ -611,7 +622,7 @@ impl ZerobusService {
         let arrow_schema = Self::resolve_arrow_schema(
             &self.config,
             &self.http_client,
-            self.token_manager.as_ref(),
+            self.unity_catalog_client.as_ref(),
         )
         .await?;
         let mut batch_encoding = self.config.batch_encoding.clone();
@@ -1006,6 +1017,7 @@ impl Clone for ZerobusService {
             schema: Arc::clone(&self.schema),
             schema_resolve: Arc::clone(&self.schema_resolve),
             token_manager: self.token_manager.clone(),
+            unity_catalog_client: self.unity_catalog_client.clone(),
             oauth_provider: self.oauth_provider.clone(),
             custom_headers: self.custom_headers,
             #[cfg(test)]
@@ -1065,6 +1077,7 @@ impl ZerobusService {
             schema: Arc::new(RwLock::new(None)),
             schema_resolve: Arc::new(Mutex::new(())),
             token_manager: None,
+            unity_catalog_client: None,
             oauth_provider,
             custom_headers,
             schema_fetch_results: Arc::new(std::sync::Mutex::new(Default::default())),

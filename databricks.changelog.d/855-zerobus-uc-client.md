@@ -1,0 +1,1 @@
+Move internal Unity Catalog getTable/schema decoding from TokenManager into a client owned by the Zerobus sink, sharing the Login token manager. Preserve the auth.unity_catalog layout and connection settings. https://github.com/databricks-eng/vector/pull/855

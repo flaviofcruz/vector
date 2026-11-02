@@ -17,11 +17,11 @@ use super::error::{
 };
 
 /// HTTP client used for every gRPC call issued by the token manager.
-pub(super) type GrpcHttpClient =
+pub(crate) type GrpcHttpClient =
     hyper::Client<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>;
 
 /// Load a runtime-mounted `FileDescriptorSet` into a `DescriptorPool`.
-pub(super) async fn load_descriptor_pool(path: &Path) -> Result<DescriptorPool, TokenManagerError> {
+pub(crate) async fn load_descriptor_pool(path: &Path) -> Result<DescriptorPool, TokenManagerError> {
     let descriptor_bytes = tokio::fs::read(path).await.context(ReadDescriptorSnafu {
         path: path.to_path_buf(),
     })?;
@@ -35,7 +35,7 @@ pub(super) async fn load_descriptor_pool(path: &Path) -> Result<DescriptorPool, 
 /// to the request URI; SNI is set to `server_name` for the s2s-proxy sidecar to
 /// route correctly. With `verify_hostname` false the certificate chain is still
 /// verified, but not its hostname.
-pub(super) fn build_hyper_openssl_client(
+pub(crate) fn build_hyper_openssl_client(
     config: &LoginServiceAuthConfig,
     server_name: &str,
     verify_hostname: bool,
@@ -95,7 +95,7 @@ pub(super) fn build_hyper_openssl_client(
 ///
 /// `extra_headers` are added verbatim; binary (`-bin`) header values must already be
 /// base64-encoded.
-pub(super) async fn grpc_unary_call(
+pub(crate) async fn grpc_unary_call(
     client: &GrpcHttpClient,
     uri: Uri,
     extra_headers: &[(&str, String)],
@@ -154,7 +154,7 @@ pub(super) fn grpc_status_error(headers: &HeaderMap) -> Option<TokenManagerError
 }
 
 /// Build the request URI for `method` on `endpoint`.
-pub(super) fn grpc_method_uri(
+pub(crate) fn grpc_method_uri(
     endpoint: &Uri,
     method: &prost_reflect::MethodDescriptor,
 ) -> Result<Uri, TokenManagerError> {

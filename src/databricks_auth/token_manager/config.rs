@@ -32,14 +32,6 @@ pub(super) const PC_METHOD_NAME: &str = "CreatePrincipalContext";
 /// accepts from data-plane callers.
 pub(super) const SIGNED_PRINCIPAL_CONTEXT_TYPE: &str = "PCTX_DP_AUTH_TOKEN";
 
-/// Unity Catalog (managed-catalog) gRPC service and the method used to read a table's columns.
-pub(super) const UC_SERVICE_NAME: &str = "managedcatalog.UnityCatalogService";
-pub(super) const UC_GET_TABLE_METHOD_NAME: &str = "getTable";
-
-/// Unsigned principal-context header. UC's east-west ingress authorizes internal callers from
-/// this header (it rejects requests without one).
-pub(super) const PRINCIPAL_CONTEXT_HEADER: &str = "s2s-principal-context-bin";
-
 /// Signed principal-context header carrying the `ProtectedMetadataWrapper` Zerobus verifies.
 pub(crate) const SIGNED_PRINCIPAL_CONTEXT_HEADER: &str = "s2s-principal-context-sig-bin";
 

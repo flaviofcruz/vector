@@ -12,7 +12,6 @@ mod manager;
 mod request;
 mod response;
 mod transport;
-mod uc;
 
 pub(crate) use config::SIGNED_PRINCIPAL_CONTEXT_HEADER;
 pub use config::{
@@ -21,6 +20,10 @@ pub use config::{
 };
 pub use error::TokenManagerError;
 pub use manager::TokenManager;
+pub(crate) use transport::{
+    GrpcHttpClient, build_hyper_openssl_client, grpc_method_uri, grpc_unary_call,
+    load_descriptor_pool,
+};
 
 #[cfg(test)]
 mod tests;

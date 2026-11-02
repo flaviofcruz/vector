@@ -193,42 +193,6 @@ pub enum TokenManagerError {
         source: openssl::error::ErrorStack,
     },
 
-    /// A Unity Catalog schema fetch was requested but `unity_catalog` is not configured.
-    #[snafu(display("login_service auth has no `unity_catalog` endpoint configured"))]
-    UnityCatalogNotConfigured,
-
-    /// The Unity Catalog `getTable` method was not present in the descriptor.
-    #[snafu(display(
-        "Unity Catalog method `{}` not found in service `{}` in descriptor at {}",
-        method,
-        service,
-        path.display()
-    ))]
-    UcMethodNotFound {
-        /// Method name that was looked up.
-        method: String,
-        /// Service the method was expected to live in.
-        service: String,
-        /// Descriptor file the service was expected to live in.
-        path: PathBuf,
-    },
-
-    /// `unity_catalog.endpoint` from the config did not parse as an HTTP URI.
-    #[snafu(display("invalid unity_catalog endpoint `{}`: {}", uri, source))]
-    InvalidUcEndpoint {
-        /// The endpoint string that failed to parse.
-        uri: String,
-        /// Underlying URI parse error.
-        source: http::uri::InvalidUri,
-    },
-
-    /// The Unity Catalog `getTable` request or response did not have the expected shape.
-    #[snafu(display("Unity Catalog getTable: {}", message))]
-    UcResponse {
-        /// Description of the mismatch.
-        message: String,
-    },
-
     /// The `CreatePrincipalContext` response did not carry the expected context.
     #[snafu(display("principal context: {}", message))]
     PrincipalContext {
