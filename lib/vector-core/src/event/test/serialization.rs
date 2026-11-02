@@ -61,6 +61,48 @@ fn back_and_forth_through_bytes() {
 }
 
 #[test]
+fn disk_decoding_restores_shared_schema_and_preserves_delivery_metadata() {
+    use std::sync::Arc;
+
+    use crate::{config::LogNamespace, schema};
+
+    let default = EventMetadata::default();
+    let custom = Arc::new(schema::Definition::new_with_default_metadata(
+        vrl::value::Kind::bytes(),
+        [LogNamespace::Legacy],
+    ));
+
+    for definition in [default.schema_definition(), &custom] {
+        let mut event = LogEvent::from("log line");
+        event.metadata_mut().set_schema_definition(definition);
+        event.metadata_mut().set_delivery_event_count(7);
+        event
+            .metadata_mut()
+            .set_delivery_event_service_system("money-settings".to_owned());
+        let source_event_id = event.metadata().source_event_id();
+        let mut buffer = BytesMut::new();
+        encode_value(EventArray::from(Event::from(event)), &mut buffer);
+
+        let decoded = decode_value::<EventArray, _>(buffer)
+            .into_events()
+            .next()
+            .unwrap();
+        let metadata = decoded.as_log().metadata();
+        assert!(metadata.0.schema_definition.is_none());
+        assert!(Arc::ptr_eq(
+            metadata.schema_definition(),
+            default.schema_definition()
+        ));
+        assert_eq!(metadata.source_event_id(), source_event_id);
+        assert_eq!(metadata.delivery_event_count(), 7);
+        assert_eq!(
+            metadata.delivery_event_service_system(),
+            Some("money-settings")
+        );
+    }
+}
+
+#[test]
 fn delivery_event_count_round_trips_through_bytes() {
     let mut event = LogEvent::from("reduced log line");
     event.metadata_mut().set_delivery_event_count(7);

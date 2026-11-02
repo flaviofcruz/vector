@@ -1,6 +1,11 @@
 #![deny(missing_docs)]
 
-use std::{borrow::Cow, collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, LazyLock},
+};
 
 use derivative::Derivative;
 use lookup::OwnedTargetPath;
@@ -58,10 +63,13 @@ pub(super) struct Inner {
     /// An identifier for a globally registered schema definition which provides information about
     /// the event shape (type information, and semantic meaning of fields).
     /// This definition is only currently valid for logs, and shouldn't be used for other event types.
+    /// `None` stands for the shared default definition, so creating an event allocates nothing
+    /// for it.
     ///
     /// TODO(Jean): must not skip serialization to track schemas across restarts.
-    #[serde(default = "default_schema_definition", skip)]
-    pub(crate) schema_definition: Arc<schema::Definition>,
+    #[derivative(PartialEq(compare_with = "schema_definition_eq"))]
+    #[serde(default, skip)]
+    pub(crate) schema_definition: Option<Arc<schema::Definition>>,
 
     /// A store of values that may be dropped during the encoding process but may be needed
     /// later on. The map is indexed by meaning.
@@ -297,7 +305,7 @@ impl Default for Inner {
             value: Value::Object(ObjectMap::new()),
             secrets: Secrets::new(),
             finalizers: Default::default(),
-            schema_definition: default_schema_definition(),
+            schema_definition: None,
             source_id: None,
             source_type: None,
             upstream_id: None,
@@ -317,11 +325,29 @@ impl Default for EventMetadata {
     }
 }
 
-pub(super) fn default_schema_definition() -> Arc<schema::Definition> {
+static DEFAULT_SCHEMA_DEFINITION: LazyLock<Arc<schema::Definition>> = LazyLock::new(|| {
     Arc::new(schema::Definition::new_with_default_metadata(
         Kind::any(),
         [LogNamespace::Legacy, LogNamespace::Vector],
     ))
+});
+
+fn default_schema_definition() -> &'static Arc<schema::Definition> {
+    &DEFAULT_SCHEMA_DEFINITION
+}
+
+fn resolve_schema_definition(
+    definition: Option<&Arc<schema::Definition>>,
+) -> &Arc<schema::Definition> {
+    definition.unwrap_or_else(|| default_schema_definition())
+}
+
+#[expect(clippy::ref_option, reason = "signature required by `derivative`")]
+fn schema_definition_eq(
+    left: &Option<Arc<schema::Definition>>,
+    right: &Option<Arc<schema::Definition>>,
+) -> bool {
+    resolve_schema_definition(left.as_ref()) == resolve_schema_definition(right.as_ref())
 }
 
 impl ByteSizeOf for EventMetadata {
@@ -366,7 +392,7 @@ impl EventMetadata {
     /// Replace the schema definition with the given one.
     #[must_use]
     pub fn with_schema_definition(mut self, schema_definition: &Arc<schema::Definition>) -> Self {
-        self.get_mut().schema_definition = Arc::clone(schema_definition);
+        self.get_mut().schema_definition = Some(Arc::clone(schema_definition));
         self
     }
 
@@ -455,12 +481,12 @@ impl EventMetadata {
 
     /// Get the schema definition.
     pub fn schema_definition(&self) -> &Arc<schema::Definition> {
-        &self.0.schema_definition
+        resolve_schema_definition(self.0.schema_definition.as_ref())
     }
 
     /// Set the schema definition.
     pub fn set_schema_definition(&mut self, definition: &Arc<schema::Definition>) {
-        self.get_mut().schema_definition = Arc::clone(definition);
+        self.get_mut().schema_definition = Some(Arc::clone(definition));
     }
 
     /// Helper function to add a semantic meaning to the schema definition.
@@ -479,7 +505,11 @@ impl EventMetadata {
     ///     .set_schema_definition(new_schema);
     /// ````
     pub fn add_schema_meaning(&mut self, target_path: OwnedTargetPath, meaning: &str) {
-        let schema = Arc::make_mut(&mut self.get_mut().schema_definition);
+        let schema = Arc::make_mut(
+            self.get_mut()
+                .schema_definition
+                .get_or_insert_with(|| Arc::clone(default_schema_definition())),
+        );
         schema.add_meaning(target_path, meaning);
     }
 }
@@ -593,6 +623,99 @@ mod test {
 
     const SECRET: &str = "secret";
     const SECRET2: &str = "secret2";
+
+    #[test]
+    fn default_schema_is_shared_without_storing_an_arc() {
+        let first = EventMetadata::default();
+        let second = EventMetadata::default();
+
+        assert!(first.0.schema_definition.is_none());
+        assert!(second.0.schema_definition.is_none());
+        assert!(Arc::ptr_eq(
+            first.schema_definition(),
+            second.schema_definition()
+        ));
+    }
+
+    #[test]
+    fn schema_equality_resolves_implicit_defaults() {
+        let implicit = EventMetadata::default();
+        let equivalent = Arc::new(schema::Definition::new_with_default_metadata(
+            Kind::any(),
+            [LogNamespace::Legacy, LogNamespace::Vector],
+        ));
+        let explicit = EventMetadata::default().with_schema_definition(&equivalent);
+        assert_eq!(implicit, explicit);
+        assert_eq!(explicit, implicit);
+
+        let custom = Arc::new(schema::Definition::new_with_default_metadata(
+            Kind::bytes(),
+            [LogNamespace::Legacy],
+        ));
+        let mut changed = implicit.clone();
+        changed.set_schema_definition(&custom);
+        assert_ne!(changed, implicit);
+        assert!(Arc::ptr_eq(changed.schema_definition(), &custom));
+        assert_eq!(
+            changed,
+            EventMetadata::default().with_schema_definition(&custom)
+        );
+    }
+
+    #[test]
+    fn adding_schema_meanings_does_not_mutate_clones_or_the_shared_default() {
+        let default = EventMetadata::default();
+        let explicit = EventMetadata::default().with_schema_definition(default.schema_definition());
+        let path = OwnedTargetPath::event(lookup::owned_value_path!("message"));
+
+        for mut changed in [default.clone(), explicit] {
+            let original = changed.clone();
+            changed.add_schema_meaning(path.clone(), "message");
+
+            assert_eq!(
+                changed.schema_definition().meaning_path("message"),
+                Some(&path)
+            );
+            assert_eq!(original.schema_definition().meaning_path("message"), None);
+            assert_eq!(default.schema_definition().meaning_path("message"), None);
+            assert_ne!(changed, original);
+        }
+    }
+
+    #[test]
+    fn serde_restores_shared_schema_without_losing_delivery_metadata() {
+        let default = EventMetadata::default();
+        let custom = Arc::new(schema::Definition::new_with_default_metadata(
+            Kind::bytes(),
+            [LogNamespace::Legacy],
+        ));
+
+        for definition in [default.schema_definition(), &custom] {
+            let mut metadata = EventMetadata::default().with_schema_definition(definition);
+            metadata.set_delivery_event_count(7);
+            metadata.set_delivery_event_service_system("money-settings".to_owned());
+            metadata.set_delivery_path_accounting(Some(DeliveryPathAccounting::default()));
+            let encoded = serde_json::to_value(&metadata).unwrap();
+            assert!(encoded.get("schema_definition").is_none());
+
+            let decoded: EventMetadata = serde_json::from_value(encoded).unwrap();
+            assert!(decoded.0.schema_definition.is_none());
+            assert!(Arc::ptr_eq(
+                decoded.schema_definition(),
+                default.schema_definition()
+            ));
+            assert_eq!(decoded.source_event_id(), metadata.source_event_id());
+            assert_eq!(
+                decoded.delivery_path_accounting(),
+                metadata.delivery_path_accounting()
+            );
+            assert_eq!(decoded.delivery_event_count(), 7);
+            assert_eq!(
+                decoded.delivery_event_service_system(),
+                Some("money-settings")
+            );
+        }
+    }
 
     #[test]
     fn metadata_hardcoded_secrets_get_set() {
