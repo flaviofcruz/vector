@@ -23,35 +23,28 @@ When the user asks to push changes or open a PR (including requests such as
 user:
 
 1. Make and validate the code or repository changes.
-2. Commit the changes without the `README.databricks.md` entry, then push the
-   branch.
+2. Commit the changes without the changelog fragment, then push the branch.
 3. Open the PR against `v0.53-custom` so the final PR number and URL exist.
-4. Fetch `origin/v0.53-custom` again. If it moved, rebase the PR branch before
-   choosing the changelog number. Read the refreshed end of
-   `README.databricks.md` and use the next consecutive number.
-5. Add the changelog entry with the PR's exact URL. Never commit a placeholder
-   such as `pull/TODO`, and never reuse a number already present on the fresh
-   base.
-6. Commit the changelog update as a separate commit and push again. If step 4
-   required a rebase, use `--force-with-lease` rather than an unguarded force
-   push.
-7. Verify that the PR head includes the changelog commit and that the entry's
-   number and URL are correct. Only then report the push or PR as complete.
+4. Add the changelog fragment `databricks.changelog.d/<pr-number>-<slug>.md`
+   containing the PR's exact URL. Never commit a placeholder such as
+   `pull/TODO`.
+5. Commit the fragment as a separate commit and push again.
+6. Verify that the PR head includes the fragment commit and that its file name
+   and URL match the PR. Only then report the push or PR as complete.
 
 Do not return immediately after the initial push or PR creation; the follow-up
-changelog commit, second push, and verification are part of the requested
+fragment commit, second push, and verification are part of the requested
 workflow.
 
 ## Databricks Changelog
 
 - Do not add upstream `changelog.d/*` fragments for Databricks-only changes.
-- Add a numbered entry to `README.databricks.md` for behavior changes,
-  backports, operational fixes, and repo/process changes.
-- Include the PR link in each entry. If the PR has not been opened yet, add
-  its link after creation and push that update to the same PR.
-- Keep the numbering consecutive. If `v0.53-custom` moved while you were
-  working, fetch/rebase first, then resolve the README entry at the new end of
-  the list.
+- Add a fragment to `databricks.changelog.d/` for behavior changes, backports,
+  operational fixes, and repo/process changes. See
+  `databricks.changelog.d/README.md` for the format.
+- `README.databricks.md` is the frozen historical list. Do not add, edit, or
+  renumber its entries.
+- The `BLOCKING: Databricks Changelog Check` workflow enforces both rules.
 
 ## Validation
 

@@ -1,4 +1,8 @@
 This lists custom changes merged in Databricks fork of Vector.
+
+This list is frozen at entry 316. New changes are recorded as one file per PR in
+[`databricks.changelog.d/`](databricks.changelog.d/README.md); do not add or edit entries here.
+
 1. Fix premature ack when data file is full. https://github.com/databricks/vector/pull/1
 2. Retry s3 request even when observing ConstructionFailure to avoid data loss. https://github.com/databricks/vector/pull/2
 3. Updating/adding INFO logs for when vector sends to cloud storage. https://github.com/databricks/vector/pull/5

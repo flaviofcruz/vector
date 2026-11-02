@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 
-"""Validate appended Databricks changelog entries for a pull request."""
+"""Validate the Databricks changelog fragment added by a pull request.
+
+Each PR adds one file per change to `databricks.changelog.d/`, named
+`<pr-number>-<slug>.md`, containing the PR's URL. `README.databricks.md` holds
+the frozen historical list; its numbered entries must not change.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,13 @@ import sys
 from dataclasses import dataclass
 
 
+FRAGMENT_DIR = "databricks.changelog.d"
+FROZEN_CHANGELOG = "README.databricks.md"
+FRAGMENT_NAME = re.compile(
+    rf"^{re.escape(FRAGMENT_DIR)}/([0-9]+)-[a-z0-9][a-z0-9-]*\.md$"
+)
+# Files in the fragment directory that are not changelog fragments.
+NON_FRAGMENT_FILES = {f"{FRAGMENT_DIR}/README.md"}
 ENTRY_HEADING = re.compile(r"^([0-9]+)\.\s")
 
 
@@ -61,45 +73,57 @@ def contains_exact_pr_url(text: str, pr_url: str) -> bool:
     return re.search(re.escape(pr_url) + boundary, text) is not None
 
 
-def validate_changelog(base_contents: str, head_contents: str, pr_url: str) -> list[Entry]:
-    """Return valid appended entries or raise a policy error."""
-    base_entries = parse_entries(base_contents)
-    head_entries = parse_entries(head_contents)
+def validate_changelog(
+    base_frozen: str,
+    head_frozen: str,
+    added_files: dict[str, str],
+    pr_number: int,
+    pr_url: str,
+) -> list[str]:
+    """Return the valid fragment paths added by the PR or raise a policy error.
 
-    if not base_entries:
-        raise ValidationError("The base changelog has no numbered entries.")
+    `added_files` maps each file the PR adds under the fragment directory to its
+    contents.
+    """
+    # Compare text, not line positions, so the header above the list may change.
+    def entry_texts(contents: str) -> list[tuple[int, tuple[str, ...]]]:
+        return [(entry.number, entry.lines) for entry in parse_entries(contents)]
 
-    base_numbers = [entry.number for entry in base_entries]
-    existing_head_numbers = [
-        entry.number for entry in head_entries[: len(base_entries)]
-    ]
-    if len(head_entries) < len(base_entries) or existing_head_numbers != base_numbers:
+    if entry_texts(base_frozen) != entry_texts(head_frozen):
         raise ValidationError(
-            "Existing changelog entry headings were inserted, removed, reordered, or "
-            "renumbered. Preserve existing headings and append new entries at the end."
+            f"{FROZEN_CHANGELOG} is frozen: do not add, edit or renumber its "
+            f"entries. Add a file to {FRAGMENT_DIR}/ instead."
         )
 
-    new_entries = head_entries[len(base_entries) :]
-    if not new_entries:
+    fragments = []
+    for path, contents in sorted(added_files.items()):
+        if path in NON_FRAGMENT_FILES:
+            continue
+        match = FRAGMENT_NAME.match(path)
+        if not match:
+            raise ValidationError(
+                f"{path} is not a valid changelog fragment name; use "
+                f"{FRAGMENT_DIR}/{pr_number}-<slug>.md (lowercase, digits, hyphens)."
+            )
+        if int(match.group(1)) != pr_number:
+            raise ValidationError(
+                f"{path} is named for PR {match.group(1)}, but this is PR {pr_number}."
+            )
+        if not contents.strip():
+            raise ValidationError(f"{path} is empty.")
+        if not contains_exact_pr_url(contents, pr_url):
+            raise ValidationError(
+                f"{path} must contain the exact current PR URL: {pr_url}"
+            )
+        fragments.append(path)
+
+    if not fragments:
         raise ValidationError(
-            "No new numbered entry was appended to README.databricks.md."
+            f"No changelog fragment was added. Add "
+            f"{FRAGMENT_DIR}/{pr_number}-<slug>.md containing {pr_url}"
         )
 
-    expected_number = base_entries[-1].number + 1
-    for entry in new_entries:
-        if entry.number != expected_number:
-            raise ValidationError(
-                f"Expected appended changelog entry {expected_number}, found "
-                f"{entry.number} on line {entry.start_line}."
-            )
-        if not contains_exact_pr_url(entry.text, pr_url):
-            raise ValidationError(
-                f"Changelog entry {entry.number} must contain the exact current PR "
-                f"URL: {pr_url}"
-            )
-        expected_number += 1
-
-    return new_entries
+    return fragments
 
 
 def git_output(*args: str) -> str:
@@ -110,18 +134,11 @@ def git_output(*args: str) -> str:
         stderr=subprocess.PIPE,
         text=True,
     )
-    return result.stdout.strip()
+    return result.stdout
 
 
 def read_file_at_revision(revision: str, path: str) -> str:
-    result = subprocess.run(
-        ["git", "show", f"{revision}:{path}"],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    return result.stdout
+    return git_output("show", f"{revision}:{path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,18 +147,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-ref", default="HEAD")
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", required=True, type=int)
-    parser.add_argument("--path", default="README.databricks.md")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
-        merge_base = git_output("merge-base", args.base_ref, args.head_ref)
-        base_contents = read_file_at_revision(merge_base, args.path)
-        head_contents = read_file_at_revision(args.head_ref, args.path)
+        merge_base = git_output("merge-base", args.base_ref, args.head_ref).strip()
+        added_paths = git_output(
+            "diff",
+            "--name-only",
+            "--diff-filter=A",
+            merge_base,
+            args.head_ref,
+            "--",
+            FRAGMENT_DIR,
+        ).splitlines()
+        added_files = {
+            path: read_file_at_revision(args.head_ref, path) for path in added_paths
+        }
         pr_url = f"https://github.com/{args.repository}/pull/{args.pr_number}"
-        new_entries = validate_changelog(base_contents, head_contents, pr_url)
+        fragments = validate_changelog(
+            read_file_at_revision(merge_base, FROZEN_CHANGELOG),
+            read_file_at_revision(args.head_ref, FROZEN_CHANGELOG),
+            added_files,
+            args.pr_number,
+            pr_url,
+        )
     except ValidationError as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1
@@ -150,8 +182,7 @@ def main() -> int:
         print(f"::error::Unable to inspect the changelog: {detail}", file=sys.stderr)
         return 2
 
-    numbers = ", ".join(str(entry.number) for entry in new_entries)
-    print(f"Validated Databricks changelog entry or entries: {numbers}")
+    print(f"Validated Databricks changelog fragment(s): {', '.join(fragments)}")
     return 0
 
 
