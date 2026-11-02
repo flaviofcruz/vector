@@ -2,11 +2,15 @@ use prost_reflect::{DeserializeOptions, DynamicMessage, MessageDescriptor};
 use serde_json::json;
 use snafu::ResultExt;
 
-use super::config::LoginServiceAuthConfig;
+use super::config::{LoginServiceAuthConfig, SIGNED_PRINCIPAL_CONTEXT_TYPE};
 use super::error::{BuildRequestSnafu, TokenManagerError};
 
-/// Build a `DynamicMessage` for the OAuth bootstrap request from config + the runtime
-/// request `MessageDescriptor`.
+/// Build a `CreatePrincipalContext` request (`databricks.identity.PrincipalContextRequest`) from
+/// config + the runtime request `MessageDescriptor`.
+///
+/// With `signed` set, the request also carries a `SignedPrincipalContextConfig` so Login
+/// returns the signed wrapper Zerobus accepts; otherwise Login returns only the unsigned
+/// context UC reads.
 ///
 /// The request is constructed as a `serde_json::Value` and then deserialized into a
 /// `DynamicMessage` through `prost-reflect`'s serde integration. This gives us schema
@@ -19,6 +23,7 @@ use super::error::{BuildRequestSnafu, TokenManagerError};
 pub(super) fn build_request_message(
     config: &LoginServiceAuthConfig,
     request_desc: &MessageDescriptor,
+    signed: bool,
 ) -> Result<DynamicMessage, TokenManagerError> {
     let uc_securable_permission: Vec<_> = config
         .user
@@ -41,7 +46,7 @@ pub(super) fn build_request_message(
         json!({ "ucPermissionConstraint": { "ucSecurablePermission": uc_securable_permission } })
     };
 
-    let request = json!({
+    let mut request = json!({
         "authentication": {
             "workspace": config.user.workspace_id,
             "service": {
@@ -51,6 +56,19 @@ pub(super) fn build_request_message(
         },
         "authorization": { "authorizationConstraint": authorization_constraint },
     });
+    if signed {
+        let ssp_resource_path = config.zerobus_ssp_resource_path.clone().unwrap_or_else(|| {
+            format!(
+                "workspaces/{}/zerobusDirectWriteApi",
+                config.user.workspace_id
+            )
+        });
+        request["signedPrincipalContextConfig"] = json!({
+            "signedPrincipalContextType": SIGNED_PRINCIPAL_CONTEXT_TYPE,
+            "allowedServicePrincipalResourcePath": ssp_resource_path,
+            "metastoreId": &config.metastore_id,
+        });
+    }
 
     let opts = DeserializeOptions::new().deny_unknown_fields(true);
     DynamicMessage::deserialize_with_options(request_desc.clone(), &request, &opts)

@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
 use prost_reflect::prost_types::{
     DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto, FieldDescriptorProto,
     FileDescriptorProto, FileDescriptorSet, MethodDescriptorProto, OneofDescriptorProto,
@@ -11,80 +10,26 @@ use prost_reflect::{
     DescriptorPool, DynamicMessage, MessageDescriptor, ReflectMessage, Value, prost::Message,
 };
 
-use super::cache::CachedToken;
+use super::cache::CachedPrincipalContext;
 use super::config::{
     LoginServiceAuthConfig, LoginServiceConfig, MIN_TOKEN_VALIDITY, TOKEN_REFRESH_THRESHOLD,
     UcPermissionEntry, UserAuthInfo,
 };
 use super::error::TokenManagerError;
-use super::jwt::{extract_jwt_expiry, principal_context_from_jwt};
 use super::request::build_request_message;
+use super::response::{message_field_bytes, principal_context_expiry};
 use super::transport::{encode_grpc_message, grpc_status_error, parse_grpc_response_message};
 use super::uc::uc_table_schema_from_response;
-
-// ---- JWT expiry tests ----
-
-fn jwt_with_exp(exp: u64) -> String {
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(b"{\"typ\":\"JWT\",\"alg\":\"RS256\"}");
-    let payload =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{{\"exp\":{exp}}}"));
-    format!("{header}.{payload}.sig")
-}
-
-#[test]
-fn extract_jwt_expiry_valid() {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let jwt = jwt_with_exp(now + 3600);
-    let expiry = extract_jwt_expiry(&jwt).expect("expected Some");
-    let remaining = expiry.saturating_duration_since(Instant::now());
-    assert!(remaining.as_secs() > 3500 && remaining.as_secs() <= 3600);
-}
-
-#[test]
-fn extract_jwt_expiry_already_expired() {
-    let jwt = jwt_with_exp(1);
-    assert!(extract_jwt_expiry(&jwt).is_none());
-}
-
-#[test]
-fn extract_jwt_expiry_malformed_not_three_parts() {
-    assert!(extract_jwt_expiry("not.a.valid.jwt").is_none());
-    assert!(extract_jwt_expiry("only-one-part").is_none());
-}
-
-#[test]
-fn extract_jwt_expiry_payload_not_json() {
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(b"{\"typ\":\"JWT\",\"alg\":\"RS256\"}");
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not-json");
-    let jwt = format!("{header}.{payload}.sig");
-    assert!(extract_jwt_expiry(&jwt).is_none());
-}
-
-#[test]
-fn extract_jwt_expiry_payload_missing_exp() {
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(b"{\"typ\":\"JWT\",\"alg\":\"RS256\"}");
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"sub\":\"x\"}");
-    let jwt = format!("{header}.{payload}.sig");
-    assert!(extract_jwt_expiry(&jwt).is_none());
-}
 
 // ---- Fixture descriptor pool ----
 //
 // Builds an in-memory `FileDescriptorSet` matching the relevant subset of the
-// OAuth + identity protos so we can exercise `build_request_message` without
-// mounting a real `oauth_service.pb`. Mirrors the test pool pattern in
+// principal-context protos so we can exercise `build_request_message` without
+// mounting a real `principal_context_service.pb`. Mirrors the test pool pattern in
 // `src/sinks/bricklens_ingest/service.rs`.
 
-const TEST_REQUEST_TYPE: &str =
-    ".test.GenerateReauthenticatedAndReauthorizedInternalOAuthTokenRequest";
-const TEST_RESPONSE_TYPE: &str =
-    ".test.GenerateReauthenticatedAndReauthorizedInternalOAuthTokenResponse";
+const TEST_REQUEST_TYPE: &str = ".test.PrincipalContextRequest";
+const TEST_RESPONSE_TYPE: &str = ".test.PrincipalContextResponse";
 
 fn make_test_pool() -> DescriptorPool {
     // -- identity.proto (subset) --
@@ -236,9 +181,59 @@ fn make_test_pool() -> DescriptorPool {
         ..Default::default()
     };
 
-    // -- oauth_service.proto (subset) --
+    // -- signed_principal_context_config.proto (subset) --
+    let signed_type_enum = EnumDescriptorProto {
+        name: Some("SignedPrincipalContextType".into()),
+        value: vec![
+            EnumValueDescriptorProto {
+                name: Some("SIGNED_PRINCIPAL_CONTEXT_TYPE_UNSPECIFIED".into()),
+                number: Some(0),
+                ..Default::default()
+            },
+            EnumValueDescriptorProto {
+                name: Some("PCTX_DP_AUTH_TOKEN".into()),
+                number: Some(1),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let signed_config = DescriptorProto {
+        name: Some("SignedPrincipalContextConfig".into()),
+        field: vec![
+            FieldDescriptorProto {
+                name: Some("signed_principal_context_type".into()),
+                number: Some(1),
+                label: Some(field_descriptor_proto::Label::Optional as i32),
+                r#type: Some(field_descriptor_proto::Type::Enum as i32),
+                type_name: Some(".test.SignedPrincipalContextType".into()),
+                json_name: Some("signedPrincipalContextType".into()),
+                ..Default::default()
+            },
+            FieldDescriptorProto {
+                name: Some("allowed_service_principal_resource_path".into()),
+                number: Some(3),
+                label: Some(field_descriptor_proto::Label::Optional as i32),
+                r#type: Some(field_descriptor_proto::Type::String as i32),
+                json_name: Some("allowedServicePrincipalResourcePath".into()),
+                ..Default::default()
+            },
+            FieldDescriptorProto {
+                name: Some("metastore_id".into()),
+                number: Some(4),
+                label: Some(field_descriptor_proto::Label::Optional as i32),
+                r#type: Some(field_descriptor_proto::Type::String as i32),
+                json_name: Some("metastoreId".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    // -- principal_context_request.proto (subset) --
     let request = DescriptorProto {
-        name: Some("GenerateReauthenticatedAndReauthorizedInternalOAuthTokenRequest".into()),
+        name: Some("PrincipalContextRequest".into()),
         field: vec![
             FieldDescriptorProto {
                 name: Some("authentication".into()),
@@ -258,72 +253,79 @@ fn make_test_pool() -> DescriptorPool {
                 json_name: Some("authorization".into()),
                 ..Default::default()
             },
-        ],
-        ..Default::default()
-    };
-
-    let state_enum = EnumDescriptorProto {
-        name: Some("State".into()),
-        value: vec![
-            EnumValueDescriptorProto {
-                name: Some("STATE_UNSPECIFIED".into()),
-                number: Some(0),
-                ..Default::default()
-            },
-            EnumValueDescriptorProto {
-                name: Some("SUCCESS".into()),
-                number: Some(1),
-                ..Default::default()
-            },
-            EnumValueDescriptorProto {
-                name: Some("FAILURE".into()),
-                number: Some(2),
-                ..Default::default()
-            },
-        ],
-        ..Default::default()
-    };
-
-    let response = DescriptorProto {
-        name: Some("GenerateReauthenticatedAndReauthorizedInternalOAuthTokenResponse".into()),
-        field: vec![
             FieldDescriptorProto {
-                name: Some("state".into()),
-                number: Some(1),
-                label: Some(field_descriptor_proto::Label::Optional as i32),
-                r#type: Some(field_descriptor_proto::Type::Enum as i32),
-                type_name: Some(
-                    ".test.GenerateReauthenticatedAndReauthorizedInternalOAuthTokenResponse.State"
-                        .into(),
-                ),
-                json_name: Some("state".into()),
-                ..Default::default()
-            },
-            FieldDescriptorProto {
-                name: Some("error_message".into()),
-                number: Some(2),
-                label: Some(field_descriptor_proto::Label::Optional as i32),
-                r#type: Some(field_descriptor_proto::Type::String as i32),
-                json_name: Some("errorMessage".into()),
-                ..Default::default()
-            },
-            FieldDescriptorProto {
-                name: Some("access_token".into()),
+                name: Some("signed_principal_context_config".into()),
                 number: Some(3),
                 label: Some(field_descriptor_proto::Label::Optional as i32),
-                r#type: Some(field_descriptor_proto::Type::String as i32),
-                json_name: Some("accessToken".into()),
+                r#type: Some(field_descriptor_proto::Type::Message as i32),
+                type_name: Some(".test.SignedPrincipalContextConfig".into()),
+                json_name: Some("signedPrincipalContextConfig".into()),
                 ..Default::default()
             },
         ],
-        enum_type: vec![state_enum],
+        ..Default::default()
+    };
+
+    // -- principal_context_response.proto and its referenced messages (subset) --
+    let timestamp = DescriptorProto {
+        name: Some("Timestamp".into()),
+        field: vec![
+            pc_field("seconds", 1, field_descriptor_proto::Type::Int64, None),
+            pc_field("nanos", 2, field_descriptor_proto::Type::Int32, None),
+        ],
+        ..Default::default()
+    };
+    let authentication_details = DescriptorProto {
+        name: Some("AuthenticationDetails".into()),
+        field: vec![pc_field(
+            "token_expiration",
+            6,
+            field_descriptor_proto::Type::Message,
+            Some(".test.Timestamp"),
+        )],
+        ..Default::default()
+    };
+    let principal_context = DescriptorProto {
+        name: Some("PrincipalContext".into()),
+        field: vec![pc_field(
+            "authentication_details",
+            11,
+            field_descriptor_proto::Type::Message,
+            Some(".test.AuthenticationDetails"),
+        )],
+        ..Default::default()
+    };
+    let protected_metadata_wrapper = DescriptorProto {
+        name: Some("ProtectedMetadataWrapper".into()),
+        field: vec![
+            pc_field("header", 1, field_descriptor_proto::Type::Bytes, None),
+            pc_field("payload", 2, field_descriptor_proto::Type::Bytes, None),
+        ],
+        ..Default::default()
+    };
+    let response = DescriptorProto {
+        name: Some("PrincipalContextResponse".into()),
+        field: vec![
+            pc_field(
+                "principal_context",
+                1,
+                field_descriptor_proto::Type::Message,
+                Some(".test.PrincipalContext"),
+            ),
+            pc_field(
+                "signed_principal_context",
+                2,
+                field_descriptor_proto::Type::Message,
+                Some(".test.ProtectedMetadataWrapper"),
+            ),
+        ],
         ..Default::default()
     };
 
     let service = ServiceDescriptorProto {
-        name: Some("InternalOAuthTokenService".into()),
+        name: Some("PrincipalContextService".into()),
         method: vec![MethodDescriptorProto {
-            name: Some("GenerateReauthenticatedAndReauthorizedInternalOAuthToken".into()),
+            name: Some("CreatePrincipalContext".into()),
             input_type: Some(TEST_REQUEST_TYPE.into()),
             output_type: Some(TEST_RESPONSE_TYPE.into()),
             ..Default::default()
@@ -343,9 +345,15 @@ fn make_test_pool() -> DescriptorPool {
             uc_permission_constraint,
             authorization_constraint,
             authorization,
+            signed_config,
             request,
+            timestamp,
+            authentication_details,
+            principal_context,
+            protected_metadata_wrapper,
             response,
         ],
+        enum_type: vec![signed_type_enum],
         service: vec![service],
         ..Default::default()
     };
@@ -369,24 +377,24 @@ fn cfg(workspace_id: i64, perms: Vec<UcPermissionEntry>) -> LoginServiceAuthConf
             tls_key_file: "/dev/null".into(),
             tls_ca_file: None,
             verify_hostname: true,
-            oauth_proto_descriptor_path: PathBuf::from("/dev/null"),
+            proto_descriptor_path: PathBuf::from("/dev/null"),
         },
+        metastore_id: "metastore-1".into(),
+        zerobus_ssp_resource_path: None,
         unity_catalog: None,
     }
 }
 
 fn request_descriptor() -> MessageDescriptor {
     let pool = make_test_pool();
-    pool.get_message_by_name("test.GenerateReauthenticatedAndReauthorizedInternalOAuthTokenRequest")
+    pool.get_message_by_name("test.PrincipalContextRequest")
         .expect("request message in test pool")
 }
 
 fn response_descriptor() -> MessageDescriptor {
     let pool = make_test_pool();
-    pool.get_message_by_name(
-        "test.GenerateReauthenticatedAndReauthorizedInternalOAuthTokenResponse",
-    )
-    .expect("response message in test pool")
+    pool.get_message_by_name("test.PrincipalContextResponse")
+        .expect("response message in test pool")
 }
 
 // ---- request-shape tests against the dynamic builder ----
@@ -394,7 +402,8 @@ fn response_descriptor() -> MessageDescriptor {
 #[test]
 fn build_request_sets_workspace_scope_oneof() {
     let request_desc = request_descriptor();
-    let msg = build_request_message(&cfg(848_677_326_595_393, vec![]), &request_desc).unwrap();
+    let msg =
+        build_request_message(&cfg(848_677_326_595_393, vec![]), &request_desc, false).unwrap();
 
     let auth = msg.get_field_by_name("authentication").unwrap();
     let auth_msg = match &*auth {
@@ -411,7 +420,7 @@ fn build_request_sets_workspace_scope_oneof() {
 #[test]
 fn build_request_sets_service_method_oneof() {
     let request_desc = request_descriptor();
-    let msg = build_request_message(&cfg(1, vec![]), &request_desc).unwrap();
+    let msg = build_request_message(&cfg(1, vec![]), &request_desc, false).unwrap();
 
     let auth = msg.get_field_by_name("authentication").unwrap();
     let auth_msg = match &*auth {
@@ -460,7 +469,7 @@ fn build_request_emits_one_uc_permission_per_entry() {
         },
     ];
     let request_desc = request_descriptor();
-    let msg = build_request_message(&cfg(1, perms), &request_desc).unwrap();
+    let msg = build_request_message(&cfg(1, perms), &request_desc, false).unwrap();
 
     let authz = msg.get_field_by_name("authorization").unwrap();
     let authz_msg = match &*authz {
@@ -542,7 +551,7 @@ fn build_request_emits_one_uc_permission_per_entry() {
 #[test]
 fn build_request_with_no_uc_permissions_omits_uc_permission_constraint() {
     let request_desc = request_descriptor();
-    let msg = build_request_message(&cfg(1, vec![]), &request_desc).unwrap();
+    let msg = build_request_message(&cfg(1, vec![]), &request_desc, false).unwrap();
 
     // authorization is set, with an (empty) authorization_constraint, but no
     // uc_permission_constraint nested inside.
@@ -586,25 +595,14 @@ fn encode_grpc_message_adds_5_byte_framing() {
 fn parse_grpc_response_message_round_trip() {
     let response_desc = response_descriptor();
 
-    // Build a SUCCESS response with an access_token.
-    let mut response = DynamicMessage::new(response_desc.clone());
-    let state_field = response_desc.get_field_by_name("state").unwrap();
-    response.set_field(&state_field, Value::EnumNumber(1));
-    let token_field = response_desc.get_field_by_name("access_token").unwrap();
-    response.set_field(
-        &token_field,
-        Value::String("eyJhbGciOiJSUzI1NiJ9.payload.sig".into()),
-    );
-
-    let body_bytes = response.encode_to_vec();
-    let framed = encode_grpc_message(body_bytes);
+    let response = response_with(Some(b"pc"), Some(4_000_000_000));
+    let framed = encode_grpc_message(response.encode_to_vec());
 
     let parsed = parse_grpc_response_message(bytes::Bytes::from(framed), &response_desc).unwrap();
-    let token = parsed.get_field_by_name("access_token").unwrap();
-    match &*token {
-        Value::String(s) => assert_eq!(s, "eyJhbGciOiJSUzI1NiJ9.payload.sig"),
-        _ => panic!(),
-    }
+    assert_eq!(
+        message_field_bytes(&parsed, "principal_context").unwrap(),
+        message_field_bytes(&response, "principal_context").unwrap()
+    );
 }
 
 #[test]
@@ -636,8 +634,9 @@ fn parse_grpc_response_message_rejects_compressed_flag() {
 #[test]
 fn cached_token_is_valid_far_in_future() {
     let now = Instant::now();
-    let cached = CachedToken {
-        access_token: "tok".into(),
+    let cached = CachedPrincipalContext {
+        principal_context: vec![],
+        signed_principal_context: vec![],
         expires_at: now + Duration::from_secs(3600),
     };
     assert!(cached.is_valid_at(now));
@@ -646,8 +645,9 @@ fn cached_token_is_valid_far_in_future() {
 #[test]
 fn cached_token_not_valid_when_already_expired() {
     let now = Instant::now();
-    let cached = CachedToken {
-        access_token: "tok".into(),
+    let cached = CachedPrincipalContext {
+        principal_context: vec![],
+        signed_principal_context: vec![],
         // Saturating-sub keeps this on the past side of `now` without panicking
         // on monotonic clocks that can't represent times before the process start.
         expires_at: now - Duration::from_secs(1),
@@ -659,8 +659,9 @@ fn cached_token_not_valid_when_already_expired() {
 fn cached_token_not_valid_within_refresh_threshold() {
     let now = Instant::now();
     // Expires just inside the refresh threshold → should refresh.
-    let cached = CachedToken {
-        access_token: "tok".into(),
+    let cached = CachedPrincipalContext {
+        principal_context: vec![],
+        signed_principal_context: vec![],
         expires_at: now + TOKEN_REFRESH_THRESHOLD - Duration::from_secs(1),
     };
     assert!(!cached.is_valid_at(now));
@@ -669,8 +670,9 @@ fn cached_token_not_valid_within_refresh_threshold() {
 #[test]
 fn cached_token_valid_just_past_refresh_threshold() {
     let now = Instant::now();
-    let cached = CachedToken {
-        access_token: "tok".into(),
+    let cached = CachedPrincipalContext {
+        principal_context: vec![],
+        signed_principal_context: vec![],
         expires_at: now + TOKEN_REFRESH_THRESHOLD + Duration::from_secs(1),
     };
     assert!(cached.is_valid_at(now));
@@ -681,8 +683,9 @@ fn cached_token_below_min_validity_is_rejected() {
     let now = Instant::now();
     // A freshly minted token with less than MIN_TOKEN_VALIDITY remaining must not be served:
     // bootstrap() rejects it as TokenTooShortLived rather than risk a mid-write expiry.
-    let cached = CachedToken {
-        access_token: "tok".into(),
+    let cached = CachedPrincipalContext {
+        principal_context: vec![],
+        signed_principal_context: vec![],
         expires_at: now + MIN_TOKEN_VALIDITY - Duration::from_secs(1),
     };
     assert!(!cached.has_remaining_lifetime(now, MIN_TOKEN_VALIDITY));
@@ -691,63 +694,169 @@ fn cached_token_below_min_validity_is_rejected() {
 #[test]
 fn cached_token_above_min_validity_is_accepted() {
     let now = Instant::now();
-    let cached = CachedToken {
-        access_token: "tok".into(),
+    let cached = CachedPrincipalContext {
+        principal_context: vec![],
+        signed_principal_context: vec![],
         expires_at: now + MIN_TOKEN_VALIDITY + Duration::from_secs(1),
     };
     assert!(cached.has_remaining_lifetime(now, MIN_TOKEN_VALIDITY));
 }
 
-// ---- Principal context extraction ----
+// ---- CreatePrincipalContext request/response ----
 
-/// Encode one protobuf length-delimited field (`tag = field << 3 | 2`); test values stay
-/// under 128 bytes so the tag and length each fit in a single varint byte.
-fn ld_field(field: u8, bytes: &[u8]) -> Vec<u8> {
-    assert!(bytes.len() < 128);
-    let mut out = vec![(field << 3) | 2, bytes.len() as u8];
-    out.extend_from_slice(bytes);
-    out
+fn pc_field(
+    name: &str,
+    number: i32,
+    ty: field_descriptor_proto::Type,
+    type_name: Option<&str>,
+) -> FieldDescriptorProto {
+    FieldDescriptorProto {
+        name: Some(name.into()),
+        number: Some(number),
+        label: Some(field_descriptor_proto::Label::Optional as i32),
+        r#type: Some(ty as i32),
+        type_name: type_name.map(Into::into),
+        ..Default::default()
+    }
 }
 
-fn jwt_with_claims(claims: &str) -> String {
-    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-    format!(
-        "{}.{}.sig",
-        b64(b"{\"alg\":\"RS256\"}"),
-        b64(claims.as_bytes())
+fn message(desc: MessageDescriptor, fields: &[(&str, Value)]) -> DynamicMessage {
+    let mut msg = DynamicMessage::new(desc);
+    for (name, value) in fields {
+        msg.set_field_by_name(name, value.clone());
+    }
+    msg
+}
+
+/// A `PrincipalContextResponse` with an unsigned context expiring at `exp` (unix seconds),
+/// and a signed wrapper whose payload is `signed_payload`.
+fn response_with(signed_payload: Option<&[u8]>, exp: Option<i64>) -> DynamicMessage {
+    let pool = make_test_pool();
+    let get = |name: &str| pool.get_message_by_name(name).unwrap();
+    let mut details = Vec::new();
+    if let Some(exp) = exp {
+        let ts = message(get("test.Timestamp"), &[("seconds", Value::I64(exp))]);
+        details.push(("token_expiration", Value::Message(ts)));
+    }
+    let details = message(get("test.AuthenticationDetails"), &details);
+    let pc = message(
+        get("test.PrincipalContext"),
+        &[("authentication_details", Value::Message(details))],
+    );
+    let mut fields = vec![("principal_context", Value::Message(pc))];
+    if let Some(payload) = signed_payload {
+        let wrapper = message(
+            get("test.ProtectedMetadataWrapper"),
+            &[
+                ("header", Value::Bytes(b"header".to_vec().into())),
+                ("payload", Value::Bytes(payload.to_vec().into())),
+            ],
+        );
+        fields.push(("signed_principal_context", Value::Message(wrapper)));
+    }
+    message(response_descriptor(), &fields)
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[test]
+fn unsigned_request_omits_signed_config() {
+    let msg = build_request_message(&cfg(1, vec![]), &request_descriptor(), false).unwrap();
+    assert!(!msg.has_field_by_name("signed_principal_context_config"));
+}
+
+#[test]
+fn signed_request_sets_signed_config_with_default_ssp_path() {
+    let msg = build_request_message(&cfg(42, vec![]), &request_descriptor(), true).unwrap();
+    let config = match &*msg
+        .get_field_by_name("signed_principal_context_config")
+        .unwrap()
+    {
+        Value::Message(m) => m.clone(),
+        other => panic!("expected signed config message, got {other:?}"),
+    };
+    assert_eq!(
+        *config
+            .get_field_by_name("signed_principal_context_type")
+            .unwrap(),
+        Value::EnumNumber(1)
+    );
+    assert_eq!(
+        *config
+            .get_field_by_name("allowed_service_principal_resource_path")
+            .unwrap(),
+        Value::String("workspaces/42/zerobusDirectWriteApi".into())
+    );
+    assert_eq!(
+        *config.get_field_by_name("metastore_id").unwrap(),
+        Value::String("metastore-1".into())
+    );
+}
+
+#[test]
+fn signed_request_honors_ssp_path_override() {
+    let mut config = cfg(42, vec![]);
+    config.zerobus_ssp_resource_path = Some("workspaces/42/custom".into());
+    let msg = build_request_message(&config, &request_descriptor(), true).unwrap();
+    let Value::Message(signed) = &*msg
+        .get_field_by_name("signed_principal_context_config")
+        .unwrap()
+    else {
+        panic!("expected signed config message");
+    };
+    assert_eq!(
+        *signed
+            .get_field_by_name("allowed_service_principal_resource_path")
+            .unwrap(),
+        Value::String("workspaces/42/custom".into())
+    );
+}
+
+#[test]
+fn message_field_bytes_returns_serialized_signed_wrapper() {
+    let response = response_with(Some(b"signed-pc"), None);
+    let bytes = message_field_bytes(&response, "signed_principal_context").unwrap();
+    let pool = make_test_pool();
+    let wrapper = DynamicMessage::decode(
+        pool.get_message_by_name("test.ProtectedMetadataWrapper")
+            .unwrap(),
+        bytes.as_slice(),
     )
+    .unwrap();
+    assert_eq!(
+        *wrapper.get_field_by_name("payload").unwrap(),
+        Value::Bytes(b"signed-pc".to_vec().into())
+    );
 }
 
 #[test]
-fn principal_context_from_jwt_returns_wrapper_payload() {
-    let pc = b"principal-context-bytes";
-    // ProtectedMetadataWrapper: header (field 1) is skipped, payload (field 2) is returned.
-    let wrapper = [ld_field(1, b"header"), ld_field(2, pc)].concat();
-    let claim = ld_field(1, &wrapper);
-    let pctx = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&claim);
-    let jwt = jwt_with_claims(&format!("{{\"exp\":1,\"pctx\":\"{pctx}\"}}"));
-
-    assert_eq!(principal_context_from_jwt(&jwt).unwrap(), pc.to_vec());
-}
-
-#[test]
-fn principal_context_from_jwt_rejects_missing_claim() {
-    let jwt = jwt_with_claims("{\"exp\":1}");
+fn message_field_bytes_rejects_missing_field() {
+    let response = response_with(None, None);
     assert!(matches!(
-        principal_context_from_jwt(&jwt),
+        message_field_bytes(&response, "signed_principal_context"),
         Err(TokenManagerError::PrincipalContext { .. })
     ));
 }
 
 #[test]
-fn principal_context_from_jwt_rejects_wrapper_without_payload() {
-    let claim = ld_field(1, &ld_field(1, b"header"));
-    let pctx = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&claim);
-    let jwt = jwt_with_claims(&format!("{{\"pctx\":\"{pctx}\"}}"));
-    assert!(matches!(
-        principal_context_from_jwt(&jwt),
-        Err(TokenManagerError::PrincipalContext { .. })
-    ));
+fn principal_context_expiry_reads_token_expiration() {
+    let response = response_with(None, Some(unix_now() + 3600));
+    let remaining = principal_context_expiry(&response)
+        .expect("expected Some")
+        .saturating_duration_since(Instant::now());
+    assert!(remaining.as_secs() > 3500 && remaining.as_secs() <= 3600);
+}
+
+#[test]
+fn principal_context_expiry_none_when_unset_or_past() {
+    assert!(principal_context_expiry(&response_with(None, None)).is_none());
+    assert!(principal_context_expiry(&response_with(None, Some(1))).is_none());
+    assert!(principal_context_expiry(&message(response_descriptor(), &[])).is_none());
 }
 
 // ---- Unity Catalog getTable response decoding ----

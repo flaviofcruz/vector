@@ -418,13 +418,12 @@ impl ZerobusService {
 
         // Initialize token manager for Login service auth. The first call to
         // `LoginServiceHeadersProvider::get_headers` (during the healthcheck stream-create
-        // below) triggers the initial bootstrap. `TokenManager::get_token` re-bootstraps on
-        // demand when the cached token is within 60s of expiry, so no background refresh
-        // loop is needed.
+        // below) triggers the initial bootstrap. `TokenManager` re-bootstraps on demand when
+        // the cached principal contexts near expiry, so no background refresh loop is needed.
         //
-        // `TokenManager::new` is async because it loads the OAuth proto FileDescriptorSet
-        // from disk at startup (mounted into the container) — vector no longer carries a
-        // snapshot of the OAuth proto via build-time codegen. See databricks_auth::TokenManager.
+        // `TokenManager::new` is async because it loads the principal-context proto
+        // FileDescriptorSet from disk at startup (mounted into the container) — vector carries
+        // no snapshot of the proto via build-time codegen. See databricks_auth::TokenManager.
         let token_manager = match &config.auth {
             super::config::DatabricksAuthentication::LoginService(auth_config) => {
                 let tm = TokenManager::new(auth_config.clone()).await.map_err(|e| {
@@ -732,9 +731,9 @@ impl ZerobusService {
     ///
     /// The two auth flows: `OAuth` exchanges long-lived credentials for a token on
     /// every call (the upstream path external customers use), while `LoginService`
-    /// bootstraps a JWT over mTLS against the Databricks Login service via the
-    /// s2s-proxy, refreshed lazily by `TokenManager` (used by the logging-agent's
-    /// SSP-acted-as flow).
+    /// mints signed and unsigned principal contexts over mTLS from the Databricks Login
+    /// service via the s2s-proxy, refreshed lazily by `TokenManager` (used by the
+    /// logging-agent's SSP-acted-as flow).
     ///
     /// TODO(LP-1615): distinguish stream creation for native OTEL ingestion
     /// endpoints (e.g. emit OTLP-shaped streams). Tracked separately.

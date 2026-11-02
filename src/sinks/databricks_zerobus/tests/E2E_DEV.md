@@ -22,10 +22,10 @@ vector (in pod) → mTLS → pop-proxy → Login → JWT
   pod on a `dev-aws-uw2-s1-*` cluster works. Extract its workspace ID from the
   cert SAN OID `1.3.6.1.4.1.42.113.1`, or relabel its node with the workspace
   you want (see "Targeting a specific workspace" below).
-- An OAuth-service protobuf descriptor at `/tmp/oauth_service.pb`, generated
-  via the universe `proto_descriptor_set` rule against
-  `//common/authentication/oauth/proto:oauth_proto_library` and copied into
-  the pod.
+- A principal-context-service protobuf descriptor at
+  `/tmp/principal_context_service.pb`, generated via the universe
+  `proto_descriptor_set` rule against `//common/principal-context/api/proto`
+  and copied into the pod.
 
 ## Streaming files into the pod
 
@@ -65,9 +65,9 @@ POD=bricklens-agent-nimbus-XXXXX CTX=dev-aws-uw2-s1-0-XXXXXX \
   SRC_GZ=/tmp/vector-stripped.gz DST=/tmp/vector /tmp/stream_to_pod.sh
 # Expect: COPY_DONE size=<~255_000_000>
 
-# OAuth proto descriptor (built with bazel proto_descriptor_set; ~414 KB)
-gzip -1 -k /tmp/oauth_service.pb
-POD=... CTX=... SRC_GZ=/tmp/oauth_service.pb.gz DST=/tmp/oauth_service.pb \
+# Principal-context service proto descriptor (built with bazel proto_descriptor_set)
+gzip -1 -k /tmp/principal_context_service.pb
+POD=... CTX=... SRC_GZ=/tmp/principal_context_service.pb.gz DST=/tmp/principal_context_service.pb \
   /tmp/stream_to_pod.sh
 
 # Vector config
@@ -191,7 +191,8 @@ sinks:
       tls_crt_file: "/databricks-infra/dbts2/creds.combined.pem"
       tls_key_file: "/databricks-infra/dbts2/creds.combined.pem"
       tls_ca_file: "/databricks-infra/dbts2/creds.combined.pem"
-      oauth_proto_descriptor_path: "/tmp/oauth_service.pb"
+      proto_descriptor_path: "/tmp/principal_context_service.pb"
+      metastore_id: <metastore_id>
       uc_permissions:
         - privileges: [USE_CATALOG]
           securable_type: CATALOG
@@ -238,8 +239,8 @@ bin/dbctl exec -t $CTX -n logging-agent $POD -c vector-daemon --dbcert -- \
 
 In vector's stderr, look for:
 
-1. `Bootstrapping OAuth token from Login service.` (info)
-2. `OAuth token bootstrap successful.` with `expires_in_secs` near 3600 (info)
+1. `Bootstrapping principal context from Login service.` (info)
+2. `Principal context bootstrap successful.` with `expires_in_secs` near 3600 (info)
 3. `Successfully created stream stream_id=<uuid>` (Zerobus accepted the proto schema)
 4. `Healthcheck passed.` and `√ Validated`
 5. On shutdown: `Stream is caught up to offset N. Waiting for offset N+1.` then
@@ -248,7 +249,7 @@ In vector's stderr, look for:
 
 What you should NOT see:
 
-- `Failed to get OAuth token from Login service` → Login mint failed; check
+- `Failed to get principal context from Login service` → Login mint failed; check
   `service_principal_resource`, `workspace_id` (must match the cert's UWI
   workspace), and the cert path.
 - `IllegalStateException: authorizationDetailsClaim must be defined` (visible
@@ -270,7 +271,7 @@ use the curl harness in
 
 ```bash
 bin/dbctl exec -t $CTX -n logging-agent $POD -c vector-daemon --dbcert -- \
-  rm -f /tmp/vector /tmp/vector.yaml /tmp/oauth_service.pb /tmp/test_otel_logs.desc
+  rm -f /tmp/vector /tmp/vector.yaml /tmp/principal_context_service.pb /tmp/test_otel_logs.desc
 ```
 
 Also restore the node's original `orgId` label if you relabelled it.

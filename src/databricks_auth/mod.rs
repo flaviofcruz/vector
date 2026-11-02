@@ -1,8 +1,7 @@
 //! Databricks Login service authentication for logging-agent.
 //!
-//! Provides token management for bootstrapping and refreshing internal OAuth tokens
-//! via the Login service's `GenerateReauthenticatedAndReauthorizedInternalOAuthTokenPair`
-//! and `RefreshInternalOAuthTokenPair` RPCs.
+//! Mints and refreshes signed and unsigned principal contexts via the Login service's
+//! `PrincipalContextService.CreatePrincipalContext` RPC.
 
 mod headers_provider;
 mod token_manager;

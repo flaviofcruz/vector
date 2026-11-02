@@ -1,20 +1,20 @@
-//! OAuth token manager for the bricklens-agent zerobus sink.
+//! Principal-context manager for the bricklens-agent zerobus sink.
 //!
-//! Bootstraps an internal-OAuth access token from Databricks Login via mTLS and
-//! the `databricks.common.authentication.oauth.InternalOAuthTokenService.GenerateReauthenticatedAndReauthorizedInternalOAuthToken`
-//! RPC, then re-bootstraps before expiry. The OAuth proto schema is loaded from
-//! a runtime `FileDescriptorSet` so vector never carries a snapshot of universe
-//! protos.
+//! Mints signed and unsigned principal contexts from Databricks Login via mTLS and
+//! the `databricks.identity.PrincipalContextService.CreatePrincipalContext` RPC, then
+//! re-bootstraps before expiry. The proto schema is loaded from a runtime
+//! `FileDescriptorSet` so vector never carries a snapshot of universe protos.
 
 mod cache;
 mod config;
 mod error;
-mod jwt;
 mod manager;
 mod request;
+mod response;
 mod transport;
 mod uc;
 
+pub(crate) use config::SIGNED_PRINCIPAL_CONTEXT_HEADER;
 pub use config::{
     LoginServiceAuthConfig, LoginServiceConfig, UcPermissionEntry, UnityCatalogServiceConfig,
     UserAuthInfo,

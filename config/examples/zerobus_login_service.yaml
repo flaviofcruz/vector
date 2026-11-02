@@ -55,7 +55,7 @@ sinks:
 
     auth:
       strategy: login_service
-      # Per-customer identity used when minting the JWT (UserAuthInfo).
+      # Per-customer identity used when minting the principal context (UserAuthInfo).
       user:
         workspace_id: ${WORKSPACE_ID}
         service_principal_resource: "accounts/0829fba4-55f5-4fef-9850-00f15b1a3d73/apps"
@@ -84,9 +84,12 @@ sinks:
         tls_key_file: "/databricks-infra/dbts2/creds.combined.pem"
         # tls_ca_file: "/databricks-infra/dbts2/ca.pem"   # add once confirmed on the pod
 
-        # FileDescriptorSet covering Login's InternalOAuthTokenService. Built once from
-        # universe protos and mounted into the agent container alongside otel_logs.desc.
-        # Generate with:
-        #   protoc --descriptor_set_out=oauth_service.pb --include_imports \
-        #          common/authentication/oauth/proto/oauth.proto
-        oauth_proto_descriptor_path: "/etc/vector/oauth_service.pb"
+        # FileDescriptorSet covering Login's PrincipalContextService. Built once from
+        # universe protos (common/principal-context/api/proto/service.proto, with
+        # --include_imports) and mounted into the agent container alongside otel_logs.desc.
+        proto_descriptor_path: "/etc/vector/principal_context_service.pb"
+      # Metastore the signed principal context is bound to.
+      metastore_id: ${METASTORE_ID}
+      # SSP resource path Zerobus accepts the signed context for.
+      # Defaults to workspaces/<workspace_id>/zerobusDirectWriteApi.
+      # zerobus_ssp_resource_path: "workspaces/<workspace_id>/zerobusDirectWriteApi"

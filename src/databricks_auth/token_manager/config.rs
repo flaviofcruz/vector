@@ -1,4 +1,4 @@
-//! Configuration types for the Login OAuth `TokenManager`.
+//! Configuration types for the Login principal-context `TokenManager`.
 //!
 //! # Duplication note
 //!
@@ -7,7 +7,7 @@
 //! The struct shapes (`UserAuthInfo`, `LoginServiceConfig`, `UcPermissionEntry`)
 //! are intentionally kept in sync, but some fields differ for architectural
 //! reasons — vector is config-file driven so `LoginServiceConfig` carries
-//! `login_endpoint`, `login_server_name`, and `oauth_proto_descriptor_path`,
+//! `login_endpoint`, `login_server_name`, and `proto_descriptor_path`,
 //! while the universe side derives those from DB_CONF and compile-time generated
 //! protos.
 //!
@@ -23,32 +23,37 @@ use std::time::Duration;
 
 use vector_lib::configurable::configurable_component;
 
-/// Fully-qualified name of the Login OAuth service. Looked up in the runtime-loaded
+/// Fully-qualified name of Login's principal-context service. Looked up in the runtime-loaded
 /// `DescriptorPool` to resolve the request/response message types.
-pub(super) const OAUTH_SERVICE_NAME: &str =
-    "databricks.common.authentication.oauth.InternalOAuthTokenService";
-pub(super) const OAUTH_METHOD_NAME: &str =
-    "GenerateReauthenticatedAndReauthorizedInternalOAuthToken";
+pub(super) const PC_SERVICE_NAME: &str = "databricks.identity.PrincipalContextService";
+pub(super) const PC_METHOD_NAME: &str = "CreatePrincipalContext";
+
+/// `databricks.identity.SignedPrincipalContextType` requested for the signed context Zerobus
+/// accepts from data-plane callers.
+pub(super) const SIGNED_PRINCIPAL_CONTEXT_TYPE: &str = "PCTX_DP_AUTH_TOKEN";
 
 /// Unity Catalog (managed-catalog) gRPC service and the method used to read a table's columns.
 pub(super) const UC_SERVICE_NAME: &str = "managedcatalog.UnityCatalogService";
 pub(super) const UC_GET_TABLE_METHOD_NAME: &str = "getTable";
 
 /// Unsigned principal-context header. UC's east-west ingress authorizes internal callers from
-/// this header (it rejects requests without one), so the bearer token alone is not enough.
+/// this header (it rejects requests without one).
 pub(super) const PRINCIPAL_CONTEXT_HEADER: &str = "s2s-principal-context-bin";
 
-/// Default token lifetime when the JWT `exp` claim cannot be parsed.
+/// Signed principal-context header carrying the `ProtectedMetadataWrapper` Zerobus verifies.
+pub(crate) const SIGNED_PRINCIPAL_CONTEXT_HEADER: &str = "s2s-principal-context-sig-bin";
+
+/// Default context lifetime when `authentication_details.token_expiration` is unset.
 pub(super) const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(50 * 60);
 
-/// Re-bootstrap a cached token once its remaining TTL drops below this threshold.
-/// With a 50-minute default lifetime, tokens are refreshed at the 45-minute mark.
+/// Re-bootstrap cached contexts once their remaining TTL drops below this threshold.
+/// With a 50-minute default lifetime, contexts are refreshed at the 45-minute mark.
 pub(super) const TOKEN_REFRESH_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
-/// A freshly bootstrapped token with less than this much remaining lifetime is rejected
-/// rather than served: serving it would risk the token expiring mid-write to Zerobus.
-/// Distinct from `TOKEN_REFRESH_THRESHOLD` (proactive refresh of an already-cached token) —
-/// this is a backstop against Login minting a token too short-lived to use at all.
+/// Freshly bootstrapped contexts with less than this much remaining lifetime are rejected
+/// rather than served: serving them would risk expiry mid-write to Zerobus.
+/// Distinct from `TOKEN_REFRESH_THRESHOLD` (proactive refresh of an already-cached context) —
+/// this is a backstop against Login minting a context too short-lived to use at all.
 pub(super) const MIN_TOKEN_VALIDITY: Duration = Duration::from_secs(60);
 
 /// `databricks.common.authentication.identity.ServicePrincipalType::SYSTEM` enum value.
@@ -78,7 +83,7 @@ pub struct UcPermissionEntry {
     pub full_name: String,
 }
 
-/// Per-customer identity for the Login service OAuth request.
+/// Per-customer identity for the Login `CreatePrincipalContext` request.
 ///
 /// Mirrors `bricklens-ingest-external/src/databricks_auth/config.rs::UserAuthInfo`
 /// in universe. In universe, `service_principal_type` is the typed proto enum
@@ -88,8 +93,8 @@ pub struct UcPermissionEntry {
 #[derive(Clone, Debug)]
 pub struct UserAuthInfo {
     /// Workspace ID this agent's UWI cert is bound to. Used as `Authentication.scope.workspace`
-    /// when minting the JWT. For nimbus pods, this matches the workspace ID encoded in the
-    /// cert SAN OID `1.3.6.1.4.1.42.113.1`.
+    /// when minting the principal context. For nimbus pods, this matches the workspace ID
+    /// encoded in the cert SAN OID `1.3.6.1.4.1.42.113.1`.
     ///
     /// Eventually this should come from `bricklens-config-service`; for now the deploy
     /// template renders it per-pod.
@@ -133,32 +138,35 @@ pub struct LoginServiceConfig {
     pub verify_hostname: bool,
 
     /// Path to a protobuf `FileDescriptorSet` covering Login's
-    /// `InternalOAuthTokenService.GenerateReauthenticatedAndReauthorizedInternalOAuthToken`
-    /// (and its transitively-referenced messages from `databricks.identity`).
-    ///
-    /// Generated with:
-    /// ```sh
-    /// protoc --descriptor_set_out=oauth_service.pb --include_imports oauth_service.proto
-    /// ```
+    /// `databricks.identity.PrincipalContextService.CreatePrincipalContext` (generated with
+    /// `--include_imports` from universe's `common/principal-context/api/proto/service.proto`).
     ///
     /// Mounted into the agent container alongside the bricklens_ingest service descriptor.
     /// Loading the descriptor at runtime keeps vector decoupled from a snapshot of
     /// universe protos. The same precedent is in use by the `bricklens_ingest` sink.
-    pub oauth_proto_descriptor_path: PathBuf,
+    pub proto_descriptor_path: PathBuf,
 }
 
 /// Configuration for Login service authentication.
 #[configurable_component]
 #[derive(Clone, Debug)]
 pub struct LoginServiceAuthConfig {
-    /// Per-customer identity used when minting the JWT.
+    /// Per-customer identity used when minting the principal context.
     pub user: UserAuthInfo,
 
     /// Login service connection parameters.
     pub login_service: LoginServiceConfig,
 
-    /// Internal Unity Catalog endpoint used to fetch the table schema with the Login-minted
-    /// token. Required by the `databricks_zerobus` sink.
+    /// Unity Catalog metastore ID the signed principal context is bound to.
+    pub metastore_id: String,
+
+    /// SSP resource path Zerobus accepts the signed principal context for. Defaults to
+    /// `workspaces/<workspace_id>/zerobusDirectWriteApi`.
+    #[serde(default)]
+    pub zerobus_ssp_resource_path: Option<String>,
+
+    /// Internal Unity Catalog endpoint used to fetch the table schema with the unsigned
+    /// principal context. Required by the `databricks_zerobus` sink.
     #[serde(default)]
     pub unity_catalog: Option<UnityCatalogServiceConfig>,
 }

@@ -10,7 +10,7 @@ const GRPC_ABORTED: i32 = 10;
 const GRPC_INTERNAL: i32 = 13;
 const GRPC_UNAVAILABLE: i32 = 14;
 
-/// Errors produced while bootstrapping or refreshing an OAuth token through the
+/// Errors produced while bootstrapping or refreshing principal contexts through the
 /// Databricks Login service.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
@@ -38,22 +38,22 @@ pub enum TokenManagerError {
         source: prost_reflect::DescriptorError,
     },
 
-    /// The configured OAuth service name was not present in the descriptor pool.
+    /// The principal-context service name was not present in the descriptor pool.
     #[snafu(display(
-        "OAuth service `{}` not found in descriptor at {}",
+        "service `{}` not found in descriptor at {}",
         service,
         path.display()
     ))]
-    OauthServiceNotFound {
+    ServiceNotFound {
         /// Fully-qualified service name that was looked up.
         service: String,
         /// Descriptor file the service was expected to live in.
         path: PathBuf,
     },
 
-    /// The configured OAuth method name was not present on the resolved service.
-    #[snafu(display("OAuth method `{}` not found in service `{}`", method, service))]
-    OauthMethodNotFound {
+    /// The principal-context method name was not present on the resolved service.
+    #[snafu(display("method `{}` not found in service `{}`", method, service))]
+    MethodNotFound {
         /// Method name that was looked up.
         method: String,
         /// Service the method was expected to live in.
@@ -80,7 +80,7 @@ pub enum TokenManagerError {
 
     /// Serializing the JSON request body into a `DynamicMessage` failed.
     /// Typically indicates a config/descriptor mismatch.
-    #[snafu(display("build OAuth request from descriptor: {}", source))]
+    #[snafu(display("build CreatePrincipalContext request from descriptor: {}", source))]
     BuildRequest {
         /// Underlying serde-JSON error.
         source: serde_json::Error,
@@ -138,28 +138,15 @@ pub enum TokenManagerError {
         source: prost_reflect::prost::DecodeError,
     },
 
-    /// The response decoded but had no `access_token` field set.
-    #[snafu(display("OAuth response missing access_token field"))]
-    AccessTokenMissing,
-
-    /// The Login service returned a non-success `state` enum value.
-    #[snafu(display("Login service returned state {}: {}", state, message))]
-    OauthFailed {
-        /// State value reported by Login.
-        state: i32,
-        /// Optional `error_message` accompanying the failure.
-        message: String,
-    },
-
-    /// The freshly bootstrapped token expires too soon to use safely — serving it would
-    /// risk the token expiring mid-write to Zerobus.
+    /// The freshly bootstrapped principal context expires too soon to use safely — serving
+    /// it would risk expiry mid-write to Zerobus.
     #[snafu(display(
-        "Login minted a token valid for only {}s (minimum {}s)",
+        "Login minted a principal context valid for only {}s (minimum {}s)",
         ttl_secs,
         min_secs
     ))]
     TokenTooShortLived {
-        /// Remaining lifetime of the minted token, in seconds.
+        /// Remaining lifetime of the minted principal context, in seconds.
         ttl_secs: u64,
         /// Minimum acceptable lifetime, in seconds.
         min_secs: u64,
@@ -242,10 +229,10 @@ pub enum TokenManagerError {
         message: String,
     },
 
-    /// The Login-minted token did not carry a usable `pctx` principal-context claim.
-    #[snafu(display("extract principal context from Login token: {}", message))]
+    /// The `CreatePrincipalContext` response did not carry the expected context.
+    #[snafu(display("principal context: {}", message))]
     PrincipalContext {
-        /// Why the claim could not be extracted.
+        /// What was missing.
         message: String,
     },
 }
@@ -271,7 +258,6 @@ impl TokenManagerError {
             | Self::ReadResponseBody { .. }
             | Self::ResponseTooShort
             | Self::IncompleteResponseMessage
-            | Self::OauthFailed { .. }
             | Self::TokenTooShortLived { .. } => true,
             _ => false,
         }

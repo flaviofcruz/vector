@@ -37,7 +37,7 @@ pub enum DatabricksAuthentication {
 
     /// Authenticate via Login service using mTLS bootstrap.
     ///
-    /// Used by logging-agent to obtain internal OAuth tokens by authenticating
+    /// Used by logging-agent to mint signed and unsigned principal contexts by authenticating
     /// as a System Service Principal via s2s-proxy.
     #[serde(rename = "login_service")]
     LoginService(crate::databricks_auth::LoginServiceAuthConfig),
@@ -359,12 +359,26 @@ impl ZerobusSinkConfig {
                         message: "LoginService login_endpoint cannot be empty".to_string(),
                     });
                 }
+                if config.metastore_id.is_empty() {
+                    return Err(ZerobusSinkError::ConfigError {
+                        message: "LoginService metastore_id cannot be empty".to_string(),
+                    });
+                }
                 if config.unity_catalog.is_none() {
                     return Err(ZerobusSinkError::ConfigError {
                         message: "LoginService unity_catalog is required to fetch the table schema"
                             .to_string(),
                     });
                 }
+                // Zerobus authenticates this strategy from `s2s-principal-context-sig-bin`,
+                // which the pinned SDK cannot send: it adds every header as ASCII metadata and
+                // rejects `-bin` keys, so each stream create would fail and discard its batch.
+                // Fail at startup instead until the SDK sends `-bin` headers as binary metadata.
+                return Err(ZerobusSinkError::ConfigError {
+                    message: "LoginService auth requires Zerobus SDK support for binary \
+                              (`-bin`) metadata headers, which the pinned SDK lacks"
+                        .to_string(),
+                });
             }
         }
 
@@ -372,8 +386,9 @@ impl ZerobusSinkConfig {
         // here — the gRPC layer would otherwise reject an uppercase name at the
         // first stream create rather than at config load. Reject reserved auth
         // headers and gRPC transport headers that would corrupt the exchange.
-        const RESERVED: [&str; 4] = [
+        const RESERVED: [&str; 5] = [
             "authorization",
+            "s2s-principal-context-sig-bin",
             "x-databricks-zerobus-table-name",
             "user-agent",
             "content-type",
@@ -750,6 +765,39 @@ mod tests {
         assert_eq!(
             batch.column(2).as_string::<i64>().value(0),
             "alice@example.com"
+        );
+    }
+
+    #[test]
+    fn login_service_rejected_until_sdk_sends_binary_headers() {
+        let mut config = create_test_config();
+        config.auth = toml::from_str(
+            r#"
+            strategy = "login_service"
+            metastore_id = "metastore-1"
+
+            [user]
+            workspace_id = 1
+            service_principal_resource = "accounts/u/apps"
+
+            [login_service]
+            login_endpoint = "https://login:443"
+            login_server_name = "login"
+            tls_crt_file = "/dev/null"
+            tls_key_file = "/dev/null"
+            proto_descriptor_path = "/dev/null"
+
+            [unity_catalog]
+            endpoint = "https://uc:443"
+            server_name = "uc"
+            proto_descriptor_path = "/dev/null"
+            "#,
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ZerobusSinkError::ConfigError { message } if message.contains("binary")),
+            "expected login_service startup rejection"
         );
     }
 
