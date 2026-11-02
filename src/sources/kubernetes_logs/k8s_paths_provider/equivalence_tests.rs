@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use super::{
     AnnotationSelector, CONTAINER_EXCLUSION_ANNOTATION_KEY,
     DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY, GlobScanRootMatcher, K8sPathsProvider,
-    POD_NAME_ANNOTATION_KEY, ScanRootMatcher,
+    POD_EXCLUSION_LABEL, POD_NAME_ANNOTATION_KEY, ScanRootMatcher,
     listing_cache::{
         MAX_ENTRIES, MAX_LISTING_AGE,
         test_support::{ManualClock, cache_with_reader, counting_cache},
@@ -354,6 +354,19 @@ fn equivalence_on_unnormalized_scan_roots() {
 }
 
 #[test]
+fn equivalence_with_parent_segments_in_patterns() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    mkdir(root, "scan-root");
+    touch(root, "sibling/direct.log");
+    touch(root, "sibling/nested/deep.log");
+    assert_match_root_equivalent(
+        &root.join("scan-root"),
+        &strings(&["../sibling/*.log", "../sibling/**/*.log"]),
+    );
+}
+
+#[test]
 fn new_subdir_and_file_appear_together_within_max_age() {
     use std::sync::atomic::Ordering;
 
@@ -468,13 +481,22 @@ fn random_pattern(rng: &mut SmallRng) -> String {
     pattern
 }
 
+fn randomized_scan_root() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let scan_root = tmp.path().join("scan-root");
+    fs::create_dir(&scan_root).unwrap();
+    (tmp, scan_root)
+}
+
 #[test]
 fn randomized_equivalence() {
     let (mut walked, mut total) = (0, 0);
     for seed in 0..300_u64 {
         let mut rng = SmallRng::seed_from_u64(seed);
-        let tmp = TempDir::new().unwrap();
-        random_tree(&mut rng, tmp.path(), 0);
+        // Keep generated `..` patterns inside a seed-private parent instead of letting them
+        // recursively glob unrelated files elsewhere under /tmp.
+        let (_tmp, scan_root) = randomized_scan_root();
+        random_tree(&mut rng, &scan_root, 0);
         let patterns: Vec<String> = (0..rng.random_range(1..=8))
             .map(|_| random_pattern(&mut rng))
             .filter(|pattern| glob::Pattern::new(pattern).is_ok())
@@ -484,7 +506,7 @@ fn randomized_equivalence() {
             .iter()
             .filter(|pattern| walks_without_glob(pattern))
             .count();
-        assert_match_root_equivalent(tmp.path(), &patterns);
+        assert_match_root_equivalent(&scan_root, &patterns);
     }
     // Most patterns must take the listing walk rather than the glob fallback.
     assert!(
@@ -620,6 +642,7 @@ fn provider(
     patterns: &[&str],
     extract_databricks_logs: bool,
     annotation_selector: &str,
+    enforce_client_side_pod_exclusion: bool,
 ) -> K8sPathsProvider {
     let mut pod_writer = Writer::<Pod>::default();
     for pod in pods {
@@ -635,8 +658,65 @@ fn provider(
         vec![glob::Pattern::new("/**/*.gz").unwrap()],
         false,
         extract_databricks_logs,
+        enforce_client_side_pod_exclusion,
         Some(DATABRICKS_HOSTPATH_LOGGING_ANNOTATION_KEY.to_owned()),
     )
+}
+
+#[derive(Default)]
+struct AlwaysMatch;
+
+impl ScanRootMatcher for AlwaysMatch {
+    fn existing_subdirs(&mut self, base: &Path, names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(|name| base.join(name)).collect()
+    }
+
+    fn match_root(&mut self, dir: &str, _patterns: &[String]) -> Vec<PathBuf> {
+        vec![Path::new(dir).join("container/0.log")]
+    }
+}
+
+fn pod_is_collected(
+    enforce_client_side_pod_exclusion: bool,
+    exclusion_label_value: Option<&str>,
+    extract_databricks_logs: bool,
+) -> bool {
+    let mut pod = pod("pod", "uid", &[]);
+    pod.metadata.labels = exclusion_label_value
+        .map(|value| BTreeMap::from([(POD_EXCLUSION_LABEL.to_owned(), value.to_owned())]));
+    let provider = provider(
+        vec![pod],
+        &["*"],
+        extract_databricks_logs,
+        "",
+        enforce_client_side_pod_exclusion,
+    );
+    !provider.paths_with(&mut AlwaysMatch).is_empty()
+}
+
+#[test]
+fn client_side_pod_exclusion_grid() {
+    let cases = [
+        ("dblet exact true", true, Some("true"), false),
+        ("dblet label absent", true, None, true),
+        ("dblet false", true, Some("false"), true),
+        ("dblet case differs", true, Some("True"), true),
+        ("non-dblet unchanged", false, Some("true"), true),
+    ];
+
+    for (name, enforce_client_side_pod_exclusion, label_value, expected) in cases {
+        for extract_databricks_logs in [false, true] {
+            assert_eq!(
+                pod_is_collected(
+                    enforce_client_side_pod_exclusion,
+                    label_value,
+                    extract_databricks_logs,
+                ),
+                expected,
+                "case={name}, extract_databricks_logs={extract_databricks_logs}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -688,7 +768,7 @@ fn provider_equivalence_on_databricks_tree() {
         pod("pod-d", "uid-missing", &[]),
     ];
     let patterns = ["*/*.log*", "*/*.json", "*/stdout.log", "c/*", "**/*.log"];
-    let provider = provider(pods, &patterns, true, "");
+    let provider = provider(pods, &patterns, true, "", false);
 
     let expected = provider.paths_with(&mut Rebased {
         root,
@@ -740,8 +820,8 @@ fn providers_share_listings_until_they_expire() {
     touch(root, &empty_dir("uid-a", "data/app/access.log"));
     let pods = || vec![pod("pod-a", "uid-a", &[]), pod("pod-x", "uid-missing", &[])];
     // Two sources with different patterns over the same pod store.
-    let first = provider(pods(), &["*/*.log", "svc/*"], true, "");
-    let second = provider(pods(), &["*/*.log", "app/*.log"], true, "");
+    let first = provider(pods(), &["*/*.log", "svc/*"], true, "", false);
+    let second = provider(pods(), &["*/*.log", "app/*.log"], true, "", false);
 
     let clock = ManualClock::new();
     let (cache, reads) = counting_cache(&clock, MAX_ENTRIES);
@@ -808,7 +888,7 @@ fn provider_equivalence_on_kubelet_tree_with_selector() {
         ),
         pod("pod-b", "uid-b", &[]),
     ];
-    let provider = provider(pods, &["*/*.log*", "c1/*"], false, "logs=yes");
+    let provider = provider(pods, &["*/*.log*", "c1/*"], false, "logs=yes", false);
 
     let expected = provider.paths_with(&mut Rebased {
         root,

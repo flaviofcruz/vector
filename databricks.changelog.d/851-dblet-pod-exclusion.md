@@ -1,0 +1,2 @@
+Add opt-in `enforce_client_side_pod_exclusion` to `kubernetes_logs` for the dblet Discovery API, which does not honor Vector's built-in `vector.dev/exclude!=true` label selector. When enabled with `/var/lib/kubelet/plugins/discovery-api/kubeconfig`, pods whose `vector.dev/exclude` label has the exact value `true` are removed before any standard Kubernetes or Databricks emptyDir/hostPath log-file discovery. The option defaults to false and is rejected with any other kubeconfig, preserving control-plane behavior.
+https://github.com/databricks-eng/vector/pull/851

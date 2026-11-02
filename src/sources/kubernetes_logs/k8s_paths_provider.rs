@@ -18,6 +18,7 @@ use kube::runtime::reflector::{ObjectRef, store::Store};
 use vector_lib::file_source::paths_provider::{LogFileInfo, PathsProvider};
 
 use super::{
+    POD_EXCLUSION_LABEL, POD_EXCLUSION_LABEL_VALUE,
     path_helpers::{build_databricks_k8s_pod_logs_directory, build_pod_logs_directory},
     pod_metadata_annotator::service_system_from_metadata,
 };
@@ -40,6 +41,7 @@ pub struct K8sPathsProvider {
     exclude_paths: Vec<glob::Pattern>,
     insert_namespace_fields: bool,
     extract_databricks_logs: bool,
+    enforce_client_side_pod_exclusion: bool,
     /// When set, the annotation key to read for hostPath-based log directory discovery.
     /// None = use emptyDir-based discovery only.
     hostpath_logging_annotation_key: Option<String>,
@@ -98,6 +100,7 @@ impl K8sPathsProvider {
         exclude_paths: Vec<glob::Pattern>,
         insert_namespace_fields: bool,
         extract_databricks_logs: bool,
+        enforce_client_side_pod_exclusion: bool,
         hostpath_logging_annotation_key: Option<String>,
     ) -> Self {
         Self {
@@ -109,6 +112,7 @@ impl K8sPathsProvider {
             exclude_paths,
             insert_namespace_fields,
             extract_databricks_logs,
+            enforce_client_side_pod_exclusion,
             hostpath_logging_annotation_key,
             listing_cache: None,
         }
@@ -142,6 +146,17 @@ impl K8sPathsProvider {
 
         state
             .into_iter()
+            .filter(|pod| {
+                // The dblet Discovery API ignores Kubernetes label selectors, so enforce the
+                // built-in pod exclusion client-side before discovering any log files.
+                !self.enforce_client_side_pod_exclusion
+                    || pod
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get(POD_EXCLUSION_LABEL))
+                        .is_none_or(|value| value != POD_EXCLUSION_LABEL_VALUE)
+            })
             .filter(|pod| {
                 self.annotation_selector
                     .matches(pod.metadata.annotations.as_ref())

@@ -5,7 +5,13 @@
 
 #![allow(unused_variables, dead_code, unused_imports)]
 #![deny(missing_docs)]
-use std::{cmp::min, collections::HashMap, num::NonZeroU64, path::PathBuf, time::Duration};
+use std::{
+    cmp::min,
+    collections::HashMap,
+    num::NonZeroU64,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::sources::file::{deserialize_iso8601_timestamp, wrap_with_line_agg};
 use bytes::Bytes;
@@ -99,6 +105,9 @@ use self::{
 
 /// The `self_node_name` value env var key.
 const SELF_NODE_NAME_ENV_KEY: &str = "VECTOR_SELF_NODE_NAME";
+const POD_EXCLUSION_LABEL: &str = "vector.dev/exclude";
+const POD_EXCLUSION_LABEL_VALUE: &str = "true";
+const DBLET_DISCOVERY_API_KUBECONFIG: &str = "/var/lib/kubelet/plugins/discovery-api/kubeconfig";
 
 /// Configuration for the `kubernetes_logs` source.
 #[serde_as]
@@ -332,6 +341,12 @@ pub struct Config {
     #[configurable(metadata(docs::examples = "/path/to/.kube/config"))]
     kube_config_file: Option<PathBuf>,
 
+    /// Enforces the built-in `vector.dev/exclude!=true` Pod label selector client-side.
+    ///
+    /// Enable this only for Kubernetes-compatible APIs that do not honor label selectors, such as
+    /// the dblet Discovery API. Only the exact label value `"true"` is excluded.
+    enforce_client_side_pod_exclusion: bool,
+
     /// Determines if requests to the kube-apiserver can be served by a cache.
     use_apiserver_cache: bool,
 
@@ -550,6 +565,7 @@ impl Default for Config {
             ingestion_timestamp_field: None,
             timezone: None,
             kube_config_file: None,
+            enforce_client_side_pod_exclusion: false,
             use_apiserver_cache: false,
             share_watcher: default_share_watcher(),
             delay_deletion_ms: default_delay_deletion_ms(),
@@ -855,6 +871,7 @@ struct Source {
     node_field_spec: node_metadata_annotator::FieldsSpec,
     insert_namespace_fields: bool,
     extract_databricks_logs: bool,
+    enforce_client_side_pod_exclusion: bool,
     annotation_selector: AnnotationSelector,
     hostpath_logging_annotation_key: Option<String>,
     ttl_removal_config: Option<TTLRemovalConfig>,
@@ -953,6 +970,7 @@ impl Source {
         key: &ComponentKey,
         delivery_paths: Vec<(String, Condition)>,
     ) -> crate::Result<Self> {
+        let enforce_client_side_pod_exclusion = client_side_pod_exclusion_enabled(config)?;
         let self_node_name = if config.self_node_name.is_empty()
             || config.self_node_name == default_self_node_name_env_template()
         {
@@ -1174,6 +1192,7 @@ impl Source {
             node_field_spec: config.node_annotation_fields.clone(),
             insert_namespace_fields,
             extract_databricks_logs: config.extract_databricks_logs,
+            enforce_client_side_pod_exclusion,
             annotation_selector,
             // Always default to the dblet-logs-path annotation when no key is explicitly
             // configured. Pods without the annotation are silently skipped for hostPath
@@ -1235,6 +1254,7 @@ impl Source {
             node_field_spec,
             insert_namespace_fields,
             extract_databricks_logs,
+            enforce_client_side_pod_exclusion,
             annotation_selector,
             hostpath_logging_annotation_key,
             ttl_removal_config,
@@ -1288,6 +1308,7 @@ impl Source {
             exclude_paths,
             insert_namespace_fields,
             extract_databricks_logs,
+            enforce_client_side_pod_exclusion,
             hostpath_logging_annotation_key,
         )
         .with_shared_listing_cache(glob_minimum_cooldown);
@@ -1841,13 +1862,26 @@ fn prepare_node_selector(self_node_name: &str) -> crate::Result<String> {
 // This function constructs the effective label selector to use, based on
 // the specified configuration.
 fn prepare_label_selector(selector: &str) -> String {
-    const BUILT_IN: &str = "vector.dev/exclude!=true";
+    let built_in = format!("{POD_EXCLUSION_LABEL}!={POD_EXCLUSION_LABEL_VALUE}");
 
     if selector.is_empty() {
-        return BUILT_IN.to_string();
+        return built_in;
     }
 
-    format!("{BUILT_IN},{selector}")
+    format!("{built_in},{selector}")
+}
+
+fn client_side_pod_exclusion_enabled(config: &Config) -> crate::Result<bool> {
+    if !config.enforce_client_side_pod_exclusion {
+        return Ok(false);
+    }
+    if config.kube_config_file.as_deref() != Some(Path::new(DBLET_DISCOVERY_API_KUBECONFIG)) {
+        return Err(format!(
+            "enforce_client_side_pod_exclusion requires kube_config_file = {DBLET_DISCOVERY_API_KUBECONFIG}"
+        )
+        .into());
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1861,7 +1895,10 @@ mod tests {
     };
     use vrl::value::{Kind, kind::Collection};
 
-    use super::{Config, attach_delivery_path_accounting};
+    use super::{
+        Config, DBLET_DISCOVERY_API_KUBECONFIG, attach_delivery_path_accounting,
+        client_side_pod_exclusion_enabled,
+    };
     use crate::conditions::Condition;
     use crate::config::SourceConfig;
     use crate::encoding_transcode::{Decoder, Encoder};
@@ -2176,6 +2213,55 @@ mod tests {
         for (input, expected) in cases {
             let output = super::prepare_label_selector(&input);
             assert_eq!(expected, output, "expected left, actual right");
+        }
+    }
+
+    #[test]
+    fn client_side_pod_exclusion_is_opt_in() {
+        let cases = [
+            ("default CP config", Config::default(), Some(false)),
+            (
+                "dblet path without opt-in",
+                Config {
+                    kube_config_file: Some(DBLET_DISCOVERY_API_KUBECONFIG.into()),
+                    ..Default::default()
+                },
+                Some(false),
+            ),
+            (
+                "dblet path with opt-in",
+                Config {
+                    kube_config_file: Some(DBLET_DISCOVERY_API_KUBECONFIG.into()),
+                    enforce_client_side_pod_exclusion: true,
+                    ..Default::default()
+                },
+                Some(true),
+            ),
+            (
+                "opt-in without kubeconfig",
+                Config {
+                    enforce_client_side_pod_exclusion: true,
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                "opt-in with non-dblet kubeconfig",
+                Config {
+                    kube_config_file: Some("/etc/kubernetes/kubeconfig".into()),
+                    enforce_client_side_pod_exclusion: true,
+                    ..Default::default()
+                },
+                None,
+            ),
+        ];
+
+        for (name, config, expected) in cases {
+            let actual = client_side_pod_exclusion_enabled(&config);
+            match expected {
+                Some(expected) => assert_eq!(actual.unwrap(), expected, "case={name}"),
+                None => assert!(actual.is_err(), "case={name}"),
+            }
         }
     }
 
