@@ -5,7 +5,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from check_databricks_changelog import ValidationError, validate_changelog  # noqa: E402
+from check_databricks_changelog import (  # noqa: E402
+    ValidationError,
+    infer_pr_number,
+    validate_changelog,
+)
 
 
 PR_NUMBER = 123
@@ -14,6 +18,35 @@ FROZEN = "This lists custom changes.\n10. Existing entry.\n11. Last entry.\n"
 
 
 class ValidateChangelogTest(unittest.TestCase):
+    def test_infers_pr_number_from_fragment_paths(self):
+        self.assertEqual(
+            PR_NUMBER,
+            infer_pr_number(
+                {
+                    "databricks.changelog.d/123-first.md": "First.",
+                    "databricks.changelog.d/123-second.md": "Second.",
+                    "databricks.changelog.d/README.md": "Docs.",
+                }
+            ),
+        )
+
+    def test_pr_number_inference_rejects_missing_or_ambiguous_fragments(self):
+        cases = [
+            ({}, "found 0"),
+            (
+                {
+                    "databricks.changelog.d/123-first.md": "First.",
+                    "databricks.changelog.d/124-second.md": "Second.",
+                },
+                "found 2",
+            ),
+        ]
+
+        for added, error_pattern in cases:
+            with self.subTest(error_pattern=error_pattern):
+                with self.assertRaisesRegex(ValidationError, error_pattern):
+                    infer_pr_number(added)
+
     def test_accepts_valid_changes(self):
         cases = [
             (

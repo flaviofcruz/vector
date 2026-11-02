@@ -73,6 +73,22 @@ def contains_exact_pr_url(text: str, pr_url: str) -> bool:
     return re.search(re.escape(pr_url) + boundary, text) is not None
 
 
+def infer_pr_number(added_files: dict[str, str]) -> int:
+    """Infer one PR number from valid fragment filenames for local validation."""
+    numbers = {
+        int(match.group(1))
+        for path in added_files
+        if path not in NON_FRAGMENT_FILES
+        if (match := FRAGMENT_NAME.match(path)) is not None
+    }
+    if len(numbers) != 1:
+        raise ValidationError(
+            "Expected changelog fragments for exactly one PR when --pr-number is "
+            f"omitted, found {len(numbers)} PR numbers."
+        )
+    return numbers.pop()
+
+
 def validate_changelog(
     base_frozen: str,
     head_frozen: str,
@@ -146,7 +162,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--head-ref", default="HEAD")
     parser.add_argument("--repository", required=True)
-    parser.add_argument("--pr-number", required=True, type=int)
+    parser.add_argument(
+        "--pr-number",
+        type=int,
+        help="Current PR number; if omitted, infer it from fragment filenames.",
+    )
     return parser.parse_args()
 
 
@@ -166,12 +186,17 @@ def main() -> int:
         added_files = {
             path: read_file_at_revision(args.head_ref, path) for path in added_paths
         }
-        pr_url = f"https://github.com/{args.repository}/pull/{args.pr_number}"
+        pr_number = (
+            args.pr_number
+            if args.pr_number is not None
+            else infer_pr_number(added_files)
+        )
+        pr_url = f"https://github.com/{args.repository}/pull/{pr_number}"
         fragments = validate_changelog(
             read_file_at_revision(merge_base, FROZEN_CHANGELOG),
             read_file_at_revision(args.head_ref, FROZEN_CHANGELOG),
             added_files,
-            args.pr_number,
+            pr_number,
             pr_url,
         )
     except ValidationError as error:

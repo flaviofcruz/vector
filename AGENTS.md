@@ -50,6 +50,16 @@ workflow.
 
 - There is no reliable GitHub CI signal for this fork/branch. A PR can be open
   without the tests that would normally protect upstream Vector changes.
+- Run all blocking Databricks PR checks from any directory in the repository
+  with:
+
+  ```bash
+  scripts/ci-local.sh
+  ```
+
+  The full check can take up to 10 minutes to run. Use `--fix` to run the
+  supported Rust formatting and Clippy fixers before verification. It never
+  edits the changelog, which is validated last.
 - Run comprehensive local validation before pushing. At minimum, run the
   relevant focused tests plus broader `cargo test` coverage when the change can
   affect shared topology, buffering, config, sources, sinks, or shutdown.
