@@ -15,7 +15,7 @@ use tracing::{debug, info};
 use vector_common::constants::GZIP_MAGIC;
 
 use file_source_common::{
-    AsyncFileInfo, FilePosition, PortableFileExt, ReadFrom,
+    AsyncFileInfo, FilePosition, FileStat, PortableFileExt, ReadFrom,
     buffer::{ReadResult, read_until_with_max_size},
 };
 
@@ -67,6 +67,12 @@ pub struct FileWatcher {
     max_line_bytes: usize,
     line_delimiter: Bytes,
     buf: BytesMut,
+    /// Whether this watcher starts reading its file from offset 0 and has not yet reported
+    /// its first read attempt (see `take_read_started`).
+    read_started_pending: bool,
+    lines_read: u64,
+    bytes_read: u64,
+    last_seen_stat: FileStat,
 }
 
 impl FileWatcher {
@@ -116,13 +122,16 @@ impl FileWatcher {
 
         let gzipped = is_gzipped(&mut reader).await?;
 
-        // Determine the actual position at which we should start reading
+        // Determine the actual position at which we should start reading. Arms that skip the
+        // file (`null_reader`) clear `reads_file`.
+        let mut reads_file = true;
         let (reader, file_position): (Box<dyn AsyncBufRead + Send + Sync + Unpin>, FilePosition) =
             if inactive {
                 debug!(
                     message = "Not reading file modified before `start_reading_at`.",
                     ?path,
                 );
+                reads_file = false;
                 (Box::new(null_reader()), 0)
             } else {
                 match (gzipped, too_old, read_from) {
@@ -133,6 +142,7 @@ impl FileWatcher {
                                 ?path,
                             );
                         }
+                        reads_file = false;
                         (Box::new(null_reader()), 0)
                     }
                     (true, _, ReadFrom::Checkpoint(file_position)) => {
@@ -155,6 +165,7 @@ impl FileWatcher {
                             message = "Can't read from the end of already-compressed file.",
                             ?path,
                         );
+                        reads_file = false;
                         (Box::new(null_reader()), 0)
                     }
                     (true, false, ReadFrom::Beginning) => {
@@ -178,7 +189,11 @@ impl FileWatcher {
                     }
                 }
             };
+        // Reading the file from the beginning means a real reader positioned at offset 0. That
+        // includes a file that is still empty when seeked to its end.
+        let read_started_pending = reads_file && file_position == 0;
 
+        let last_seen_stat = FileStat::from_metadata(&metadata);
         let ts = metadata
             .modified()
             .ok()
@@ -204,6 +219,10 @@ impl FileWatcher {
             line_delimiter,
             buf: BytesMut::new(),
             is_active: !inactive,
+            read_started_pending,
+            lines_read: 0,
+            bytes_read: 0,
+            last_seen_stat,
         })
     }
 
@@ -262,12 +281,56 @@ impl FileWatcher {
         self.file_position.saturating_sub(self.buf.len() as u64)
     }
 
+    /// Returns `true` exactly once per watcher, on the first call, if the watcher reads its
+    /// file from offset 0. Watchers resumed from a nonzero checkpoint, seeked to a nonempty
+    /// file's end, or skipped never do.
+    pub fn take_read_started(&mut self) -> bool {
+        std::mem::take(&mut self.read_started_pending)
+    }
+
+    /// Lines returned by `read_line` over the lifetime of this watcher.
+    pub fn lines_read(&self) -> u64 {
+        self.lines_read
+    }
+
+    /// Line bytes returned by `read_line` over the lifetime of this watcher.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// The file's mtime and size as of watcher creation or the last discovery pass that
+    /// found it (see `refresh_last_seen_stat`). Never does I/O.
+    pub fn last_seen_stat(&self) -> FileStat {
+        self.last_seen_stat
+    }
+
+    /// Records the stat a discovery pass just looked up for this watcher's current path.
+    /// `None` (no lookup this pass, e.g. a cached archive fingerprint) keeps the old value.
+    pub fn refresh_last_seen_stat(&mut self, stat: Option<FileStat>) {
+        if let Some(stat) = stat {
+            self.last_seen_stat = stat;
+        }
+    }
+
     /// Read a single line from the underlying file
     ///
     /// This function will attempt to read a new line from its file, blocking,
     /// up to some maximum but unspecified amount of time. `read_line` will open
     /// a new file handler as needed, transparently to the caller.
     pub(super) async fn read_line(&mut self) -> io::Result<RawLineResult> {
+        let result = self.read_raw_line().await;
+        if let Ok(RawLineResult {
+            raw_line: Some(line),
+            ..
+        }) = &result
+        {
+            self.lines_read += 1;
+            self.bytes_read += line.bytes.len() as u64;
+        }
+        result
+    }
+
+    async fn read_raw_line(&mut self) -> io::Result<RawLineResult> {
         self.track_read_attempt();
 
         let reader = &mut self.reader;

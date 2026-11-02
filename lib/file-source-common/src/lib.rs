@@ -12,7 +12,9 @@ use vector_config::configurable_component;
 pub use self::{
     checkpointer::{CHECKPOINT_FILE_NAME, Checkpointer, CheckpointsView},
     fingerprinter::{FileFingerprint, FingerprintStrategy, Fingerprinter},
-    internal_events::FileSourceInternalEvents,
+    internal_events::{
+        FileReadStartedInfo, FileSourceInternalEvents, FileStat, FileStopReason, FileUnwatchedInfo,
+    },
     metadata_ext::{AsyncFileInfo, PortableFileExt},
 };
 

@@ -113,7 +113,9 @@ mod source {
     use metrics::counter;
     use vector_lib::{
         NamedInternalEvent, emit,
-        file_source_common::internal_events::FileSourceInternalEvents,
+        file_source_common::internal_events::{
+            FileReadStartedInfo, FileSourceInternalEvents, FileUnwatchedInfo,
+        },
         internal_event::{ComponentEventsDropped, INTENTIONAL, error_stage, error_type},
         json_size::JsonSize,
     };
@@ -315,19 +317,63 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
+    pub struct FileReadStarted<'a> {
+        pub file: &'a Path,
+        pub info: &'a FileReadStartedInfo,
+        pub include_file_metric_tag: bool,
+    }
+
+    impl InternalEvent for FileReadStarted<'_> {
+        fn emit(self) {
+            info!(
+                message = "Started reading file from the beginning.",
+                file = %self.file.display(),
+                fingerprint = %self.info.fingerprint,
+                num_lines_read = self.info.lines_read,
+                num_bytes_read = self.info.bytes_read,
+                file_mtime_ms = self.info.stat.mtime_ms,
+                file_size_bytes = self.info.stat.size_bytes,
+                internal_log_rate_limit = false,
+                vector_event_type = "VECTOR_FILE_EVENT",
+                vector_file_event_type = "LOGGING_AGENT_FILE_READ_STARTED"
+            );
+            if self.include_file_metric_tag {
+                counter!(
+                    "files_read_started_total",
+                    "file" => self.file.to_string_lossy().into_owned(),
+                )
+            } else {
+                counter!("files_read_started_total")
+            }
+            .increment(1);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
     pub struct FileUnwatched<'a> {
         pub file: &'a Path,
+        pub info: &'a FileUnwatchedInfo,
         pub include_file_metric_tag: bool,
-        pub reached_eof: bool,
     }
 
     impl InternalEvent for FileUnwatched<'_> {
         fn emit(self) {
-            let reached_eof = if self.reached_eof { "true" } else { "false" };
+            let reached_eof = if self.info.reached_eof {
+                "true"
+            } else {
+                "false"
+            };
             info!(
                 message = "Stopped watching file.",
                 file = %self.file.display(),
                 reached_eof,
+                fingerprint = %self.info.fingerprint,
+                stop_reason = self.info.reason.as_str(),
+                end_offset = self.info.end_offset,
+                num_lines_read = self.info.lines_read,
+                num_bytes_read = self.info.bytes_read,
+                file_mtime_ms = self.info.stat.mtime_ms,
+                file_size_bytes = self.info.stat.size_bytes,
                 internal_log_rate_limit = false,
                 vector_event_type = "VECTOR_FILE_EVENT",
                 vector_file_event_type = "LOGGING_AGENT_FILE_STOPPED"
@@ -348,7 +394,8 @@ mod source {
 
             // Same as `files_unwatched_total`, but kept under `delivery_events_total`
             // to centralize delivery observability.
-            vector_lib::internal_event::delivery_singleton().emit_file_unwatched(self.reached_eof);
+            vector_lib::internal_event::delivery_singleton()
+                .emit_file_unwatched(self.info.reached_eof);
         }
     }
 
@@ -570,11 +617,19 @@ mod source {
             });
         }
 
-        fn emit_file_unwatched(&self, file: &Path, reached_eof: bool) {
+        fn emit_file_read_started(&self, file: &Path, info: &FileReadStartedInfo) {
+            emit!(FileReadStarted {
+                file,
+                info,
+                include_file_metric_tag: self.include_file_metric_tag
+            });
+        }
+
+        fn emit_file_unwatched(&self, file: &Path, info: &FileUnwatchedInfo) {
             emit!(FileUnwatched {
                 file,
-                include_file_metric_tag: self.include_file_metric_tag,
-                reached_eof
+                info,
+                include_file_metric_tag: self.include_file_metric_tag
             });
         }
 
@@ -636,5 +691,134 @@ mod source {
                 encountered_size_so_far
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        path::Path,
+        sync::{Arc, Mutex},
+    };
+
+    use tracing::{
+        Subscriber,
+        field::{Field, Visit},
+    };
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+    use vector_lib::file_source_common::{
+        FileFingerprint, FileReadStartedInfo, FileSourceInternalEvents, FileStat, FileStopReason,
+        FileUnwatchedInfo,
+    };
+
+    use super::FileSourceInternalEventsEmitter;
+
+    type Fields = BTreeMap<String, String>;
+
+    /// Captures the fields of every event that carries a `vector_file_event_type`.
+    #[derive(Clone, Default)]
+    struct FileEventCapture(Arc<Mutex<Vec<Fields>>>);
+
+    struct FieldsVisitor(Fields);
+
+    impl Visit for FieldsVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for FileEventCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldsVisitor(Fields::new());
+            event.record(&mut visitor);
+            if visitor.0.contains_key("vector_file_event_type") {
+                self.0.lock().unwrap().push(visitor.0);
+            }
+        }
+    }
+
+    fn capture(emit: impl FnOnce(&FileSourceInternalEventsEmitter)) -> Fields {
+        let capture = FileEventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            emit(&FileSourceInternalEventsEmitter {
+                include_file_metric_tag: false,
+            })
+        });
+        let mut events = capture.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "{events:?}");
+        events.pop().unwrap()
+    }
+
+    fn field<'a>(fields: &'a Fields, name: &str) -> Option<&'a str> {
+        fields.get(name).map(String::as_str)
+    }
+
+    // Field names match `VectorFileEvent` in universe's `vector_event_log.proto`.
+    #[test]
+    fn read_started_logs_proto_fields() {
+        let info = FileReadStartedInfo {
+            fingerprint: FileFingerprint::FirstLinesChecksum(42),
+            lines_read: 2,
+            bytes_read: 21,
+            stat: FileStat {
+                mtime_ms: Some(1_700_000_000_000),
+                size_bytes: Some(23),
+            },
+        };
+        let fields = capture(|e| e.emit_file_read_started(Path::new("/var/log/app.log"), &info));
+
+        assert_eq!(
+            field(&fields, "vector_file_event_type"),
+            Some("LOGGING_AGENT_FILE_READ_STARTED")
+        );
+        assert_eq!(
+            field(&fields, "vector_event_type"),
+            Some("VECTOR_FILE_EVENT")
+        );
+        assert_eq!(field(&fields, "file"), Some("/var/log/app.log"));
+        assert_eq!(
+            field(&fields, "fingerprint"),
+            Some("first_lines_checksum:42")
+        );
+        assert_eq!(field(&fields, "num_lines_read"), Some("2"));
+        assert_eq!(field(&fields, "num_bytes_read"), Some("21"));
+        assert_eq!(field(&fields, "file_mtime_ms"), Some("1700000000000"));
+        assert_eq!(field(&fields, "file_size_bytes"), Some("23"));
+    }
+
+    #[test]
+    fn unwatched_logs_proto_fields_and_omits_missing_stat() {
+        let info = FileUnwatchedInfo {
+            fingerprint: FileFingerprint::DevInode(1, 2),
+            reason: FileStopReason::FileGone,
+            reached_eof: false,
+            end_offset: 100,
+            lines_read: 3,
+            bytes_read: 90,
+            stat: FileStat::default(),
+        };
+        let fields = capture(|e| e.emit_file_unwatched(Path::new("/var/log/app.log"), &info));
+
+        assert_eq!(
+            field(&fields, "vector_file_event_type"),
+            Some("LOGGING_AGENT_FILE_STOPPED")
+        );
+        assert_eq!(field(&fields, "fingerprint"), Some("dev_inode:1:2"));
+        assert_eq!(
+            field(&fields, "stop_reason"),
+            Some("VECTOR_FILE_STOP_REASON_FILE_GONE")
+        );
+        assert_eq!(field(&fields, "reached_eof"), Some("false"));
+        assert_eq!(field(&fields, "end_offset"), Some("100"));
+        assert_eq!(field(&fields, "num_lines_read"), Some("3"));
+        assert_eq!(field(&fields, "num_bytes_read"), Some("90"));
+        assert_eq!(field(&fields, "file_mtime_ms"), None);
+        assert_eq!(field(&fields, "file_size_bytes"), None);
     }
 }

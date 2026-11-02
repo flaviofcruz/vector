@@ -9,7 +9,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use file_source_common::{
-    FileFingerprint, FileSourceInternalEvents, Fingerprinter, ReadFrom,
+    FileFingerprint, FileReadStartedInfo, FileSourceInternalEvents, FileStopReason,
+    FileUnwatchedInfo, Fingerprinter, ReadFrom,
     checkpointer::{Checkpointer, CheckpointsView},
 };
 use futures::{
@@ -336,28 +337,35 @@ where
                     // single shared block below. This avoids the class of bugs
                     // where a short-circuiting fast path skipped state
                     // reconciliation and left watchers bound to stale inodes.
-                    let file_id = if !self.ignore_checkpoints && self.is_archive(&path) {
+                    // `stat` is the metadata the fingerprinter already looked up; it is `None`
+                    // when an archive's fingerprint came from the checkpoint cache.
+                    let (file_id, stat) = if !self.ignore_checkpoints && self.is_archive(&path) {
                         match checkpoints.get_archive_fingerprint(&path) {
-                            Some(id) => Some(id),
+                            Some(id) => (Some(id), None),
                             None => {
-                                let id = self
+                                let found = self
                                     .fingerprinter
-                                    .fingerprint_or_emit(
+                                    .fingerprint_with_stat_or_emit(
                                         &path,
                                         &mut known_small_files,
                                         &self.emitter,
                                     )
                                     .await;
-                                if let Some(id) = id {
+                                if let Some((id, _)) = found {
                                     checkpoints.set_archive_path(id, &path);
                                 }
-                                id
+                                found.unzip()
                             }
                         }
                     } else {
                         self.fingerprinter
-                            .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
+                            .fingerprint_with_stat_or_emit(
+                                &path,
+                                &mut known_small_files,
+                                &self.emitter,
+                            )
                             .await
+                            .unzip()
                     };
 
                     if let Some(file_id) = file_id {
@@ -370,6 +378,7 @@ where
                                     message = "Continue watching file.",
                                     path = ?path,
                                 );
+                                watcher.refresh_last_seen_stat(stat);
                             } else if !was_found_this_cycle {
                                 // matches a file with a different path
                                 info!(
@@ -379,6 +388,7 @@ where
                                 );
                                 let old_path = watcher.path.clone();
                                 if watcher.update_path(path.clone()).await.is_ok() {
+                                    watcher.refresh_last_seen_stat(stat);
                                     self.update_file_to_pod_map_for_path_change(
                                         &old_path,
                                         path,
@@ -404,6 +414,7 @@ where
                                     );
                                     let old_path = watcher.path.clone();
                                     if watcher.update_path(path.clone()).await.is_ok() {
+                                        watcher.refresh_last_seen_stat(stat);
                                         self.update_file_to_pod_map_for_path_change(
                                             &old_path,
                                             path,
@@ -552,6 +563,15 @@ where
                     }
                 }
                 stats.record("reading", start.elapsed());
+                if !is_done && watcher.take_read_started() {
+                    let info = FileReadStartedInfo {
+                        fingerprint: file_id,
+                        lines_read: watcher.lines_read(),
+                        bytes_read: watcher.bytes_read(),
+                        stat: watcher.last_seen_stat(),
+                    };
+                    self.emitter.emit_file_read_started(&watcher.path, &info);
+                }
                 if lines_read > 0 {
                     // Pre-multiline read spot, gated off by default
                     // (EMIT_READ_EVENT_AFTER_MULTILINE_AGG). The counter fires
@@ -575,7 +595,6 @@ where
                     );
                 }
                 if watcher.reached_eof() && self.is_archive(&watcher.path) {
-                    //TODO: a vector event for done. important for debugging
                     debug!(message = "File reached eof. Marking it done.", path = ?watcher.path);
                     checkpoints.set_done(file_id, &watcher.path);
                     done_archives.push((file_id, watcher.path.clone()));
@@ -624,8 +643,10 @@ where
             // from fp_map without calling checkpoints.set_dead so that the done/
             // archive_paths entries survive until remove_after actually deletes the file.
             for (fng, path) in done_archives {
-                self.emitter.emit_file_unwatched(&path, true);
-                fp_map.swap_remove(&fng);
+                if let Some(watcher) = fp_map.swap_remove(&fng) {
+                    let info = unwatched_info(fng, &watcher, FileStopReason::ArchiveDone);
+                    self.emitter.emit_file_unwatched(&path, &info);
+                }
             }
 
             for (_, watcher) in &mut fp_map {
@@ -646,8 +667,8 @@ where
             // If the FileWatcher is dead we don't retain it; it will be deallocated.
             fp_map.retain(|file_id, watcher| {
                 if watcher.dead() {
-                    self.emitter
-                        .emit_file_unwatched(&watcher.path, watcher.reached_eof());
+                    let info = unwatched_info(*file_id, watcher, FileStopReason::FileGone);
+                    self.emitter.emit_file_unwatched(&watcher.path, &info);
                     checkpoints.set_dead(*file_id);
                     false
                 } else {
@@ -1025,6 +1046,23 @@ where
     }
 }
 
+fn unwatched_info(
+    fingerprint: FileFingerprint,
+    watcher: &FileWatcher,
+    reason: FileStopReason,
+) -> FileUnwatchedInfo {
+    FileUnwatchedInfo {
+        fingerprint,
+        reason,
+        reached_eof: watcher.reached_eof(),
+        // Excludes bytes buffered for an unterminated line, matching the checkpoint.
+        end_offset: watcher.get_checkpoint_position(),
+        lines_read: watcher.lines_read(),
+        bytes_read: watcher.bytes_read(),
+        stat: watcher.last_seen_stat(),
+    }
+}
+
 async fn checkpoint_writer(
     checkpointer: Arc<Checkpointer>,
     sleep_duration: Duration,
@@ -1209,7 +1247,8 @@ mod tests {
 
     use bytes::{Bytes, BytesMut};
     use file_source_common::{
-        Checkpointer, FileSourceInternalEvents, FingerprintStrategy, Fingerprinter, ReadFrom,
+        Checkpointer, FileReadStartedInfo, FileSourceInternalEvents, FileUnwatchedInfo,
+        FingerprintStrategy, Fingerprinter, ReadFrom,
     };
     use futures::{StreamExt, channel::mpsc};
     use tempfile::tempdir;
@@ -1232,7 +1271,8 @@ mod tests {
         fn emit_file_watch_error(&self, _: &Path, _: Error) {
             panic!("unexpected file watch error");
         }
-        fn emit_file_unwatched(&self, _: &Path, _: bool) {}
+        fn emit_file_read_started(&self, _: &Path, _: &FileReadStartedInfo) {}
+        fn emit_file_unwatched(&self, _: &Path, _: &FileUnwatchedInfo) {}
         fn emit_file_deleted(&self, _: &Path) {}
         fn emit_file_delete_error(&self, _: &Path, _: Error) {
             panic!("unexpected file delete error");
@@ -1271,8 +1311,11 @@ mod tests {
         fn emit_file_watch_error(&self, path: &Path, error: Error) {
             NoErrors.emit_file_watch_error(path, error);
         }
-        fn emit_file_unwatched(&self, path: &Path, reached_eof: bool) {
-            NoErrors.emit_file_unwatched(path, reached_eof);
+        fn emit_file_read_started(&self, path: &Path, info: &FileReadStartedInfo) {
+            NoErrors.emit_file_read_started(path, info);
+        }
+        fn emit_file_unwatched(&self, path: &Path, info: &FileUnwatchedInfo) {
+            NoErrors.emit_file_unwatched(path, info);
         }
         fn emit_file_deleted(&self, path: &Path) {
             NoErrors.emit_file_deleted(path);
@@ -1301,6 +1344,100 @@ mod tests {
         fn emit_file_line_too_long(&self, bytes: &BytesMut, limit: usize, size: usize) {
             NoErrors.emit_file_line_too_long(bytes, limit, size);
         }
+    }
+
+    /// Records READ_STARTED and STOPPED (unwatched) events; everything else behaves like
+    /// `NoErrors`.
+    #[derive(Clone, Default)]
+    struct LifecycleEvents {
+        read_started: Arc<Mutex<Vec<(PathBuf, FileReadStartedInfo)>>>,
+        unwatched: Arc<Mutex<Vec<(PathBuf, FileUnwatchedInfo)>>>,
+    }
+
+    impl FileSourceInternalEvents for LifecycleEvents {
+        fn emit_file_added(&self, path: &Path) {
+            NoErrors.emit_file_added(path);
+        }
+        fn emit_file_resumed(&self, path: &Path, position: u64) {
+            NoErrors.emit_file_resumed(path, position);
+        }
+        fn emit_file_watch_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_watch_error(path, error);
+        }
+        fn emit_file_read_started(&self, path: &Path, info: &FileReadStartedInfo) {
+            self.read_started
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), *info));
+        }
+        fn emit_file_unwatched(&self, path: &Path, info: &FileUnwatchedInfo) {
+            self.unwatched
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), *info));
+        }
+        fn emit_file_deleted(&self, path: &Path) {
+            NoErrors.emit_file_deleted(path);
+        }
+        fn emit_file_delete_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_delete_error(path, error);
+        }
+        fn emit_file_fingerprint_read_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_fingerprint_read_error(path, error);
+        }
+        fn emit_file_checkpointed(&self, count: usize, duration: Duration) {
+            NoErrors.emit_file_checkpointed(count, duration);
+        }
+        fn emit_file_checksum_failed(&self, path: &Path) {
+            NoErrors.emit_file_checksum_failed(path);
+        }
+        fn emit_file_checkpoint_write_error(&self, error: Error) {
+            NoErrors.emit_file_checkpoint_write_error(error);
+        }
+        fn emit_files_open(&self, count: usize) {
+            NoErrors.emit_files_open(count);
+        }
+        fn emit_path_globbing_failed(&self, path: &Path, error: &Error) {
+            NoErrors.emit_path_globbing_failed(path, error);
+        }
+        fn emit_file_line_too_long(&self, bytes: &BytesMut, limit: usize, size: usize) {
+            NoErrors.emit_file_line_too_long(bytes, limit, size);
+        }
+    }
+
+    /// Runs `file_server` while `actions` runs alongside it, then shuts the server down.
+    async fn run_file_server_during<P, E, F>(
+        file_server: FileServer<P, E>,
+        data_dir: &Path,
+        actions: F,
+    ) where
+        P: PathsProvider,
+        E: FileSourceInternalEvents,
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel::<Vec<Line>>(8);
+        let collector = tokio::spawn(rx.collect::<Vec<_>>());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown_data: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+            });
+        let driver = tokio::spawn(async move {
+            actions.await;
+            let _ = shutdown_tx.send(());
+        });
+
+        file_server
+            .run(
+                tx,
+                shutdown_data,
+                futures::future::ready(()),
+                Checkpointer::new(data_dir),
+            )
+            .await
+            .unwrap();
+        driver.await.unwrap();
+        collector.await.unwrap();
     }
 
     // Simple PathsProvider that returns a fixed set of paths.
@@ -2523,6 +2660,157 @@ mod tests {
             open_count, 0,
             "expected 0 open fds on done gz file while server was still \
              running, found {open_count}"
+        );
+    }
+
+    // A gzip archive read to EOF reports READ_STARTED once, then STOPPED with
+    // ARCHIVE_DONE, its decompressed end offset and lifetime totals.
+    #[tokio::test]
+    async fn gz_read_to_eof_emits_read_started_and_archive_done() {
+        use async_compression::tokio::bufread::GzipEncoder;
+        use file_source_common::FileStopReason;
+        use tokio::io::AsyncReadExt;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+        let gz_path = tmp.path().join("app.log.gz");
+        let payload: &[u8] = b"first line\nsecond line\n";
+        let mut gz_bytes = Vec::new();
+        GzipEncoder::new(payload)
+            .read_to_end(&mut gz_bytes)
+            .await
+            .unwrap();
+        fs::write(&gz_path, &gz_bytes).await.unwrap();
+
+        let events = LifecycleEvents::default();
+        let file_server = make_file_server_with_emitter(
+            vec![gz_path.clone()],
+            data_dir.clone(),
+            false,
+            events.clone(),
+        );
+        run_file_server_during(file_server, &data_dir, async {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        })
+        .await;
+
+        let read_started = events.read_started.lock().unwrap().clone();
+        assert_eq!(read_started.len(), 1, "{read_started:?}");
+        let (path, info) = &read_started[0];
+        assert_eq!(path, &gz_path);
+        assert_eq!((info.lines_read, info.bytes_read), (2, 21));
+        assert_eq!(info.stat.size_bytes, Some(gz_bytes.len() as u64));
+        assert!(info.stat.mtime_ms.is_some());
+
+        let unwatched = events.unwatched.lock().unwrap().clone();
+        assert_eq!(unwatched.len(), 1, "{unwatched:?}");
+        let (path, stopped) = &unwatched[0];
+        assert_eq!(path, &gz_path);
+        assert_eq!(stopped.fingerprint, info.fingerprint);
+        assert_eq!(stopped.reason, FileStopReason::ArchiveDone);
+        assert!(stopped.reached_eof);
+        assert_eq!(stopped.end_offset, payload.len() as u64);
+        assert_eq!((stopped.lines_read, stopped.bytes_read), (2, 21));
+        assert_eq!(stopped.stat.size_bytes, Some(gz_bytes.len() as u64));
+    }
+
+    // A file removed by `remove_after` while it ends in an unterminated line reports an
+    // `end_offset` at the end of its last delivered line, not past the buffered bytes.
+    #[tokio::test]
+    async fn stopped_end_offset_excludes_buffered_partial_line() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+        let path = tmp.path().join("app.log");
+        fs::write(&path, b"first line\npartial").await.unwrap();
+
+        let events = LifecycleEvents::default();
+        let mut file_server = make_file_server_with_emitter(
+            vec![path.clone()],
+            data_dir.clone(),
+            false,
+            events.clone(),
+        );
+        file_server.remove_after = Some(Duration::from_millis(200));
+        run_file_server_during(file_server, &data_dir, async {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        })
+        .await;
+
+        assert!(!path.exists(), "remove_after should have deleted the file");
+        let unwatched = events.unwatched.lock().unwrap().clone();
+        assert_eq!(unwatched.len(), 1, "{unwatched:?}");
+        let stopped = &unwatched[0].1;
+        assert_eq!((stopped.lines_read, stopped.bytes_read), (1, 10));
+        assert_eq!(
+            stopped.end_offset, 11,
+            "end of `first line\\n`, excluding `partial`"
+        );
+    }
+
+    // A rotated-away file reports STOPPED with FILE_GONE and its own last-seen size. Its old
+    // path now holds the new file, whose size must not leak into the event.
+    #[tokio::test]
+    async fn rotated_away_file_emits_file_gone_with_its_last_seen_stat() {
+        use file_source_common::FileStopReason;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+        let path = tmp.path().join("app.log");
+        fs::write(&path, b"first line\n").await.unwrap();
+
+        let events = LifecycleEvents::default();
+        let mut file_server = make_file_server_with_emitter(
+            vec![path.clone()],
+            data_dir.clone(),
+            false,
+            events.clone(),
+        );
+        file_server.rotate_wait = Duration::ZERO;
+        let rotate_path = path.clone();
+        let rotated_path = tmp.path().join("app.log.1");
+        run_file_server_during(file_server, &data_dir, async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Grow the file after the watcher was created, so its final size can only come
+            // from a later discovery pass (glob cooldown is 100ms).
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&rotate_path)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut file, b"second line\n")
+                .await
+                .unwrap();
+            drop(file);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            fs::rename(&rotate_path, &rotated_path).await.unwrap();
+            fs::write(&rotate_path, b"new file line\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        })
+        .await;
+
+        let read_started = events.read_started.lock().unwrap().clone();
+        assert_eq!(read_started.len(), 2, "one per file: {read_started:?}");
+        let original = read_started[0].1.fingerprint;
+        assert_ne!(read_started[1].1.fingerprint, original);
+
+        let unwatched = events.unwatched.lock().unwrap().clone();
+        assert_eq!(unwatched.len(), 1, "{unwatched:?}");
+        let (stopped_path, stopped) = &unwatched[0];
+        assert_eq!(stopped_path, &path);
+        assert_eq!(stopped.fingerprint, original);
+        assert_eq!(stopped.reason, FileStopReason::FileGone);
+        assert!(stopped.reached_eof);
+        assert_eq!(stopped.end_offset, 23);
+        assert_eq!((stopped.lines_read, stopped.bytes_read), (2, 21));
+        assert_eq!(stopped.stat.size_bytes, Some(23));
+        assert!(stopped.stat.mtime_ms.is_some());
+        assert_eq!(
+            read_started[1].1.stat.size_bytes,
+            Some(14),
+            "the new file's own size"
         );
     }
 

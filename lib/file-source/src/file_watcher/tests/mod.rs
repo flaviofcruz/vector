@@ -4,6 +4,8 @@ mod experiment_no_truncations;
 use std::{path::PathBuf, str, thread, time::Duration};
 
 use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
+use file_source_common::{FileStat, ReadFrom};
 use quickcheck::{Arbitrary, Gen};
 use tokio::time::Instant;
 
@@ -196,6 +198,10 @@ fn watcher_for_timing() -> FileWatcher {
         max_line_bytes: 1024,
         line_delimiter: Bytes::from_static(b"\n"),
         buf: BytesMut::new(),
+        read_started_pending: false,
+        lines_read: 0,
+        bytes_read: 0,
+        last_seen_stat: FileStat::default(),
     }
 }
 
@@ -268,6 +274,112 @@ async fn read_line_does_not_reap_on_eof_when_not_findable() {
 
     assert!(!watcher.dead(), "read_line must not reap the watcher");
     assert!(watcher.reached_eof());
+}
+
+async fn new_watcher(
+    path: PathBuf,
+    read_from: ReadFrom,
+    ignore_before: Option<DateTime<Utc>>,
+) -> FileWatcher {
+    FileWatcher::new(
+        path,
+        read_from,
+        ignore_before,
+        None,
+        1024,
+        Bytes::from_static(b"\n"),
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap()
+}
+
+// `take_read_started` fires once, and only for watchers that read their file from offset 0.
+#[tokio::test]
+async fn take_read_started_only_for_reads_from_offset_zero() {
+    use async_compression::tokio::bufread::GzipEncoder;
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("app.log");
+    std::fs::write(&plain, b"first line\nsecond line\n").unwrap();
+    let gz = dir.path().join("app.log.gz");
+    let mut gz_bytes = Vec::new();
+    GzipEncoder::new(&b"first line\n"[..])
+        .read_to_end(&mut gz_bytes)
+        .await
+        .unwrap();
+    std::fs::write(&gz, &gz_bytes).unwrap();
+    let empty = dir.path().join("empty.log");
+    std::fs::write(&empty, b"").unwrap();
+    let too_old = Some(Utc::now() + chrono::Duration::days(1));
+
+    let cases = [
+        (&plain, ReadFrom::Beginning, None, true),
+        (&plain, ReadFrom::Checkpoint(0), None, true),
+        (&plain, ReadFrom::Checkpoint(5), None, false),
+        (&plain, ReadFrom::End, None, false),
+        // Seeking to the end of an empty file lands at 0, so everything later is read from the start.
+        (&empty, ReadFrom::End, None, true),
+        (&plain, ReadFrom::Beginning, too_old, false),
+        (&gz, ReadFrom::Beginning, None, true),
+        (&gz, ReadFrom::Checkpoint(0), None, true),
+        (&gz, ReadFrom::Checkpoint(5), None, false),
+        (&gz, ReadFrom::End, None, false),
+        (&gz, ReadFrom::Beginning, too_old, false),
+    ];
+    for (path, read_from, ignore_before, expected) in cases {
+        let mut watcher = new_watcher(path.clone(), read_from, ignore_before).await;
+        assert_eq!(
+            watcher.take_read_started(),
+            expected,
+            "{path:?} {read_from:?} ignore_before={ignore_before:?}"
+        );
+        assert!(!watcher.take_read_started(), "must fire at most once");
+    }
+}
+
+#[tokio::test]
+async fn read_line_counts_lines_and_line_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.log");
+    std::fs::write(&path, b"first line\nsecond line\n").unwrap();
+
+    let mut watcher = new_watcher(path, ReadFrom::Beginning, None).await;
+    while watcher.read_line().await.unwrap().raw_line.is_some() {}
+
+    assert_eq!(watcher.lines_read(), 2);
+    assert_eq!(watcher.bytes_read(), 21, "delimiters are not counted");
+    assert_eq!(watcher.get_file_position(), 23);
+}
+
+// A new watcher's last-seen stat comes from the file it opened; later passes overwrite it.
+#[tokio::test]
+async fn last_seen_stat_starts_from_the_opened_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.log");
+    std::fs::write(&path, b"first line\n").unwrap();
+    let mut watcher = new_watcher(path.clone(), ReadFrom::Beginning, None).await;
+
+    let stat = watcher.last_seen_stat();
+    assert_eq!(stat.size_bytes, Some(11));
+    let expected_mtime =
+        DateTime::<Utc>::from(std::fs::metadata(&path).unwrap().modified().unwrap())
+            .timestamp_millis();
+    assert_eq!(stat.mtime_ms, Some(expected_mtime));
+
+    let updated = FileStat {
+        mtime_ms: Some(1),
+        size_bytes: Some(2),
+    };
+    watcher.refresh_last_seen_stat(Some(updated));
+    assert_eq!(watcher.last_seen_stat(), updated);
+    watcher.refresh_last_seen_stat(None);
+    assert_eq!(
+        watcher.last_seen_stat(),
+        updated,
+        "None keeps the last value"
+    );
 }
 
 #[inline]

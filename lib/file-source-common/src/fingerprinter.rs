@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt,
     io::{ErrorKind, Result, SeekFrom},
     path::{Path, PathBuf},
     time,
@@ -15,7 +16,9 @@ use tokio::{
 use vector_common::constants::GZIP_MAGIC;
 
 use crate::{
-    AsyncFileInfo, internal_events::FileSourceInternalEvents, metadata_ext::PortableFileExt,
+    AsyncFileInfo,
+    internal_events::{FileSourceInternalEvents, FileStat},
+    metadata_ext::PortableFileExt,
 };
 
 const FINGERPRINT_CRC: Crc<u64> = Crc::<u64>::new(&crc::CRC_64_ECMA_182);
@@ -66,6 +69,17 @@ pub enum FileFingerprint {
     #[serde(alias = "first_line_checksum")]
     FirstLinesChecksum(u64),
     DevInode(u64, u64),
+}
+
+/// Renders the fingerprint as a stable string for internal events, using the same
+/// variant names as the checkpoint file (e.g. `first_lines_checksum:123`, `dev_inode:1:2`).
+impl fmt::Display for FileFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FirstLinesChecksum(checksum) => write!(f, "first_lines_checksum:{checksum}"),
+            Self::DevInode(dev, ino) => write!(f, "dev_inode:{dev}:{ino}"),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -216,10 +230,25 @@ impl Fingerprinter {
         known_small_files: &mut HashMap<PathBuf, time::Instant>,
         emitter: &impl FileSourceInternalEvents,
     ) -> Option<FileFingerprint> {
+        self.fingerprint_with_stat_or_emit(path, known_small_files, emitter)
+            .await
+            .map(|(fingerprint, _)| fingerprint)
+    }
+
+    /// Like `fingerprint_or_emit`, but also returns the file's mtime and size from the
+    /// metadata lookup it already does, so callers don't need a separate `stat`.
+    pub async fn fingerprint_with_stat_or_emit(
+        &mut self,
+        path: &Path,
+        known_small_files: &mut HashMap<PathBuf, time::Instant>,
+        emitter: &impl FileSourceInternalEvents,
+    ) -> Option<(FileFingerprint, FileStat)> {
         let metadata = match fs::metadata(path).await {
             Ok(metadata) => {
                 if !metadata.is_dir() {
-                    self.fingerprint(path).await.map(Some)
+                    self.fingerprint(path)
+                        .await
+                        .map(|fingerprint| Some((fingerprint, FileStat::from_metadata(&metadata))))
                 } else {
                     Ok(None)
                 }
@@ -298,6 +327,7 @@ mod test {
     use tempfile::{TempDir, tempdir};
 
     use super::{FileSourceInternalEvents, FingerprintStrategy, Fingerprinter};
+    use crate::internal_events::{FileReadStartedInfo, FileUnwatchedInfo};
 
     use tokio::io::AsyncReadExt;
 
@@ -680,7 +710,9 @@ mod test {
             panic!();
         }
 
-        fn emit_file_unwatched(&self, _: &Path, _: bool) {}
+        fn emit_file_read_started(&self, _: &Path, _: &FileReadStartedInfo) {}
+
+        fn emit_file_unwatched(&self, _: &Path, _: &FileUnwatchedInfo) {}
 
         fn emit_file_deleted(&self, _: &Path) {}
 
