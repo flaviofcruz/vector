@@ -11,6 +11,7 @@ use std::{
 
 // Azure SDK imports for blob and queue operations
 // Note: Using azure_core_for_storage (v0.21) to match azure_storage_* crate versions
+use azure_core_for_storage::StatusCode;
 use azure_core_for_storage::error::ErrorKind;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::*;
@@ -21,7 +22,6 @@ use azure_storage_queues::prelude::*;
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use futures::{FutureExt, Stream, StreamExt};
-use serde::de::Error as SerdeDeError;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use smallvec::SmallVec;
@@ -36,13 +36,16 @@ use vector_lib::codecs::decoding::FramingError;
 use vector_lib::configurable::configurable_component;
 use vector_lib::internal_event::{
     ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol, Registered,
+    error_stage, error_type,
 };
 use vector_lib::source_sender::SendError;
 
 use crate::codecs::Decoder;
 use crate::event::{Event, LogEvent};
 use crate::internal_events::{
-    EventsReceived, ObjectStorageBlobTruncated, QueueMessageCount, QueueMessageDeleteSucceeded,
+    AzureBlobMessageProcessingError, AzureBlobQueueDeleteFailed, AzureBlobQueueMetadataFailed,
+    AzureBlobQueueMetadataTimedOut, AzureBlobQueueReceiveFailed, EventsReceived,
+    ObjectStorageBlobTruncated, QueueMessageCount, QueueMessageDeleteSucceeded,
     QueueMessageReceived, QueueNotificationProcessLag, StreamClosedError,
     emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
 };
@@ -206,16 +209,24 @@ pub(super) enum IngestorNewError {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Snafu)]
 pub enum ProcessingError {
-    /// Failed to parse a queue message as an Event Grid notification
+    /// The queue message body is not valid base64
+    #[snafu(display("Could not base64-decode queue message: {}", source))]
+    InvalidBase64 { source: base64::DecodeError },
+
+    /// The base64-decoded queue message body is not valid UTF-8
+    #[snafu(display("Could not convert decoded queue message to UTF-8: {}", source))]
+    InvalidUtf8 { source: std::string::FromUtf8Error },
+
+    /// The decoded queue message body is not a JSON object this source understands
     #[snafu(display(
-        "Could not parse queue message with id {} as Event Grid notification: {}",
-        message_id,
+        "Could not parse decoded queue message as an Event Grid notification or direct ingest message: {}",
         source
     ))]
-    InvalidQueueMessage {
-        source: serde_json::Error,
-        message_id: String,
-    },
+    InvalidJson { source: serde_json::Error },
+
+    /// An Event Grid notification's subject is not a blob path
+    #[snafu(display("Invalid Event Grid blob subject: {}", subject))]
+    InvalidBlobSubject { subject: String },
 
     /// Failed to fetch a blob from Azure Storage
     #[snafu(display("Failed to fetch blob {}/{}: {}", container, blob, source))]
@@ -225,10 +236,29 @@ pub enum ProcessingError {
         blob: String,
     },
 
+    /// The blob fetch completed without yielding a response
+    #[snafu(display("No response received while fetching blob {}/{}", container, blob))]
+    GetBlobEmptyResponse { container: String, blob: String },
+
     /// Failed to read the contents of a blob
     #[snafu(display("Failed to read all of blob {}/{}: {}", container, blob, source))]
     ReadBlob {
         source: Box<dyn FramingError>,
+        container: String,
+        blob: String,
+    },
+
+    /// The blob body ended before the advertised content length was received (short transfer)
+    #[snafu(display(
+        "Incomplete download of blob {}/{}: read {} of {} bytes",
+        container,
+        blob,
+        bytes_read,
+        content_length
+    ))]
+    IncompleteBlobDownload {
+        bytes_read: u64,
+        content_length: u64,
         container: String,
         blob: String,
     },
@@ -272,13 +302,17 @@ pub enum ProcessingError {
     #[snafu(display("Unsupported Event Grid version: {}.", version,))]
     UnsupportedEventGridVersion { version: semver::Version },
 
-    /// Failed to process a blob due to error acknowledgement
+    /// The pipeline acknowledged the blob's events as errored
     #[snafu(display(
-        "Failed to process blob {}/{} due to error acknowledgement",
+        "Blob {}/{} was acknowledged as errored by the pipeline",
         container,
         blob
     ))]
-    ErrorAcknowledgement { container: String, blob: String },
+    BlobDeliveryErrored { container: String, blob: String },
+
+    /// The pipeline rejected the blob's events
+    #[snafu(display("Blob {}/{} was rejected by the pipeline", container, blob))]
+    BlobDeliveryRejected { container: String, blob: String },
 
     /// Blob was not found in Azure Storage (404)
     #[snafu(display("Blob not found {}/{}: {}", container, blob, source))]
@@ -293,6 +327,134 @@ pub enum ProcessingError {
         blob
     ))]
     EmptyFileId { container: String, blob: String },
+}
+
+/// Classifies a failed blob fetch (`GetBlob`) into an `(error_type, error_code)` pair.
+///
+/// `error_code` is a bounded static string so it can label `component_errors_total`.
+/// Status-specific codes distinguish the causes operators act on (forbidden, throttled,
+/// server-side); everything else falls back to the generic code for its kind.
+fn get_blob_failure(err: &azure_core_for_storage::Error) -> (&'static str, &'static str) {
+    match err.kind() {
+        ErrorKind::HttpResponse { status, .. } => {
+            let code = if *status == StatusCode::Forbidden {
+                "get_blob_forbidden"
+            } else if *status == StatusCode::TooManyRequests
+                || *status == StatusCode::ServiceUnavailable
+            {
+                "get_blob_throttled"
+            } else if status.is_server_error() {
+                "get_blob_server_error"
+            } else {
+                "get_blob_failed"
+            };
+            (error_type::REQUEST_FAILED, code)
+        }
+        ErrorKind::Io => (error_type::CONNECTION_FAILED, "get_blob_io_failed"),
+        ErrorKind::Credential => (
+            error_type::CONFIGURATION_FAILED,
+            "get_blob_credential_failed",
+        ),
+        _ => (error_type::REQUEST_FAILED, "get_blob_failed"),
+    }
+}
+
+impl ProcessingError {
+    /// The `error_type` label for `component_errors_total`. Exhaustive on purpose: a new variant
+    /// must be classified before it compiles.
+    pub(crate) fn error_type(&self) -> &'static str {
+        match self {
+            Self::InvalidBase64 { .. }
+            | Self::InvalidUtf8 { .. }
+            | Self::InvalidJson { .. }
+            | Self::InvalidBlobSubject { .. }
+            | Self::UnsupportedEventGridVersion { .. } => error_type::PARSER_FAILED,
+            Self::EmptyFileId { .. }
+            | Self::WrongStorageAccount { .. }
+            | Self::DisallowedStorageAccount { .. } => error_type::CONDITION_FAILED,
+            Self::GetBlob { source, .. } => get_blob_failure(source).0,
+            Self::GetBlobEmptyResponse { .. } | Self::BlobNotFound { .. } => {
+                error_type::REQUEST_FAILED
+            }
+            Self::ReadBlob { .. } | Self::IncompleteBlobDownload { .. } => {
+                error_type::READER_FAILED
+            }
+            Self::PipelineSend { .. } => error_type::WRITER_FAILED,
+            Self::BlobDeliveryErrored { .. } | Self::BlobDeliveryRejected { .. } => {
+                error_type::ACKNOWLEDGMENT_FAILED
+            }
+        }
+    }
+
+    /// The bounded, static `error_code` label for `component_errors_total`.
+    pub(crate) fn error_code(&self) -> &'static str {
+        match self {
+            Self::InvalidBase64 { .. } => "invalid_base64",
+            Self::InvalidUtf8 { .. } => "invalid_utf8",
+            Self::InvalidJson { .. } => "invalid_json",
+            Self::InvalidBlobSubject { .. } => "invalid_blob_subject",
+            Self::UnsupportedEventGridVersion { .. } => "unsupported_event_grid_version",
+            Self::EmptyFileId { .. } => "empty_file_id",
+            Self::WrongStorageAccount { .. } => "wrong_storage_account",
+            Self::DisallowedStorageAccount { .. } => "disallowed_storage_account",
+            Self::GetBlob { source, .. } => get_blob_failure(source).1,
+            Self::GetBlobEmptyResponse { .. } => "get_blob_empty_response",
+            Self::BlobNotFound { .. } => "blob_not_found",
+            Self::ReadBlob { .. } => "read_blob_failed",
+            Self::IncompleteBlobDownload { .. } => "incomplete_blob_download",
+            Self::PipelineSend { .. } => "pipeline_send_failed",
+            Self::BlobDeliveryErrored { .. } => "delivery_errored",
+            Self::BlobDeliveryRejected { .. } => "delivery_rejected",
+        }
+    }
+
+    /// The `stage` label for `component_errors_total`.
+    pub(crate) const fn stage(&self) -> &'static str {
+        match self {
+            Self::InvalidBase64 { .. }
+            | Self::InvalidUtf8 { .. }
+            | Self::InvalidJson { .. }
+            | Self::InvalidBlobSubject { .. }
+            | Self::UnsupportedEventGridVersion { .. }
+            | Self::EmptyFileId { .. }
+            | Self::WrongStorageAccount { .. }
+            | Self::DisallowedStorageAccount { .. } => error_stage::PROCESSING,
+            Self::GetBlob { .. }
+            | Self::GetBlobEmptyResponse { .. }
+            | Self::BlobNotFound { .. }
+            | Self::ReadBlob { .. }
+            | Self::IncompleteBlobDownload { .. } => error_stage::RECEIVING,
+            Self::PipelineSend { .. }
+            | Self::BlobDeliveryErrored { .. }
+            | Self::BlobDeliveryRejected { .. } => error_stage::SENDING,
+        }
+    }
+
+    /// Whether retrying can never succeed, so the failure is logged at `warn` rather than `error`.
+    pub(crate) const fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::EmptyFileId { .. }
+                | Self::WrongStorageAccount { .. }
+                | Self::DisallowedStorageAccount { .. }
+                | Self::BlobNotFound { .. }
+        )
+    }
+
+    /// Whether this failure is already counted by another event, so the per-message error event
+    /// must not count it again.
+    ///
+    /// - `PipelineSend` is counted by `StreamClosedError` where the send fails.
+    /// - Delivery failures are counted where the batch status is observed, because
+    ///   `delete_failed_message` can turn them into `Ok` and they would otherwise go uncounted.
+    pub(crate) const fn reported_elsewhere(&self) -> bool {
+        matches!(
+            self,
+            Self::PipelineSend { .. }
+                | Self::BlobDeliveryErrored { .. }
+                | Self::BlobDeliveryRejected { .. }
+        )
+    }
 }
 
 /// Internal state maintained by the ingestor
@@ -529,17 +691,10 @@ impl Ingestor {
                             });
                         }
                         Ok(Err(err)) => {
-                            warn!(
-                                message = "Failed to fetch queue metadata for depth metric.",
-                                error = ?err,
-                                internal_log_rate_limit = true,
-                            );
+                            emit!(AzureBlobQueueMetadataFailed { error: &err });
                         }
                         Err(_) => {
-                            warn!(
-                                message = "Timed out fetching queue metadata for depth metric.",
-                                internal_log_rate_limit = true,
-                            );
+                            emit!(AzureBlobQueueMetadataTimedOut);
                         }
                     }
                 }
@@ -643,10 +798,7 @@ impl IngestorProcess {
                 }
             })
             .inspect_err(|err| {
-                error!(
-                    message = "Failed to receive messages from queue.",
-                    error = ?err,
-                );
+                emit!(AzureBlobQueueReceiveFailed { error: err });
             })
             .unwrap_or_default();
 
@@ -685,61 +837,38 @@ impl IngestorProcess {
                     }
                 }
                 Err(err) => {
+                    // Count and log the failure once here. Failures already counted elsewhere are
+                    // skipped (see `ProcessingError::reported_elsewhere`).
+                    if !err.reported_elsewhere() {
+                        emit!(AzureBlobMessageProcessingError {
+                            message_id: &message_id,
+                            error: &err,
+                        });
+                    }
                     match err {
-                        ProcessingError::BlobNotFound {
-                            ref source,
-                            ref container,
-                            ref blob,
-                        } => {
-                            warn!(
-                                message = "Blob not found.",
-                                message_id = &message_id,
-                                container = %container,
-                                blob = %blob,
-                                error = %source,
-                            );
-                            // Blob no longer exists — retrying won't help.
-                            // Delete the queue message to prevent infinite retries.
+                        // Blob no longer exists — retrying won't help.
+                        // Delete the queue message to prevent infinite retries.
+                        ProcessingError::BlobNotFound { .. } => {
                             if self.state.delete_message {
                                 delete_messages.push(message.clone());
                             }
                         }
-                        ProcessingError::EmptyFileId {
-                            ref container,
-                            ref blob,
-                        } => {
-                            warn!(
-                                message = "Direct ingest message has empty file_id, discarding.",
-                                message_id = &message_id,
-                                container = %container,
-                                blob = %blob,
-                            );
-                            // Empty file_id is a permanent invalid state — retrying won't help.
-                            // Delete the queue message to prevent infinite retries.
+                        // Empty file_id is a permanent invalid state — retrying won't help.
+                        // Delete the queue message to prevent infinite retries.
+                        ProcessingError::EmptyFileId { .. } => {
                             if self.state.delete_message {
                                 delete_messages.push(message.clone());
                             }
                         }
-                        ProcessingError::DisallowedStorageAccount { ref account, .. }
-                        | ProcessingError::WrongStorageAccount { ref account, .. } => {
-                            warn!(
-                                message = "Message names a storage account this source cannot read, discarding.",
-                                message_id = &message_id,
-                                account = %account,
-                            );
-                            // Permanent: the allowlist is static config, so a retry can never
-                            // succeed. Delete to avoid redelivery until queue TTL.
+                        // Permanent: the allowlist is static config, so a retry can never
+                        // succeed. Delete to avoid redelivery until queue TTL.
+                        ProcessingError::DisallowedStorageAccount { .. }
+                        | ProcessingError::WrongStorageAccount { .. } => {
                             if self.state.delete_message {
                                 delete_messages.push(message.clone());
                             }
                         }
-                        _ => {
-                            error!(
-                                message = "Failed to process queue message.",
-                                message_id = &message_id,
-                                error = ?err,
-                            );
-                        }
+                        _ => {}
                     }
                 }
             }
@@ -749,12 +878,10 @@ impl IngestorProcess {
         let mut deleted_count: u64 = 0;
         for message in delete_messages {
             if let Err(err) = self.delete_message(&message).await {
-                let message_id = message.message_id.clone();
-                error!(
-                    message = "Failed to delete message from queue.",
-                    message_id = %message_id,
-                    error = ?err,
-                );
+                emit!(AzureBlobQueueDeleteFailed {
+                    message_id: &message.message_id,
+                    error: &err,
+                });
             } else {
                 deleted_count += 1;
             }
@@ -784,11 +911,10 @@ impl IngestorProcess {
         for message in messages {
             match self.delete_message(&message).await {
                 Ok(()) => deleted_count += 1,
-                Err(err) => error!(
-                    message = "Failed to delete drained message from queue.",
-                    message_id = %message.message_id,
-                    error = ?err,
-                ),
+                Err(err) => emit!(AzureBlobQueueDeleteFailed {
+                    message_id: &message.message_id,
+                    error: &err,
+                }),
             }
         }
         if deleted_count > 0 {
@@ -810,30 +936,13 @@ impl IngestorProcess {
         let message_text = &message.message_text;
 
         // Decode base64 message content
-        let decoded_message = STANDARD.decode(message_text).map_err(|e| {
-            error!(
-                message = "Failed to base64 decode queue message",
-                error = ?e,
-                message_id = &message.message_id
-            );
-            ProcessingError::InvalidQueueMessage {
-                source: serde_json::Error::custom(format!("Failed to base64 decode: {}", e)),
-                message_id: message.message_id.clone(),
-            }
-        })?;
+        let decoded_message = STANDARD
+            .decode(message_text)
+            .map_err(|source| ProcessingError::InvalidBase64 { source })?;
 
         // Convert decoded bytes to UTF-8 string
-        let decoded_str = String::from_utf8(decoded_message).map_err(|e| {
-            error!(
-                message = "Failed to convert decoded message to string",
-                error = ?e,
-                message_id = &message.message_id
-            );
-            ProcessingError::InvalidQueueMessage {
-                source: serde_json::Error::custom(format!("Failed to convert to UTF-8: {}", e)),
-                message_id: message.message_id.clone(),
-            }
-        })?;
+        let decoded_str = String::from_utf8(decoded_message)
+            .map_err(|source| ProcessingError::InvalidUtf8 { source })?;
 
         // Represents the time at which the message was inserted into the queue
         let queue_notification_create_timestamp = Utc
@@ -846,18 +955,8 @@ impl IngestorProcess {
         let message_id = &message.message_id;
 
         // Try to parse as a QueueEvent (DirectIngest is tried first due to deny_unknown_fields)
-        let queue_event: QueueEvent = serde_json::from_str(&decoded_str).map_err(|e| {
-            error!(
-                message = "Failed to parse decoded message as JSON object",
-                error = ?e,
-                message_id = message_id,
-                decoded_message = %decoded_str
-            );
-            ProcessingError::InvalidQueueMessage {
-                source: e,
-                message_id: message_id.clone(),
-            }
-        })?;
+        let queue_event: QueueEvent = serde_json::from_str(&decoded_str)
+            .map_err(|source| ProcessingError::InvalidJson { source })?;
 
         match queue_event {
             QueueEvent::DirectIngest(msg) => {
@@ -865,7 +964,7 @@ impl IngestorProcess {
                     .await
             }
             QueueEvent::EventGrid(event) => {
-                self.handle_event_grid_event(event, queue_notification_create_timestamp)
+                self.handle_event_grid_event(event, message_id, queue_notification_create_timestamp)
                     .await
             }
         }
@@ -938,6 +1037,7 @@ impl IngestorProcess {
         let processing_start = std::time::Instant::now();
         let result = self
             .process_blob_object(
+                message_id,
                 &target_account,
                 &msg.container,
                 &msg.blob,
@@ -975,6 +1075,7 @@ impl IngestorProcess {
     async fn handle_event_grid_event(
         &mut self,
         event: EventGridEvent,
+        message_id: &str,
         queue_notification_create_timestamp: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), ProcessingError> {
         // Capture the processing start time for metrics
@@ -993,9 +1094,8 @@ impl IngestorProcess {
 
         // Extract container and blob names from subject
         let (container, blob) = parse_blob_subject(&event.subject).ok_or_else(|| {
-            ProcessingError::InvalidQueueMessage {
-                source: <serde_json::Error as serde::de::Error>::custom("Invalid subject format"),
-                message_id: event.id.clone(),
+            ProcessingError::InvalidBlobSubject {
+                subject: event.subject.clone(),
             }
         })?;
 
@@ -1020,7 +1120,7 @@ impl IngestorProcess {
         // Event Grid notifications are always for the source's configured account.
         // They carry no log type, unlike direct-ingest messages.
         let account = self.state.storage_account_name.clone();
-        self.process_blob_object(&account, container, blob, None)
+        self.process_blob_object(message_id, &account, container, blob, None)
             .await
     }
 
@@ -1030,6 +1130,7 @@ impl IngestorProcess {
     ///
     async fn process_blob_object(
         &mut self,
+        message_id: &str,
         account: &str,
         container: &str,
         blob: &str,
@@ -1081,11 +1182,7 @@ impl IngestorProcess {
             }
         };
 
-        let blob_response = response_opt.ok_or_else(|| ProcessingError::GetBlob {
-            source: azure_core_for_storage::Error::message(
-                ErrorKind::Other,
-                "no blob response received",
-            ),
+        let blob_response = response_opt.ok_or_else(|| ProcessingError::GetBlobEmptyResponse {
             container: container.clone(),
             blob: blob.clone(),
         })?;
@@ -1314,34 +1411,36 @@ impl IngestorProcess {
                             delivered = true;
                             Ok(())
                         }
+                        // Counted here, not by the per-message arm: with `delete_failed_message`
+                        // these become `Ok` (and are deleted), so they would otherwise go uncounted.
                         BatchStatus::Errored => {
-                            warn!(
-                                message = "Blob processing errored.",
-                                container = %container,
-                                blob = %blob,
-                            );
+                            let err = ProcessingError::BlobDeliveryErrored {
+                                container: container.clone(),
+                                blob: blob.clone(),
+                            };
+                            emit!(AzureBlobMessageProcessingError {
+                                message_id,
+                                error: &err,
+                            });
                             if self.state.delete_failed_message {
                                 Ok(())
                             } else {
-                                Err(ProcessingError::ErrorAcknowledgement {
-                                    container: container.clone(),
-                                    blob: blob.clone(),
-                                })
+                                Err(err)
                             }
                         }
                         BatchStatus::Rejected => {
-                            warn!(
-                                message = "Blob was rejected.",
-                                container = %container,
-                                blob = %blob,
-                            );
+                            let err = ProcessingError::BlobDeliveryRejected {
+                                container: container.clone(),
+                                blob: blob.clone(),
+                            };
+                            emit!(AzureBlobMessageProcessingError {
+                                message_id,
+                                error: &err,
+                            });
                             if self.state.delete_failed_message {
                                 Ok(())
                             } else {
-                                Err(ProcessingError::ErrorAcknowledgement {
-                                    container: container.clone(),
-                                    blob: blob.clone(),
-                                })
+                                Err(err)
                             }
                         }
                     }
@@ -1357,20 +1456,9 @@ impl IngestorProcess {
                 // Saw a trailing UnexpectedEof but did NOT read the whole committed blob: the
                 // download was cut short (transient), not a truncated archive. Force redelivery
                 // rather than acking a partial read as if it were the whole blob.
-                warn!(
-                    message = "Incomplete blob download (short transfer); will redeliver.",
-                    container = %container,
-                    blob = %blob,
-                    bytes_read = %pulled,
-                    content_length = %content_length,
-                );
-                processing_result = Err(ProcessingError::ReadBlob {
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "incomplete blob download: read {pulled} of {content_length} bytes"
-                        ),
-                    )),
+                processing_result = Err(ProcessingError::IncompleteBlobDownload {
+                    bytes_read: pulled,
+                    content_length,
                     container: container.clone(),
                     blob: blob.clone(),
                 });
@@ -2344,6 +2432,284 @@ mod tests {
 }
 
 #[cfg(test)]
+mod error_classification_tests {
+    use super::*;
+    use azure_core_for_storage::error::ErrorKind;
+    use vector_lib::internal_event::{error_stage, error_type};
+
+    fn io_err() -> azure_core_for_storage::Error {
+        ErrorKind::Io.into_error()
+    }
+
+    fn http_err(status: StatusCode) -> azure_core_for_storage::Error {
+        ErrorKind::http_response(status, None).into_error()
+    }
+
+    /// Every `GetBlob` failure kind maps to a bounded (error_type, error_code) pair.
+    #[test]
+    fn get_blob_failure_classifies_by_kind_and_status() {
+        let cases = [
+            (
+                http_err(StatusCode::Forbidden),
+                error_type::REQUEST_FAILED,
+                "get_blob_forbidden",
+            ),
+            (
+                http_err(StatusCode::TooManyRequests),
+                error_type::REQUEST_FAILED,
+                "get_blob_throttled",
+            ),
+            (
+                http_err(StatusCode::ServiceUnavailable),
+                error_type::REQUEST_FAILED,
+                "get_blob_throttled",
+            ),
+            (
+                http_err(StatusCode::InternalServerError),
+                error_type::REQUEST_FAILED,
+                "get_blob_server_error",
+            ),
+            (
+                http_err(StatusCode::BadGateway),
+                error_type::REQUEST_FAILED,
+                "get_blob_server_error",
+            ),
+            (
+                http_err(StatusCode::BadRequest),
+                error_type::REQUEST_FAILED,
+                "get_blob_failed",
+            ),
+            (
+                http_err(StatusCode::Conflict),
+                error_type::REQUEST_FAILED,
+                "get_blob_failed",
+            ),
+            (
+                io_err(),
+                error_type::CONNECTION_FAILED,
+                "get_blob_io_failed",
+            ),
+            (
+                ErrorKind::Credential.into_error(),
+                error_type::CONFIGURATION_FAILED,
+                "get_blob_credential_failed",
+            ),
+            (
+                ErrorKind::Other.into_error(),
+                error_type::REQUEST_FAILED,
+                "get_blob_failed",
+            ),
+            (
+                ErrorKind::DataConversion.into_error(),
+                error_type::REQUEST_FAILED,
+                "get_blob_failed",
+            ),
+        ];
+        for (err, expected_type, expected_code) in cases {
+            let (ty, code) = get_blob_failure(&err);
+            assert_eq!((ty, code), (expected_type, expected_code), "for {err:?}");
+
+            let processing = ProcessingError::GetBlob {
+                source: err,
+                container: "c".into(),
+                blob: "b".into(),
+            };
+            assert_eq!(processing.error_type(), expected_type);
+            assert_eq!(processing.error_code(), expected_code);
+            assert_eq!(processing.stage(), error_stage::RECEIVING);
+        }
+    }
+
+    /// Every `ProcessingError` variant is classified, with the expected labels, permanence, and
+    /// whether the per-message event must skip it. The match in the methods is exhaustive, so a
+    /// new variant also fails to compile until it is added here.
+    #[test]
+    fn processing_error_labels_cover_every_variant() {
+        let base64_err = STANDARD.decode("!!!").unwrap_err();
+        let utf8_err = String::from_utf8(vec![0xff]).unwrap_err();
+        let json_err = serde_json::from_str::<u8>("x").unwrap_err();
+        let (c, b) = ("c".to_string(), "k.log".to_string());
+
+        // (error, error_type, error_code, stage, permanent, reported_elsewhere)
+        let cases: Vec<(ProcessingError, &str, &str, &str, bool, bool)> = vec![
+            (
+                ProcessingError::InvalidBase64 { source: base64_err },
+                error_type::PARSER_FAILED,
+                "invalid_base64",
+                error_stage::PROCESSING,
+                false,
+                false,
+            ),
+            (
+                ProcessingError::InvalidUtf8 { source: utf8_err },
+                error_type::PARSER_FAILED,
+                "invalid_utf8",
+                error_stage::PROCESSING,
+                false,
+                false,
+            ),
+            (
+                ProcessingError::InvalidJson { source: json_err },
+                error_type::PARSER_FAILED,
+                "invalid_json",
+                error_stage::PROCESSING,
+                false,
+                false,
+            ),
+            (
+                ProcessingError::InvalidBlobSubject {
+                    subject: "/bad".into(),
+                },
+                error_type::PARSER_FAILED,
+                "invalid_blob_subject",
+                error_stage::PROCESSING,
+                false,
+                false,
+            ),
+            (
+                ProcessingError::UnsupportedEventGridVersion {
+                    version: semver::Version::new(2, 0, 0),
+                },
+                error_type::PARSER_FAILED,
+                "unsupported_event_grid_version",
+                error_stage::PROCESSING,
+                false,
+                false,
+            ),
+            (
+                ProcessingError::EmptyFileId {
+                    container: c.clone(),
+                    blob: b.clone(),
+                },
+                error_type::CONDITION_FAILED,
+                "empty_file_id",
+                error_stage::PROCESSING,
+                true,
+                false,
+            ),
+            (
+                ProcessingError::WrongStorageAccount {
+                    account: "a".into(),
+                    container: c.clone(),
+                    blob: b.clone(),
+                },
+                error_type::CONDITION_FAILED,
+                "wrong_storage_account",
+                error_stage::PROCESSING,
+                true,
+                false,
+            ),
+            (
+                ProcessingError::DisallowedStorageAccount {
+                    account: "a".into(),
+                    container: c.clone(),
+                    blob: b.clone(),
+                },
+                error_type::CONDITION_FAILED,
+                "disallowed_storage_account",
+                error_stage::PROCESSING,
+                true,
+                false,
+            ),
+            (
+                ProcessingError::BlobNotFound {
+                    source: http_err(StatusCode::NotFound),
+                    container: c.clone(),
+                    blob: b.clone(),
+                },
+                error_type::REQUEST_FAILED,
+                "blob_not_found",
+                error_stage::RECEIVING,
+                true,
+                false,
+            ),
+            (
+                ProcessingError::GetBlobEmptyResponse {
+                    container: c.clone(),
+                    blob: b.clone(),
+                },
+                error_type::REQUEST_FAILED,
+                "get_blob_empty_response",
+                error_stage::RECEIVING,
+                false,
+                false,
+            ),
+            (
+                ProcessingError::ReadBlob {
+                    source: Box::new(std::io::Error::other("boom")),
+                    container: c.clone(),
+                    blob: b.clone(),
+                },
+                error_type::READER_FAILED,
+                "read_blob_failed",
+                error_stage::RECEIVING,
+                false,
+                false,
+            ),
+            (
+                ProcessingError::IncompleteBlobDownload {
+                    bytes_read: 3,
+                    content_length: 10,
+                    container: c.clone(),
+                    blob: b.clone(),
+                },
+                error_type::READER_FAILED,
+                "incomplete_blob_download",
+                error_stage::RECEIVING,
+                false,
+                false,
+            ),
+            (
+                ProcessingError::PipelineSend {
+                    source: SendError::Closed,
+                    container: c.clone(),
+                    blob: b.clone(),
+                },
+                error_type::WRITER_FAILED,
+                "pipeline_send_failed",
+                error_stage::SENDING,
+                false,
+                true,
+            ),
+            (
+                ProcessingError::BlobDeliveryErrored {
+                    container: c.clone(),
+                    blob: b.clone(),
+                },
+                error_type::ACKNOWLEDGMENT_FAILED,
+                "delivery_errored",
+                error_stage::SENDING,
+                false,
+                true,
+            ),
+            (
+                ProcessingError::BlobDeliveryRejected {
+                    container: c.clone(),
+                    blob: b.clone(),
+                },
+                error_type::ACKNOWLEDGMENT_FAILED,
+                "delivery_rejected",
+                error_stage::SENDING,
+                false,
+                true,
+            ),
+        ];
+
+        for (err, ty, code, stage, permanent, elsewhere) in &cases {
+            assert_eq!(err.error_type(), *ty, "error_type for {err}");
+            assert_eq!(err.error_code(), *code, "error_code for {err}");
+            assert_eq!(err.stage(), *stage, "stage for {err}");
+            assert_eq!(err.is_permanent(), *permanent, "is_permanent for {err}");
+            assert_eq!(
+                err.reported_elsewhere(),
+                *elsewhere,
+                "reported_elsewhere for {err}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod drain_tests {
     use std::sync::Arc;
 
@@ -2351,6 +2717,9 @@ mod drain_tests {
     use azure_storage_queues::QueueServiceClientBuilder;
     use base64::Engine as _;
     use vector_lib::codecs::{NewlineDelimitedDecoderConfig, decoding::FramingConfig};
+    use vector_lib::event::EventStatus;
+
+    use crate::test_util::trace_init;
     use vector_lib::config::LogNamespace;
     use vrl::value::Value;
     use wiremock::{
@@ -2377,6 +2746,12 @@ mod drain_tests {
             .insert_header("date", "Fri, 17 Oct 2026 00:00:00 GMT")
     }
 
+    /// The base64 body of a direct-ingest message for blob `c/k.log`.
+    fn ingest_message_text() -> String {
+        base64::engine::general_purpose::STANDARD
+            .encode(r#"{"kind": "INGEST", "container": "c", "blob": "k.log", "file_id": "f1"}"#)
+    }
+
     /// The queue returns one INGEST message; deletes succeed; any blob GET 404s.
     async fn mock_queue_and_blob() -> MockServer {
         mock_queue_and_blob_with(204).await
@@ -2385,9 +2760,23 @@ mod drain_tests {
     /// Like `mock_queue_and_blob`, with `delete_status` as the queue-message DELETE response
     /// (404 is not retried by the SDK, so it fails the delete immediately).
     async fn mock_queue_and_blob_with(delete_status: u16) -> MockServer {
+        mock_queue(
+            &ingest_message_text(),
+            delete_status,
+            ResponseTemplate::new(404),
+        )
+        .await
+    }
+
+    /// A queue returning one message with body `message_text`, DELETE answering `delete_status`,
+    /// and blob GETs answering `blob_get`.
+    async fn mock_queue(
+        message_text: &str,
+        delete_status: u16,
+        blob_get: ResponseTemplate,
+    ) -> MockServer {
         let server = MockServer::start().await;
-        let text = base64::engine::general_purpose::STANDARD
-            .encode(r#"{"kind": "INGEST", "container": "c", "blob": "k.log", "file_id": "f1"}"#);
+        let text = message_text;
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"utf-8\"?><QueueMessagesList><QueueMessage>\
              <MessageId>m1</MessageId>\
@@ -2415,7 +2804,7 @@ mod drain_tests {
             .await;
         Mock::given(method("GET"))
             .and(path_regex("^/c/"))
-            .respond_with(storage_headers(ResponseTemplate::new(404)))
+            .respond_with(storage_headers(blob_get))
             .mount(&server)
             .await;
         server
@@ -2430,6 +2819,19 @@ mod drain_tests {
         drain_gate: Option<DrainGate>,
         pause_gate: Option<PauseGate>,
         delete_message: bool,
+    ) {
+        run_once_full(server, drain_gate, pause_gate, delete_message, false, None).await;
+    }
+
+    /// Runs one poll. `finalize` (when `Some`) enables acknowledgements and finalizes every event
+    /// with that status, as a sink would; `None` disables acknowledgements.
+    async fn run_once_full(
+        server: &MockServer,
+        drain_gate: Option<DrainGate>,
+        pause_gate: Option<PauseGate>,
+        delete_message: bool,
+        delete_failed_message: bool,
+        finalize: Option<EventStatus>,
     ) {
         let location = || CloudLocation::Custom {
             account: "devstoreaccount1".to_string(),
@@ -2451,6 +2853,7 @@ mod drain_tests {
             poll_secs: 0,
             process_custom_message: true,
             delete_message,
+            delete_failed_message,
             ..Default::default()
         };
         let ingestor = Ingestor::new(
@@ -2468,15 +2871,51 @@ mod drain_tests {
         .await
         .expect("ingestor must build")
         .with_gate(object_gate(drain_gate, pause_gate));
-        let (out, _rx) = SourceSender::new_test();
+        let acknowledgements = finalize.is_some();
+        // The sink side: draining the stream is what finalizes each batch.
+        let out = if let Some(status) = finalize {
+            let (out, rx) = SourceSender::new_test_finalize(status);
+            tokio::spawn(drain_stream(rx));
+            out
+        } else {
+            let (out, rx) = SourceSender::new_test();
+            tokio::spawn(drain_stream(rx));
+            out
+        };
         let mut process = IngestorProcess::new(
             Arc::clone(&ingestor.state),
             out,
             ShutdownSignal::noop(),
             LogNamespace::Legacy,
-            false,
+            acknowledgements,
         );
         process.run_once().await;
+    }
+
+    async fn drain_stream(mut rx: impl Stream<Item = Event> + Unpin) {
+        while rx.next().await.is_some() {}
+    }
+
+    /// Current value of `component_errors_total` for the exact label set, or 0 if unseen.
+    fn component_errors(error_type: &str, error_code: &str, stage: &str) -> f64 {
+        use vector_lib::event::MetricValue;
+        use vector_lib::metrics::Controller;
+        Controller::get()
+            .unwrap()
+            .capture_metrics()
+            .iter()
+            .filter(|m| m.name() == "component_errors_total")
+            .find(|m| {
+                let tags = m.tags().expect("component_errors_total has tags");
+                tags.get("error_code") == Some(error_code)
+                    && tags.get("error_type") == Some(error_type)
+                    && tags.get("stage") == Some(stage)
+            })
+            .map(|m| match m.value() {
+                MetricValue::Counter { value } => *value,
+                other => panic!("expected a counter, got {other:?}"),
+            })
+            .unwrap_or(0.0)
     }
 
     /// (blob GETs, queue-message DELETEs)
@@ -2609,6 +3048,81 @@ mod drain_tests {
         assert_eq!(gets, 0, "a paused batch is not fetched");
         assert_eq!(deletes, 0, "a paused batch is not deleted");
         assert_eq!(polls, 0, "the poll itself was not skipped");
+    }
+
+    /// A blob GET that succeeds with one JSON log line (`{"a":"b"}` plus newline).
+    fn blob_ok() -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/json")
+            .insert_header("content-length", "10")
+            .insert_header("last-modified", "Fri, 17 Oct 2026 00:00:00 GMT")
+            .insert_header("etag", "\"0x1\"")
+            .insert_header("x-ms-blob-type", "BlockBlob")
+            .insert_header("x-ms-server-encrypted", "true")
+            .set_body_string("{\"a\":\"b\"}\n")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_base64_message_is_counted_and_not_deleted() {
+        trace_init();
+        let server = mock_queue("!!!", 204, ResponseTemplate::new(404)).await;
+        let before = component_errors("parser_failed", "invalid_base64", "processing");
+        run_once_with(&server, None).await;
+        let after = component_errors("parser_failed", "invalid_base64", "processing");
+        assert!(
+            after >= before + 1.0,
+            "invalid base64 must increment component_errors_total ({before} -> {after})"
+        );
+        assert_eq!(
+            requests(&server).await,
+            (0, 0),
+            "parse failures keep their existing behavior: no blob fetch and no delete"
+        );
+    }
+
+    /// A batch the sink errors or rejects is counted exactly once. With `delete_failed_message`
+    /// the message is still acknowledged and deleted, as before; without it the error propagates
+    /// and the message stays queued. Both paths keep their behavior, and neither double-counts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_delivery_is_counted_once_whether_or_not_failed_message_is_deleted() {
+        trace_init();
+        let cases = [
+            (EventStatus::Errored, "delivery_errored"),
+            (EventStatus::Rejected, "delivery_rejected"),
+        ];
+        for (status, code) in cases {
+            // delete_failed_message = true: Ok, so the message is deleted.
+            let server = mock_queue(&ingest_message_text(), 204, blob_ok()).await;
+            let before = component_errors("acknowledgment_failed", code, "sending");
+            run_once_full(&server, None, None, true, true, Some(status)).await;
+            let after = component_errors("acknowledgment_failed", code, "sending");
+            assert_eq!(
+                after - before,
+                1.0,
+                "{code} must be counted exactly once when delete_failed_message = true"
+            );
+            assert_eq!(
+                requests(&server).await,
+                (1, 1),
+                "{code}: the blob is fetched and the message deleted when delete_failed_message = true"
+            );
+
+            // delete_failed_message = false: the error propagates and the message stays queued.
+            let server = mock_queue(&ingest_message_text(), 204, blob_ok()).await;
+            let before = component_errors("acknowledgment_failed", code, "sending");
+            run_once_full(&server, None, None, true, false, Some(status)).await;
+            let after = component_errors("acknowledgment_failed", code, "sending");
+            assert_eq!(
+                after - before,
+                1.0,
+                "{code} must be counted exactly once when delete_failed_message = false"
+            );
+            assert_eq!(
+                requests(&server).await,
+                (1, 0),
+                "{code}: the message is left on the queue when delete_failed_message = false"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

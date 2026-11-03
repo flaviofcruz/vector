@@ -27,6 +27,8 @@ mod aws_kinesis;
 mod aws_kinesis_firehose;
 #[cfg(any(feature = "sources-aws_s3", feature = "sources-aws_sqs",))]
 mod aws_sqs;
+#[cfg(feature = "sources-azure_blob")]
+mod azure_blob;
 mod batch;
 #[cfg(feature = "sinks-clickhouse")]
 mod clickhouse;
@@ -203,6 +205,8 @@ pub(crate) use self::aws_kinesis::*;
 pub(crate) use self::aws_kinesis_firehose::*;
 #[cfg(any(feature = "sources-aws_s3", feature = "sources-aws_sqs",))]
 pub(crate) use self::aws_sqs::*;
+#[cfg(feature = "sources-azure_blob")]
+pub(crate) use self::azure_blob::*;
 #[cfg(feature = "sinks-clickhouse")]
 pub(crate) use self::clickhouse::*;
 #[cfg(feature = "sinks-databricks-zerobus")]
