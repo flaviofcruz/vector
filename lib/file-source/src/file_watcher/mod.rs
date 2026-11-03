@@ -73,6 +73,8 @@ pub struct FileWatcher {
     lines_read: u64,
     bytes_read: u64,
     last_seen_stat: FileStat,
+    /// Start offset retained with a partial line across EOF polling.
+    buffered_line_start: Option<FilePosition>,
 }
 
 impl FileWatcher {
@@ -218,6 +220,7 @@ impl FileWatcher {
             max_line_bytes,
             line_delimiter,
             buf: BytesMut::new(),
+            buffered_line_start: None,
             is_active: !inactive,
             read_started_pending,
             lines_read: 0,
@@ -335,7 +338,7 @@ impl FileWatcher {
 
         let reader = &mut self.reader;
         let file_position = &mut self.file_position;
-        let initial_position = *file_position;
+        let initial_position = self.buffered_line_start.unwrap_or(*file_position);
         match read_until_with_max_size(
             reader.as_mut(),
             file_position,
@@ -349,6 +352,7 @@ impl FileWatcher {
                 successfully_read: Some(_),
                 discarded_for_size_and_truncated,
             }) => {
+                self.buffered_line_start = None;
                 self.track_read_success();
                 Ok(RawLineResult {
                     raw_line: Some(RawLine {
@@ -369,6 +373,7 @@ impl FileWatcher {
                     // didn't end with a newline. This is not a perfect signal for when we should
                     // give up waiting for a newline, but it's decent.
                     let buf = self.buf.split().freeze();
+                    self.buffered_line_start = None;
                     if buf.is_empty() {
                         // EOF
                         self.reached_eof = true;
@@ -386,6 +391,7 @@ impl FileWatcher {
                         })
                     }
                 } else {
+                    self.buffered_line_start = (!self.buf.is_empty()).then_some(initial_position);
                     self.track_read_eof();
                     Ok(RawLineResult {
                         raw_line: None,

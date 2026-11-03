@@ -202,6 +202,7 @@ fn watcher_for_timing() -> FileWatcher {
         lines_read: 0,
         bytes_read: 0,
         last_seen_stat: FileStat::default(),
+        buffered_line_start: None,
     }
 }
 
@@ -337,6 +338,34 @@ async fn take_read_started_only_for_reads_from_offset_zero() {
         );
         assert!(!watcher.take_read_started(), "must fire at most once");
     }
+}
+
+// A record completed by a later append keeps the offset where its first bytes began.
+#[tokio::test]
+async fn partial_append_preserves_the_record_start_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("partial.log");
+    std::fs::write(&path, b"id-").unwrap();
+    let mut watcher = new_watcher(path.clone(), ReadFrom::Beginning, None).await;
+
+    assert!(watcher.read_line().await.unwrap().raw_line.is_none());
+    // Blocking std I/O: a tokio `File` write may still be queued when the next read runs.
+    let mut append = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    std::io::Write::write_all(&mut append, b"1\nnext\n").unwrap();
+
+    let line = watcher.read_line().await.unwrap().raw_line.unwrap();
+    assert_eq!(line.bytes, Bytes::from_static(b"id-1"));
+    assert_eq!(line.offset, 0);
+
+    let next = watcher.read_line().await.unwrap().raw_line.unwrap();
+    assert_eq!(next.bytes, Bytes::from_static(b"next"));
+    assert_eq!(
+        next.offset, 5,
+        "the retained start is cleared once the record is emitted"
+    );
 }
 
 #[tokio::test]
