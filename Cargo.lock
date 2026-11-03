@@ -14296,6 +14296,8 @@ dependencies = [
 name = "vector-vrl-functions"
 version = "0.1.0"
 dependencies = [
+ "base64-simd",
+ "bytes 1.11.1",
  "chrono",
  "dnstap-parser",
  "enrichment",
@@ -14306,6 +14308,7 @@ dependencies = [
  "vector-redaction-executor",
  "vector-vrl-metrics",
  "vrl",
+ "zstd 0.13.3",
 ]
 
 [[package]]

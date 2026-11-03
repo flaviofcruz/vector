@@ -19,6 +19,7 @@ pub mod enforce_metadata_shape;
 pub mod get_secret;
 #[cfg(feature = "databricks-redaction")]
 pub mod lp_splice_metadata;
+pub mod lp_unwrap;
 #[cfg(feature = "databricks-redaction")]
 pub mod redaction;
 pub mod remove_secret;
@@ -44,6 +45,11 @@ pub fn secret_functions() -> Vec<Box<dyn Function>> {
     ]
 }
 
+/// Returns the Lumberjack Prime pipeline functions that need no redaction executor.
+pub fn lumberjack_prime_functions() -> Vec<Box<dyn Function>> {
+    vec![Box::new(lp_unwrap::LpUnwrap) as _]
+}
+
 /// Returns Vector-specific redaction functions.
 #[cfg(feature = "databricks-redaction")]
 pub fn redaction_functions() -> Vec<Box<dyn Function>> {
@@ -66,6 +72,7 @@ pub fn all() -> Vec<Box<dyn Function>> {
     let functions = vrl::stdlib::all()
         .into_iter()
         .chain(secret_functions())
+        .chain(lumberjack_prime_functions())
         .chain(redaction_functions())
         .chain(enrichment::vrl_functions());
 

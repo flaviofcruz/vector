@@ -10,6 +10,11 @@ license = "MPL-2.0"
 indoc.workspace = true
 vrl.workspace = true
 enrichment = { path = "../../enrichment" }
+# lp_unwrap: base64 + wire-format walk against the LogDaemonWrapper / LogEntry descriptors.
+base64-simd = "0.8"
+bytes.workspace = true
+prost-reflect.workspace = true
+zstd = { version = "0.13.0", default-features = false }
 vector-redaction-executor = { path = "../../vector-redaction-executor", optional = true }
 dnstap-parser = { path = "../../dnstap-parser", optional = true }
 vector-vrl-metrics = { path = "../../vector-vrl-metrics", optional = true }

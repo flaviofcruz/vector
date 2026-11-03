@@ -1,0 +1,33 @@
+# The Lumberjack Prime stage-1 unwrap as it was written in VRL before `lp_unwrap!` existed
+# (universe woodchuck/configuration/components/transforms/vector-aggregator/lumberjack_prime.libsonnet).
+# The parity tests run this and `lp_unwrap!` on the same event and require identical results.
+logDaemonWrapper = parse_proto!(
+  decode_base64!(.message),
+  "{WRAPPER_DESCRIPTOR}",
+  "LogDaemonWrapper"
+)
+
+inner_bytes, _decompress_err = decode_zstd(logDaemonWrapper.message)
+if _decompress_err != null {
+  inner_bytes = logDaemonWrapper.message
+}
+
+logEntry, log_entry_err = parse_proto(
+  inner_bytes,
+  "{LOG_ENTRY_DESCRIPTOR}",
+  "logging.LogEntry"
+)
+log_entry_parsed = log_entry_err == null
+if !log_entry_parsed {
+  logEntry = {}
+}
+
+._lp_inner_bytes = inner_bytes
+._lp_log_entry = logEntry
+._lp_log_entry_parsed = log_entry_parsed
+._lp_log_daemon_wrapper = logDaemonWrapper
+
+._workspace_id = logDaemonWrapper.workspace_id
+if !is_null(logEntry.workspace_id) {
+  ._workspace_id = logEntry.workspace_id
+}
