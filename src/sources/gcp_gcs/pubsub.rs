@@ -32,7 +32,8 @@ use crate::{
     http::{HttpClient, HttpError},
     internal_events::{
         PubSubMessageProcessingError, PubSubMessageProcessingSucceeded, PubSubMessageReceiveError,
-        PubSubMessageReceiveSucceeded, QueueMessageCount, QueueNotificationProcessLag,
+        PubSubMessageReceiveSucceeded, PubSubMessageReleased, QueueMessageCount,
+        QueueNotificationProcessLag,
     },
     shutdown::ShutdownSignal,
     sources::ingestion_callback::IngestionCallbackClient,
@@ -90,6 +91,23 @@ pub(super) struct Config {
     #[serde(default = "default_true")]
     #[derivative(Default(value = "default_true()"))]
     pub(super) acknowledge_failed_message: bool,
+
+    /// How long, in seconds, a message stays leased after its GCS object could not be fetched.
+    ///
+    /// When set, a failed request for the object (a transport error or a non-success GCS status
+    /// other than 404) calls `ModifyAckDeadline` on the message with this value, so it is
+    /// redelivered after this delay instead of waiting out the subscription's full ack deadline.
+    /// Failures reading or decoding the object body, and every other error, keep the normal ack
+    /// deadline. Has no effect on messages acknowledged by `acknowledge_failed_message`. Unset (the
+    /// default) keeps that behavior for all failures.
+    ///
+    /// Valid values are 0 - 600. A small non-zero value, such as 10 - 30, avoids redelivering in a
+    /// tight loop during a short GCS outage.
+    #[serde(default)]
+    #[derivative(Default)]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 15))]
+    pub(super) failed_message_ack_deadline_secs: Option<u32>,
 
     /// Number of concurrent polling tasks.
     ///
@@ -238,6 +256,20 @@ fn parse_gcs_native_notification(
 pub(super) enum IngestorNewError {
     #[snafu(display("Invalid max_number_of_messages {}: must be 1–1000", messages))]
     InvalidNumberOfMessages { messages: u32 },
+    #[snafu(display("Invalid failed_message_ack_deadline_secs {}: must be 0–600", secs))]
+    InvalidFailedMessageAckDeadline { secs: u32 },
+}
+
+/// Pub/Sub rejects ack deadlines above 10 minutes.
+const MAX_ACK_DEADLINE_SECS: u32 = 600;
+
+const fn validate_failed_message_ack_deadline(secs: Option<u32>) -> Result<(), IngestorNewError> {
+    match secs {
+        Some(secs) if secs > MAX_ACK_DEADLINE_SECS => {
+            Err(IngestorNewError::InvalidFailedMessageAckDeadline { secs })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Errors that can occur while processing a single Pub/Sub message.
@@ -335,6 +367,16 @@ impl ProcessingError {
             _ => true,
         }
     }
+
+    /// Whether the message should be redelivered early. Only a request-level fetch failure
+    /// qualifies; broken or undecodable files would fail again on redelivery.
+    pub const fn release_reason(&self) -> Option<&'static str> {
+        match self {
+            ProcessingError::FetchObject { .. } => Some("fetch_object"),
+            ProcessingError::GetObject { .. } => Some("get_object"),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -378,6 +420,14 @@ struct PubSubMessage {
 #[serde(rename_all = "camelCase")]
 struct AcknowledgeRequest<'a> {
     ack_ids: &'a [String],
+}
+
+/// Request body for the Pub/Sub `modifyAckDeadline` endpoint.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModifyAckDeadlineRequest<'a> {
+    ack_ids: &'a [String],
+    ack_deadline_seconds: u32,
 }
 
 // ============================================================================
@@ -496,6 +546,7 @@ struct State {
     client_concurrency: usize,
     acknowledge_message: bool,
     acknowledge_failed_message: bool,
+    failed_message_ack_deadline_secs: Option<u32>,
     callback_client: Option<IngestionCallbackClient>,
     message_format: MessageFormat,
     rate_limiter: ObjectStorageRateLimiter,
@@ -536,6 +587,8 @@ impl Ingestor {
             });
         }
 
+        validate_failed_message_ack_deadline(config.failed_message_ack_deadline_secs)?;
+
         let subscription_resource_name =
             format!("projects/{project}/subscriptions/{}", config.subscription);
 
@@ -560,6 +613,7 @@ impl Ingestor {
                 .unwrap_or_else(crate::num_threads),
             acknowledge_message: config.acknowledge_message,
             acknowledge_failed_message: config.acknowledge_failed_message,
+            failed_message_ack_deadline_secs: config.failed_message_ack_deadline_secs,
             callback_client,
             message_format,
             rate_limiter,
@@ -801,6 +855,7 @@ impl IngestorProcess {
         }
 
         let mut ack_ids: Vec<String> = Vec::new();
+        let mut released: Vec<(String, &'static str)> = Vec::new();
 
         for msg in messages {
             let message_id = msg.message.message_id.clone();
@@ -840,9 +895,19 @@ impl IngestorProcess {
                     // acknowledge_failed_message config flag.
                     if !err.is_retriable() || self.state.acknowledge_failed_message {
                         ack_ids.push(ack_id);
+                    } else if self.state.failed_message_ack_deadline_secs.is_some()
+                        && let Some(reason) = err.release_reason()
+                    {
+                        released.push((ack_id, reason));
                     }
                 }
             }
+        }
+
+        if let Some(secs) = self.state.failed_message_ack_deadline_secs
+            && !released.is_empty()
+        {
+            self.release_messages(&released, secs).await;
         }
 
         if !ack_ids.is_empty()
@@ -1146,6 +1211,60 @@ impl IngestorProcess {
         Ok(pull_response.received_messages)
     }
 
+    /// Redelivers failed messages after `secs` instead of the full ack deadline. A failure here
+    /// only logs: the messages then fall back to the subscription's normal ack deadline.
+    async fn release_messages(&self, released: &[(String, &'static str)], secs: u32) {
+        let ack_ids: Vec<String> = released.iter().map(|(id, _)| id.clone()).collect();
+        match self.modify_ack_deadline(&ack_ids, secs).await {
+            Ok(true) => {
+                for (_, reason) in released {
+                    emit!(PubSubMessageReleased { reason });
+                }
+            }
+            Ok(false) => {}
+            Err(error) => warn!(
+                message = "Failed to modify Pub/Sub ack deadline.",
+                %error,
+                count = %ack_ids.len(),
+                internal_log_rate_limit = true,
+            ),
+        }
+    }
+
+    /// Sets the ack deadline of a batch of messages. Returns whether Pub/Sub accepted it.
+    async fn modify_ack_deadline(&self, ack_ids: &[String], secs: u32) -> Result<bool, HttpError> {
+        let url = format!(
+            "{}/v1/{}:modifyAckDeadline",
+            self.state.endpoint, self.state.subscription_resource_name
+        );
+
+        let body = serde_json::to_string(&ModifyAckDeadlineRequest {
+            ack_ids,
+            ack_deadline_seconds: secs,
+        })
+        .expect("ModifyAckDeadlineRequest must serialize");
+
+        let mut request = Request::post(&url)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("modifyAckDeadline request must be valid");
+        self.state.auth.apply(&mut request);
+
+        let response = self.state.client.send(request).await?;
+
+        let accepted = response.status().is_success();
+        if !accepted {
+            warn!(
+                message = "Pub/Sub modifyAckDeadline request returned a non-success status.",
+                status = %response.status(),
+                subscription = %self.state.subscription_resource_name,
+                internal_log_rate_limit = true,
+            );
+        }
+
+        Ok(accepted)
+    }
+
     /// Acknowledges a batch of messages by their ack IDs.
     /// Returns whether Pub/Sub accepted the acknowledgement.
     async fn acknowledge_messages(&self, ack_ids: &[String]) -> Result<bool, HttpError> {
@@ -1220,6 +1339,97 @@ mod tests {
             config.acknowledge_failed_message,
             "failed messages must be acknowledged by default to prevent infinite retries"
         );
+    }
+
+    #[test]
+    fn failed_message_ack_deadline_config() {
+        let config: Config = toml::from_str(r#"subscription = "s""#).unwrap();
+        assert_eq!(
+            config.failed_message_ack_deadline_secs, None,
+            "early release must be off by default"
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+                subscription = "s"
+                failed_message_ack_deadline_secs = 15
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.failed_message_ack_deadline_secs, Some(15));
+    }
+
+    #[test]
+    fn failed_message_ack_deadline_validation() {
+        assert!(validate_failed_message_ack_deadline(None).is_ok());
+        assert!(validate_failed_message_ack_deadline(Some(0)).is_ok());
+        assert!(validate_failed_message_ack_deadline(Some(600)).is_ok());
+        assert!(matches!(
+            validate_failed_message_ack_deadline(Some(601)),
+            Err(IngestorNewError::InvalidFailedMessageAckDeadline { secs: 601 })
+        ));
+    }
+
+    /// Only a request-level fetch failure is released early; body, decode, and permanent errors
+    /// are left alone.
+    #[test]
+    fn only_fetch_failures_release_early() {
+        let bucket = || "b".to_string();
+        let key = || "k".to_string();
+        let cases = [
+            (
+                ProcessingError::GetObject {
+                    status: 503,
+                    bucket: bucket(),
+                    key: key(),
+                },
+                Some("get_object"),
+            ),
+            (
+                ProcessingError::ReadObject {
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "truncated",
+                    )),
+                    bucket: bucket(),
+                    key: key(),
+                },
+                None,
+            ),
+            (
+                ProcessingError::PipelineSend {
+                    source: vector_lib::source_sender::SendError::Closed,
+                    bucket: bucket(),
+                    key: key(),
+                },
+                None,
+            ),
+            (
+                ProcessingError::ErrorAcknowledgement {
+                    bucket: bucket(),
+                    key: key(),
+                },
+                None,
+            ),
+            (
+                ProcessingError::ObjectNotFound {
+                    bucket: bucket(),
+                    key: key(),
+                    reason: "gone".into(),
+                },
+                None,
+            ),
+            (
+                ProcessingError::EmptyFileId {
+                    bucket: bucket(),
+                    key: key(),
+                },
+                None,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.release_reason(), expected, "{err:?}");
+        }
     }
 
     /// Unknown fields must be rejected so that misconfigured deployments fail
@@ -1689,6 +1899,11 @@ mod drain_tests {
 
     /// Like `mock_pubsub_and_gcs`, with `ack_status` as the `:acknowledge` response status.
     async fn mock_pubsub_and_gcs_with(ack_status: u16) -> MockServer {
+        mock_pubsub_and_gcs_full(ack_status, 404).await
+    }
+
+    /// Like `mock_pubsub_and_gcs_with`, with `get_status` as the GCS object download status.
+    async fn mock_pubsub_and_gcs_full(ack_status: u16, get_status: u16) -> MockServer {
         let server = MockServer::start().await;
         let data = base64::engine::general_purpose::STANDARD
             .encode(r#"{"kind": "INGEST", "bucket": "b", "key": "k.log", "file_id": "f1"}"#);
@@ -1705,14 +1920,14 @@ mod drain_tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(404))
+            .respond_with(ResponseTemplate::new(get_status))
             .mount(&server)
             .await;
         server
     }
 
     async fn run_once_with(server: &MockServer, drain_gate: Option<DrainGate>) {
-        run_once_configured(server, drain_gate, None, true).await;
+        run_once_configured(server, drain_gate, None, true, None).await;
     }
 
     async fn run_once_configured(
@@ -1720,6 +1935,7 @@ mod drain_tests {
         drain_gate: Option<DrainGate>,
         pause_gate: Option<PauseGate>,
         acknowledge_message: bool,
+        failed_message_ack_deadline_secs: Option<u32>,
     ) {
         let client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default())
             .expect("HttpClient must build");
@@ -1746,6 +1962,9 @@ mod drain_tests {
             subscription: "test-sub".into(),
             endpoint: Some(server.uri()),
             acknowledge_message,
+            // Early release only applies to failed messages that are not acknowledged.
+            acknowledge_failed_message: failed_message_ack_deadline_secs.is_none(),
+            failed_message_ack_deadline_secs,
             poll_secs: 0,
             ..Default::default()
         };
@@ -1809,7 +2028,7 @@ mod drain_tests {
         let server = mock_pubsub_and_gcs().await;
         let ((), drained) = with_drained_count(
             "span",
-            run_once_configured(&server, Some(disabled_gate()), None, false),
+            run_once_configured(&server, Some(disabled_gate()), None, false, None),
         );
         let (gets, acks) = requests(&server).await;
         assert_eq!(gets, 0, "a disabled table must not fetch objects");
@@ -1832,6 +2051,57 @@ mod drain_tests {
             drained, 0,
             "a message Pub/Sub rejected the ack for is not drained"
         );
+    }
+
+    /// `modifyAckDeadline` request bodies.
+    async fn ack_deadline_changes(server: &MockServer) -> Vec<String> {
+        let received = server.received_requests().await.expect("recording enabled");
+        received
+            .iter()
+            .filter(|r| r.url.path().ends_with(":modifyAckDeadline"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    async fn mock_modify_ack_deadline(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path_regex(":modifyAckDeadline$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_failure_releases_message_when_configured() {
+        let server = mock_pubsub_and_gcs_full(200, 503).await;
+        mock_modify_ack_deadline(&server).await;
+        run_once_configured(&server, None, None, true, Some(15)).await;
+        let changes = ack_deadline_changes(&server).await;
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(
+            changes[0].contains("\"ackDeadlineSeconds\":15"),
+            "{changes:?}"
+        );
+        assert!(changes[0].contains("ack-1"), "{changes:?}");
+        assert!(
+            requests(&server).await.1.is_empty(),
+            "a failed message must not be acknowledged"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_failure_keeps_ack_deadline_by_default() {
+        let server = mock_pubsub_and_gcs_full(200, 503).await;
+        run_once_configured(&server, None, None, true, None).await;
+        assert!(ack_deadline_changes(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn object_not_found_is_not_released_early() {
+        // The default mock answers GET with 404, which is ObjectNotFound (acknowledged).
+        let server = mock_pubsub_and_gcs().await;
+        run_once_configured(&server, None, None, true, Some(15)).await;
+        assert!(ack_deadline_changes(&server).await.is_empty());
     }
 
     #[tokio::test]
@@ -1873,7 +2143,7 @@ mod drain_tests {
         let paused = pause_gate("span", &[(PAUSED_LIST_KEY, Value::from("span"))]);
         let ((), polls) = with_paused_count(
             "span",
-            run_once_configured(&server, Some(disabled_gate()), Some(paused), true),
+            run_once_configured(&server, Some(disabled_gate()), Some(paused), true, None),
         );
         let received = server.received_requests().await.expect("recording enabled");
         assert!(
@@ -1894,7 +2164,7 @@ mod drain_tests {
         );
         let ((), polls) = with_paused_count(
             "span",
-            run_once_configured(&server, Some(disabled_gate()), Some(paused), true),
+            run_once_configured(&server, Some(disabled_gate()), Some(paused), true, None),
         );
         assert!(
             !server
@@ -1916,7 +2186,7 @@ mod drain_tests {
         let unpaused = pause_gate("span", &[(PAUSED_LIST_KEY, Value::from("qpl"))]);
         let ((), polls) = with_paused_count(
             "span",
-            run_once_configured(&server, None, Some(unpaused), true),
+            run_once_configured(&server, None, Some(unpaused), true, None),
         );
         assert!(
             requests(&server).await.0 > 0,

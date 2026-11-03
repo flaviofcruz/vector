@@ -89,6 +89,25 @@ mod s3 {
     }
 
     #[derive(Debug, NamedInternalEvent)]
+    pub struct SqsMessageVisibilityReleased {
+        pub reason: &'static str,
+    }
+
+    impl InternalEvent for SqsMessageVisibilityReleased {
+        fn emit(self) {
+            debug!(
+                message = "Released failed SQS message early.",
+                reason = %self.reason,
+            );
+            counter!(
+                "sqs_message_visibility_released_total",
+                "reason" => self.reason,
+            )
+            .increment(1);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
     pub struct SqsMessageDeleteSucceeded {
         pub message_ids: Vec<DeleteMessageBatchResultEntry>,
     }

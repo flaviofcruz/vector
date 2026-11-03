@@ -58,8 +58,9 @@ use crate::{
         S3ObjectProcessingSucceeded, SqsMessageDeleteBatchError, SqsMessageDeletePartialError,
         SqsMessageDeleteSucceeded, SqsMessageProcessingError, SqsMessageProcessingSucceeded,
         SqsMessageReceiveError, SqsMessageReceiveSucceeded, SqsMessageSendBatchError,
-        SqsMessageSentPartialError, SqsMessageSentSucceeded, SqsS3EventRecordInvalidEventIgnored,
-        StreamClosedError, emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
+        SqsMessageSentPartialError, SqsMessageSentSucceeded, SqsMessageVisibilityReleased,
+        SqsS3EventRecordInvalidEventIgnored, StreamClosedError, emit_object_storage_ack_metrics,
+        emit_object_storage_non_ack_metrics,
     },
     line_agg::{self, LineAgg},
     shutdown::ShutdownSignal,
@@ -169,6 +170,22 @@ pub(super) struct Config {
     #[derivative(Default(value = "default_true()"))]
     pub(super) delete_failed_message: bool,
 
+    /// How long, in seconds, a message stays invisible after its S3 object could not be fetched.
+    ///
+    /// When set, a `GetObject` request failure (5xx, throttling, timeout, credentials) calls
+    /// `ChangeMessageVisibility` on the message with this value, so it is retried after this delay
+    /// instead of waiting out the full `visibility_timeout_secs`. Failures reading or decoding the
+    /// object body, and every other error, keep the normal visibility timeout. Unset (the default)
+    /// keeps that behavior for all failures.
+    ///
+    /// Valid values are 0 - 43200. A value of 10 - 30 is intended: a non-zero delay avoids burning
+    /// through the dead-letter queue's `maxReceiveCount` during a short S3 blip.
+    #[serde(default)]
+    #[derivative(Default)]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 15))]
+    pub(super) failed_message_visibility_timeout_secs: Option<u32>,
+
     /// Number of concurrent tasks to create for polling the queue for messages.
     ///
     /// Defaults to the number of available CPUs on the system.
@@ -242,7 +259,15 @@ const fn default_true() -> bool {
 pub(super) enum IngestorNewError {
     #[snafu(display("Invalid value for max_number_of_messages {}", messages))]
     InvalidNumberOfMessages { messages: u32 },
+    #[snafu(display(
+        "Invalid value for failed_message_visibility_timeout_secs {}: must be 0 - 43200",
+        secs
+    ))]
+    InvalidFailedMessageVisibilityTimeout { secs: u32 },
 }
+
+/// SQS rejects visibility timeouts above 12 hours.
+const MAX_VISIBILITY_TIMEOUT_SECS: u32 = 43_200;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Snafu)]
@@ -323,6 +348,29 @@ pub enum ProcessingError {
     EmptyFileId { bucket: String, key: String },
 }
 
+fn validate_failed_message_visibility_timeout(
+    secs: Option<u32>,
+) -> Result<Option<i32>, IngestorNewError> {
+    match secs {
+        Some(secs) if secs > MAX_VISIBILITY_TIMEOUT_SECS => {
+            Err(IngestorNewError::InvalidFailedMessageVisibilityTimeout { secs })
+        }
+        // Bounded by MAX_VISIBILITY_TIMEOUT_SECS, so the cast cannot truncate.
+        secs => Ok(secs.map(|secs| secs as i32)),
+    }
+}
+
+impl ProcessingError {
+    /// Whether the message should be made visible again early. Only a request-level `GetObject`
+    /// failure qualifies; broken or undecodable files would fail again on redelivery.
+    const fn release_reason(&self) -> Option<&'static str> {
+        match self {
+            ProcessingError::GetObject { .. } => Some("get_object"),
+            _ => None,
+        }
+    }
+}
+
 pub struct State {
     region: Region,
 
@@ -340,6 +388,7 @@ pub struct State {
     visibility_timeout_secs: i32,
     delete_message: bool,
     delete_failed_message: bool,
+    failed_message_visibility_timeout_secs: Option<i32>,
     decoder: Decoder,
 
     deferred: Option<DeferredConfig>,
@@ -371,6 +420,10 @@ impl Ingestor {
             });
         }
 
+        let failed_message_visibility_timeout_secs = validate_failed_message_visibility_timeout(
+            config.failed_message_visibility_timeout_secs,
+        )?;
+
         let state = Arc::new(State {
             region,
 
@@ -391,6 +444,7 @@ impl Ingestor {
             visibility_timeout_secs: config.visibility_timeout_secs as i32,
             delete_message: config.delete_message,
             delete_failed_message: config.delete_failed_message,
+            failed_message_visibility_timeout_secs,
             decoder,
 
             deferred: config.deferred,
@@ -749,6 +803,12 @@ impl IngestorProcess {
                                 message_id: &message_id,
                                 error: &err,
                             });
+                            if let Some(secs) = self.state.failed_message_visibility_timeout_secs
+                                && let Some(reason) = err.release_reason()
+                            {
+                                self.release_message(&message_id, &receipt_handle, secs, reason)
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -1374,6 +1434,35 @@ impl IngestorProcess {
             .send()
             .map_ok(|res| res.messages.unwrap_or_default())
             .await
+    }
+
+    /// Makes a failed message visible again after `secs` instead of the full visibility timeout.
+    /// A failure here only logs: the message then falls back to the normal visibility timeout.
+    async fn release_message(
+        &self,
+        message_id: &str,
+        receipt_handle: &str,
+        secs: i32,
+        reason: &'static str,
+    ) {
+        match self
+            .state
+            .sqs_client
+            .change_message_visibility()
+            .queue_url(self.state.queue_url.clone())
+            .receipt_handle(receipt_handle)
+            .visibility_timeout(secs)
+            .send()
+            .await
+        {
+            Ok(_) => emit!(SqsMessageVisibilityReleased { reason }),
+            Err(error) => warn!(
+                message = "Failed to change SQS message visibility.",
+                message_id = %message_id,
+                error = %error,
+                internal_log_rate_limit = true,
+            ),
+        }
     }
 
     async fn delete_messages(
@@ -2204,6 +2293,93 @@ fn test_process_custom_message_config_parsing() {
 }
 
 #[test]
+fn failed_message_visibility_timeout_config() {
+    const QUEUE: &str = r#"queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue""#;
+
+    let config: Config = toml::from_str(QUEUE).unwrap();
+    assert_eq!(
+        config.failed_message_visibility_timeout_secs, None,
+        "early release must be off by default"
+    );
+
+    let config: Config = toml::from_str(&format!(
+        "{QUEUE}\nfailed_message_visibility_timeout_secs = 15"
+    ))
+    .unwrap();
+    assert_eq!(config.failed_message_visibility_timeout_secs, Some(15));
+
+    let negative = toml::from_str::<Config>(&format!(
+        "{QUEUE}\nfailed_message_visibility_timeout_secs = -1"
+    ));
+    assert!(negative.is_err());
+}
+
+#[test]
+fn failed_message_visibility_timeout_validation() {
+    assert_eq!(
+        validate_failed_message_visibility_timeout(None).unwrap(),
+        None
+    );
+    assert_eq!(
+        validate_failed_message_visibility_timeout(Some(0)).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        validate_failed_message_visibility_timeout(Some(43_200)).unwrap(),
+        Some(43_200)
+    );
+    assert!(validate_failed_message_visibility_timeout(Some(43_201)).is_err());
+}
+
+#[test]
+fn only_get_object_failures_release_early() {
+    let get_object = || SdkError::timeout_error("timed out");
+    let bucket = || "b".to_string();
+    let key = || "k".to_string();
+
+    let released = [ProcessingError::GetObject {
+        source: get_object(),
+        bucket: bucket(),
+        key: key(),
+    }];
+    for err in &released {
+        assert_eq!(err.release_reason(), Some("get_object"), "{err:?}");
+    }
+
+    let kept = [
+        ProcessingError::InvalidSqsMessage {
+            source: serde_json::from_str::<()>("x").unwrap_err(),
+            message_id: "m".into(),
+        },
+        ProcessingError::ObjectNotFound {
+            source: get_object(),
+            bucket: bucket(),
+            key: key(),
+        },
+        ProcessingError::WrongRegion {
+            region: "r".into(),
+            bucket: bucket(),
+            key: key(),
+        },
+        ProcessingError::UnsupportedS3EventVersion {
+            version: semver::Version::new(9, 0, 0),
+        },
+        ProcessingError::ErrorAcknowledgement {
+            region: "r".into(),
+            bucket: bucket(),
+            key: key(),
+        },
+        ProcessingError::EmptyFileId {
+            bucket: bucket(),
+            key: key(),
+        },
+    ];
+    for err in &kept {
+        assert_eq!(err.release_reason(), None, "{err:?}");
+    }
+}
+
+#[test]
 fn parse_sqs_config() {
     let config: Config = toml::from_str(
         r#"
@@ -2405,6 +2581,14 @@ mod drain_tests {
 
     /// Like `mock_sqs_and_s3`, but DeleteMessageBatch reports `m1` as failed when `delete_fails`.
     async fn mock_sqs_and_s3_with(delete_fails: bool) -> MockServer {
+        mock_sqs_and_s3_full(delete_fails, ResponseTemplate::new(404)).await
+    }
+
+    /// Like `mock_sqs_and_s3_with`, with `get_response` as the S3 `GetObject` response.
+    async fn mock_sqs_and_s3_full(
+        delete_fails: bool,
+        get_response: ResponseTemplate,
+    ) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(header("x-amz-target", "AmazonSQS.ReceiveMessage"))
@@ -2433,14 +2617,14 @@ mod drain_tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(404))
+            .respond_with(get_response)
             .mount(&server)
             .await;
         server
     }
 
     async fn run_once_with(server: &MockServer, drain_gate: Option<DrainGate>) {
-        run_once_configured(server, drain_gate, None, true).await;
+        run_once_configured(server, drain_gate, None, true, None).await;
     }
 
     async fn run_once_configured(
@@ -2448,6 +2632,7 @@ mod drain_tests {
         drain_gate: Option<DrainGate>,
         pause_gate: Option<PauseGate>,
         delete_message: bool,
+        failed_message_visibility_timeout_secs: Option<u32>,
     ) {
         let region = Region::new("us-east-1");
         let credentials = Credentials::new("akid", "secret", None, None, "test");
@@ -2478,6 +2663,7 @@ mod drain_tests {
         let config = Config {
             queue_url: format!("{}/123456789012/q", server.uri()),
             delete_message,
+            failed_message_visibility_timeout_secs,
             poll_secs: 0,
             ..Default::default()
         };
@@ -2551,7 +2737,7 @@ mod drain_tests {
         let server = mock_sqs_and_s3().await;
         let ((), drained) = with_drained_count(
             "span",
-            run_once_configured(&server, Some(disabled_gate()), None, false),
+            run_once_configured(&server, Some(disabled_gate()), None, false, None),
         );
         let (gets, deletes) = requests(&server).await;
         assert_eq!(gets, 0, "a disabled table must not fetch objects");
@@ -2571,6 +2757,64 @@ mod drain_tests {
         assert_eq!(gets, 0, "a disabled table must not fetch objects");
         assert_eq!(deletes.len(), 1, "the delete is still attempted");
         assert_eq!(drained, 0, "a message SQS failed to delete is not drained");
+    }
+
+    /// `ChangeMessageVisibility` request bodies.
+    async fn visibility_changes(server: &MockServer) -> Vec<String> {
+        let received = server.received_requests().await.expect("recording enabled");
+        received
+            .iter()
+            .filter(|r| target(r) == "AmazonSQS.ChangeMessageVisibility")
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    async fn mock_change_message_visibility(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "AmazonSQS.ChangeMessageVisibility"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-amz-json-1.0")
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_object_failure_releases_message_when_configured() {
+        let server = mock_sqs_and_s3_full(false, ResponseTemplate::new(500)).await;
+        mock_change_message_visibility(&server).await;
+        run_once_configured(&server, None, None, true, Some(15)).await;
+        let changes = visibility_changes(&server).await;
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(
+            changes[0].contains("\"VisibilityTimeout\":15"),
+            "{changes:?}"
+        );
+        assert!(changes[0].contains("rh-1"), "{changes:?}");
+        assert!(
+            requests(&server).await.1.is_empty(),
+            "a failed message must not be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_failure_keeps_visibility_timeout_by_default() {
+        let server = mock_sqs_and_s3_full(false, ResponseTemplate::new(500)).await;
+        run_once_configured(&server, None, None, true, None).await;
+        assert!(visibility_changes(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn object_not_found_is_not_released_early() {
+        // A 404 with a NoSuchKey body is ObjectNotFound (deleted, not released).
+        let no_such_key = ResponseTemplate::new(404)
+            .insert_header("content-type", "application/xml")
+            .set_body_string("<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>");
+        let server = mock_sqs_and_s3_full(false, no_such_key).await;
+        run_once_configured(&server, None, None, true, Some(15)).await;
+        assert!(visibility_changes(&server).await.is_empty());
     }
 
     #[tokio::test]
@@ -2608,7 +2852,7 @@ mod drain_tests {
         let paused = pause_gate("span", &[(PAUSED_LIST_KEY, Value::from("span"))]);
         let ((), polls) = with_paused_count(
             "span",
-            run_once_configured(&server, Some(disabled_gate()), Some(paused), true),
+            run_once_configured(&server, Some(disabled_gate()), Some(paused), true, None),
         );
         let received = server.received_requests().await.expect("recording enabled");
         assert!(
@@ -2629,7 +2873,7 @@ mod drain_tests {
         );
         let ((), polls) = with_paused_count(
             "span",
-            run_once_configured(&server, Some(disabled_gate()), Some(paused), true),
+            run_once_configured(&server, Some(disabled_gate()), Some(paused), true, None),
         );
         assert!(
             !server
@@ -2651,7 +2895,7 @@ mod drain_tests {
         let unpaused = pause_gate("span", &[(PAUSED_LIST_KEY, Value::from("qpl"))]);
         let ((), polls) = with_paused_count(
             "span",
-            run_once_configured(&server, None, Some(unpaused), true),
+            run_once_configured(&server, None, Some(unpaused), true, None),
         );
         assert!(
             requests(&server).await.0 > 0,

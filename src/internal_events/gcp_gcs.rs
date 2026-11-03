@@ -125,3 +125,22 @@ impl InternalEvent for PubSubMessageProcessingError<'_> {
         .increment(1);
     }
 }
+
+#[derive(Debug, NamedInternalEvent)]
+pub struct PubSubMessageReleased {
+    pub reason: &'static str,
+}
+
+impl InternalEvent for PubSubMessageReleased {
+    fn emit(self) {
+        debug!(
+            message = "Released failed Pub/Sub message early.",
+            reason = %self.reason,
+        );
+        counter!(
+            "pubsub_message_ack_deadline_released_total",
+            "reason" => self.reason,
+        )
+        .increment(1);
+    }
+}
