@@ -4,8 +4,8 @@ use vector_lib::emit;
 use vector_lib::internal_event::{InternalEvent, NamedInternalEvent};
 
 /// This metrics the delay between when a blob is created in object storage
-/// and when the notification appears in the SQS / Azure queue.
-/// This is controlled by the cloud services such as AWS SNS and Azure Event Grid.
+/// and when the notification appears in the SQS / Azure queue / GCP Pub/Sub topic.
+/// This is controlled by the cloud services such as AWS SNS, Azure Event Grid and GCS Pub/Sub notifications.
 #[derive(Debug)]
 pub struct QueueNotificationCreationDelay<'a> {
     pub delay_seconds: f64,

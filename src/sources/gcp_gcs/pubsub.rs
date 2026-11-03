@@ -33,7 +33,7 @@ use crate::{
     internal_events::{
         PubSubMessageProcessingError, PubSubMessageProcessingSucceeded, PubSubMessageReceiveError,
         PubSubMessageReceiveSucceeded, PubSubMessageReleased, QueueMessageCount,
-        QueueNotificationProcessLag,
+        QueueNotificationProcessLag, emit_object_storage_non_ack_metrics,
     },
     shutdown::ShutdownSignal,
     sources::ingestion_callback::IngestionCallbackClient,
@@ -208,6 +208,8 @@ pub(crate) enum MessageFormat {
 const GCS_EVENT_TYPE_ATTR: &str = "eventType";
 const GCS_BUCKET_ID_ATTR: &str = "bucketId";
 const GCS_OBJECT_ID_ATTR: &str = "objectId";
+/// RFC3339 time the object event happened (for finalize, when the object was created).
+const GCS_EVENT_TIME_ATTR: &str = "eventTime";
 /// The only event that means "a new object is fully written and readable". Other kinds
 /// (`OBJECT_DELETE`, `OBJECT_ARCHIVE`, `OBJECT_METADATA_UPDATE`) carry no object to ingest.
 const GCS_OBJECT_FINALIZE: &str = "OBJECT_FINALIZE";
@@ -215,7 +217,12 @@ const GCS_OBJECT_FINALIZE: &str = "OBJECT_FINALIZE";
 /// What a native GCS notification resolves to once its attributes are interpreted.
 enum GcsNativeOutcome {
     /// An `OBJECT_FINALIZE` for `gs://bucket/object` — download and ingest it.
-    Ingest { bucket: String, object: String },
+    /// `event_time` is the optional `eventTime` attribute (RFC3339), used only for metrics.
+    Ingest {
+        bucket: String,
+        object: String,
+        event_time: Option<String>,
+    },
     /// A non-finalize event — acknowledge and move on, nothing to fetch.
     Skip,
 }
@@ -244,6 +251,10 @@ fn parse_gcs_native_notification(
     Ok(GcsNativeOutcome::Ingest {
         bucket: non_empty(GCS_BUCKET_ID_ATTR)?,
         object: non_empty(GCS_OBJECT_ID_ATTR)?,
+        event_time: attributes
+            .get(GCS_EVENT_TIME_ATTR)
+            .filter(|v| !v.is_empty())
+            .cloned(),
     })
 }
 
@@ -1018,7 +1029,7 @@ impl IngestorProcess {
             reason: "message has no attributes".to_string(),
         })?;
 
-        let (bucket, object) =
+        let (bucket, object, event_time) =
             match parse_gcs_native_notification(attributes).map_err(|reason| {
                 ProcessingError::InvalidNativeNotification {
                     message_id: message_id.to_string(),
@@ -1033,16 +1044,33 @@ impl IngestorProcess {
                     );
                     return Ok(());
                 }
-                GcsNativeOutcome::Ingest { bucket, object } => (bucket, object),
+                GcsNativeOutcome::Ingest {
+                    bucket,
+                    object,
+                    event_time,
+                } => (bucket, object, event_time),
             };
 
-        if let Some(ts) = publish_time {
-            let lag_secs = Utc::now().signed_duration_since(ts).num_milliseconds() as f64 / 1000.0;
-            emit!(QueueNotificationProcessLag {
-                lag_seconds: lag_secs,
-                cloud: "gcp",
-                bucket: &bucket,
-            });
+        match (event_time.as_deref(), publish_time) {
+            // Emits both the creation delay (publish_time - eventTime) and the process lag.
+            // An unparseable eventTime skips only the delay; the lag is still emitted.
+            (Some(event_time), Some(ts)) => emit_object_storage_non_ack_metrics(
+                event_time,
+                Some(ts),
+                Utc::now(),
+                "gcp",
+                &bucket,
+            ),
+            (None, Some(ts)) => {
+                let lag_secs =
+                    Utc::now().signed_duration_since(ts).num_milliseconds() as f64 / 1000.0;
+                emit!(QueueNotificationProcessLag {
+                    lag_seconds: lag_secs,
+                    cloud: "gcp",
+                    bucket: &bucket,
+                });
+            }
+            (_, None) => {}
         }
 
         debug!(
@@ -1794,12 +1822,59 @@ mod tests {
             ("payloadFormat", "JSON_API_V1"),
         ]);
         match parse_gcs_native_notification(&a).expect("finalize must parse") {
-            GcsNativeOutcome::Ingest { bucket, object } => {
+            GcsNativeOutcome::Ingest {
+                bucket,
+                object,
+                event_time,
+            } => {
+                assert_eq!(event_time, None);
                 assert_eq!(bucket, "my-logs-bucket");
                 assert_eq!(object, "archived-log/2026/03/21/events.log");
             }
             GcsNativeOutcome::Skip => panic!("OBJECT_FINALIZE must ingest, not skip"),
         }
+    }
+
+    /// `eventTime` is carried through when present; absent or empty must not fail the parse.
+    #[test]
+    fn native_finalize_event_time_optional() {
+        let with = attrs(&[
+            ("eventType", "OBJECT_FINALIZE"),
+            ("bucketId", "b"),
+            ("objectId", "k"),
+            ("eventTime", "2026-03-21T10:00:00.123Z"),
+        ]);
+        match parse_gcs_native_notification(&with).unwrap() {
+            GcsNativeOutcome::Ingest { event_time, .. } => {
+                assert_eq!(event_time.as_deref(), Some("2026-03-21T10:00:00.123Z"));
+            }
+            GcsNativeOutcome::Skip => panic!("must ingest"),
+        }
+        for extra in [None, Some(("eventTime", ""))] {
+            let mut pairs = vec![
+                ("eventType", "OBJECT_FINALIZE"),
+                ("bucketId", "b"),
+                ("objectId", "k"),
+            ];
+            pairs.extend(extra);
+            match parse_gcs_native_notification(&attrs(&pairs)).unwrap() {
+                GcsNativeOutcome::Ingest { event_time, .. } => assert_eq!(event_time, None),
+                GcsNativeOutcome::Skip => panic!("must ingest"),
+            }
+        }
+    }
+
+    /// The creation delay is publish_time - eventTime: positive when published after the event.
+    #[test]
+    fn native_event_time_delay_sign() {
+        let publish = DateTime::parse_from_rfc3339("2026-03-21T10:00:02.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let delay =
+            crate::internal_events::calculate_duration_seconds("2026-03-21T10:00:00.000Z", publish)
+                .unwrap();
+        assert!((delay - 2.5).abs() < 1e-9);
+        assert!(crate::internal_events::calculate_duration_seconds("garbage", publish).is_none());
     }
 
     /// Non-finalize events (delete/archive/metadata) carry no object to fetch and must be skipped
