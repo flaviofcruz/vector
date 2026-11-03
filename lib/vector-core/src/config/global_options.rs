@@ -1,5 +1,6 @@
 use std::{fs::DirBuilder, path::PathBuf, time::Duration};
 
+use serde_with::{As, DisplayFromStr, PickFirst, Same};
 use snafu::{ResultExt, Snafu};
 use vector_common::TimeZone;
 use vector_config::{configurable_component, impl_generate_config_from_default};
@@ -42,6 +43,36 @@ pub enum WildcardMatching {
 
     /// Relaxed matching (must match 0 or more inputs)
     Relaxed,
+}
+
+/// Admission behavior for process-wide Kubernetes log rate limiting.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PodRateLimitMode {
+    /// Preserve the existing source behavior.
+    #[default]
+    Disabled,
+    /// Account against virtual balances without delaying sources.
+    Shadow,
+    /// Enforce reserved entitlements and distribute shared supply fairly.
+    Enforce,
+}
+
+/// Process-wide per-pod rate-limit configuration.
+#[configurable_component]
+#[derive(Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PodRateLimitOptions {
+    /// Admission behavior.
+    pub mode: PodRateLimitMode,
+    /// Events admitted per minute for one logging unit.
+    pub events_per_minute_per_lu: u64,
+    /// Node logging capacity in logging units.
+    pub node_capacity_lu: f64,
+    /// Collective reserve for logs without an attributable pod entitlement.
+    #[serde(deserialize_with = "As::<PickFirst<(Same, DisplayFromStr)>>::deserialize")]
+    pub unattributed_reserve_lu: f64,
 }
 
 /// Global configuration options.
@@ -143,6 +174,11 @@ pub struct GlobalOptions {
     )]
     #[configurable(metadata(docs::common = false, docs::required = false))]
     pub async_file_server: AsyncFileServerConfig,
+
+    /// Process-wide fair rate limiting for Kubernetes pod logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[configurable(metadata(docs::common = false, docs::required = false))]
+    pub pod_rate_limit: Option<PodRateLimitOptions>,
 
     /// The amount of time, in seconds, that internal metrics will persist after having not been
     /// updated before they expire and are removed.
@@ -296,6 +332,10 @@ impl GlobalOptions {
             errors.push("conflicting values for 'async_file_server' found".to_owned());
         }
 
+        if conflicts(self.pod_rate_limit.as_ref(), with.pod_rate_limit.as_ref()) {
+            errors.push("conflicting values for 'pod_rate_limit' found".to_owned());
+        }
+
         if conflicts(self.expire_metrics.as_ref(), with.expire_metrics.as_ref()) {
             errors.push("conflicting values for 'expire_metrics' found".to_owned());
         }
@@ -328,15 +368,10 @@ impl GlobalOptions {
         let mut telemetry = self.telemetry.clone();
         telemetry.merge(&with.telemetry);
 
-        let merged_expire_metrics_per_metric_set = match (
-            &self.expire_metrics_per_metric_set,
-            &with.expire_metrics_per_metric_set,
-        ) {
-            (Some(a), Some(b)) => Some(a.iter().chain(b).cloned().collect()),
-            (Some(a), None) => Some(a.clone()),
-            (None, Some(b)) => Some(b.clone()),
-            (None, None) => None,
-        };
+        let merged_expire_metrics_per_metric_set = merge_per_metric_set_expirations(
+            self.expire_metrics_per_metric_set.as_deref(),
+            with.expire_metrics_per_metric_set.as_deref(),
+        );
 
         if errors.is_empty() {
             Ok(Self {
@@ -351,6 +386,7 @@ impl GlobalOptions {
                 async_file_server: self
                     .async_file_server
                     .merge_default(&with.async_file_server),
+                pod_rate_limit: self.pod_rate_limit.clone().or(with.pod_rate_limit),
                 timezone: self.timezone.or(with.timezone),
                 proxy: self.proxy.merge(&with.proxy),
                 expire_metrics: self.expire_metrics.or(with.expire_metrics),
@@ -407,6 +443,19 @@ impl GlobalOptions {
     }
 }
 
+// Extracted from `GlobalOptions::merge` to keep it under clippy's `too_many_lines` limit.
+fn merge_per_metric_set_expirations(
+    this: Option<&[PerMetricSetExpiration]>,
+    that: Option<&[PerMetricSetExpiration]>,
+) -> Option<Vec<PerMetricSetExpiration>> {
+    match (this, that) {
+        (Some(a), Some(b)) => Some(a.iter().chain(b).cloned().collect()),
+        (Some(a), None) => Some(a.to_vec()),
+        (None, Some(b)) => Some(b.to_vec()),
+        (None, None) => None,
+    }
+}
+
 fn conflicts<T: PartialEq>(this: Option<&T>, that: Option<&T>) -> bool {
     matches!((this, that), (Some(this), Some(that)) if this != that)
 }
@@ -418,6 +467,45 @@ mod tests {
     use chrono_tz::Tz;
 
     use super::*;
+
+    #[test]
+    fn pod_rate_limit_merges_across_config_files() {
+        let parse = |reserve| {
+            toml::from_str::<GlobalOptions>(&format!(
+                "[pod_rate_limit]\nmode = \"shadow\"\nevents_per_minute_per_lu = 5000\n\
+                 node_capacity_lu = 16\nunattributed_reserve_lu = {reserve}"
+            ))
+            .unwrap()
+        };
+        let numeric = parse("2");
+        let interpolated = parse("\"2\"");
+        assert_eq!(
+            interpolated
+                .pod_rate_limit
+                .as_ref()
+                .unwrap()
+                .unattributed_reserve_lu,
+            2.0
+        );
+        assert_eq!(
+            numeric.merge(interpolated).unwrap().pod_rate_limit,
+            numeric.pod_rate_limit
+        );
+        let omitted: GlobalOptions = toml::from_str("").unwrap();
+        assert!(omitted.pod_rate_limit.is_none());
+        assert_eq!(
+            omitted.merge(numeric.clone()).unwrap().pod_rate_limit,
+            numeric.pod_rate_limit
+        );
+        assert_eq!(
+            numeric.merge(omitted).unwrap().pod_rate_limit,
+            numeric.pod_rate_limit
+        );
+        assert!(numeric.merge(parse("3")).is_err());
+        let mut changed_mode = numeric.clone();
+        changed_mode.pod_rate_limit.as_mut().unwrap().mode = PodRateLimitMode::Enforce;
+        assert!(numeric.merge(changed_mode).is_err());
+    }
 
     #[test]
     fn merges_data_dir() {
