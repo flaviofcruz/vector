@@ -741,6 +741,10 @@ impl From<EventMetadata> for Metadata {
             delivery_event_count: delivery_event_count.map(|count| count as u64),
             delivery_event_service_system,
             delivery_path_accounting: delivery_path_accounting.map(Into::into),
+            // Release A still writes the 8-10 fields that Release A and earlier readers understand.
+            delivery_event_count_v2: None,
+            delivery_event_service_system_v2: None,
+            delivery_path_accounting_v2: None,
         }
     }
 }
@@ -758,7 +762,16 @@ impl From<Metadata> for EventMetadata {
             delivery_event_count,
             delivery_event_service_system,
             delivery_path_accounting,
+            delivery_event_count_v2,
+            delivery_event_service_system_v2,
+            delivery_path_accounting_v2,
         } = value;
+
+        // Prefer the 100+ fields written by newer peers; fall back to 8-10 from older writers.
+        let delivery_event_count = delivery_event_count_v2.or(delivery_event_count);
+        let delivery_event_service_system =
+            delivery_event_service_system_v2.or(delivery_event_service_system);
+        let delivery_path_accounting = delivery_path_accounting_v2.or(delivery_path_accounting);
 
         let metadata_value = metadata_value.and_then(decode_value);
         let source_id = source_id.map(|s| Arc::new(s.into()));
@@ -869,5 +882,98 @@ fn encode_map(fields: ObjectMap) -> ValueMap {
 fn encode_array(items: Vec<super::Value>) -> ValueArray {
     ValueArray {
         items: items.into_iter().map(encode_value).collect(),
+    }
+}
+
+#[cfg(test)]
+mod delivery_metadata_compat_tests {
+    use prost::Message as _;
+
+    use super::{DeliveryPathAccounting, Metadata};
+    use crate::event::EventMetadata;
+
+    /// The fork's delivery fields as Vector 0.53-custom and earlier releases encode them: fields
+    /// 8-10 only. Decoding and encoding through this type models a pre-Release-A peer.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Released053Metadata {
+        #[prost(uint64, optional, tag = "8")]
+        event_count: Option<u64>,
+        #[prost(string, optional, tag = "9")]
+        service_system: Option<String>,
+        #[prost(message, optional, tag = "10")]
+        path_accounting: Option<DeliveryPathAccounting>,
+    }
+
+    fn event_metadata_with_delivery_fields() -> EventMetadata {
+        let mut metadata = EventMetadata::default();
+        metadata.set_delivery_event_count(7);
+        metadata.set_delivery_event_service_system("sink-service".to_owned());
+        metadata
+    }
+
+    #[test]
+    fn release_a_writes_only_legacy_fields() {
+        let metadata = Metadata::from(event_metadata_with_delivery_fields());
+        assert_eq!(metadata.delivery_event_count, Some(7));
+        assert_eq!(
+            metadata.delivery_event_service_system.as_deref(),
+            Some("sink-service")
+        );
+        assert_eq!(metadata.delivery_event_count_v2, None);
+        assert_eq!(metadata.delivery_event_service_system_v2, None);
+        assert_eq!(metadata.delivery_path_accounting_v2, None);
+    }
+
+    #[test]
+    fn release_a_output_is_readable_by_pre_release_a_peers() {
+        let bytes = Metadata::from(event_metadata_with_delivery_fields()).encode_to_vec();
+        let legacy = Released053Metadata::decode(bytes.as_slice()).expect("0.53 decode");
+        assert_eq!(legacy.event_count, Some(7));
+        assert_eq!(legacy.service_system.as_deref(), Some("sink-service"));
+    }
+
+    #[test]
+    fn pre_release_a_output_is_read_by_release_a() {
+        let legacy = Released053Metadata {
+            event_count: Some(3),
+            service_system: Some("legacy-service".to_owned()),
+            path_accounting: Some(DeliveryPathAccounting { counts: vec![] }),
+        };
+        let bytes = legacy.encode_to_vec();
+        let metadata = EventMetadata::from(Metadata::decode(bytes.as_slice()).expect("decode"));
+        assert_eq!(metadata.delivery_event_count(), 3);
+        assert_eq!(
+            metadata.delivery_event_service_system(),
+            Some("legacy-service")
+        );
+        assert!(metadata.delivery_path_accounting().is_some());
+    }
+
+    #[test]
+    fn release_a_prefers_100_plus_fields_over_legacy_fields() {
+        let metadata = Metadata {
+            delivery_event_count: Some(3),
+            delivery_event_service_system: Some("legacy".to_owned()),
+            delivery_event_count_v2: Some(11),
+            delivery_event_service_system_v2: Some("current".to_owned()),
+            ..Default::default()
+        };
+        let decoded = EventMetadata::from(metadata);
+        assert_eq!(decoded.delivery_event_count(), 11);
+        assert_eq!(decoded.delivery_event_service_system(), Some("current"));
+    }
+
+    #[test]
+    fn release_b_fields_are_invisible_to_pre_release_a_peers() {
+        // Release B writes only 100+. Pre-Release-A peers must ignore them rather than misread them.
+        let bytes = Metadata {
+            delivery_event_count_v2: Some(11),
+            delivery_event_service_system_v2: Some("current".to_owned()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let legacy = Released053Metadata::decode(bytes.as_slice()).expect("0.53 decode");
+        assert_eq!(legacy.event_count, None);
+        assert_eq!(legacy.service_system, None);
     }
 }

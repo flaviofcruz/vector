@@ -94,9 +94,17 @@ message Metadata {
   OutputId upstream_id = 5;
   Secrets secrets = 6;
   bytes source_event_id = 7;
+  // Fork-only fields. Upstream Vector uses 8 (trace_layout) and 9 (datadog_metric_unit) for
+  // other meanings, so the fork's own writes of 8-10 must not be read as upstream data by
+  // mixed-version peers. Release A writes 8-10 and reads the 100+ copies first; Release B
+  // writes only the 100+ copies. Do not reuse 8-10 for anything else.
   optional uint64 delivery_event_count = 8;
   optional string delivery_event_service_system = 9;
   DeliveryPathAccounting delivery_path_accounting = 10;
+  // Release A readers prefer these over 8-10. Release A writers never set them.
+  optional uint64 delivery_event_count_v2 = 100;
+  optional string delivery_event_service_system_v2 = 101;
+  DeliveryPathAccounting delivery_path_accounting_v2 = 102;
 }
 
 message DeliveryPathAccounting {
