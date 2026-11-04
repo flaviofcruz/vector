@@ -230,7 +230,12 @@ impl<L> Controller<L> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(
+        test,
+        feature = "sources-aws_s3",
+        feature = "sources-azure_blob",
+        feature = "sources-gcp_gcs"
+    ))]
     pub(super) fn current_limit(&self) -> usize {
         self.inner
             .lock()
@@ -239,7 +244,12 @@ impl<L> Controller<L> {
     }
 
     /// A cancelled or unprocessed source message must not train the RTT estimator.
-    #[cfg(test)]
+    #[cfg(any(
+        test,
+        feature = "sources-aws_s3",
+        feature = "sources-azure_blob",
+        feature = "sources-gcp_gcs"
+    ))]
     pub(super) fn cancel_request(&self) {
         let mut inner = self.inner.lock().expect("Controller mutex is poisoned");
         #[cfg(test)]
@@ -252,7 +262,12 @@ impl<L> Controller<L> {
         self.in_flight.emit(inner.in_flight as u64);
     }
 
-    #[cfg(test)]
+    #[cfg(any(
+        test,
+        feature = "sources-aws_s3",
+        feature = "sources-azure_blob",
+        feature = "sources-gcp_gcs"
+    ))]
     pub(super) fn clamp_to_one(&self) {
         let mut inner = self.inner.lock().expect("Controller mutex is poisoned");
         if inner.current_limit > 1 {

@@ -4,9 +4,10 @@ This preparatory change adapts Vector's existing request-concurrency controller
 to source lifecycles. It is new integration code, not an upstream sync. The sink
 algorithm and production behavior are unchanged.
 
-The adapter compiles only in tests until a source integration enables its runtime
-feature gates. It has no cloud dependencies, queue configuration, shared memory
-guard, or object-storage metrics.
+In the standalone controller PR, the adapter compiles only in tests. The
+blob-source integration enables its runtime feature gates. The adapter itself has
+no cloud dependencies, queue configuration, shared memory guard, or object-storage
+metrics.
 
 ## Lifecycle
 

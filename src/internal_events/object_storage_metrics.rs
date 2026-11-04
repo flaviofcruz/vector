@@ -3,6 +3,51 @@ use tracing::{debug, info, trace, warn};
 use vector_lib::emit;
 use vector_lib::internal_event::{InternalEvent, NamedInternalEvent};
 
+#[derive(Debug)]
+pub struct ObjectStorageAdaptiveConcurrency {
+    pub limit: usize,
+    pub active_objects: usize,
+    pub memory_pressure: bool,
+}
+
+impl NamedInternalEvent for ObjectStorageAdaptiveConcurrency {
+    fn name(&self) -> &'static str {
+        "ObjectStorageAdaptiveConcurrency"
+    }
+}
+
+impl InternalEvent for ObjectStorageAdaptiveConcurrency {
+    fn emit(self) {
+        gauge!("object_storage_adaptive_concurrency_limit").set(self.limit as f64);
+        gauge!("object_storage_adaptive_active_objects").set(self.active_objects as f64);
+        gauge!("object_storage_adaptive_memory_pressure")
+            .set(u8::from(self.memory_pressure) as f64);
+    }
+}
+
+#[derive(Debug)]
+pub struct ObjectStorageAdaptiveCompletion {
+    pub elapsed: std::time::Duration,
+    pub decoded_bytes: u64,
+    pub delivered: bool,
+}
+
+impl NamedInternalEvent for ObjectStorageAdaptiveCompletion {
+    fn name(&self) -> &'static str {
+        "ObjectStorageAdaptiveCompletion"
+    }
+}
+
+impl InternalEvent for ObjectStorageAdaptiveCompletion {
+    fn emit(self) {
+        if self.delivered {
+            histogram!("object_storage_adaptive_processing_seconds")
+                .record(self.elapsed.as_secs_f64());
+            histogram!("object_storage_adaptive_decoded_bytes").record(self.decoded_bytes as f64);
+        }
+    }
+}
+
 /// This metrics the delay between when a blob is created in object storage
 /// and when the notification appears in the SQS / Azure queue / GCP Pub/Sub topic.
 /// This is controlled by the cloud services such as AWS SNS, Azure Event Grid and GCS Pub/Sub notifications.

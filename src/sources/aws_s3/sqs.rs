@@ -47,6 +47,10 @@ use vector_lib::{
 
 use crate::codecs::Decoder;
 use crate::event::{Event, LogEvent};
+use crate::sources::util::object_storage_adaptive_concurrency::{
+    ADAPTIVE_POLL_BACKOFF, ADAPTIVE_POLL_TIMEOUT, AdaptiveObjectStorageConcurrency,
+    ObjectStorageAdaptiveConcurrencyConfig,
+};
 use crate::{
     SourceSender,
     aws::AwsTimeout,
@@ -199,6 +203,10 @@ pub(super) struct Config {
     #[configurable(metadata(docs::examples = 5))]
     pub(super) client_concurrency: Option<NonZeroUsize>,
 
+    /// Opt-in adaptive admission. `client_concurrency` remains the hard ceiling.
+    #[serde(default)]
+    pub(super) adaptive_concurrency: Option<ObjectStorageAdaptiveConcurrencyConfig>,
+
     /// Maximum number of messages to poll from SQS in a batch
     ///
     /// Defaults to 10
@@ -259,6 +267,8 @@ const fn default_true() -> bool {
 pub(super) enum IngestorNewError {
     #[snafu(display("Invalid value for max_number_of_messages {}", messages))]
     InvalidNumberOfMessages { messages: u32 },
+    #[snafu(display("Invalid adaptive concurrency: {}", reason))]
+    AdaptiveConcurrency { reason: String },
     #[snafu(display(
         "Invalid value for failed_message_visibility_timeout_secs {}: must be 0 - 43200",
         secs
@@ -395,6 +405,7 @@ pub struct State {
     process_custom_message: bool,
     callback_client: Option<IngestionCallbackClient>,
     rate_limiter: ObjectStorageRateLimiter,
+    adaptive: Option<AdaptiveObjectStorageConcurrency>,
     gate: Option<ObjectStorageGate>,
 }
 
@@ -420,6 +431,17 @@ impl Ingestor {
             });
         }
 
+        let client_concurrency = config
+            .client_concurrency
+            .map(|n| n.get())
+            .unwrap_or_else(crate::num_threads);
+        let adaptive = AdaptiveObjectStorageConcurrency::build(
+            config.adaptive_concurrency.as_ref(),
+            client_concurrency,
+            u64::from(config.max_number_of_messages),
+        )
+        .map_err(|reason| IngestorNewError::AdaptiveConcurrency { reason })?;
+
         let failed_message_visibility_timeout_secs = validate_failed_message_visibility_timeout(
             config.failed_message_visibility_timeout_secs,
         )?;
@@ -437,10 +459,7 @@ impl Ingestor {
             poll_secs: config.poll_secs as i32,
             depth_poll_secs: config.depth_poll_secs,
             max_number_of_messages: config.max_number_of_messages as i32,
-            client_concurrency: config
-                .client_concurrency
-                .map(|n| n.get())
-                .unwrap_or_else(crate::num_threads),
+            client_concurrency,
             visibility_timeout_secs: config.visibility_timeout_secs as i32,
             delete_message: config.delete_message,
             delete_failed_message: config.delete_failed_message,
@@ -451,6 +470,7 @@ impl Ingestor {
             process_custom_message: config.process_custom_message,
             callback_client,
             rate_limiter,
+            adaptive,
             gate: None,
         });
 
@@ -643,6 +663,10 @@ impl IngestorProcess {
             return Ok(());
         }
 
+        let mut admission = match &self.state.adaptive {
+            Some(adaptive) => Some(adaptive.acquire().await),
+            None => None,
+        };
         let messages = match self.receive_messages().await {
             Ok(messages) => {
                 emit!(SqsMessageReceiveSucceeded {
@@ -656,6 +680,12 @@ impl IngestorProcess {
             }
         };
 
+        if messages.is_empty() && admission.is_some() {
+            drop(admission);
+            tokio::time::sleep(ADAPTIVE_POLL_BACKOFF).await;
+            return Ok(());
+        }
+
         let state = Arc::clone(&self.state);
         if !messages.is_empty()
             && let Some(gate) = &state.gate
@@ -663,6 +693,9 @@ impl IngestorProcess {
             match gate.decide_batch(messages.len()) {
                 GateDecision::Process => {}
                 GateDecision::Drain => {
+                    if let Some(admission) = admission.as_mut() {
+                        admission.release_for_drain();
+                    }
                     self.drain_messages(gate, messages).await;
                     return Ok(());
                 }
@@ -670,6 +703,13 @@ impl IngestorProcess {
             }
         }
 
+        if !messages.is_empty()
+            && let Some(admission) = admission.as_mut()
+        {
+            admission.start_processing();
+        }
+        let mut delivered = true;
+        let mut back_pressure = false;
         let mut delete_entries = Vec::new();
         let mut deferred_entries = Vec::new();
         for message in messages {
@@ -709,6 +749,12 @@ impl IngestorProcess {
                     }
                 }
                 Err(err) => {
+                    delivered = false;
+                    back_pressure = matches!(
+                        &err,
+                        ProcessingError::PipelineSend { .. }
+                            | ProcessingError::ErrorAcknowledgement { .. }
+                    );
                     match err {
                         ProcessingError::FileTooOld { .. } => {
                             emit!(SqsMessageProcessingSucceeded {
@@ -861,12 +907,14 @@ impl IngestorProcess {
                     }
 
                     if !result.failed.is_empty() {
+                        delivered = false;
                         emit!(SqsMessageDeletePartialError {
                             entries: result.failed
                         });
                     }
                 }
                 Err(err) => {
+                    delivered = false;
                     emit!(SqsMessageDeleteBatchError {
                         entries: cloned_entries,
                         error: err,
@@ -875,6 +923,10 @@ impl IngestorProcess {
             }
         }
 
+        let decoded_bytes = self.byte_counter.get();
+        if let Some(admission) = admission {
+            admission.finish(back_pressure, delivered && decoded_bytes > 0, decoded_bytes);
+        }
         // Pace between polls: the batch is fully processed and its messages are
         // deleted, so nothing is in flight while we wait to honor the byte rate.
         self.state.rate_limiter.pace(self.byte_counter.take()).await;
@@ -1377,6 +1429,11 @@ impl IngestorProcess {
                 None => Ok(()),
                 Some(receiver) => {
                     let result = receiver.await;
+                    if result != BatchStatus::Delivered
+                        && let Some(adaptive) = &self.state.adaptive
+                    {
+                        adaptive.note_failed_delivery();
+                    }
                     emit_object_storage_ack_metrics(processing_start_time, CLOUD_PROVIDER, &bucket);
 
                     match result {
@@ -1419,21 +1476,29 @@ impl IngestorProcess {
     async fn receive_messages(
         &mut self,
     ) -> Result<Vec<Message>, SdkError<ReceiveMessageError, HttpResponse>> {
-        self.state
+        let adaptive = self.state.adaptive.is_some();
+        let receive = self
+            .state
             .sqs_client
             .receive_message()
             .queue_url(self.state.queue_url.clone())
             .max_number_of_messages(self.state.max_number_of_messages)
             .visibility_timeout(self.state.visibility_timeout_secs)
-            .wait_time_seconds(self.state.poll_secs)
+            .wait_time_seconds(if adaptive { 0 } else { self.state.poll_secs })
             // Add the "SentTimestamp" to the requested attributes
             // This is the timestamp is the UNIX epoch time when the message was sent to the queue by SNS
             // We make use of it during lag / delay metric calculations
             // Ref: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html#API_ReceiveMessage_RequestSyntax
             .message_system_attribute_names(MessageSystemAttributeName::SentTimestamp)
             .send()
-            .map_ok(|res| res.messages.unwrap_or_default())
-            .await
+            .map_ok(|res| res.messages.unwrap_or_default());
+        if adaptive {
+            tokio::time::timeout(ADAPTIVE_POLL_TIMEOUT, receive)
+                .await
+                .unwrap_or_else(|error| Err(SdkError::timeout_error(error)))
+        } else {
+            receive.await
+        }
     }
 
     /// Makes a failed message visible again after `secs` instead of the full visibility timeout.
@@ -2634,6 +2699,72 @@ mod drain_tests {
         delete_message: bool,
         failed_message_visibility_timeout_secs: Option<u32>,
     ) {
+        let (mut process, sink) = process_configured(
+            server,
+            drain_gate,
+            pause_gate,
+            delete_message,
+            failed_message_visibility_timeout_secs,
+            None,
+            None,
+        )
+        .await;
+        process.run_once().await.expect("receive succeeds");
+        drop(process);
+        sink.await.unwrap();
+    }
+
+    async fn run_once_with_admission(
+        server: &MockServer,
+        drain_gate: Option<DrainGate>,
+        pause_gate: Option<PauseGate>,
+        delete_message: bool,
+        adaptive: Option<AdaptiveObjectStorageConcurrency>,
+        delivery_status: Option<crate::event::EventStatus>,
+    ) {
+        let (mut process, sink) = process_with_admission(
+            server,
+            drain_gate,
+            pause_gate,
+            delete_message,
+            adaptive,
+            delivery_status,
+        )
+        .await;
+        process.run_once().await.expect("receive succeeds");
+        drop(process);
+        sink.await.unwrap();
+    }
+
+    async fn process_with_admission(
+        server: &MockServer,
+        drain_gate: Option<DrainGate>,
+        pause_gate: Option<PauseGate>,
+        delete_message: bool,
+        adaptive: Option<AdaptiveObjectStorageConcurrency>,
+        delivery_status: Option<crate::event::EventStatus>,
+    ) -> (IngestorProcess, tokio::task::JoinHandle<()>) {
+        process_configured(
+            server,
+            drain_gate,
+            pause_gate,
+            delete_message,
+            None,
+            adaptive,
+            delivery_status,
+        )
+        .await
+    }
+
+    async fn process_configured(
+        server: &MockServer,
+        drain_gate: Option<DrainGate>,
+        pause_gate: Option<PauseGate>,
+        delete_message: bool,
+        failed_message_visibility_timeout_secs: Option<u32>,
+        adaptive: Option<AdaptiveObjectStorageConcurrency>,
+        delivery_status: Option<crate::event::EventStatus>,
+    ) -> (IngestorProcess, tokio::task::JoinHandle<()>) {
         let region = Region::new("us-east-1");
         let credentials = Credentials::new("akid", "secret", None, None, "test");
         let sqs_client = SqsClient::from_conf(
@@ -2667,7 +2798,7 @@ mod drain_tests {
             poll_secs: 0,
             ..Default::default()
         };
-        let ingestor = Ingestor::new(
+        let mut ingestor = Ingestor::new(
             region,
             sqs_client,
             s3_client,
@@ -2681,15 +2812,19 @@ mod drain_tests {
         .await
         .expect("ingestor must build")
         .with_gate(object_gate(drain_gate, pause_gate));
-        let (out, _rx) = SourceSender::new_test();
-        let mut process = IngestorProcess::new(
+        Arc::get_mut(&mut ingestor.state).unwrap().adaptive = adaptive;
+        let (out, mut rx) = SourceSender::new_test_finalize(
+            delivery_status.unwrap_or(crate::event::EventStatus::Delivered),
+        );
+        let sink = tokio::spawn(async move { while rx.next().await.is_some() {} });
+        let process = IngestorProcess::new(
             Arc::clone(&ingestor.state),
             out,
             ShutdownSignal::noop(),
             LogNamespace::Legacy,
-            false,
+            delivery_status.is_some(),
         );
-        process.run_once().await.expect("receive succeeds");
+        (process, sink)
     }
 
     fn target(request: &Request) -> String {
@@ -2718,6 +2853,236 @@ mod drain_tests {
 
     fn disabled_gate() -> DrainGate {
         gate("span", false, &[(ENABLED_LIST_KEY, Value::from("qpl"))])
+    }
+
+    #[tokio::test]
+    async fn fixed_poll_preserves_configured_wait_time() {
+        let server = mock_sqs_and_s3().await;
+        let (mut process, sink) =
+            process_with_admission(&server, None, None, true, None, None).await;
+        Arc::get_mut(&mut process.state).unwrap().poll_secs = 17;
+        process.run_once().await.unwrap();
+        let received = server.received_requests().await.unwrap();
+        let receive = received
+            .iter()
+            .find(|request| target(request) == "AmazonSQS.ReceiveMessage")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&receive.body).unwrap();
+        assert_eq!(body["WaitTimeSeconds"], 17);
+        drop(process);
+        sink.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn adaptive_empty_poll_releases_capacity_before_backoff() {
+        let server = mock_sqs_and_s3().await;
+        Mock::given(method("POST"))
+            .and(header("x-amz-target", "AmazonSQS.ReceiveMessage"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-amz-json-1.0")
+                    .set_body_json(serde_json::json!({"Messages": []})),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let (adaptive, _usage) = AdaptiveObjectStorageConcurrency::for_test(1, 1, 1);
+        let sibling = adaptive.sibling_for_test(1, 1);
+        let (mut process, sink) =
+            process_with_admission(&server, None, None, true, Some(adaptive.clone()), None).await;
+        {
+            let poll = process.run_once();
+            tokio::pin!(poll);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), &mut poll)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            let _next = tokio::time::timeout(Duration::from_millis(100), sibling.acquire())
+                .await
+                .unwrap();
+            assert!(!adaptive.test_has_rtt());
+        }
+        drop(process);
+        sink.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn adaptive_stalled_poll_timeout_and_cancellation_release_capacity() {
+        for cancel in [false, true] {
+            let server = mock_sqs_and_s3().await;
+            let started = Arc::new(tokio::sync::Notify::new());
+            let notify = Arc::clone(&started);
+            Mock::given(method("POST"))
+                .and(header("x-amz-target", "AmazonSQS.ReceiveMessage"))
+                .respond_with(move |_: &wiremock::Request| {
+                    notify.notify_one();
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/x-amz-json-1.0")
+                        .set_body_json(serde_json::json!({"Messages": []}))
+                        .set_delay(Duration::from_secs(60))
+                })
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            let (adaptive, _usage) = AdaptiveObjectStorageConcurrency::for_test(1, 1, 1);
+            let sibling = adaptive.sibling_for_test(1, 1);
+            let (mut process, sink) =
+                process_with_admission(&server, None, None, true, Some(adaptive.clone()), None)
+                    .await;
+            {
+                let poll = process.run_once();
+                tokio::pin!(poll);
+                tokio::select! {
+                    _ = &mut poll => panic!("stalled poll completed before timeout"),
+                    _ = started.notified() => {},
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), sibling.acquire())
+                        .await
+                        .is_err()
+                );
+                if !cancel {
+                    let result = tokio::time::timeout(
+                        ADAPTIVE_POLL_TIMEOUT + Duration::from_secs(2),
+                        &mut poll,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(result.is_err());
+                }
+            }
+            let _next = tokio::time::timeout(Duration::from_secs(1), sibling.acquire())
+                .await
+                .unwrap();
+            assert!(!adaptive.test_has_rtt());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            drop(process);
+            sink.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn adaptive_capacity_wait_does_not_consume_delivery_attempts() {
+        let server = mock_sqs_and_s3().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok\n"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let (adaptive, _usage) = AdaptiveObjectStorageConcurrency::for_test(2, 2, 1);
+        let competing = adaptive.sibling_for_test(1, 1);
+        let mut blocker = competing.acquire().await;
+        blocker.start_processing();
+        let poll = run_once_with_admission(&server, None, None, true, Some(adaptive), None);
+        tokio::pin!(poll);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut poll)
+                .await
+                .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        drop(blocker);
+        tokio::time::timeout(Duration::from_secs(5), poll)
+            .await
+            .unwrap();
+        let (gets, deletes) = requests(&server).await;
+        assert_eq!(gets, 1);
+        assert_eq!(deletes.len(), 1);
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received
+                .iter()
+                .filter(|request| target(request) == "AmazonSQS.ReceiveMessage")
+                .count(),
+            1
+        );
+        assert!(
+            received
+                .iter()
+                .all(|request| target(request) != "AmazonSQS.ChangeMessageVisibility")
+        );
+        let receive = received
+            .iter()
+            .find(|request| target(request) == "AmazonSQS.ReceiveMessage")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&receive.body).unwrap();
+        assert_eq!(body["WaitTimeSeconds"], 0);
+    }
+
+    #[tokio::test]
+    async fn adaptive_feedback_tracks_actual_delivery_not_delete_policy() {
+        use crate::event::EventStatus;
+
+        for status in [
+            EventStatus::Delivered,
+            EventStatus::Errored,
+            EventStatus::Rejected,
+        ] {
+            let server = mock_sqs_and_s3().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("ok\n"))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            let (adaptive, _usage) = AdaptiveObjectStorageConcurrency::for_test(2, 4, 4);
+            run_once_with_admission(
+                &server,
+                None,
+                None,
+                true,
+                Some(adaptive.clone()),
+                Some(status),
+            )
+            .await;
+            let delivered = status == EventStatus::Delivered;
+            assert_eq!(adaptive.test_has_rtt(), delivered, "{status:?}");
+            assert_eq!(
+                adaptive.test_limit(),
+                if delivered { 2 } else { 1 },
+                "{status:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn adaptive_missing_object_is_neutral() {
+        let server = mock_sqs_and_s3().await;
+        let (adaptive, _usage) = AdaptiveObjectStorageConcurrency::for_test(2, 4, 4);
+        run_once_with_admission(&server, None, None, true, Some(adaptive.clone()), None).await;
+        assert!(!adaptive.test_has_rtt());
+        assert_eq!(adaptive.test_limit(), 2);
+    }
+
+    #[tokio::test]
+    async fn adaptive_cancelled_download_releases_both_permits() {
+        let server = Arc::new(mock_sqs_and_s3().await);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&started);
+        Mock::given(method("GET"))
+            .respond_with(move |_: &wiremock::Request| {
+                notify.notify_one();
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(60))
+            })
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let (adaptive, _usage) = AdaptiveObjectStorageConcurrency::for_test(1, 1, 1);
+        let controller = adaptive.clone();
+        let task = tokio::spawn(async move {
+            run_once_with_admission(&server, None, None, true, Some(controller), None).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let mut next = tokio::time::timeout(Duration::from_secs(1), adaptive.acquire())
+            .await
+            .unwrap();
+        next.start_processing();
+        assert!(!adaptive.test_has_rtt());
     }
 
     #[tokio::test(flavor = "multi_thread")]

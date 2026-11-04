@@ -6,8 +6,12 @@ mod layer;
 mod semaphore;
 mod service;
 
-// Compile the adapter in tests until a source integration enables it at runtime.
-#[cfg(test)]
+#[cfg(any(
+    test,
+    feature = "sources-aws_s3",
+    feature = "sources-azure_blob",
+    feature = "sources-gcp_gcs"
+))]
 pub(crate) mod source;
 
 #[cfg(test)]

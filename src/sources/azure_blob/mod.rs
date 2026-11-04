@@ -216,6 +216,11 @@ impl SourceConfig for AzureBlobConfig {
     /// # Returns
     /// A Result containing the configured source or an error if configuration is invalid
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
+        if self.queue.adaptive_concurrency.is_some()
+            && !cx.do_acknowledgements(self.acknowledgements)
+        {
+            return Err("adaptive blob concurrency requires end-to-end acknowledgements".into());
+        }
         let log_namespace = cx.log_namespace(self.log_namespace);
 
         // Convert multiline config if specified

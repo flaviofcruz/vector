@@ -172,6 +172,14 @@ impl_generate_config_from_default!(GcpGcsConfig);
 #[typetag::serde(name = "gcp_gcs")]
 impl SourceConfig for GcpGcsConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
+        if self
+            .pubsub
+            .as_ref()
+            .is_some_and(|queue| queue.adaptive_concurrency.is_some())
+            && !cx.do_acknowledgements(self.acknowledgements)
+        {
+            return Err("adaptive blob concurrency requires end-to-end acknowledgements".into());
+        }
         let log_namespace = cx.log_namespace(self.log_namespace);
 
         let multiline_config: Option<line_agg::Config> = self

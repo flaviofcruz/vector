@@ -30,6 +30,12 @@ mod message_decoding;
 pub mod multiline_config;
 #[cfg(any(feature = "sources-utils-net-tcp", feature = "sources-utils-net-udp"))]
 pub mod net;
+#[cfg(any(
+    feature = "sources-aws_s3",
+    feature = "sources-azure_blob",
+    feature = "sources-gcp_gcs"
+))]
+pub mod object_storage_adaptive_concurrency;
 pub mod object_storage_compression;
 #[cfg(any(
     feature = "sources-aws_s3",

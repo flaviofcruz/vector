@@ -30,6 +30,7 @@ use crate::{
     },
     line_agg::{self, LineAgg},
     sources::gcp_gcs::{Compression, GcpGcsConfig},
+    sources::util::object_storage_adaptive_concurrency::AdaptiveObjectStorageConcurrency,
     sources::util::object_storage_rate_limit::ByteCounter,
 };
 
@@ -39,6 +40,7 @@ const GCS_BASE_URL: &str = "https://storage.googleapis.com";
 
 /// Handles downloading GCS objects via the GCS XML API and processing
 /// their content into Vector events.
+#[derive(Clone)]
 pub(super) struct GcsDownloader {
     client: HttpClient,
     auth: GcpAuthenticator,
@@ -49,6 +51,7 @@ pub(super) struct GcsDownloader {
     /// GCS base URL, parsed and validated at construction. Defaults to
     /// [`GCS_BASE_URL`] and can be overridden via the source's `storage_endpoint` config.
     base_url: url::Url,
+    adaptive: Option<AdaptiveObjectStorageConcurrency>,
 }
 
 /// Parses the GCS base URL, defaulting to [`GCS_BASE_URL`]. Returns a config error
@@ -85,7 +88,16 @@ impl GcsDownloader {
             multiline,
             project,
             base_url: parse_base_url(endpoint)?,
+            adaptive: None,
         })
+    }
+
+    pub(super) fn with_adaptive_concurrency(
+        mut self,
+        adaptive: Option<AdaptiveObjectStorageConcurrency>,
+    ) -> Self {
+        self.adaptive = adaptive;
+        self
     }
 
     /// Downloads a GCS object, decompresses, frames, decodes, and emits events.
@@ -281,6 +293,11 @@ impl GcsDownloader {
             None => Ok(()),
             Some(receiver) => {
                 let result = receiver.await;
+                if result != BatchStatus::Delivered
+                    && let Some(adaptive) = &self.adaptive
+                {
+                    adaptive.note_failed_delivery();
+                }
                 emit_object_storage_ack_metrics(processing_start_time, "gcp", &bucket);
 
                 match result {
