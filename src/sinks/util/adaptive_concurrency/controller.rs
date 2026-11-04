@@ -105,6 +105,16 @@ impl<L> Controller<L> {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn has_rtt_measurement(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("Controller mutex is poisoned")
+            .past_rtt
+            .state()
+            .is_some()
+    }
+
     pub(super) fn acquire(
         &self,
     ) -> impl Future<Output = OwnedSemaphorePermit> + Send + 'static + use<L> {
@@ -131,7 +141,12 @@ impl<L> Controller<L> {
     /// Adjust the controller to a response, based on type of response
     /// given (backpressure or not) and if it should be used as a valid
     /// RTT measurement.
-    fn adjust_to_response_inner(&self, start: Instant, is_back_pressure: bool, use_rtt: bool) {
+    pub(super) fn adjust_to_response_inner(
+        &self,
+        start: Instant,
+        is_back_pressure: bool,
+        use_rtt: bool,
+    ) {
         let now = instant_now();
         let mut inner = self.inner.lock().expect("Controller mutex is poisoned");
 
@@ -212,6 +227,37 @@ impl<L> Controller<L> {
                     inner.reached_limit = false;
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn current_limit(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("Controller mutex is poisoned")
+            .current_limit
+    }
+
+    /// A cancelled or unprocessed source message must not train the RTT estimator.
+    #[cfg(test)]
+    pub(super) fn cancel_request(&self) {
+        let mut inner = self.inner.lock().expect("Controller mutex is poisoned");
+        #[cfg(test)]
+        self.stats
+            .lock()
+            .expect("Stats mutex is poisoned")
+            .in_flight
+            .add(inner.in_flight, instant_now());
+        inner.in_flight -= 1;
+        self.in_flight.emit(inner.in_flight as u64);
+    }
+
+    #[cfg(test)]
+    pub(super) fn clamp_to_one(&self) {
+        let mut inner = self.inner.lock().expect("Controller mutex is poisoned");
+        if inner.current_limit > 1 {
+            self.semaphore.forget_permits(inner.current_limit - 1);
+            inner.current_limit = 1;
         }
     }
 

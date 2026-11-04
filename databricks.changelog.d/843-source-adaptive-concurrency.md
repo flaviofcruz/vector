@@ -1,0 +1,2 @@
+Prepare reusable source-side adaptive concurrency around the existing request controller, including cancellation-neutral RTT accounting, failure clamping, serialized feedback, and lifecycle tests. The adapter and source-only hooks compile only in tests until a dependent integration enables runtime use; the existing algorithm and production sink behavior are unchanged.
+https://github.com/databricks-eng/vector/pull/843

@@ -6,6 +6,10 @@ mod layer;
 mod semaphore;
 mod service;
 
+// Compile the adapter in tests until a source integration enables it at runtime.
+#[cfg(test)]
+pub(crate) mod source;
+
 #[cfg(test)]
 pub mod tests;
 
