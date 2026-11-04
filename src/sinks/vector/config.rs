@@ -2,6 +2,7 @@ use http::Uri;
 use hyper::client::HttpConnector;
 use hyper_openssl::HttpsConnector;
 use hyper_proxy::ProxyConnector;
+use serde::{Deserialize, Deserializer, de};
 use tonic::body::BoxBody;
 use tower::ServiceBuilder;
 use vector_lib::configurable::configurable_component;
@@ -56,7 +57,7 @@ pub struct VectorConfig {
     ///
     /// [gzip_docs]: https://www.gzip.org/
     #[configurable(metadata(docs::advanced))]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_compression")]
     compression: bool,
 
     #[configurable(derived)]
@@ -149,6 +150,34 @@ impl SinkConfig for VectorConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
+    }
+}
+
+/// Accepts the boolean form (`true` = gzip, `false` = none) and the string forms `"gzip"` and
+/// `"none"`. The string forms match the `compression` setting in newer Vector releases, so one
+/// rendered config can be loaded by either version. `"zstd"` is rejected because this build has no
+/// zstd support for the `vector` sink.
+fn deserialize_compression<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CompressionSetting {
+        Enabled(bool),
+        Algorithm(String),
+    }
+
+    match CompressionSetting::deserialize(deserializer)? {
+        CompressionSetting::Enabled(enabled) => Ok(enabled),
+        CompressionSetting::Algorithm(name) => match name.as_str() {
+            "gzip" => Ok(true),
+            "none" => Ok(false),
+            "zstd" => Err(de::Error::custom(
+                "compression \"zstd\" is not supported by the vector sink in this Vector build; use \"gzip\", \"none\", or a boolean",
+            )),
+            other => Err(de::Error::unknown_variant(other, &["gzip", "none"])),
+        },
     }
 }
 
@@ -245,5 +274,37 @@ impl RetryLogic for VectorGrpcRetryLogic {
             ),
             _ => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VectorConfig;
+
+    fn compression_from(value: &str) -> Result<bool, toml::de::Error> {
+        let config = format!("address = \"127.0.0.1:6000\"\ncompression = {value}\n");
+        toml::from_str::<VectorConfig>(&config).map(|config| config.compression)
+    }
+
+    #[test]
+    fn compression_accepts_boolean_and_string_forms() {
+        assert!(compression_from("true").unwrap());
+        assert!(!compression_from("false").unwrap());
+        assert!(compression_from("\"gzip\"").unwrap());
+        assert!(!compression_from("\"none\"").unwrap());
+    }
+
+    #[test]
+    fn compression_defaults_to_disabled_when_absent() {
+        let config: VectorConfig = toml::from_str("address = \"127.0.0.1:6000\"\n").unwrap();
+        assert!(!config.compression);
+    }
+
+    #[test]
+    fn compression_rejects_zstd_and_unknown_values() {
+        let zstd = compression_from("\"zstd\"").unwrap_err().to_string();
+        assert!(zstd.contains("zstd"), "{zstd}");
+        let unknown = compression_from("\"snappy\"").unwrap_err().to_string();
+        assert!(unknown.contains("gzip"), "{unknown}");
     }
 }
