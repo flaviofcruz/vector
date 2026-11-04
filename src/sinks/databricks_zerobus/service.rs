@@ -27,8 +27,8 @@ use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, Reques
 use vector_lib::stream::DriverResponse;
 
 use super::{
-    config::ZerobusSinkConfig, error::ZerobusSinkError, headers, uc_client::UnityCatalogClient,
-    unity_catalog_schema,
+    config::ZerobusSinkConfig, error::ZerobusSinkError, freshness, headers,
+    uc_client::UnityCatalogClient, unity_catalog_schema,
 };
 
 /// Build a connector factory that routes Zerobus gRPC traffic through
@@ -915,6 +915,7 @@ impl ZerobusService {
         events_byte_size: GroupedCountByteSize,
     ) -> Result<ZerobusResponse, ZerobusSinkError> {
         let ZerobusPayload(record_batch) = payload;
+        let ack_times = freshness::AckTimes::from_batch(&record_batch);
         let result = match stream.as_ref() {
             ActiveStream::Arrow(lock, stats) => {
                 let guard = lock.read().await;
@@ -924,6 +925,9 @@ impl ZerobusService {
                 match s.ingest_batch(record_batch).await {
                     Ok(offset) => {
                         let acked = s.wait_for_offset(offset).await;
+                        if acked.is_ok() {
+                            ack_times.record_acked(&self.config.table_name);
+                        }
                         // Take on every outcome so failed offsets don't linger in the map.
                         let bytes_sent = stats.take(offset);
                         acked.map(|_| bytes_sent)
@@ -932,7 +936,13 @@ impl ZerobusService {
                 }
             }
             #[cfg(test)]
-            ActiveStream::Mock(mock) => mock.try_ingest().await.map(|_| None),
+            ActiveStream::Mock(mock) => {
+                let acked = mock.try_ingest().await;
+                if acked.is_ok() {
+                    ack_times.record_acked(&self.config.table_name);
+                }
+                acked.map(|_| None)
+            }
         };
 
         match result {
@@ -1269,6 +1279,7 @@ mod tests {
         DatabricksAuthentication, SchemaSource, ZerobusStreamOptions,
     };
     use databricks_zerobus_ingest_sdk::ZerobusError;
+    use vector_lib::event::MetricValue;
     use vector_lib::event_test_util::{clear_recorded_events, contains_name_once};
     use vector_lib::sensitive_string::SensitiveString;
 
@@ -1375,6 +1386,222 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(service.has_active_stream().await);
+    }
+
+    /// Freshness metrics captured for one table label.
+    fn freshness_metrics(table: &str) -> Vec<vector_lib::event::Metric> {
+        vector_lib::metrics::Controller::get()
+            .unwrap()
+            .capture_metrics()
+            .into_iter()
+            .filter(|m| {
+                m.name().starts_with("zerobus_ack_")
+                    && m.tags()
+                        .and_then(|t| t.get("table"))
+                        .map(String::from)
+                        .as_deref()
+                        == Some(table)
+            })
+            .collect()
+    }
+
+    fn histogram_count(metrics: &[vector_lib::event::Metric], name: &str) -> u64 {
+        let found: Vec<u64> = metrics
+            .iter()
+            .filter(|m| m.name() == name)
+            .map(|m| match m.value() {
+                MetricValue::AggregatedHistogram { count, .. } => *count,
+                other => panic!("{name} is not a histogram: {other:?}"),
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{name} recorded {} times", found.len());
+        found[0]
+    }
+
+    fn counter_value(
+        metrics: &[vector_lib::event::Metric],
+        name: &str,
+        series: Option<&str>,
+    ) -> f64 {
+        let matching: Vec<f64> = metrics
+            .iter()
+            .filter(|m| {
+                m.name() == name
+                    && series.is_none_or(|s| {
+                        m.tags()
+                            .and_then(|t| t.get("series"))
+                            .map(String::from)
+                            .as_deref()
+                            == Some(s)
+                    })
+            })
+            .map(|m| match m.value() {
+                MetricValue::Counter { value } => *value,
+                other => panic!("{name} is not a counter: {other:?}"),
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "{name} series {series:?} missing");
+        matching[0]
+    }
+
+    #[tokio::test]
+    async fn freshness_is_recorded_only_for_acked_batches() {
+        use crate::sinks::databricks_zerobus::freshness::test_support::batch_with_times;
+
+        vector_lib::metrics::init_test();
+
+        // Row 0: real born-at and ingest. Row 1: no born-at, so it is missing.
+        let mut acked_config = test_config();
+        acked_config.table_name = "freshness.acked.logs".to_string();
+        let service = ZerobusService::new_with_mock(acked_config, MockStream::succeeding())
+            .await
+            .unwrap();
+        let stream = current_stream(&service).await;
+        let payload = ZerobusPayload(batch_with_times(
+            vec![Some(1_000), None],
+            vec![Some(2_000), Some(2_000)],
+        ));
+        service
+            .ingest(stream, payload, GroupedCountByteSize::new_untagged())
+            .await
+            .unwrap();
+
+        let acked = freshness_metrics("freshness.acked.logs");
+        assert_eq!(
+            histogram_count(&acked, "zerobus_ack_born_to_saved_seconds"),
+            1
+        );
+        assert_eq!(
+            histogram_count(&acked, "zerobus_ack_lp_ingest_to_saved_seconds"),
+            2
+        );
+        assert_eq!(
+            counter_value(&acked, "zerobus_ack_missing_born_at_total", None),
+            1.0
+        );
+        // Row 0's born-at is 1_000 ms epoch, so its lag is far over the SLA.
+        assert_eq!(
+            counter_value(&acked, "zerobus_ack_over_sla_total", None),
+            1.0
+        );
+        assert_eq!(
+            counter_value(
+                &acked,
+                "zerobus_ack_negative_latency_total",
+                Some("born_to_saved")
+            ),
+            0.0
+        );
+        assert_eq!(
+            counter_value(
+                &acked,
+                "zerobus_ack_negative_latency_total",
+                Some("lp_ingest_to_saved")
+            ),
+            0.0
+        );
+
+        let mut failed_config = test_config();
+        failed_config.table_name = "freshness.failed.logs".to_string();
+        let mock = MockStream::failing(ZerobusError::ChannelCreationError(
+            "connection reset".to_string(),
+        ));
+        let service = ZerobusService::new_with_mock(failed_config, mock)
+            .await
+            .unwrap();
+        let stream = current_stream(&service).await;
+        let payload = ZerobusPayload(batch_with_times(vec![Some(1_000)], vec![Some(2_000)]));
+        assert!(
+            service
+                .ingest(stream, payload, GroupedCountByteSize::new_untagged())
+                .await
+                .is_err()
+        );
+        assert!(freshness_metrics("freshness.failed.logs").is_empty());
+    }
+
+    fn freshness_perf_schema() -> arrow::datatypes::Schema {
+        use arrow::datatypes::{DataType, Field, Fields, Schema};
+        let service_metadata = DataType::Struct(Fields::from(vec![Field::new(
+            "log_timestamp_ms",
+            DataType::Int64,
+            true,
+        )]));
+        let vector_metadata = DataType::Struct(Fields::from(vec![Field::new(
+            "timestamp_ms",
+            DataType::Int64,
+            true,
+        )]));
+        let log_metadata = DataType::Struct(Fields::from(vec![
+            Field::new("service_metadata", service_metadata, true),
+            Field::new("vector_metadata", vector_metadata, true),
+        ]));
+        Schema::new(vec![
+            Field::new("_log_metadata", log_metadata, true),
+            Field::new("message", DataType::Utf8, true),
+            Field::new("level", DataType::Utf8, true),
+            Field::new("count", DataType::Int64, true),
+        ])
+    }
+
+    /// Timing proof: the freshness step against `encode_batch` on the same 5,000-row batch.
+    ///
+    /// Run in release mode:
+    /// `cargo test --release --lib freshness_step_vs_encode -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    #[allow(clippy::print_stderr)]
+    fn freshness_step_vs_encode() {
+        use std::time::{Duration, Instant};
+
+        vector_lib::metrics::init_test();
+        const ROWS: usize = 5_000;
+        const ITERS: usize = 300;
+
+        let schema = ZerobusService::build_test_schema(&test_config(), freshness_perf_schema());
+        let events: Vec<Event> = (0..ROWS)
+            .map(|i| {
+                let mut log = vector_lib::event::LogEvent::default();
+                log.insert(
+                    "_log_metadata.service_metadata.log_timestamp_ms",
+                    1_700_000_000_000_i64 + i as i64,
+                );
+                log.insert(
+                    "_log_metadata.vector_metadata.timestamp_ms",
+                    1_700_000_001_000_i64 + i as i64,
+                );
+                log.insert("message", format!("row {i} payload bytes"));
+                log.insert("level", "INFO");
+                log.insert("count", i as i64);
+                Event::Log(log)
+            })
+            .collect();
+
+        let mut encode = Vec::with_capacity(ITERS);
+        let mut freshness = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let start = Instant::now();
+            let BatchOutput::Arrow(batch) = schema.encoder.encode_batch(&events).unwrap();
+            encode.push(start.elapsed());
+            let start = Instant::now();
+            freshness::AckTimes::from_batch(&batch).record_acked("perf.table");
+            freshness.push(start.elapsed());
+            std::hint::black_box(&batch);
+        }
+
+        let median = |mut v: Vec<Duration>| {
+            v.sort();
+            v[v.len() / 2]
+        };
+        let encode_ns = median(encode).as_nanos() as f64 / ROWS as f64;
+        let freshness_ns = median(freshness).as_nanos() as f64 / ROWS as f64;
+        eprintln!(
+            "rows={ROWS} iters={ITERS} (median)\n\
+             encode_batch: {encode_ns:.1} ns/row\n\
+             freshness:    {freshness_ns:.1} ns/row\n\
+             overhead:     {:.2}% of encode_batch",
+            freshness_ns / encode_ns * 100.0
+        );
     }
 
     #[tokio::test]

@@ -98,3 +98,37 @@ impl InternalEvent for ZerobusRetryableError {
         .increment(1);
     }
 }
+
+/// Freshness counters for one acked batch, summed so they are bumped once per batch.
+///
+/// A negative lag means the producer or LP clock runs ahead of this host. It is counted
+/// here and kept out of the histograms, so skew shows up instead of pulling latency below zero.
+#[derive(Debug, NamedInternalEvent)]
+pub(crate) struct ZerobusAckFreshness {
+    pub table: String,
+    pub negative_born_to_saved: u64,
+    pub negative_lp_ingest_to_saved: u64,
+    pub missing_born_at: u64,
+    pub over_sla_born_to_saved: u64,
+}
+
+impl InternalEvent for ZerobusAckFreshness {
+    fn emit(self) {
+        counter!(
+            "zerobus_ack_negative_latency_total",
+            "table" => self.table.clone(),
+            "series" => "born_to_saved",
+        )
+        .increment(self.negative_born_to_saved);
+        counter!(
+            "zerobus_ack_negative_latency_total",
+            "table" => self.table.clone(),
+            "series" => "lp_ingest_to_saved",
+        )
+        .increment(self.negative_lp_ingest_to_saved);
+        counter!("zerobus_ack_over_sla_total", "table" => self.table.clone())
+            .increment(self.over_sla_born_to_saved);
+        counter!("zerobus_ack_missing_born_at_total", "table" => self.table)
+            .increment(self.missing_born_at);
+    }
+}
