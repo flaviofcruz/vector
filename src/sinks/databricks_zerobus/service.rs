@@ -734,11 +734,11 @@ impl ZerobusService {
 
     /// Open a new Arrow Flight stream shaped to `schema`.
     ///
-    /// Overrides only the two timeouts `stream_options` exposes, accepting the
-    /// SDK's defaults otherwise — notably `recovery = true`, so the SDK reconnects
-    /// and replays in-flight batches itself and only surfaces a retryable error
-    /// once its own budget is spent. Both layers are at-least-once, so a reconnect
-    /// may re-send unacknowledged batches.
+    /// Overrides only the two timeouts and the compression mode `stream_options`
+    /// exposes, accepting the SDK's defaults otherwise — notably `recovery = true`,
+    /// so the SDK reconnects and replays in-flight batches itself and only
+    /// surfaces a retryable error once its own budget is spent. Both layers are
+    /// at-least-once, so a reconnect may re-send unacknowledged batches.
     ///
     /// The two auth flows: `OAuth` exchanges long-lived credentials for a token on
     /// every call (the upstream path external customers use), while `LoginService`
@@ -786,7 +786,7 @@ impl ZerobusService {
             .arrow(Arc::clone(&schema.arrow_schema))
             .server_lack_of_ack_timeout_ms(options.server_lack_of_ack_timeout_ms)
             .flush_timeout_ms(options.flush_timeout_ms)
-            .ipc_compression(options.compression.into())
+            .compression(options.arrow_compression())
             .stats_exporter(Arc::clone(&stats))
             .build_arrow()
             .await

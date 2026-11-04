@@ -54,23 +54,22 @@ impl UnityCatalogTableSchema {
     /// schema-conversion helpers (`arrow_schema_from_uc_schema`, etc.).
     pub fn to_sdk_uc_schema(&self) -> databricks_zerobus_ingest_sdk::schema::UcTableSchema {
         use databricks_zerobus_ingest_sdk::schema::{UcColumn, UcTableSchema};
-        UcTableSchema {
-            name: self.name.clone(),
-            catalog_name: self.catalog_name.clone(),
-            schema_name: self.schema_name.clone(),
-            columns: self
-                .columns
+        // The SDK structs are `#[non_exhaustive]`, so build them through their constructors.
+        UcTableSchema::new(
+            self.catalog_name.clone(),
+            self.schema_name.clone(),
+            self.name.clone(),
+            self.columns
                 .iter()
-                .map(|c| UcColumn {
-                    name: c.name.clone(),
-                    type_name: c.type_name.clone(),
-                    type_text: c.type_text.clone(),
-                    type_json: c.type_json.clone(),
-                    nullable: c.nullable,
-                    position: c.position,
+                .map(|c| {
+                    UcColumn::new(c.name.clone(), c.type_name.clone())
+                        .with_type_text(c.type_text.clone())
+                        .with_type_json(c.type_json.clone())
+                        .with_nullable(c.nullable)
+                        .with_position(c.position)
                 })
                 .collect(),
-        }
+        )
     }
 }
 

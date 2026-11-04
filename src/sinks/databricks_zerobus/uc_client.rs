@@ -149,12 +149,12 @@ fn uc_table_schema_from_response(
         _ => return Err(uc_error("`column_infos.columns` is missing")),
     };
 
-    Ok(UcTableSchema {
-        name: string_field(&table_info, "name")?,
-        catalog_name: string_field(&table_info, "catalog_name")?,
-        schema_name: string_field(&table_info, "schema_name")?,
+    Ok(UcTableSchema::new(
+        string_field(&table_info, "catalog_name")?,
+        string_field(&table_info, "schema_name")?,
+        string_field(&table_info, "name")?,
         columns,
-    })
+    ))
 }
 
 fn column_from_proto(column: &DynamicMessage) -> Result<UcColumn, ZerobusSinkError> {
@@ -167,14 +167,14 @@ fn column_from_proto(column: &DynamicMessage) -> Result<UcColumn, ZerobusSinkErr
         Some(Value::I32(n)) => *n,
         _ => return Err(uc_error("column `position` is missing")),
     };
-    Ok(UcColumn {
-        name: string_field(column, "name")?,
-        type_name: enum_name_field(column, "type_name")?,
-        type_text: string_field(column, "type_text")?,
-        type_json: string_field(column, "type_json")?,
-        nullable,
-        position,
-    })
+    Ok(UcColumn::new(
+        string_field(column, "name")?,
+        enum_name_field(column, "type_name")?,
+    )
+    .with_type_text(string_field(column, "type_text")?)
+    .with_type_json(string_field(column, "type_json")?)
+    .with_nullable(nullable)
+    .with_position(position))
 }
 
 fn message_field(message: &DynamicMessage, name: &str) -> Result<DynamicMessage, ZerobusSinkError> {

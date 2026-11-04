@@ -97,12 +97,33 @@ pub enum Compression {
     Zstd,
 }
 
-impl From<Compression> for Option<arrow::ipc::CompressionType> {
+impl From<Compression> for databricks_zerobus_ingest_sdk::ArrowCompression {
     fn from(value: Compression) -> Self {
         match value {
-            Compression::None => None,
-            Compression::Lz4Frame => Some(arrow::ipc::CompressionType::LZ4_FRAME),
-            Compression::Zstd => Some(arrow::ipc::CompressionType::ZSTD),
+            Compression::None => Self::Uncompressed,
+            Compression::Lz4Frame => Self::IpcLz4,
+            Compression::Zstd => Self::IpcZstd,
+        }
+    }
+}
+
+/// Whole-message gRPC compression codec for Zerobus Arrow Flight payloads.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrpcCompression {
+    /// No whole-message gRPC compression.
+    #[default]
+    None,
+    /// Zstandard compression of each whole gRPC request message.
+    Zstd,
+}
+
+impl From<GrpcCompression> for databricks_zerobus_ingest_sdk::ArrowCompression {
+    fn from(value: GrpcCompression) -> Self {
+        match value {
+            GrpcCompression::None => Self::Uncompressed,
+            GrpcCompression::Zstd => Self::GrpcZstd,
         }
     }
 }
@@ -129,6 +150,29 @@ pub struct ZerobusStreamOptions {
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
     pub compression: Compression,
+
+    /// Whole-message gRPC compression for Flight payloads.
+    ///
+    /// Compresses each entire gRPC request message, including the IPC header and
+    /// alignment padding that IPC `compression` leaves raw, which sends fewer bytes
+    /// for wide or sparse schemas at the cost of more client CPU. Buffers are sent
+    /// without IPC compression. Mutually exclusive with `compression`. Defaults to no
+    /// compression.
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    pub grpc_compression: GrpcCompression,
+}
+
+impl ZerobusStreamOptions {
+    /// The single SDK compression mode these options select.
+    ///
+    /// Callers must have passed `validate`, which rejects setting both codecs.
+    pub fn arrow_compression(&self) -> databricks_zerobus_ingest_sdk::ArrowCompression {
+        match self.grpc_compression {
+            GrpcCompression::None => self.compression.into(),
+            grpc => grpc.into(),
+        }
+    }
 }
 
 impl Default for ZerobusStreamOptions {
@@ -137,6 +181,7 @@ impl Default for ZerobusStreamOptions {
             flush_timeout_ms: default_flush_timeout_ms(),
             server_lack_of_ack_timeout_ms: default_server_ack_timeout_ms(),
             compression: Compression::None,
+            grpc_compression: GrpcCompression::None,
         }
     }
 }
@@ -414,6 +459,18 @@ impl ZerobusSinkConfig {
             })?;
         }
 
+        // The SDK takes one compression mode, so IPC and gRPC compression cannot
+        // be combined. Fail here rather than silently preferring one.
+        if self.stream_options.grpc_compression != GrpcCompression::None
+            && self.stream_options.compression != Compression::None
+        {
+            return Err(ZerobusSinkError::ConfigError {
+                message: "stream_options.grpc_compression cannot be combined with \
+                          stream_options.compression; set only one"
+                    .to_string(),
+            });
+        }
+
         if let Some(max_bytes) = self.batch.max_bytes {
             // Zerobus SDK limits max bytes to 10MB.
             // NOTE: The size of the batch in Vector is not exactly the same as the size of the
@@ -458,6 +515,7 @@ fn default_batch_encoding() -> BatchSerializerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use databricks_zerobus_ingest_sdk::ArrowCompression;
     use vector_lib::sensitive_string::SensitiveString;
 
     fn create_test_config() -> ZerobusSinkConfig {
@@ -503,6 +561,108 @@ mod tests {
         )
         .unwrap();
         assert!(!config.recover_from_schema_rejection);
+    }
+
+    const MINIMAL_TOML: &str = r#"
+        ingestion_endpoint = "https://test.databricks.com"
+        table_name = "test.default.logs"
+        unity_catalog_endpoint = "https://test-workspace.databricks.com"
+        auth.strategy = "oauth"
+        auth.client_id = "id"
+        auth.client_secret = "secret"
+    "#;
+
+    fn parse_with_stream_options(
+        stream_options: &str,
+    ) -> Result<ZerobusSinkConfig, toml::de::Error> {
+        toml::from_str(&format!(
+            "{MINIMAL_TOML}\n[stream_options]\n{stream_options}"
+        ))
+    }
+
+    #[test]
+    fn compression_defaults_to_uncompressed() {
+        // Omitting both fields must keep the pre-existing wire behavior.
+        let config: ZerobusSinkConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        assert_eq!(
+            config.stream_options.grpc_compression,
+            GrpcCompression::None
+        );
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.stream_options.arrow_compression(),
+            ArrowCompression::Uncompressed
+        );
+    }
+
+    #[test]
+    fn ipc_compression_maps_to_sdk_ipc_variants() {
+        for (value, expected) in [
+            ("none", ArrowCompression::Uncompressed),
+            ("lz4_frame", ArrowCompression::IpcLz4),
+            ("zstd", ArrowCompression::IpcZstd),
+        ] {
+            let config = parse_with_stream_options(&format!("compression = \"{value}\"")).unwrap();
+            assert!(config.validate().is_ok(), "{value}");
+            assert_eq!(
+                config.stream_options.arrow_compression(),
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_compression_zstd_maps_to_grpc_zstd() {
+        let config = parse_with_stream_options("grpc_compression = \"zstd\"").unwrap();
+        assert_eq!(
+            config.stream_options.grpc_compression,
+            GrpcCompression::Zstd
+        );
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.stream_options.arrow_compression(),
+            ArrowCompression::GrpcZstd
+        );
+    }
+
+    #[test]
+    fn grpc_compression_none_is_accepted_and_uncompressed() {
+        let config = parse_with_stream_options("grpc_compression = \"none\"").unwrap();
+        assert_eq!(
+            config.stream_options.grpc_compression,
+            GrpcCompression::None
+        );
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.stream_options.arrow_compression(),
+            ArrowCompression::Uncompressed
+        );
+    }
+
+    #[test]
+    fn grpc_compression_rejects_unknown_codec() {
+        for bad in ["lz4", "gzip", "ZSTD"] {
+            assert!(
+                parse_with_stream_options(&format!("grpc_compression = \"{bad}\"")).is_err(),
+                "{bad} should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_compression_conflicts_with_ipc_compression() {
+        for ipc in ["zstd", "lz4_frame"] {
+            let config = parse_with_stream_options(&format!(
+                "compression = \"{ipc}\"\ngrpc_compression = \"zstd\""
+            ))
+            .unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("grpc_compression") && err.contains("compression"),
+                "unexpected error for {ipc}: {err}"
+            );
+        }
     }
 
     #[test]

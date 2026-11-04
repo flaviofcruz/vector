@@ -1,6 +1,6 @@
 //! Error types for the Zerobus sink.
 
-use databricks_zerobus_ingest_sdk::ZerobusError;
+use databricks_zerobus_ingest_sdk::{GrpcCode, ZerobusError};
 use snafu::Snafu;
 use vector_lib::event::EventStatus;
 
@@ -133,7 +133,7 @@ fn sdk_error_code(error: &ZerobusError) -> &'static str {
         ZerobusError::InvalidSchema { .. } => "schema_mismatch",
         ZerobusError::InvalidArgument(_) => "invalid_argument",
         ZerobusError::CreateStreamError(status) | ZerobusError::StreamClosedError(status) => {
-            grpc_error_code(i32::from(status.code()))
+            grpc_error_code(grpc_status_number(status.code()))
         }
         ZerobusError::ChannelCreationError(_) => "channel_creation_failed",
         ZerobusError::FailedToEstablishTlsConnectionError => "tls_failed",
@@ -147,6 +147,31 @@ fn sdk_error_code(error: &ZerobusError) -> &'static str {
         | ZerobusError::InvalidUCTokenError(_) => "invalid_config",
         // `ZerobusError` is `#[non_exhaustive]`.
         _ => "other",
+    }
+}
+
+/// Numeric value of an SDK gRPC code, as defined by the gRPC spec. The SDK's enum has no
+/// integer conversion, and its `#[non_exhaustive]` requires the wildcard arm.
+const fn grpc_status_number(code: GrpcCode) -> i32 {
+    match code {
+        GrpcCode::Ok => 0,
+        GrpcCode::Cancelled => 1,
+        GrpcCode::Unknown => 2,
+        GrpcCode::InvalidArgument => 3,
+        GrpcCode::DeadlineExceeded => 4,
+        GrpcCode::NotFound => 5,
+        GrpcCode::AlreadyExists => 6,
+        GrpcCode::PermissionDenied => 7,
+        GrpcCode::ResourceExhausted => 8,
+        GrpcCode::FailedPrecondition => 9,
+        GrpcCode::Aborted => 10,
+        GrpcCode::OutOfRange => 11,
+        GrpcCode::Unimplemented => 12,
+        GrpcCode::Internal => 13,
+        GrpcCode::Unavailable => 14,
+        GrpcCode::DataLoss => 15,
+        GrpcCode::Unauthenticated => 16,
+        _ => -1,
     }
 }
 

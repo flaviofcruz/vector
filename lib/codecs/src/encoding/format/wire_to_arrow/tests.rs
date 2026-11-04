@@ -1724,7 +1724,7 @@ fn map_preserves_user_entry_field_name_and_metadata() {
         Field::new("entries", DataType::Struct(entry_fields), false).with_metadata(
             [("source".to_string(), "unit_test".to_string())]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<_, _>>(),
         ),
     );
     let outer_field = Field::new("data", DataType::Map(Arc::clone(&user_entry), false), true);
