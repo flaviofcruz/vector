@@ -13,6 +13,7 @@ use std::{
 // Note: Using azure_core_for_storage (v0.21) to match azure_storage_* crate versions
 use azure_core_for_storage::StatusCode;
 use azure_core_for_storage::error::ErrorKind;
+use azure_core_for_storage::request_options::IfMatchCondition;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::*;
 use azure_storage_queues::operations::Message;
@@ -70,6 +71,112 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
 const CLOUD_PROVIDER: &str = "azure";
+
+/// Default size of each ranged GET used to read a blob (the SDK's own default, made explicit).
+const DEFAULT_BLOB_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Tracks how much of the blob the page chain has promised, so the caller can tell a complete
+/// read from a short one. `GetBlobResponse::blob.properties.content_length` is only the length of
+/// the first *page*, never the blob's size, so it can't serve as the expected total.
+#[derive(Debug, Default)]
+struct BlobReadProgress {
+    /// Bytes the server has said the blob prefix up to the latest page contains (`Content-Range`
+    /// end + 1). Pages are contiguous from offset 0, so this is also the cumulative expected size.
+    expected_bytes: AtomicU64,
+    /// Set once a page reported no remaining range, i.e. the final page was reached.
+    last_page_reached: AtomicBool,
+}
+
+impl BlobReadProgress {
+    /// Records a page whose bytes `0..expected` the server has promised so far.
+    fn record_page(&self, expected: u64, last: bool) {
+        self.expected_bytes.fetch_max(expected, Ordering::Relaxed);
+        if last {
+            self.last_page_reached.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn final_page_reached(&self) -> bool {
+        self.last_page_reached.load(Ordering::Relaxed)
+    }
+
+    /// Compressed bytes that must have been pulled for the read to count as complete: the blob's
+    /// advertised size once its final page was reached. If the page chain was abandoned before
+    /// the final page, part of the blob was never requested, so nothing short of `u64::MAX`
+    /// qualifies.
+    fn required_bytes(&self) -> u64 {
+        if self.final_page_reached() {
+            self.expected_bytes.load(Ordering::Relaxed)
+        } else {
+            u64::MAX
+        }
+    }
+}
+
+/// Chains the remaining pages of a blob after `first` into one lazily-fetched body stream.
+///
+/// `GetBlobBuilder::into_stream` is a pager of `chunk_size` ranged GETs; reading only its first
+/// item silently drops everything past the first page. Pages after the first are requested with
+/// `If-Match: <etag of the first page>`, so a blob overwritten mid-read fails with 412 instead of
+/// splicing two versions. The next page is requested only after the previous body is drained, so
+/// memory stays bounded by one in-flight chunk, as with a single streaming GET.
+///
+/// `next_start` is where the page after `first_body` begins, or `None` if it was the only page.
+fn chain_blob_pages(
+    blob_client: BlobClient,
+    chunk_size: u64,
+    etag: String,
+    first_body: azure_core_for_storage::ResponseBody,
+    next_start: Option<u64>,
+    progress: Arc<BlobReadProgress>,
+) -> std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, azure_core_for_storage::Error>> + Send>> {
+    use futures::TryStreamExt;
+
+    let rest = futures::stream::try_unfold(next_start, move |next| {
+        let blob_client = blob_client.clone();
+        let etag = etag.clone();
+        let progress = Arc::clone(&progress);
+        async move {
+            let Some(start) = next else {
+                return Ok(None);
+            };
+            let page = blob_client
+                .get()
+                .range(start..)
+                .chunk_size(chunk_size)
+                .if_match(IfMatchCondition::Match(etag))
+                .into_stream()
+                .next()
+                .await
+                .ok_or_else(|| {
+                    azure_core_for_storage::Error::message(
+                        ErrorKind::Other,
+                        "no blob response received for follow-up page",
+                    )
+                })??;
+            let more = page.remaining_range.is_some();
+            // A ranged GET always answers 206 with Content-Range; without it we can't tell where
+            // the page ended, so fail rather than guess.
+            let Some(azure_core_for_storage::request_options::Range::Range(r)) =
+                page.content_range.as_ref()
+            else {
+                return Err(azure_core_for_storage::Error::message(
+                    ErrorKind::Other,
+                    "follow-up blob page has no Content-Range",
+                ));
+            };
+            let following = more.then_some(r.end + 1);
+            progress.record_page(r.end + 1, !more);
+            Ok(Some((page.data, following)))
+        }
+    });
+
+    Box::pin(
+        futures::stream::once(futures::future::ready(Ok(first_body)))
+            .chain(rest)
+            .try_flatten(),
+    )
+}
 
 /// Azure Queue Storage configuration options.
 /// This struct defines all configurable parameters for the Azure Queue source,
@@ -178,6 +285,17 @@ pub(super) struct Config {
     #[serde(default)]
     #[derivative(Default)]
     pub(super) tolerate_truncated_archives: bool,
+
+    /// Size, in bytes, of each ranged GET used to read a blob.
+    ///
+    /// Blobs larger than this are read as a sequence of ranged requests, each pinned to the first
+    /// request's ETag so a blob overwritten mid-read fails instead of mixing versions. Larger
+    /// values mean fewer round trips; smaller values bound the bytes held in flight per blob.
+    #[serde(default = "default_blob_read_chunk_size_bytes")]
+    #[derivative(Default(value = "default_blob_read_chunk_size_bytes()"))]
+    #[configurable(metadata(docs::type_unit = "bytes"))]
+    #[configurable(metadata(docs::human_name = "Blob Read Chunk Size"))]
+    pub(super) blob_read_chunk_size_bytes: NonZeroU64,
 }
 
 // Default configuration values
@@ -190,6 +308,9 @@ const fn default_depth_poll_secs() -> NonZeroU64 {
 const fn default_visibility_timeout_secs() -> u64 {
     300
 } // 5 minutes visibility timeout
+const fn default_blob_read_chunk_size_bytes() -> NonZeroU64 {
+    NonZeroU64::new(DEFAULT_BLOB_CHUNK_SIZE).unwrap()
+} // 16 MiB, the Azure SDK's own default
 const fn default_max_number_of_messages() -> u64 {
     10
 } // Default batch size
@@ -250,15 +371,17 @@ pub enum ProcessingError {
 
     /// The blob body ended before the advertised content length was received (short transfer)
     #[snafu(display(
-        "Incomplete download of blob {}/{}: read {} of {} bytes",
+        "Incomplete download of blob {}/{}: read {} bytes, {}",
         container,
         blob,
         bytes_read,
-        content_length
+        expected_size_text(*content_length)
     ))]
     IncompleteBlobDownload {
         bytes_read: u64,
-        content_length: u64,
+        /// Advertised blob size; `None` if the page chain stopped before the final page, so the
+        /// size is not known.
+        content_length: Option<u64>,
         container: String,
         blob: String,
     },
@@ -356,6 +479,13 @@ fn get_blob_failure(err: &azure_core_for_storage::Error) -> (&'static str, &'sta
             "get_blob_credential_failed",
         ),
         _ => (error_type::REQUEST_FAILED, "get_blob_failed"),
+    }
+}
+
+fn expected_size_text(content_length: Option<u64>) -> String {
+    match content_length {
+        Some(total) => format!("expected {total}"),
+        None => "stopped before the final page".to_string(),
     }
 }
 
@@ -504,6 +634,9 @@ pub struct State {
     rate_limiter: ObjectStorageRateLimiter,
     /// Drains the queue without fetching blobs while the table is disabled
     gate: Option<ObjectStorageGate>,
+    /// Size of each ranged GET the blob is read in; see [`chain_blob_pages`] and
+    /// `Config::blob_read_chunk_size_bytes`.
+    blob_chunk_size: u64,
 }
 
 impl State {
@@ -599,6 +732,7 @@ impl Ingestor {
             extra_blob_clients,
             rate_limiter,
             gate: None,
+            blob_chunk_size: config.blob_read_chunk_size_bytes.get(),
         });
 
         Ok(Ingestor { state })
@@ -1157,7 +1291,10 @@ impl IngestorProcess {
             .container_client(&container)
             .blob_client(&blob);
 
-        let mut blob_stream = blob_client.get().into_stream();
+        let mut blob_stream = blob_client
+            .get()
+            .chunk_size(self.state.blob_chunk_size)
+            .into_stream();
 
         let response_result = blob_stream.next().await.transpose();
         let response_opt = match response_result {
@@ -1201,9 +1338,9 @@ impl IngestorProcess {
         let content_type = Some(properties.content_type.as_str());
         let content_encoding = properties.content_encoding.as_deref();
         let last_modified = properties.last_modified;
-        // Advertised size of the committed blob; used to distinguish a truncated committed blob
-        // (compressed bytes pulled == content_length) from a short download (fewer bytes) below.
-        let content_length = properties.content_length;
+        // This is the length of the first page, not of the blob; see `BlobReadProgress`.
+        let first_page_length = properties.content_length;
+        let etag = properties.etag.to_string();
 
         let timestamp = last_modified;
 
@@ -1214,7 +1351,30 @@ impl IngestorProcess {
         // later confirm the whole committed blob was read before tolerating a trailing EOF.
         let compressed_bytes = Arc::new(AtomicU64::new(0));
         let byte_counter = Arc::clone(&compressed_bytes);
-        let body_stream = blob_response.data.map(move |result| {
+        let progress = Arc::new(BlobReadProgress::default());
+        let more_pages = blob_response.remaining_range.is_some();
+        // A 200 (no Content-Range) is the whole blob, so its length is the total.
+        let first_page_end = match blob_response.content_range.as_ref() {
+            Some(azure_core_for_storage::request_options::Range::Range(r)) => r.end + 1,
+            _ => first_page_length,
+        };
+        progress.record_page(first_page_end, !more_pages);
+        let next_start = match blob_response.content_range.as_ref() {
+            Some(azure_core_for_storage::request_options::Range::Range(r)) if more_pages => {
+                Some(r.end + 1)
+            }
+            _ => None,
+        };
+        // `blob_response.data` is only the first `blob_chunk_size` page; chain the rest.
+        let pages = chain_blob_pages(
+            blob_client,
+            self.state.blob_chunk_size,
+            etag,
+            blob_response.data,
+            next_start,
+            Arc::clone(&progress),
+        );
+        let body_stream = pages.map(move |result| {
             result
                 .inspect(|chunk| {
                     byte_counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
@@ -1350,10 +1510,11 @@ impl IngestorProcess {
         // prevents. Drop that residual error so we take the normal ack path (and record the
         // tolerated drop). Gated on having read the whole committed blob, so a short transfer
         // still surfaces as a real error and redelivers rather than acking a partial download.
+        let required_bytes = progress.required_bytes();
         if read_error.is_some()
             && tolerated_trailing_frame_error(
                 truncated_tail.load(Ordering::Relaxed),
-                content_length,
+                required_bytes,
                 compressed_bytes.load(Ordering::Relaxed),
             )
         {
@@ -1448,29 +1609,27 @@ impl IngestorProcess {
             }
         };
 
-        // Reconcile a tolerated trailing EOF with how much we actually read.
+        // Reconcile with how much of the committed blob we actually read. A short read is a cut-short
+        // or abandoned download, never a torn archive, so it must redeliver whether or not a
+        // decoder noticed (an uncompressed blob or a page boundary EOF raises no error at all).
         let mut processing_result = processing_result;
-        if truncated_tail.load(Ordering::Relaxed) {
-            let pulled = compressed_bytes.load(Ordering::Relaxed);
-            if content_length > 0 && pulled < content_length {
-                // Saw a trailing UnexpectedEof but did NOT read the whole committed blob: the
-                // download was cut short (transient), not a truncated archive. Force redelivery
-                // rather than acking a partial read as if it were the whole blob.
-                processing_result = Err(ProcessingError::IncompleteBlobDownload {
-                    bytes_read: pulled,
-                    content_length,
-                    container: container.clone(),
-                    blob: blob.clone(),
-                });
-            } else if delivered {
-                // Whole committed blob read but its trailing member was truncated: we ingested the
-                // decodable prefix and the batch was delivered. Record the tolerated data-drop.
-                emit!(ObjectStorageBlobTruncated {
-                    cloud: CLOUD_PROVIDER,
-                    container: &container,
-                    blob: &blob,
-                });
-            }
+        let pulled = compressed_bytes.load(Ordering::Relaxed);
+        if processing_result.is_ok() && required_bytes > 0 && pulled < required_bytes {
+            // The per-message arm counts and logs this via `AzureBlobMessageProcessingError`.
+            processing_result = Err(ProcessingError::IncompleteBlobDownload {
+                bytes_read: pulled,
+                content_length: progress.final_page_reached().then_some(required_bytes),
+                container: container.clone(),
+                blob: blob.clone(),
+            });
+        } else if truncated_tail.load(Ordering::Relaxed) && delivered {
+            // Whole committed blob read but its trailing member was truncated: we ingested the
+            // decodable prefix and the batch was delivered. Record the tolerated data-drop.
+            emit!(ObjectStorageBlobTruncated {
+                cloud: CLOUD_PROVIDER,
+                container: &container,
+                blob: &blob,
+            });
         }
 
         processing_result
@@ -1621,16 +1780,17 @@ fn parse_blob_subject(subject: &str) -> Option<(&str, &str)> {
 /// Only meaningful once `tolerate_truncated_archives` turned a trailing decoder `UnexpectedEof`
 /// into a clean EOF (`truncated_tail`). At that point the whole compressed body was consumed by
 /// the decoder, so any framer error can only come from `decode_eof` on the leftover partial
-/// frame — the truncated tail. It is tolerated only when the whole committed blob was read
-/// (`content_length` unknown, or `pulled >= content_length`); a short transfer
-/// (`pulled < content_length`) is a cut-short download and must still surface as an error so the
-/// message redelivers instead of acking a partial read.
+/// frame — the truncated tail. It is tolerated only when at least `required_bytes` (the blob's
+/// advertised size, or `u64::MAX` if the final page was never reached) were pulled; a short
+/// transfer is a cut-short download and must still surface as an error so the message
+/// redelivers instead of acking a partial read. `required_bytes == 0` (empty blob) is trivially
+/// satisfied.
 const fn tolerated_trailing_frame_error(
     truncated_tail: bool,
-    content_length: u64,
+    required_bytes: u64,
     pulled: u64,
 ) -> bool {
-    truncated_tail && !(content_length > 0 && pulled < content_length)
+    truncated_tail && pulled >= required_bytes
 }
 
 /// The expected value of the `kind` field in a direct ingest message.
@@ -1815,9 +1975,10 @@ mod tests {
         // the truncated tail's partial final frame -> tolerate so we ack the decodable prefix.
         assert!(tolerated_trailing_frame_error(true, 100, 100));
         assert!(tolerated_trailing_frame_error(true, 100, 120));
-        // Unknown length (content_length == 0): treated as whole-blob-read, matching the reconcile
-        // block's short-transfer guard which also keys off `content_length > 0`.
+        // Empty blob (required_bytes == 0): trivially fully read.
         assert!(tolerated_trailing_frame_error(true, 0, 0));
+        // Final page never reached (u64::MAX): never tolerated.
+        assert!(!tolerated_trailing_frame_error(true, u64::MAX, 100));
         // Short transfer (cut-short download): keep the error so the message redelivers rather than
         // acking a partial read as if it were a truncated archive.
         assert!(!tolerated_trailing_frame_error(true, 100, 50));
@@ -2240,6 +2401,53 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_download_message_never_prints_unknown_size() {
+        let err = |content_length| ProcessingError::IncompleteBlobDownload {
+            bytes_read: 3,
+            content_length,
+            container: "c".into(),
+            blob: "b".into(),
+        };
+        assert!(
+            err(Some(10))
+                .to_string()
+                .contains("read 3 bytes, expected 10")
+        );
+        let unknown = err(None).to_string();
+        assert!(
+            unknown.contains("stopped before the final page"),
+            "{unknown}"
+        );
+        assert!(!unknown.contains(&u64::MAX.to_string()));
+    }
+
+    #[test]
+    fn test_blob_read_chunk_size_config_parsing() {
+        let config: Config = toml::from_str(r#"queue_name = "q""#).unwrap();
+        assert_eq!(config.blob_read_chunk_size_bytes.get(), 16 * 1024 * 1024);
+
+        let config: Config = toml::from_str(
+            r#"
+            queue_name = "q"
+            blob_read_chunk_size_bytes = 4096
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.blob_read_chunk_size_bytes.get(), 4096);
+
+        assert!(
+            toml::from_str::<Config>(
+                r#"
+                queue_name = "q"
+                blob_read_chunk_size_bytes = 0
+                "#
+            )
+            .is_err(),
+            "a zero chunk size must be rejected at config load"
+        );
+    }
+
+    #[test]
     fn test_tolerate_truncated_archives_config_parsing() {
         // Default: off — tolerating truncation drops the torn tail, so it must be opt-in.
         let config: Config = toml::from_str(
@@ -2649,7 +2857,7 @@ mod error_classification_tests {
             (
                 ProcessingError::IncompleteBlobDownload {
                     bytes_read: 3,
-                    content_length: 10,
+                    content_length: Some(10),
                     container: c.clone(),
                     blob: b.clone(),
                 },
@@ -2716,6 +2924,7 @@ mod drain_tests {
     use azure_storage::CloudLocation;
     use azure_storage_queues::QueueServiceClientBuilder;
     use base64::Engine as _;
+    use std::sync::atomic::Ordering;
     use vector_lib::codecs::{NewlineDelimitedDecoderConfig, decoding::FramingConfig};
     use vector_lib::event::EventStatus;
 
@@ -3138,5 +3347,240 @@ mod drain_tests {
             "an unpaused table fetches its object"
         );
         assert_eq!(polls, 0);
+    }
+
+    /// Serves `body` for `c/k.log` as ranged GETs, like Azure Blob Storage: every GET is a 206
+    /// with `Content-Range`/`ETag`, `If-Match` is enforced against the current ETag.
+    struct RangedBlob {
+        body: Vec<u8>,
+        /// Withhold this many trailing bytes of the final page while still advertising them in
+        /// `Content-Range`, simulating a connection cut mid-body.
+        withhold_tail: usize,
+        /// Switch to a new ETag after the first request, simulating an overwrite mid-read.
+        overwrite_after_first: bool,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl wiremock::Respond for RangedBlob {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let nth = self.requests.fetch_add(1, Ordering::SeqCst);
+            let etag = if self.overwrite_after_first && nth > 0 {
+                "\"0x2\""
+            } else {
+                "\"0x1\""
+            };
+            if let Some(want) = request.headers.get("if-match")
+                && want.to_str().unwrap() != etag
+            {
+                return storage_headers(ResponseTemplate::new(412));
+            }
+            let total = self.body.len();
+            let range = request
+                .headers
+                .get("x-ms-range")
+                .map(|v| v.to_str().unwrap().to_owned())
+                .unwrap_or_default();
+            let (start, end) = range
+                .strip_prefix("bytes=")
+                .and_then(|r| r.split_once('-'))
+                .map(|(a, b)| {
+                    (
+                        a.parse::<usize>().unwrap(),
+                        b.parse::<usize>().map_or(total - 1, |b| b.min(total - 1)),
+                    )
+                })
+                .unwrap_or((0, total - 1));
+            let served_end = if end + 1 == total {
+                (end + 1).saturating_sub(self.withhold_tail).max(start)
+            } else {
+                end + 1
+            };
+            storage_headers(ResponseTemplate::new(206))
+                .insert_header("content-type", "application/octet-stream")
+                .insert_header("content-range", format!("bytes {start}-{end}/{total}"))
+                .insert_header("etag", etag)
+                .insert_header("last-modified", "Fri, 14 Aug 2026 12:00:00 GMT")
+                .insert_header("x-ms-creation-time", "Fri, 14 Aug 2026 11:00:00 GMT")
+                .insert_header("x-ms-blob-type", "BlockBlob")
+                .insert_header("x-ms-server-encrypted", "true")
+                .set_body_bytes(self.body[start..served_end].to_vec())
+        }
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(bytes).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// `rows` newline-delimited lines of pseudo-random hex, so gzip can't shrink them away.
+    fn random_rows(rows: usize) -> String {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..rows)
+            .map(|i| {
+                let mut line = format!("row{i}-");
+                for _ in 0..4 {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    line.push_str(&format!("{:016x}", x));
+                }
+                line + "\n"
+            })
+            .collect()
+    }
+
+    /// Processes the one queued `c/k.log` blob with a tiny page size; returns (events decoded,
+    /// blob GETs, queue-message DELETEs).
+    async fn run_ranged_blob(
+        blob: RangedBlob,
+        compression: super::super::Compression,
+        chunk_size: u64,
+        tolerate_truncated_archives: bool,
+    ) -> (usize, usize, usize) {
+        use futures::StreamExt as _;
+
+        let server = mock_queue_and_blob().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/c/k.log$"))
+            .respond_with(blob)
+            // Outranks the catch-all 404 blob route mounted by the queue mock.
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let location = || CloudLocation::Custom {
+            account: "devstoreaccount1".to_string(),
+            uri: server.uri(),
+        };
+        let creds = StorageCredentials::anonymous();
+        let blob_client =
+            ClientBuilder::with_location(location(), creds.clone()).blob_service_client();
+        let queue_client = QueueServiceClientBuilder::with_location(location(), creds).build();
+        let decoder = DecodingConfig::new(
+            FramingConfig::NewlineDelimited(NewlineDelimitedDecoderConfig::default()),
+            default_decoding(),
+            LogNamespace::Legacy,
+        )
+        .build()
+        .expect("decoder must build");
+        let config = Config {
+            queue_name: "q".to_string(),
+            poll_secs: 0,
+            process_custom_message: true,
+            delete_message: true,
+            tolerate_truncated_archives,
+            blob_read_chunk_size_bytes: NonZeroU64::new(chunk_size).unwrap(),
+            ..Default::default()
+        };
+        let ingestor = Ingestor::new(
+            blob_client,
+            queue_client,
+            config,
+            compression,
+            None,
+            decoder,
+            None,
+            None,
+            Vec::new(),
+            ObjectStorageRateLimiter::new(&ObjectStorageRateLimitConfig::default()),
+        )
+        .await
+        .expect("ingestor must build");
+        let (out, rx) = SourceSender::new_test();
+        let collected = tokio::spawn(async move { rx.collect::<Vec<_>>().await.len() });
+        let mut process = IngestorProcess::new(
+            Arc::clone(&ingestor.state),
+            out,
+            ShutdownSignal::noop(),
+            LogNamespace::Legacy,
+            false,
+        );
+        process.run_once().await;
+        drop(process);
+        let events = collected.await.unwrap();
+        let (gets, deletes) = requests(&server).await;
+        (events, gets, deletes)
+    }
+
+    fn ranged(body: Vec<u8>) -> RangedBlob {
+        RangedBlob {
+            body,
+            withhold_tail: 0,
+            overwrite_after_first: false,
+            requests: Default::default(),
+        }
+    }
+
+    /// Regression: only the first page of a blob larger than the chunk size used to be read, and
+    /// the rest was silently dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_page_gzip_blob_decodes_every_row() {
+        let rows = 300;
+        let body = gzip(random_rows(rows).as_bytes());
+        assert!(body.len() > 4 * 1000, "fixture must span several pages");
+        let (events, gets, deletes) =
+            run_ranged_blob(ranged(body), super::super::Compression::Gzip, 1000, false).await;
+        assert_eq!(events, rows);
+        assert!(gets > 4, "expected several page requests, got {gets}");
+        assert_eq!(deletes, 1, "a fully read blob is acked");
+    }
+
+    /// A short read of a plain (undecoded) blob raises no decoder error at all; it must still
+    /// redeliver rather than ack.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn short_uncompressed_blob_is_not_acked() {
+        let mut blob = ranged(random_rows(300).into_bytes());
+        blob.withhold_tail = 100;
+        let (_, _, deletes) =
+            run_ranged_blob(blob, super::super::Compression::None, 1000, false).await;
+        assert_eq!(deletes, 0, "short transfer must redeliver");
+    }
+
+    /// Even with truncation tolerance on, a page sequence that comes up short of the advertised
+    /// size is a short transfer (redeliver), not a torn archive (ack).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn short_gzip_blob_is_not_acked_even_when_tolerating_truncation() {
+        let mut blob = ranged(gzip(random_rows(300).as_bytes()));
+        blob.withhold_tail = 20;
+        let (_, _, deletes) =
+            run_ranged_blob(blob, super::super::Compression::Gzip, 1000, true).await;
+        assert_eq!(deletes, 0, "short transfer must redeliver");
+    }
+
+    /// A committed blob whose final gzip member is genuinely torn (full advertised length read)
+    /// keeps the tolerate behaviour: ingest the decodable prefix and ack; without the opt-in it
+    /// redelivers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn torn_final_member_with_full_length_follows_tolerate_setting() {
+        let first = random_rows(40);
+        let second = gzip(random_rows(40).as_bytes());
+        let mut body = gzip(first.as_bytes());
+        body.extend_from_slice(&second[..second.len() / 2]);
+
+        let (events, _, deletes) = run_ranged_blob(
+            ranged(body.clone()),
+            super::super::Compression::Gzip,
+            1000,
+            true,
+        )
+        .await;
+        assert!(events >= 40, "decodable prefix is ingested, got {events}");
+        assert_eq!(deletes, 1, "tolerated: acked");
+
+        let (_, _, deletes) =
+            run_ranged_blob(ranged(body), super::super::Compression::Gzip, 1000, false).await;
+        assert_eq!(deletes, 0, "not tolerated: redelivered");
+    }
+
+    /// Pages after the first carry `If-Match`, so a blob overwritten mid-read fails (412) rather
+    /// than mixing two versions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_overwritten_mid_read_is_not_acked() {
+        let mut blob = ranged(gzip(random_rows(300).as_bytes()));
+        blob.overwrite_after_first = true;
+        let (_, _, deletes) =
+            run_ranged_blob(blob, super::super::Compression::Gzip, 1000, false).await;
+        assert_eq!(deletes, 0);
     }
 }
