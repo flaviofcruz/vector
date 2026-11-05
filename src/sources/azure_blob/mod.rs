@@ -45,6 +45,7 @@ use crate::{
     tls::TlsConfig,
 };
 
+mod framing;
 pub mod pem_certificate_credential;
 pub mod queue;
 

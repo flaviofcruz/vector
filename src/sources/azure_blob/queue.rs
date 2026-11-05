@@ -74,6 +74,8 @@ use vector_lib::lookup::{PathPrefix, metadata_path, path};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
+use super::framing::TruncatedArchiveFramer;
+
 const CLOUD_PROVIDER: &str = "azure";
 
 /// Default size of each ranged GET used to read a blob (the SDK's own default, made explicit).
@@ -285,6 +287,8 @@ pub(super) struct Config {
     /// error redelivers the same un-decodable blob indefinitely, re-ingesting the decodable prefix
     /// as duplicates each cycle. When enabled, the source ingests the records that did decode, acks
     /// the message, and emits `ObjectStorageBlobTruncated` for the dropped tail.
+    /// Newline/character framing keeps only terminated frames from a truncated archive; an
+    /// unterminated final frame is discarded even if only the compression footer was missing.
     ///
     /// Defaults to `false`: tolerating truncation drops the torn tail (data loss), so it is
     /// opt-in per source. It only ever applies to a fully-downloaded but truncated archive — a
@@ -1479,9 +1483,13 @@ impl IngestorProcess {
         let byte_counter = self.byte_counter.clone();
         let obj_start_bytes = byte_counter.get();
 
-        // Create stream of decoded lines
+        // A tolerated archive EOF must not turn an unterminated line into a complete record.
+        let framer = TruncatedArchiveFramer::new(
+            self.state.decoder.framer.clone(),
+            Arc::clone(&truncated_tail),
+        );
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = Box::new(
-            FramedRead::new(blob_reader, self.state.decoder.framer.clone())
+            FramedRead::new(blob_reader, framer)
                 .map(|res| {
                     res.inspect(|bytes| {
                         bytes_received.emit(ByteSize(bytes.len()));
@@ -1565,8 +1573,8 @@ impl IngestorProcess {
         // A framer error surfaced only at end-of-stream — `decode_eof` on the residual bytes —
         // after we tolerated a trailing archive truncation is the truncated tail's incomplete
         // final frame, not a real read failure: `length_delimited`/`octet_counting` framers
-        // return `Err` on a partial trailing frame (newline/bytes framers instead emit the
-        // residual as a final frame, so there is no error to clear). Left as an error it would
+        // return `Err` on a partial trailing frame (delimiter framers discard the residual;
+        // bytes framing retains its EOF behavior). Left as an error it would
         // set `read_error` -> `ReadBlob`, so `truncated_tail` is set but `delivered` is not and
         // the whole committed blob was read, and neither reconcile branch below runs: the message
         // never acks and the immutable blob redelivers forever — the exact loop this feature
