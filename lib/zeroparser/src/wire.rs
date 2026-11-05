@@ -290,16 +290,17 @@ fn parse_varint_slow(data: &[u8]) -> ParseResult<(u64, &[u8])> {
 /// Returns error if wire type is invalid or field number is out of range.
 #[inline(always)]
 fn try_unpack_tag(tag: u64) -> ParseResult<(i32, WireType)> {
-    let field_num = (tag >> 3) as i32;
+    let field_num = tag >> 3;
     let wire_type = WireType::try_from(tag & 0x7)?;
 
     // Validate field number range per protobuf spec.
+    // Check before narrowing so oversized numbers cannot wrap into valid tags.
     // Field numbers must be 1 to 536,870,911 (2^29 - 1).
     if !(1..=536_870_911).contains(&field_num) {
         return Err(ParseError::InvalidFieldNumber { field_num });
     }
 
-    Ok((field_num, wire_type))
+    Ok((field_num as i32, wire_type))
 }
 /// Parse a field, returning the field and remaining bytes.
 ///
@@ -607,6 +608,28 @@ mod tests {
         // Tag = (536_870_911 << 3) | 0 = 4_294_967_288 -> varint [0xF8, 0xFF, 0xFF, 0xFF, 0x0F].
         let (field, _) = try_parse_field(&[0xF8, 0xFF, 0xFF, 0xFF, 0x0F, 0x01]).unwrap();
         assert_eq!(field.field_num, 536_870_911);
+    }
+
+    #[test]
+    fn field_number_range_is_checked_before_narrowing() {
+        for field_num in [
+            0,
+            1 << 29,
+            1 << 31,
+            1 << 32,
+            (1 << 32) + 14,
+            (1 << 40) + 14,
+            u64::MAX >> 3,
+        ] {
+            assert_eq!(
+                try_unpack_tag((field_num << 3) | 1),
+                Err(ParseError::InvalidFieldNumber { field_num })
+            );
+        }
+        for field_num in [1, 19_000, 536_870_911] {
+            let (parsed, _) = try_unpack_tag(field_num << 3).unwrap();
+            assert_eq!(u64::try_from(parsed).unwrap(), field_num);
+        }
     }
 
     #[test]

@@ -525,6 +525,8 @@ fn malformed_wire_reports_reference_error() {
         &[0x72, 0x02, 0xff, 0xfe],       // o_string (14): invalid UTF-8
         &[0x0d, 0x01, 0x02, 0x03, 0x04], // o_int32 (1) with fixed32 wire type
         &[0x0b, 0x0c],                   // unknown group
+        // An oversized field number must not wrap into the known field 14.
+        &[0xf1, 0x80, 0x80, 0x80, 0x80, 0x01, 0, 0, 0, 0, 0, 0, 0, 0],
     ] {
         assert!(plan.encode_direct(wire).is_none());
         let reference = encode_variant_from_message(&desc, &WireValue::Len(wire));

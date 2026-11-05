@@ -19,7 +19,7 @@ pub enum ParseError {
         field_num: i32,
     },
     /// Field number out of valid range (1 to 536,870,911).
-    InvalidFieldNumber { field_num: i32 },
+    InvalidFieldNumber { field_num: u64 },
     /// Invalid map key type (float, double, bytes are not allowed as map keys).
     InvalidMapKeyType { field_num: i32 },
     /// Invalid packed field type (non-packable type with packed encoding).
