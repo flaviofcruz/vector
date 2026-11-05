@@ -14,12 +14,21 @@ use super::config::{
     PC_SERVICE_NAME,
 };
 use super::error::{InvalidLoginEndpointSnafu, TokenManagerError, TokenTooShortLivedSnafu};
-use super::request::build_request_message;
-use super::response::{message_field_bytes, principal_context_expiry};
+use super::request::{PrincipalContextRequestKind, build_request_message};
+use super::response::{
+    message_field_bytes, optional_message_field_bytes, principal_context_expiry,
+    principal_context_v2_wire_bytes,
+};
 use super::transport::{
     GrpcHttpClient, build_hyper_openssl_client, grpc_method_uri, grpc_unary_call,
     load_descriptor_pool,
 };
+
+/// Matching authentication metadata from one cached Login bootstrap.
+pub(crate) struct PrincipalContextMetadata {
+    pub(crate) unsigned: Vec<u8>,
+    pub(crate) signed_v2: Option<Vec<u8>>,
+}
 
 /// Manages the principal-context lifecycle: bootstrap and re-bootstrap on expiry.
 ///
@@ -28,9 +37,8 @@ use super::transport::{
 /// doesn't carry a snapshot of universe protos. The wire format is identical to a
 /// tonic-generated client; only the message types are dynamic.
 ///
-/// Each bootstrap issues two `CreatePrincipalContext` calls: an unsigned one whose
-/// `principal_context` UC reads, and a signed one whose `signed_principal_context` wrapper
-/// Zerobus verifies. Neither call returns a bearer token.
+/// Each bootstrap creates a service-principal context for UC (unsigned plus optional PCv2)
+/// and a legacy signed DP auth token for Zerobus.
 pub struct TokenManager {
     config: LoginServiceAuthConfig,
     method: MethodDescriptor,
@@ -76,11 +84,8 @@ impl TokenManager {
                     uri: config.login_service.login_endpoint.clone(),
                 })?;
 
-        let client = build_hyper_openssl_client(
-            &config,
-            &config.login_service.login_server_name,
-            config.login_service.verify_hostname,
-        )?;
+        let client =
+            build_hyper_openssl_client(&config.tls, &config.login_service.login_server_name)?;
 
         Ok(Self {
             config,
@@ -91,8 +96,7 @@ impl TokenManager {
         })
     }
 
-    /// Bootstrap: call `CreatePrincipalContext` unsigned (for UC) and signed (for Zerobus)
-    /// over hyper-openssl and return the cached pair.
+    /// Bootstrap both contexts together so UC metadata stays paired across refreshes.
     async fn bootstrap(&self) -> Result<CachedPrincipalContext, TokenManagerError> {
         info!(
             message = "Bootstrapping principal context from Login service.",
@@ -101,18 +105,25 @@ impl TokenManager {
             service_principal_type = self.config.user.service_principal_type,
         );
 
-        let unsigned = self.create_principal_context(false).await?;
-        let signed = self.create_principal_context(true).await?;
+        let service_principal = self.create_service_principal_context().await?;
+        let dp_auth_token = self.create_dp_auth_token().await?;
 
         // Both contexts are minted together; serve the pair until the earlier one expires.
-        let expires_at = [&unsigned, &signed]
+        let expires_at = [&service_principal, &dp_auth_token]
             .into_iter()
             .filter_map(principal_context_expiry)
             .min()
             .unwrap_or_else(|| Instant::now() + DEFAULT_TOKEN_LIFETIME);
         let cached = CachedPrincipalContext {
-            principal_context: message_field_bytes(&unsigned, "principal_context")?,
-            signed_principal_context: message_field_bytes(&signed, "signed_principal_context")?,
+            principal_context: message_field_bytes(&service_principal, "principal_context")?,
+            signed_principal_context: message_field_bytes(
+                &dp_auth_token,
+                "signed_principal_context",
+            )?,
+            signed_principal_context_v2: optional_message_field_bytes(
+                &service_principal,
+                "signed_principal_context_v2",
+            ),
             expires_at,
         };
 
@@ -137,11 +148,23 @@ impl TokenManager {
         Ok(cached)
     }
 
-    async fn create_principal_context(
+    async fn create_service_principal_context(&self) -> Result<DynamicMessage, TokenManagerError> {
+        self.send_principal_context_request(PrincipalContextRequestKind::ServicePrincipal)
+            .await
+    }
+
+    async fn create_dp_auth_token(&self) -> Result<DynamicMessage, TokenManagerError> {
+        self.send_principal_context_request(PrincipalContextRequestKind::dp_auth_token(
+            &self.config,
+        ))
+        .await
+    }
+
+    async fn send_principal_context_request(
         &self,
-        signed: bool,
+        kind: PrincipalContextRequestKind,
     ) -> Result<DynamicMessage, TokenManagerError> {
-        let request_msg = build_request_message(&self.config, &self.method.input(), signed)?;
+        let request_msg = build_request_message(&self.config, &self.method.input(), kind)?;
         grpc_unary_call(
             &self.client,
             grpc_method_uri(&self.endpoint, &self.method)?,
@@ -188,9 +211,17 @@ impl TokenManager {
             .encode(&cached.signed_principal_context))
     }
 
-    /// Serialized unsigned principal context for internal Unity Catalog requests.
-    pub async fn get_unsigned_principal_context(&self) -> Result<Vec<u8>, TokenManagerError> {
+    /// Read both headers from the same bootstrap so a refresh cannot mix contexts.
+    pub(crate) async fn get_principal_context_metadata(
+        &self,
+    ) -> Result<PrincipalContextMetadata, TokenManagerError> {
         let cached = self.get_principal_context().await?;
-        Ok(cached.principal_context.clone())
+        Ok(PrincipalContextMetadata {
+            unsigned: cached.principal_context.clone(),
+            signed_v2: cached
+                .signed_principal_context_v2
+                .as_deref()
+                .map(principal_context_v2_wire_bytes),
+        })
     }
 }

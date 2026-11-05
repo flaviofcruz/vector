@@ -5,12 +5,36 @@ use snafu::ResultExt;
 use super::config::{LoginServiceAuthConfig, SIGNED_PRINCIPAL_CONTEXT_TYPE};
 use super::error::{BuildRequestSnafu, TokenManagerError};
 
+pub(super) enum PrincipalContextRequestKind {
+    ServicePrincipal,
+    DpAuthToken {
+        allowed_service_principal_resource_path: String,
+        metastore_id: String,
+    },
+}
+
+impl PrincipalContextRequestKind {
+    pub(super) fn dp_auth_token(config: &LoginServiceAuthConfig) -> Self {
+        Self::DpAuthToken {
+            allowed_service_principal_resource_path: config
+                .zerobus_ssp_resource_path
+                .clone()
+                .unwrap_or_else(|| {
+                    format!(
+                        "workspaces/{}/zerobusDirectWriteApi",
+                        config.user.workspace_id
+                    )
+                }),
+            metastore_id: config.metastore_id.clone(),
+        }
+    }
+}
+
 /// Build a `CreatePrincipalContext` request (`databricks.identity.PrincipalContextRequest`) from
 /// config + the runtime request `MessageDescriptor`.
 ///
-/// With `signed` set, the request also carries a `SignedPrincipalContextConfig` so Login
-/// returns the signed wrapper Zerobus accepts; otherwise Login returns only the unsigned
-/// context UC reads.
+/// DP auth tokens require the legacy signed-context config. Regular requests return an
+/// unsigned context and may also return signed PCv2, controlled by Login's producer mode.
 ///
 /// The request is constructed as a `serde_json::Value` and then deserialized into a
 /// `DynamicMessage` through `prost-reflect`'s serde integration. This gives us schema
@@ -23,7 +47,7 @@ use super::error::{BuildRequestSnafu, TokenManagerError};
 pub(super) fn build_request_message(
     config: &LoginServiceAuthConfig,
     request_desc: &MessageDescriptor,
-    signed: bool,
+    kind: PrincipalContextRequestKind,
 ) -> Result<DynamicMessage, TokenManagerError> {
     let uc_securable_permission: Vec<_> = config
         .user
@@ -56,17 +80,15 @@ pub(super) fn build_request_message(
         },
         "authorization": { "authorizationConstraint": authorization_constraint },
     });
-    if signed {
-        let ssp_resource_path = config.zerobus_ssp_resource_path.clone().unwrap_or_else(|| {
-            format!(
-                "workspaces/{}/zerobusDirectWriteApi",
-                config.user.workspace_id
-            )
-        });
+    if let PrincipalContextRequestKind::DpAuthToken {
+        allowed_service_principal_resource_path,
+        metastore_id,
+    } = kind
+    {
         request["signedPrincipalContextConfig"] = json!({
             "signedPrincipalContextType": SIGNED_PRINCIPAL_CONTEXT_TYPE,
-            "allowedServicePrincipalResourcePath": ssp_resource_path,
-            "metastoreId": &config.metastore_id,
+            "allowedServicePrincipalResourcePath": allowed_service_principal_resource_path,
+            "metastoreId": metastore_id,
         });
     }
 

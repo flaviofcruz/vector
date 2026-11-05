@@ -1,3 +1,7 @@
+> This is a historical dev runbook. The current Login config shape is in
+> `config/examples/zerobus_login_service.yaml`; the pinned SDK currently blocks Login auth.
+> Its top-level `unity_catalog_endpoint` must point to internal managed-catalog; the dummy URL below is obsolete.
+
 # E2E auth verification on dev
 
 How to validate the `databricks_zerobus` sink with `login_service` auth from a

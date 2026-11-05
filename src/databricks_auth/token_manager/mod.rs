@@ -15,8 +15,8 @@ mod transport;
 
 pub(crate) use config::SIGNED_PRINCIPAL_CONTEXT_HEADER;
 pub use config::{
-    LoginServiceAuthConfig, LoginServiceConfig, UcPermissionEntry, UnityCatalogServiceConfig,
-    UserAuthInfo,
+    LoginServiceAuthConfig, LoginServiceConfig, ServiceTlsConfig, UcPermissionEntry,
+    UnityCatalogServiceConfig, UserAuthInfo,
 };
 pub use error::TokenManagerError;
 pub use manager::TokenManager;
@@ -27,3 +27,5 @@ pub(crate) use transport::{
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use manager::PrincipalContextMetadata;

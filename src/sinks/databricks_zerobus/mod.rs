@@ -7,6 +7,7 @@ mod config;
 mod error;
 mod freshness;
 mod headers;
+mod ingest_tls;
 mod service;
 mod sink;
 mod uc_client;

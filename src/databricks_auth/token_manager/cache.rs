@@ -11,6 +11,8 @@ pub(super) struct CachedPrincipalContext {
     /// Serialized signed `ProtectedMetadataWrapper`, sent to Zerobus as
     /// `s2s-principal-context-sig-bin`.
     pub(super) signed_principal_context: Vec<u8>,
+    /// Optional signed PCv2 wrapper returned alongside the unsigned context.
+    pub(super) signed_principal_context_v2: Option<Vec<u8>>,
     pub(super) expires_at: Instant,
 }
 

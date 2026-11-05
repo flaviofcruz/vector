@@ -28,7 +28,7 @@ use vector_lib::stream::DriverResponse;
 
 use super::{
     config::ZerobusSinkConfig, error::ZerobusSinkError, freshness, headers,
-    uc_client::UnityCatalogClient, unity_catalog_schema,
+    ingest_tls::ingestion_tls_settings, uc_client::UnityCatalogClient, unity_catalog_schema,
 };
 
 /// Build a connector factory that routes Zerobus gRPC traffic through
@@ -410,6 +410,14 @@ impl ZerobusService {
             .unity_catalog_url(&config.unity_catalog_endpoint)
             .application_name(config.user_agent_suffix());
         builder = builder.connector_factory(build_connector_factory(proxy)?);
+        let tls = match &config.auth {
+            super::config::DatabricksAuthentication::LoginService(auth) => Some(&auth.tls),
+            super::config::DatabricksAuthentication::OAuth { .. } => None,
+        };
+        builder = builder.tls_config(Arc::new(ingestion_tls_settings(
+            tls,
+            config.ingestion_domain_name.as_deref(),
+        )?));
         let sdk = builder.build().map_err(|e| ZerobusSinkError::ConfigError {
             message: format!("Failed to create Zerobus SDK: {}", e),
         })?;
@@ -441,9 +449,16 @@ impl ZerobusService {
         };
 
         let unity_catalog_client = match (&config.auth, &token_manager) {
-            (super::config::DatabricksAuthentication::LoginService(auth), Some(manager)) => Some(
-                Arc::new(UnityCatalogClient::new(auth, Arc::clone(manager)).await?),
-            ),
+            (super::config::DatabricksAuthentication::LoginService(auth), Some(manager)) => {
+                Some(Arc::new(
+                    UnityCatalogClient::new(
+                        &config.unity_catalog_endpoint,
+                        auth,
+                        Arc::clone(manager),
+                    )
+                    .await?,
+                ))
+            }
             _ => None,
         };
 
@@ -1305,6 +1320,7 @@ mod tests {
     fn test_config() -> ZerobusSinkConfig {
         ZerobusSinkConfig {
             ingestion_endpoint: "https://127.0.0.1:1".to_string(),
+            ingestion_domain_name: None,
             table_name: "test.default.logs".to_string(),
             unity_catalog_endpoint: "https://127.0.0.1:1".to_string(),
             auth: DatabricksAuthentication::OAuth {

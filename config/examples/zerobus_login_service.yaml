@@ -42,16 +42,15 @@ sinks:
     inputs: [shape_otel_log]
     table_name: main.default.otel_logs
     ingestion_endpoint: "https://${WORKSPACE_ID}.zerobus.us-west-2.dev.databricks.com"
-    # unity_catalog_endpoint is required by config validation but not used in login_service mode.
-    unity_catalog_endpoint: "https://unused.dev.databricks.com"
+    # Optional: override ingestion SNI and the certificate DNS name checked by the SDK.
+    # ingestion_domain_name: "regional-dp-apiproxy.service"
+    unity_catalog_endpoint: "${UNITY_CATALOG_ENDPOINT}"
 
     schema:
-      type: path
-      path: /etc/vector/otel_logs.desc
-      message_type: otel.OtelLog
+      type: unity_catalog
 
     batch_encoding:
-      codec: proto_batch
+      codec: arrow_stream
 
     auth:
       strategy: login_service
@@ -76,18 +75,23 @@ sinks:
           - privileges: [SELECT, MODIFY]
             securable_type: TABLE
             full_name: main.default.otel_spans
-      # Login service connection parameters (LoginServiceConfig).
+      # Shared by Login, internal Unity Catalog, and Zerobus ingestion.
+      tls:
+        crt_file: "/databricks-infra/dbts2/creds.combined.pem"
+        key_file: "/databricks-infra/dbts2/creds.combined.pem"
+        # Trust bundle must include the shard-services CA for internal E/W endpoints.
+        ca_file: "/databricks-infra/dbts2/creds.cert.pem"
+        # Applies to Login and UC only; Zerobus always verifies its server name.
+        verify_hostname: false
       login_service:
         login_endpoint: "https://login-service-bricklens.privileged.dev.dbns.databricks.com:443"
         login_server_name: "login-service-bricklens.privileged.dev.dbns.databricks.com"
-        tls_crt_file: "/databricks-infra/dbts2/creds.combined.pem"
-        tls_key_file: "/databricks-infra/dbts2/creds.combined.pem"
-        # tls_ca_file: "/databricks-infra/dbts2/ca.pem"   # add once confirmed on the pod
-
         # FileDescriptorSet covering Login's PrincipalContextService. Built once from
         # universe protos (common/principal-context/api/proto/service.proto, with
         # --include_imports) and mounted into the agent container alongside otel_logs.desc.
         proto_descriptor_path: "/etc/vector/principal_context_service.pb"
+      unity_catalog:
+        proto_descriptor_path: "/etc/vector/managed_catalog_service.pb"
       # Metastore the signed principal context is bound to.
       metastore_id: ${METASTORE_ID}
       # SSP resource path Zerobus accepts the signed context for.

@@ -7,7 +7,7 @@ use hyper::body::HttpBody;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, prost::Message};
 use snafu::ResultExt;
 
-use super::config::LoginServiceAuthConfig;
+use super::config::ServiceTlsConfig;
 use super::error::{
     BuildDescriptorPoolSnafu, BuildGrpcHttpRequestSnafu, DecodeDescriptorSetSnafu,
     DecodeResponseSnafu, HttpsConnectorSnafu, IncompleteResponseMessageSnafu, InvalidGrpcUriSnafu,
@@ -33,12 +33,12 @@ pub(crate) async fn load_descriptor_pool(path: &Path) -> Result<DescriptorPool, 
 /// Build a hyper-openssl client configured with the agent's mTLS cert + an SNI
 /// override (matching the bricklens_ingest sink pattern). The TCP connection goes
 /// to the request URI; SNI is set to `server_name` for the s2s-proxy sidecar to
-/// route correctly. With `verify_hostname` false the certificate chain is still
-/// verified, but not its hostname.
+/// route correctly. Hostname verification checks the request URI's hostname,
+/// independently of SNI. With `verify_hostname` false the certificate chain is
+/// still verified, but not its hostname.
 pub(crate) fn build_hyper_openssl_client(
-    config: &LoginServiceAuthConfig,
+    tls: &ServiceTlsConfig,
     server_name: &str,
-    verify_hostname: bool,
 ) -> Result<
     hyper::Client<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>,
     TokenManagerError,
@@ -50,32 +50,32 @@ pub(crate) fn build_hyper_openssl_client(
         .context(SslBuilderSnafu)?;
 
     ssl_builder
-        .set_certificate_file(
-            &config.login_service.tls_crt_file,
-            openssl::ssl::SslFiletype::PEM,
-        )
+        .set_certificate_file(&tls.crt_file, openssl::ssl::SslFiletype::PEM)
         .context(LoadClientCertSnafu {
-            path: config.login_service.tls_crt_file.clone(),
+            path: tls.crt_file.clone(),
         })?;
     ssl_builder
-        .set_private_key_file(
-            &config.login_service.tls_key_file,
-            openssl::ssl::SslFiletype::PEM,
-        )
+        .set_private_key_file(&tls.key_file, openssl::ssl::SslFiletype::PEM)
         .context(LoadClientKeySnafu {
-            path: config.login_service.tls_key_file.clone(),
+            path: tls.key_file.clone(),
         })?;
-    if let Some(ref ca_file) = config.login_service.tls_ca_file {
+    if let Some(ref ca_file) = tls.ca_file {
         ssl_builder.set_ca_file(ca_file).context(LoadCaFileSnafu {
             path: ca_file.clone(),
         })?;
     }
+
+    // The client speaks HTTP/2 only; advertise it before the server selects a protocol.
+    ssl_builder
+        .set_alpn_protos(b"\x02h2")
+        .context(SslBuilderSnafu)?;
 
     let mut https_connector =
         hyper_openssl::HttpsConnector::with_connector(http_connector, ssl_builder)
             .context(HttpsConnectorSnafu)?;
 
     let server_name = server_name.to_string();
+    let verify_hostname = tls.verify_hostname;
     https_connector.set_callback(move |connection, _uri| {
         // Endpoint is typically the s2s-proxy sidecar (e.g. 127.0.0.3); the SNI must
         // be set explicitly to the privileged DBNS hostname so the sidecar routes to

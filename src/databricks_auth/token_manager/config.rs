@@ -4,12 +4,12 @@
 //!
 //! A parallel implementation of this auth module exists in
 //! `bricklens/bricklens-ingest-external/src/databricks_auth/` in universe.
-//! The struct shapes (`UserAuthInfo`, `LoginServiceConfig`, `UcPermissionEntry`)
+//! The identity structs (`UserAuthInfo`, `UcPermissionEntry`)
 //! are intentionally kept in sync, but some fields differ for architectural
 //! reasons — vector is config-file driven so `LoginServiceConfig` carries
 //! `login_endpoint`, `login_server_name`, and `proto_descriptor_path`,
-//! while the universe side derives those from DB_CONF and compile-time generated
-//! protos.
+//! while TLS is shared under `auth.tls`. The universe side derives connections from
+//! DB_CONF and generated protos.
 //!
 //! Once vector is vendored into universe the two implementations should be
 //! consolidated into a single shared crate. At that point there may be conflicts
@@ -107,27 +107,16 @@ pub struct UserAuthInfo {
 /// Connection parameters for the Login service.
 #[configurable_component]
 #[derive(Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct LoginServiceConfig {
     /// Login service endpoint via s2s-proxy (e.g., `https://login-service-bricklens.privileged.dev.dbns.databricks.com:443`).
     pub login_endpoint: String,
 
-    /// TLS server name / SNI for Login service DBNS hostname.
+    /// TLS SNI for the Login service DBNS hostname.
+    ///
+    /// With hostname verification enabled, the certificate is checked against
+    /// the hostname in `login_endpoint`, independently of this SNI override.
     pub login_server_name: String,
-
-    /// Path to TLS client certificate file (mTLS).
-    pub tls_crt_file: String,
-
-    /// Path to TLS client key file (mTLS).
-    pub tls_key_file: String,
-
-    /// Optional path to CA certificate for verifying the server.
-    #[serde(default)]
-    pub tls_ca_file: Option<String>,
-
-    /// Verify the Login server certificate's hostname. Disable when dialing the DBNS host
-    /// directly: Login's certificate chain is valid but its SANs do not match that host.
-    #[serde(default = "default_verify_hostname")]
-    pub verify_hostname: bool,
 
     /// Path to a protobuf `FileDescriptorSet` covering Login's
     /// `databricks.identity.PrincipalContextService.CreatePrincipalContext` (generated with
@@ -139,15 +128,43 @@ pub struct LoginServiceConfig {
     pub proto_descriptor_path: PathBuf,
 }
 
+/// Shared mTLS identity and trust, plus hostname verification for Login and Unity Catalog.
+#[configurable_component]
+#[derive(Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceTlsConfig {
+    /// Path to the client certificate file (PEM).
+    pub crt_file: String,
+
+    /// Path to the client private key file (PEM).
+    pub key_file: String,
+
+    /// Server trust bundle (PEM). Uses the system trust store when unset.
+    #[serde(default)]
+    pub ca_file: Option<String>,
+
+    /// Verify server certificate hostnames for Login and Unity Catalog.
+    ///
+    /// This does not apply to Zerobus ingestion: the SDK always verifies hostnames
+    /// and does not support disabling that check. Disabling this setting still
+    /// verifies certificate chains, validity periods, and TLS handshake signatures.
+    #[serde(default = "default_verify_hostname")]
+    pub verify_hostname: bool,
+}
+
 /// Configuration for Login service authentication.
 #[configurable_component]
 #[derive(Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct LoginServiceAuthConfig {
     /// Per-customer identity used when minting the principal context.
     pub user: UserAuthInfo,
 
     /// Login service connection parameters.
     pub login_service: LoginServiceConfig,
+
+    /// Shared TLS identity and trust for Login, Unity Catalog, and Zerobus ingestion.
+    pub tls: ServiceTlsConfig,
 
     /// Unity Catalog metastore ID the signed principal context is bound to.
     pub metastore_id: String,
@@ -157,30 +174,16 @@ pub struct LoginServiceAuthConfig {
     #[serde(default)]
     pub zerobus_ssp_resource_path: Option<String>,
 
-    /// Internal Unity Catalog endpoint used to fetch the table schema with the unsigned
-    /// principal context. Required by the `databricks_zerobus` sink.
+    /// Internal Unity Catalog protobuf descriptor. Required by the `databricks_zerobus` sink.
     #[serde(default)]
     pub unity_catalog: Option<UnityCatalogServiceConfig>,
 }
 
-/// Connection parameters for the internal Unity Catalog (managed-catalog) gRPC service.
-///
-/// Reuses the Login service's mTLS client certificate.
+/// Protobuf descriptor for the internal Unity Catalog (managed-catalog) gRPC service.
 #[configurable_component]
 #[derive(Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct UnityCatalogServiceConfig {
-    /// Unity Catalog east-west endpoint (e.g., `https://managed-catalog--<cluster>.privileged.dev.dbns.databricks.com:443`).
-    pub endpoint: String,
-
-    /// TLS server name / SNI for the Unity Catalog DBNS hostname.
-    pub server_name: String,
-
-    /// Verify the Unity Catalog server certificate's hostname. Disable when dialing the DBNS
-    /// host directly: managed-catalog's certificate chain is valid but its SANs do not match
-    /// that host.
-    #[serde(default = "default_verify_hostname")]
-    pub verify_hostname: bool,
-
     /// Path to a protobuf `FileDescriptorSet` covering `managedcatalog.UnityCatalogService.getTable`
     /// (generated with `--include_imports`).
     pub proto_descriptor_path: PathBuf,

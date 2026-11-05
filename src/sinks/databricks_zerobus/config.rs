@@ -18,7 +18,7 @@ use super::{error::ZerobusSinkError, service::ZerobusService, sink::ZerobusSink}
 /// Authentication configuration for Databricks.
 #[configurable_component]
 #[derive(Clone, Debug)]
-#[serde(tag = "strategy", rename_all = "snake_case")]
+#[serde(tag = "strategy", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)] // config value built once; size irrelevant
 pub enum DatabricksAuthentication {
     /// Authenticate using OAuth 2.0 client credentials.
@@ -201,6 +201,14 @@ pub struct ZerobusSinkConfig {
     #[configurable(metadata(docs::examples = "https://ingest.prod.databricks.com"))]
     pub ingestion_endpoint: String,
 
+    /// Optional TLS server name for the Zerobus ingestion connection.
+    ///
+    /// Overrides SNI and the name verified against the server certificate, without
+    /// changing the ingestion endpoint or HTTP authority. Applies to both auth
+    /// strategies. If unset, the SDK uses the ingestion endpoint's hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingestion_domain_name: Option<String>,
+
     /// The Unity Catalog table name to write to.
     ///
     /// This should be in the format `catalog.schema.table`.
@@ -210,7 +218,7 @@ pub struct ZerobusSinkConfig {
 
     /// The Unity Catalog endpoint URL.
     ///
-    /// This is used for authentication and table metadata.
+    /// Public workspace URL for OAuth; internal managed-catalog gRPC URL for Login auth.
     #[configurable(metadata(
         docs::examples = "https://dbc-e2f0eb31-2b0e.staging.cloud.databricks.com"
     ))]
@@ -294,6 +302,7 @@ impl GenerateConfig for ZerobusSinkConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
             ingestion_endpoint: "https://ingest.dev.databricks.com".to_string(),
+            ingestion_domain_name: None,
             table_name: "catalog.schema.table".to_string(),
             unity_catalog_endpoint: "https://your-workspace.cloud.databricks.com".to_string(),
             auth: DatabricksAuthentication::OAuth {
@@ -375,6 +384,14 @@ impl ZerobusSinkConfig {
             });
         }
 
+        if let Some(domain_name) = &self.ingestion_domain_name {
+            rustls::pki_types::ServerName::try_from(domain_name.as_str()).map_err(|_| {
+                ZerobusSinkError::ConfigError {
+                    message: "ingestion_domain_name must be a valid TLS server name".to_string(),
+                }
+            })?;
+        }
+
         // Validate authentication credentials
         match &self.auth {
             DatabricksAuthentication::OAuth {
@@ -393,6 +410,7 @@ impl ZerobusSinkConfig {
                 }
             }
             DatabricksAuthentication::LoginService(config) => {
+                super::uc_client::parse_unity_catalog_endpoint(&self.unity_catalog_endpoint)?;
                 if config.user.service_principal_resource.is_empty() {
                     return Err(ZerobusSinkError::ConfigError {
                         message: "LoginService service_principal_resource cannot be empty"
@@ -413,6 +431,11 @@ impl ZerobusSinkConfig {
                     return Err(ZerobusSinkError::ConfigError {
                         message: "LoginService unity_catalog is required to fetch the table schema"
                             .to_string(),
+                    });
+                }
+                if config.tls.crt_file.is_empty() || config.tls.key_file.is_empty() {
+                    return Err(ZerobusSinkError::ConfigError {
+                        message: "auth.tls.crt_file and key_file are required".to_string(),
                     });
                 }
                 // Zerobus authenticates this strategy from `s2s-principal-context-sig-bin`,
@@ -521,6 +544,7 @@ mod tests {
     fn create_test_config() -> ZerobusSinkConfig {
         ZerobusSinkConfig {
             ingestion_endpoint: "https://test.databricks.com".to_string(),
+            ingestion_domain_name: None,
             table_name: "test.default.logs".to_string(),
             unity_catalog_endpoint: "https://test-workspace.databricks.com".to_string(),
             auth: DatabricksAuthentication::OAuth {
@@ -928,9 +952,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn login_service_rejected_until_sdk_sends_binary_headers() {
+    fn login_config() -> ZerobusSinkConfig {
         let mut config = create_test_config();
+        config.unity_catalog_endpoint = "https://uc:443".to_string();
         config.auth = toml::from_str(
             r#"
             strategy = "login_service"
@@ -943,22 +967,295 @@ mod tests {
             [login_service]
             login_endpoint = "https://login:443"
             login_server_name = "login"
-            tls_crt_file = "/dev/null"
-            tls_key_file = "/dev/null"
             proto_descriptor_path = "/dev/null"
 
+            [tls]
+            crt_file = "/dev/null"
+            key_file = "/dev/null"
+
             [unity_catalog]
-            endpoint = "https://uc:443"
-            server_name = "uc"
             proto_descriptor_path = "/dev/null"
             "#,
         )
         .unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        toml::from_str(&serialized).unwrap()
+    }
+
+    #[test]
+    fn login_service_rejected_until_sdk_sends_binary_headers() {
+        let config = login_config();
+        let serialized = toml::Value::try_from(&config).unwrap();
+        assert_eq!(
+            serialized["unity_catalog_endpoint"].as_str(),
+            Some("https://uc:443")
+        );
+        assert_eq!(
+            serialized["auth"]["unity_catalog"]["proto_descriptor_path"].as_str(),
+            Some("/dev/null")
+        );
+        let config: ZerobusSinkConfig = serialized.try_into().unwrap();
         let err = config.validate().unwrap_err();
         assert!(
             matches!(err, ZerobusSinkError::ConfigError { message } if message.contains("binary")),
             "expected login_service startup rejection"
         );
+    }
+
+    #[test]
+    fn ingestion_domain_name_is_optional_and_roundtrips_for_both_auth_strategies() {
+        for config in [create_test_config(), login_config()] {
+            let mut serialized = toml::Value::try_from(config).unwrap();
+            assert!(serialized.get("ingestion_domain_name").is_none());
+            serialized.as_table_mut().unwrap().insert(
+                "ingestion_domain_name".into(),
+                "regional-dp-apiproxy.service".into(),
+            );
+            let mut config: ZerobusSinkConfig = serialized.try_into().unwrap();
+            if let DatabricksAuthentication::LoginService(auth) = &mut config.auth {
+                auth.tls.verify_hostname = false;
+                assert!(
+                    config
+                        .validate()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("binary")
+                );
+            } else {
+                config.validate().unwrap();
+            }
+            assert_eq!(
+                config.ingestion_domain_name.as_deref(),
+                Some("regional-dp-apiproxy.service")
+            );
+            let roundtrip: ZerobusSinkConfig =
+                toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(
+                roundtrip.ingestion_domain_name,
+                config.ingestion_domain_name
+            );
+        }
+    }
+
+    #[test]
+    fn ingestion_domain_name_rejects_invalid_names_for_both_auth_strategies() {
+        for name in [
+            "",
+            "https://proxy.example",
+            "proxy.example:443",
+            "principal://cp/apps/shinkansen",
+        ] {
+            for mut config in [create_test_config(), login_config()] {
+                config.ingestion_domain_name = Some(name.into());
+                assert!(
+                    config
+                        .validate()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("ingestion_domain_name"),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn login_service_rejects_nested_ingestion_domain_name() {
+        let mut serialized = toml::Value::try_from(login_config()).unwrap();
+        serialized["auth"]["login_service"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "ingestion_domain_name".into(),
+                "regional-dp-apiproxy.service".into(),
+            );
+        assert!(serialized.try_into::<ZerobusSinkConfig>().is_err());
+    }
+
+    #[test]
+    fn login_requires_a_valid_top_level_uc_endpoint() {
+        for endpoint in [
+            "",
+            "uc:443",
+            "https:///",
+            "http://uc:443",
+            "https://uc:bad-port",
+        ] {
+            let mut config = login_config();
+            config.unity_catalog_endpoint = endpoint.into();
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("unity_catalog_endpoint"),
+                "{endpoint}: {error}"
+            );
+        }
+        let mut serialized = toml::Value::try_from(login_config()).unwrap();
+        serialized
+            .as_table_mut()
+            .unwrap()
+            .remove("unity_catalog_endpoint");
+        assert!(serialized.try_into::<ZerobusSinkConfig>().is_err());
+    }
+
+    #[test]
+    fn login_requires_internal_uc_and_a_complete_tls_identity() {
+        let mut config = login_config();
+        let DatabricksAuthentication::LoginService(auth) = &mut config.auth else {
+            unreachable!()
+        };
+        auth.unity_catalog = None;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("unity_catalog is required")
+        );
+        for missing_cert in [true, false] {
+            let mut config = login_config();
+            let DatabricksAuthentication::LoginService(auth) = &mut config.auth else {
+                unreachable!()
+            };
+            if missing_cert {
+                auth.tls.crt_file.clear();
+            } else {
+                auth.tls.key_file.clear();
+            }
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("auth.tls.crt_file and key_file are required")
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_retains_the_upstream_uc_endpoint_location() {
+        let config = create_test_config();
+        assert!(config.validate().is_ok());
+        let serialized = toml::Value::try_from(&config).unwrap();
+        assert_eq!(
+            serialized["unity_catalog_endpoint"].as_str(),
+            Some("https://test-workspace.databricks.com")
+        );
+        let parsed: ZerobusSinkConfig = serialized.clone().try_into().unwrap();
+        assert!(parsed.validate().is_ok());
+
+        let mut nested = serialized.clone();
+        nested["auth"].as_table_mut().unwrap().insert(
+            "unity_catalog_endpoint".into(),
+            "https://nested.databricks.com".into(),
+        );
+        assert!(nested.try_into::<ZerobusSinkConfig>().is_err());
+        let mut missing = serialized;
+        missing
+            .as_table_mut()
+            .unwrap()
+            .remove("unity_catalog_endpoint");
+        assert!(missing.try_into::<ZerobusSinkConfig>().is_err());
+    }
+
+    #[test]
+    fn auth_rejects_fields_from_the_other_strategy() {
+        let oauth_with_login = r#"
+            strategy = "oauth"
+            client_id = "id"
+            client_secret = "secret"
+            login_service.ingestion_domain_name = "regional-dp-apiproxy.service"
+        "#;
+        assert!(toml::from_str::<DatabricksAuthentication>(oauth_with_login).is_err());
+        let oauth_with_tls = r#"
+            strategy = "oauth"
+            client_id = "id"
+            client_secret = "secret"
+            tls.crt_file = "/cert"
+            tls.key_file = "/key"
+        "#;
+        assert!(toml::from_str::<DatabricksAuthentication>(oauth_with_tls).is_err());
+        let login = r#"
+            strategy = "login_service"
+            metastore_id = "m"
+            user.workspace_id = 1
+            user.service_principal_resource = "accounts/a/apps"
+            login_service.login_endpoint = "https://login"
+            login_service.login_server_name = "login"
+            tls.crt_file = "/cert"
+            tls.key_file = "/key"
+            login_service.proto_descriptor_path = "/login.pb"
+        "#;
+        assert!(toml::from_str::<DatabricksAuthentication>(login).is_ok());
+        for field in [
+            "client_id = 'id'",
+            "client_secret = 'secret'",
+            "unity_catalog_endpoint = 'https://public-uc'",
+        ] {
+            let mixed = format!("{field}\n{login}");
+            assert!(
+                toml::from_str::<DatabricksAuthentication>(&mixed).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_requires_shared_tls_and_rejects_legacy_locations() {
+        let config = login_config();
+        let mut auth = toml::Value::try_from(&config.auth).unwrap();
+        assert!(auth["tls"]["verify_hostname"].as_bool().unwrap());
+        auth["tls"]["verify_hostname"] = false.into();
+        let parsed: DatabricksAuthentication = auth.clone().try_into().unwrap();
+        let DatabricksAuthentication::LoginService(parsed) = parsed else {
+            unreachable!()
+        };
+        assert!(!parsed.tls.verify_hostname);
+
+        for field in ["tls", "tls.crt_file", "tls.key_file"] {
+            let mut incomplete = auth.clone();
+            if let Some((block, key)) = field.split_once('.') {
+                incomplete[block].as_table_mut().unwrap().remove(key);
+            } else {
+                incomplete.as_table_mut().unwrap().remove(field);
+            }
+            assert!(
+                incomplete.try_into::<DatabricksAuthentication>().is_err(),
+                "{field}"
+            );
+        }
+
+        for (block, field, value) in [
+            (
+                "login_service",
+                "tls_crt_file",
+                toml::Value::from("/old-cert"),
+            ),
+            (
+                "login_service",
+                "tls_key_file",
+                toml::Value::from("/old-key"),
+            ),
+            ("login_service", "tls_ca_file", toml::Value::from("/old-ca")),
+            ("login_service", "verify_hostname", toml::Value::from(false)),
+            ("unity_catalog", "verify_hostname", toml::Value::from(false)),
+            (
+                "unity_catalog",
+                "endpoint",
+                toml::Value::from("https://old-uc"),
+            ),
+            ("unity_catalog", "server_name", toml::Value::from("old-uc")),
+            ("tls", "verify_certificate", toml::Value::from(false)),
+        ] {
+            let mut mixed = auth.clone();
+            mixed[block]
+                .as_table_mut()
+                .unwrap()
+                .insert(field.into(), value);
+            assert!(
+                mixed.try_into::<DatabricksAuthentication>().is_err(),
+                "{block}.{field}"
+            );
+        }
     }
 
     #[test]

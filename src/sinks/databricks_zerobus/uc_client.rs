@@ -17,8 +17,9 @@ use prost_reflect::{DynamicMessage, Kind, MethodDescriptor, ReflectMessage, Valu
 
 use super::error::ZerobusSinkError;
 use crate::databricks_auth::{
-    GrpcHttpClient, LoginServiceAuthConfig, TokenManager, TokenManagerError,
-    build_hyper_openssl_client, grpc_method_uri, grpc_unary_call, load_descriptor_pool,
+    GrpcHttpClient, LoginServiceAuthConfig, PrincipalContextMetadata, TokenManager,
+    TokenManagerError, build_hyper_openssl_client, grpc_method_uri, grpc_unary_call,
+    load_descriptor_pool,
 };
 
 const UC_SERVICE_NAME: &str = "managedcatalog.UnityCatalogService";
@@ -27,6 +28,7 @@ const UC_GET_TABLE_METHOD_NAME: &str = "getTable";
 /// Unsigned principal-context header. UC's east-west ingress authorizes internal callers from
 /// this header (it rejects requests without one).
 const PRINCIPAL_CONTEXT_HEADER: &str = "s2s-principal-context-bin";
+const PRINCIPAL_CONTEXT_V2_HEADER: &str = "s2s-principal-context-v2-sig-bin";
 
 /// gRPC client for the internal Unity Catalog `getTable` RPC, authenticated with the principal
 /// context from the sink's shared Login [`TokenManager`].
@@ -39,12 +41,14 @@ pub(super) struct UnityCatalogClient {
 
 impl UnityCatalogClient {
     pub(super) async fn new(
+        endpoint: &str,
         auth: &LoginServiceAuthConfig,
         token_manager: Arc<TokenManager>,
     ) -> Result<Self, ZerobusSinkError> {
         let setup = |message: String| ZerobusSinkError::ConfigError {
             message: format!("login_service Unity Catalog client: {message}"),
         };
+        let (endpoint, server_name) = parse_unity_catalog_endpoint(endpoint)?;
         let uc = auth.unity_catalog.as_ref().ok_or_else(|| {
             setup("auth.unity_catalog is required to fetch the table schema".to_string())
         })?;
@@ -61,14 +65,8 @@ impl UnityCatalogClient {
                     path.display()
                 ))
             })?;
-        let endpoint = &uc.endpoint;
-        let uri = endpoint
-            .parse()
-            .map_err(|e| setup(format!("invalid unity_catalog_endpoint `{endpoint}`: {e}")))
-            .and_then(|endpoint| {
-                grpc_method_uri(&endpoint, &method).map_err(|e| setup(e.to_string()))
-            })?;
-        let client = build_hyper_openssl_client(auth, &uc.server_name, uc.verify_hostname)
+        let uri = grpc_method_uri(&endpoint, &method).map_err(|e| setup(e.to_string()))?;
+        let client = build_hyper_openssl_client(&auth.tls, &server_name)
             .map_err(|e| setup(e.to_string()))?;
         Ok(Self {
             token_manager,
@@ -85,7 +83,7 @@ impl UnityCatalogClient {
     ) -> Result<UcTableSchema, ZerobusSinkError> {
         let principal_context = self
             .token_manager
-            .get_unsigned_principal_context()
+            .get_principal_context_metadata()
             .await
             .map_err(grpc_error)?;
         let mut request = DynamicMessage::new(self.method.input());
@@ -106,12 +104,37 @@ impl UnityCatalogClient {
     }
 }
 
-/// The internal UC endpoint authorizes schema reads from the unsigned context.
-fn principal_context_headers(principal_context: &[u8]) -> Vec<(&'static str, String)> {
-    vec![(
+pub(super) fn parse_unity_catalog_endpoint(
+    endpoint: &str,
+) -> Result<(Uri, String), ZerobusSinkError> {
+    let url = url::Url::parse(endpoint).map_err(|error| ZerobusSinkError::ConfigError {
+        message: format!("invalid unity_catalog_endpoint: {error}"),
+    })?;
+    let server_name = url
+        .host_str()
+        .filter(|host| !host.is_empty() && url.scheme() == "https")
+        .ok_or_else(|| ZerobusSinkError::ConfigError {
+            message: "unity_catalog_endpoint must be an HTTPS URL with a hostname".to_string(),
+        })?
+        .to_string();
+    let endpoint = endpoint
+        .parse()
+        .map_err(|error| ZerobusSinkError::ConfigError {
+            message: format!("invalid unity_catalog_endpoint: {error}"),
+        })?;
+    Ok((endpoint, server_name))
+}
+
+/// Login can dual-send signed PCv2 during rollout; retain unsigned metadata when it is absent.
+fn principal_context_headers(metadata: &PrincipalContextMetadata) -> Vec<(&'static str, String)> {
+    let mut headers = vec![(
         PRINCIPAL_CONTEXT_HEADER,
-        STANDARD_NO_PAD.encode(principal_context),
-    )]
+        STANDARD_NO_PAD.encode(&metadata.unsigned),
+    )];
+    if let Some(v2) = &metadata.signed_v2 {
+        headers.push((PRINCIPAL_CONTEXT_V2_HEADER, STANDARD_NO_PAD.encode(v2)));
+    }
+    headers
 }
 
 /// Transport, status, and token failures; retryable when transient.
@@ -223,6 +246,33 @@ mod tests {
     use prost_reflect::{DescriptorPool, MessageDescriptor};
 
     use super::*;
+
+    #[test]
+    fn uc_endpoint_derives_tls_name_without_the_port() {
+        let host = "managed-catalog.privileged.staging.dbns.databricks.com";
+        for (suffix, port) in [("", None), (":443", Some(443)), (":8443/", Some(8443))] {
+            let (endpoint, server_name) =
+                parse_unity_catalog_endpoint(&format!("https://{host}{suffix}")).unwrap();
+            assert_eq!(server_name, host);
+            assert_eq!(endpoint.port_u16(), port);
+        }
+    }
+
+    #[test]
+    fn uc_endpoint_rejects_missing_hosts_and_non_tls_urls() {
+        for endpoint in [
+            "",
+            "uc:443",
+            "https:///",
+            "http://uc:443",
+            "https://uc:bad-port",
+        ] {
+            assert!(
+                parse_unity_catalog_endpoint(endpoint).is_err(),
+                "{endpoint}"
+            );
+        }
+    }
 
     // ---- Unity Catalog getTable response decoding ----
 
@@ -416,14 +466,37 @@ mod tests {
     // ---- Principal-context headers ----
 
     #[test]
-    fn principal_context_headers_sends_unsigned_without_authorization() {
-        let headers = principal_context_headers(b"unsigned");
+    fn principal_context_headers_sends_unsigned_without_authorization_when_v2_is_absent() {
+        let headers = principal_context_headers(&PrincipalContextMetadata {
+            unsigned: b"unsigned".to_vec(),
+            signed_v2: None,
+        });
         assert_eq!(
             headers,
             vec![(
                 PRINCIPAL_CONTEXT_HEADER,
                 STANDARD_NO_PAD.encode(b"unsigned")
             )]
+        );
+    }
+    #[test]
+    fn principal_context_headers_adds_signed_v2_from_the_same_bootstrap() {
+        let headers = principal_context_headers(&PrincipalContextMetadata {
+            unsigned: b"unsigned".to_vec(),
+            signed_v2: Some(b"pctx_v2_wire".to_vec()),
+        });
+        assert_eq!(
+            headers,
+            vec![
+                (
+                    PRINCIPAL_CONTEXT_HEADER,
+                    STANDARD_NO_PAD.encode(b"unsigned")
+                ),
+                (
+                    PRINCIPAL_CONTEXT_V2_HEADER,
+                    STANDARD_NO_PAD.encode(b"pctx_v2_wire")
+                ),
+            ]
         );
     }
 }
