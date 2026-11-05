@@ -100,6 +100,19 @@ pub enum WireToArrowError {
         actual: u8,
     },
 
+    /// A wire-type mismatch with the enclosing proto tags, from root to leaf.
+    #[snafu(display(
+        "wire type mismatch at proto field path {field_numbers:?}: plan expected {expected}, wire bytes had {actual}"
+    ))]
+    WireTypeMismatchAtField {
+        /// Proto tag numbers locating the field without logging payload data.
+        field_numbers: Vec<u32>,
+        /// The wire type the plan expected for this field.
+        expected: u8,
+        /// The wire type actually present in the bytes.
+        actual: u8,
+    },
+
     /// String field contained non-UTF-8 bytes.
     #[snafu(display("invalid UTF-8 in proto string field"))]
     InvalidUtf8,
@@ -291,6 +304,31 @@ pub enum WireToArrowError {
         /// (e.g. "proto3 singular fields are omitted at default value").
         reason: &'static str,
     },
+}
+
+impl WireToArrowError {
+    pub(super) fn at_proto_field(self, field_number: u32) -> Self {
+        match self {
+            Self::WireTypeMismatch { expected, actual } => Self::WireTypeMismatchAtField {
+                field_numbers: vec![field_number],
+                expected,
+                actual,
+            },
+            Self::WireTypeMismatchAtField {
+                mut field_numbers,
+                expected,
+                actual,
+            } => {
+                field_numbers.insert(0, field_number);
+                Self::WireTypeMismatchAtField {
+                    field_numbers,
+                    expected,
+                    actual,
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 /// Result alias for wire-to-Arrow encoder operations.

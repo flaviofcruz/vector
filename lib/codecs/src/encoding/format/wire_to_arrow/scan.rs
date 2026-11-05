@@ -205,14 +205,14 @@ pub(super) fn validate_message(
         let slot_idx = slot_idx as usize;
         let slot = &plan.slots[slot_idx];
 
-        match slot {
+        let validation = match slot {
             PlanSlot::Scalar(sk) => {
                 if seen_singular.test_and_set(slot_idx) {
                     return Err(WireToArrowError::DuplicateSingularField {
                         field_number: field.field_num as u32,
                     });
                 }
-                validate_scalar_from_wire(*sk, &field.value)?;
+                validate_scalar_from_wire(*sk, &field.value)
             }
             PlanSlot::Struct(sub_plan) => {
                 if seen_singular.test_and_set(slot_idx) {
@@ -220,24 +220,22 @@ pub(super) fn validate_message(
                         field_number: field.field_num as u32,
                     });
                 }
-                let sub_bytes = expect_len(&field.value)?;
-                validate_message(sub_plan, sub_bytes, variants)?;
+                expect_len(&field.value)
+                    .and_then(|sub_bytes| validate_message(sub_plan, sub_bytes, variants))
             }
             PlanSlot::RepeatedMessage(sub_plan) | PlanSlot::Map(sub_plan) => {
-                let sub_bytes = expect_len(&field.value)?;
-                validate_message(sub_plan, sub_bytes, variants)?;
+                expect_len(&field.value)
+                    .and_then(|sub_bytes| validate_message(sub_plan, sub_bytes, variants))
             }
-            PlanSlot::RepeatedScalar(sk) => validate_repeated_scalar(*sk, &field.value)?,
-            PlanSlot::RepeatedEnumString(desc) => {
-                validate_repeated_enum_string(desc, &field.value)?
-            }
+            PlanSlot::RepeatedScalar(sk) => validate_repeated_scalar(*sk, &field.value),
+            PlanSlot::RepeatedEnumString(desc) => validate_repeated_enum_string(desc, &field.value),
             PlanSlot::EnumString(desc) => {
                 if seen_singular.test_and_set(slot_idx) {
                     return Err(WireToArrowError::DuplicateSingularField {
                         field_number: field.field_num as u32,
                     });
                 }
-                validate_enum_string_from_wire(desc, &field.value)?;
+                validate_enum_string_from_wire(desc, &field.value)
             }
             // Singular field: dedup like Scalar/Struct, and run the full Variant
             // build so a malformed-JSON *or* build-failing row is dropped before
@@ -248,12 +246,12 @@ pub(super) fn validate_message(
                         field_number: field.field_num as u32,
                     });
                 }
-                variants.push(encode_variant(source, &field.value)?);
+                encode_variant(source, &field.value).map(|value| variants.push(value))
             }
             // Repeated: no dedup (repeated fields legitimately recur), each
             // occurrence fully built.
             PlanSlot::RepeatedVariant(source) => {
-                variants.push(encode_variant(source, &field.value)?)
+                encode_variant(source, &field.value).map(|value| variants.push(value))
             }
             // No proto field number ever points at an Absent slot (Absent
             // slots are Arrow columns the proto descriptor lacks), so this
@@ -264,7 +262,8 @@ pub(super) fn validate_message(
                     site: "validate_message:absent_slot_unreachable",
                 });
             }
-        }
+        };
+        validation.map_err(|error| error.at_proto_field(field.field_num as u32))?;
     }
     Ok(())
 }

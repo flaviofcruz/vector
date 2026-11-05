@@ -2556,6 +2556,52 @@ fn kv_descriptor(container: &MessageDescriptor) -> MessageDescriptor {
 }
 
 #[test]
+fn wire_type_mismatch_reports_root_to_leaf_proto_field_numbers() {
+    let desc = message_variant_descriptor();
+    let fields = ArrowFields::from(vec![
+        Field::new("k", DataType::LargeUtf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]);
+    let schema = Schema::new(vec![
+        Field::new("single", DataType::Struct(fields.clone()), true),
+        Field::new(
+            "many",
+            DataType::List(Arc::new(Field::new("item", DataType::Struct(fields), true))),
+            true,
+        ),
+    ]);
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+    let cases: &[(&[u8], &[u32], u8, u8)] = &[
+        (&[0x08, 0x00], &[1], 2, 0),
+        (&[0x0a, 0x02, 0x12, 0x00], &[1, 2], 0, 2),
+        (&[0x12, 0x02, 0x08, 0x00], &[2, 1], 2, 0),
+    ];
+    for &(wire, path, expected_type, actual_type) in cases {
+        let error =
+            super::scan::validate_message(&plan, wire, &mut super::scan::BuiltVariants::default())
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("proto field path {path:?}")),
+            "{error}"
+        );
+        match error {
+            WireToArrowError::WireTypeMismatchAtField {
+                field_numbers,
+                expected,
+                actual,
+            } => {
+                assert_eq!(field_numbers, path);
+                assert_eq!(expected, expected_type);
+                assert_eq!(actual, actual_type);
+            }
+            other => panic!("expected a field path for wire mismatch: {other}"),
+        }
+    }
+}
+
+#[test]
 fn variant_column_from_singular_message() {
     // A singular nested proto message pointed at a variant-marked struct column
     // is decoded and serialized to JSON, then encoded into Parquet Variant.
