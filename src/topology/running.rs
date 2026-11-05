@@ -146,6 +146,21 @@ fn abort_active_tasks(
     (aborted_components, aborted_tasks)
 }
 
+/// Cap on how many force-terminated component ids a single `COMPONENTS_CLOSED`
+/// VEL event carries per list. A wedged topology can name 40+ stuck components;
+/// the full set still appears in the deadline-exceeded warn logs.
+const MAX_FORCE_TERMINATED_COMPONENTS: usize = 20;
+
+/// Cap the force-terminated component ids carried on the `COMPONENTS_CLOSED` VEL
+/// event. Returns the capped id list and the total count before capping, so
+/// consumers can detect truncation. Callers pass ids pre-sorted for deterministic
+/// logging; list order is preserved.
+fn bounded_component_ids(mut ids: Vec<String>) -> (Vec<String>, usize) {
+    let total = ids.len();
+    ids.truncate(MAX_FORCE_TERMINATED_COMPONENTS);
+    (ids, total)
+}
+
 /// Set the flush signal on each `(key, signal)` pair, asking those (disk-buffered) sinks to drain
 /// their currently-open batches now that their upstream sources have stopped — rather than waiting
 /// for the batcher's own timeout. Best-effort and idempotent: the batcher clears the flag when it
@@ -481,6 +496,16 @@ impl RunningTopology {
         // cloned before `reporter` takes ownership of the original `check_handles`.
         let wave1_sink_check_handles = check_handles.clone();
 
+        // Same snapshot restricted to wave-1 data sources: used only if the data-source drain
+        // deadline is exceeded, to name the force-aborted source tasks on the warn log and the
+        // COMPONENTS_CLOSED VEL event (peek-based, like the sink path below, so only tasks
+        // that were actually still running are named).
+        let wave1_source_check_handles: HashMap<ComponentKey, Vec<_>> = check_handles
+            .iter()
+            .filter(|(key, _)| wave1_source_abort_handles.contains_key(*key))
+            .map(|(key, handles)| (key.clone(), handles.clone()))
+            .collect();
+
         // Reports in intervals which components are still running.
         let mut interval = interval(Duration::from_secs(5));
         let reporter_component_roles = Arc::clone(&component_roles);
@@ -630,6 +655,14 @@ impl RunningTopology {
                 // still-running source tasks. Sources only: their downstream transforms/sinks
                 // get their own drain window in phase B.
                 let mut wave1_sources_clean = true;
+                // Force-terminated component ids from the wave-1 deadlines, carried on the
+                // COMPONENTS_CLOSED VEL event so "which component stalled at the deadline" is
+                // one central query instead of a regional service-log search. Empty unless the
+                // corresponding wave-1 deadline was missed.
+                let mut force_terminated_sources = Vec::<String>::new();
+                let mut force_terminated_source_count = 0usize;
+                let mut force_terminated_sinks = Vec::<String>::new();
+                let mut force_terminated_sink_count = 0usize;
                 if let Some(ds_deadline) = data_source_deadline {
                     if tokio::time::timeout_at(
                         ds_deadline,
@@ -639,9 +672,25 @@ impl RunningTopology {
                     .is_err()
                     {
                         wave1_sources_clean = false;
+                        // Name the stuck sources with the same peek-based filter the sink path
+                        // (phase B) uses, so only tasks that were actually still running are
+                        // listed.
+                        let mut stuck_source_handles = wave1_source_check_handles;
+                        stuck_source_handles.retain(|_key, handles| {
+                            retain(handles, |handle| handle.peek().is_none());
+                            !handles.is_empty()
+                        });
+                        let stuck_source_ids: Vec<String> = stuck_source_handles
+                            .into_keys()
+                            .sorted()
+                            .map(|key| key.to_string())
+                            .collect();
+                        (force_terminated_sources, force_terminated_source_count) =
+                            bounded_component_ids(stuck_source_ids.clone());
                         let (aborted_components, aborted_tasks) =
                             abort_active_tasks(&wave1_source_abort_handles);
                         warn!(
+                            components = ?stuck_source_ids,
                             aborted_components = aborted_components,
                             aborted_tasks = aborted_tasks,
                             message = "Wave 1: data-source drain deadline exceeded; force-aborted \
@@ -692,11 +741,17 @@ impl RunningTopology {
                             retain(handles, |handle| handle.peek().is_none());
                             !handles.is_empty()
                         });
-                        let stragglers = wave1_sink_check_handles.keys().sorted().join(", ");
+                        let straggler_ids: Vec<String> = wave1_sink_check_handles
+                            .into_keys()
+                            .sorted()
+                            .map(|key| key.to_string())
+                            .collect();
+                        (force_terminated_sinks, force_terminated_sink_count) =
+                            bounded_component_ids(straggler_ids.clone());
                         let (aborted_components, aborted_tasks) =
                             abort_active_tasks(&wave1_sink_abort_handles);
                         warn!(
-                            components = ?stragglers,
+                            components = ?straggler_ids,
                             aborted_components = aborted_components,
                             aborted_tasks = aborted_tasks,
                             message = "Wave 1 sink-drain deadline exceeded; force-terminated \
@@ -736,6 +791,21 @@ impl RunningTopology {
                 // Emit a VEL event indicating all data components have been closed.
                 // This must happen before wave 2 shuts down internal sources (including
                 // internal_logs), so the event can still be delivered through the pipeline.
+                //
+                // The force-terminated lists are JSON-encoded string arrays (the internal-log
+                // event model has no list fields; woodchuck parses them into the proto repeated
+                // fields). Empty lists on a clean shutdown; counts reflect the pre-cap totals so
+                // consumers can detect the MAX_FORCE_TERMINATED_COMPONENTS truncation. The sink
+                // list covers the wave-1 downstream that phase B force-terminates — transforms
+                // and sinks alike, named "sinks" for the dominant case. Names are snapshotted
+                // before the aborts, so a task finishing in that gap can be named even though
+                // the abort did nothing to it; only wave-1 force-terminations are named here
+                // (wave-2 and overall-deadline kills are not).
+                let force_terminated_sources_json =
+                    serde_json::to_string(&force_terminated_sources)
+                        .unwrap_or_else(|_| "[]".to_string());
+                let force_terminated_sinks_json = serde_json::to_string(&force_terminated_sinks)
+                    .unwrap_or_else(|_| "[]".to_string());
                 info!(
                     message = "All Vector data components have been closed.",
                     // VECTOR_SERVICE_EVENT
@@ -743,6 +813,10 @@ impl RunningTopology {
                     // VECTOR_PROCESS_COMPONENTS_CLOSED
                     service_event = 5,
                     gracefully_closed = gracefully_closed,
+                    force_terminated_sources = %force_terminated_sources_json,
+                    force_terminated_sinks = %force_terminated_sinks_json,
+                    force_terminated_source_count = force_terminated_source_count as u64,
+                    force_terminated_sink_count = force_terminated_sink_count as u64,
                     internal_log_rate_limit = false,
                 );
                 // Prometheus mirror of the COMPONENTS_CLOSED VEL, so graceful-shutdown health can be
@@ -852,7 +926,10 @@ impl RunningTopology {
                 // Emitted before deferred source shutdown so that internal_logs
                 // (if present as a deferred source) can still deliver the event.
                 // `gracefully_closed` is always false on this branch: two-wave shutdown
-                // is not active, so there is no wave 1 deadline to meet.
+                // is not active, so there is no wave 1 deadline to meet. The
+                // force-terminated component lists are also omitted here: the
+                // overall-deadline force-abort on this path runs after this event is
+                // emitted, so the terminated ids are unknowable at emission time.
                 info!(
                     message = "All Vector data components have been closed.",
                     // VECTOR_SERVICE_EVENT
@@ -2123,11 +2200,32 @@ mod tests {
     use vector_common::flush_signal::FlushSignal;
     use vector_lib::buffers::{BufferConfig, BufferType, WhenFull};
 
-    use super::{reusable_buffers, signal_sink_flush};
+    use super::{bounded_component_ids, reusable_buffers, signal_sink_flush};
     use crate::{
         config::{ComponentKey, Config, ConfigDiff},
         test_util::mock::{basic_sink, basic_source},
     };
+
+    #[test]
+    fn bounded_component_ids_caps_and_counts() {
+        // Order is preserved; callers pre-sort for deterministic logging.
+        let (ids, total) = bounded_component_ids(
+            ["b_sink", "a_sink", "c_sink"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        assert_eq!(ids, ["b_sink", "a_sink", "c_sink"]);
+        assert_eq!(total, 3);
+
+        // Lists are capped at MAX_FORCE_TERMINATED_COMPONENTS, with the pre-cap total.
+        let many: Vec<String> = (0..30).map(|i| format!("sink_{i:02}")).collect();
+        let (ids, total) = bounded_component_ids(many);
+        assert_eq!(ids.len(), super::MAX_FORCE_TERMINATED_COMPONENTS);
+        assert_eq!(ids.first().map(String::as_str), Some("sink_00"));
+        assert_eq!(ids.last().map(String::as_str), Some("sink_19"));
+        assert_eq!(total, 30);
+    }
 
     #[cfg(feature = "sources-prometheus-remote-write")]
     #[tokio::test]

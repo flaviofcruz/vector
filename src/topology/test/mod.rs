@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     iter,
     sync::{
         Arc,
@@ -6,11 +7,13 @@ use std::{
     },
 };
 
-use futures::{StreamExt, future, stream};
+use futures::{Future, StreamExt, future, stream};
 use tokio::{
     task::yield_now,
     time::{Duration, Instant, sleep},
 };
+use tracing_futures::WithSubscriber;
+use tracing_subscriber::layer::SubscriberExt;
 use vector_lib::{
     buffers::{BufferConfig, BufferType, WhenFull},
     config::{ComponentKey, OutputId},
@@ -1163,9 +1166,31 @@ async fn topology_two_wave_aborts_stuck_wave1_source_at_data_source_deadline() {
     // source needs to be force-aborted.
     drop(internal_tx);
 
+    let capture = ComponentsClosedCapture::default();
     let start = Instant::now();
-    topology.stop().await;
+    let gracefully_closed = capture.capture(topology.stop()).await;
     let elapsed = start.elapsed();
+
+    // The stuck source is named on the COMPONENTS_CLOSED VEL event (JSON list); the
+    // healthy drain sink closed in time, so the sink list stays empty.
+    assert_eq!(
+        capture.field("force_terminated_sources").as_deref(),
+        Some(r#"["stuck_source"]"#)
+    );
+    assert_eq!(
+        capture.field("force_terminated_source_count").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        capture.field("force_terminated_sinks").as_deref(),
+        Some("[]")
+    );
+    assert_eq!(
+        capture.field("force_terminated_sink_count").as_deref(),
+        Some("0")
+    );
+    // A source force-aborted at its deadline is not a graceful close.
+    assert!(!gracefully_closed);
 
     assert!(
         elapsed < Duration::from_secs(6),
@@ -1243,6 +1268,190 @@ async fn topology_two_wave_force_terminates_stuck_wave1_sink_at_data_sink_deadli
     assert!(
         !gracefully_closed,
         "stuck wave-1 sink never drained, so gracefully_closed must be false"
+    );
+}
+
+// COMPONENTS_CLOSED VEL payload: the force-terminated component ids.
+
+/// Captures the fields of the `COMPONENTS_CLOSED` VEL event (`service_event = 5`) emitted
+/// while the wrapped future runs, via a tracing layer installed around it. The topology
+/// tests otherwise only see `stop()`'s `gracefully_closed` return value, not the event payload.
+#[derive(Clone, Default)]
+struct ComponentsClosedCapture {
+    fields: Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
+}
+
+impl ComponentsClosedCapture {
+    async fn capture<F: Future>(&self, fut: F) -> F::Output {
+        let subscriber = tracing_subscriber::registry().with(self.clone());
+        fut.with_subscriber(subscriber).await
+    }
+
+    fn field(&self, name: &str) -> Option<String> {
+        self.fields
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|fields| fields.get(name).cloned())
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ComponentsClosedCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = HashMap::new();
+        event.record(&mut FieldStrings(&mut fields));
+        // VECTOR_PROCESS_COMPONENTS_CLOSED; other sub-events are not this test's subject.
+        if fields.get("service_event").map(String::as_str) == Some("5") {
+            *self.fields.lock().unwrap() = Some(fields);
+        }
+    }
+}
+
+/// Records every field as its string form, so the assertions don't need to model
+/// tracing's per-type record dispatch (`%`-display, ints, bools, …).
+struct FieldStrings<'a>(&'a mut HashMap<String, String>);
+
+impl tracing::field::Visit for FieldStrings<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+/// The `COMPONENTS_CLOSED` VEL event names the components force-terminated at the wave-1
+/// deadlines, so "which sink stalled at the deadline" is one central Lumberjack query
+/// instead of a regional service-log search. A stuck wave-1 sink must appear in
+/// `force_terminated_sinks`; the source list stays empty (its deadline was met) and each
+/// count matches its (uncapped) list length.
+#[tokio::test]
+async fn topology_components_closed_vel_names_force_terminated_sink() {
+    trace_init();
+
+    let (mut ext_tx, ext_source) = basic_source();
+    let stuck_sink = backpressure_sink(0); // consumes nothing, then pends forever
+
+    let (mut internal_tx, internal_source) = deferred_source();
+    let (_internal_out, internal_sink) = basic_sink(10);
+
+    let mut config = Config::builder();
+    config.global.two_wave_shutdown = true.into();
+    config.graceful_shutdown_duration = Some(Duration::from_secs(8));
+    config.graceful_data_source_shutdown_duration = Some(Duration::from_secs(1));
+    config.graceful_data_sink_shutdown_duration = Some(Duration::from_secs(2));
+    config.graceful_internal_source_shutdown_duration = Some(Duration::from_secs(3));
+
+    config.add_source("clean_source", ext_source);
+    config.add_source("internal_logs", internal_source);
+    config.add_sink("stuck_sink", &["clean_source"], stuck_sink);
+    config.add_sink("internal_sink", &["internal_logs"], internal_sink);
+
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
+
+    ext_tx
+        .send_event(Event::Log(LogEvent::from("stuck")))
+        .await
+        .unwrap();
+    internal_tx
+        .send_event(Event::Log(LogEvent::from("internal")))
+        .await
+        .unwrap();
+    drop(ext_tx);
+    drop(internal_tx);
+
+    let capture = ComponentsClosedCapture::default();
+    let gracefully_closed = capture.capture(topology.stop()).await;
+    // A sink that never drained is not a graceful close.
+    assert!(!gracefully_closed);
+
+    assert_eq!(
+        capture.field("force_terminated_sinks").as_deref(),
+        Some(r#"["stuck_sink"]"#)
+    );
+    assert_eq!(
+        capture.field("force_terminated_sources").as_deref(),
+        Some("[]")
+    );
+    assert_eq!(
+        capture.field("force_terminated_sink_count").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        capture.field("force_terminated_source_count").as_deref(),
+        Some("0")
+    );
+}
+
+/// On a clean two-wave shutdown nothing is force-terminated, so both lists are empty and
+/// both counts are zero — the VEL still reports them, just vacuously.
+#[tokio::test]
+async fn topology_components_closed_vel_lists_empty_on_clean_shutdown() {
+    trace_init();
+
+    let (ext_tx, ext_source) = basic_source();
+    let (_out, wave1_sink) = basic_sink(10);
+    let (mut internal_tx, internal_source) = deferred_source();
+    let (_internal_out, internal_sink) = basic_sink(10);
+
+    let mut config = Config::builder();
+    config.global.two_wave_shutdown = true.into();
+    config.graceful_shutdown_duration = Some(Duration::from_secs(10));
+    config.graceful_data_source_shutdown_duration = Some(Duration::from_secs(2));
+    config.graceful_data_sink_shutdown_duration = Some(Duration::from_secs(4));
+    config.graceful_internal_source_shutdown_duration = Some(Duration::from_secs(6));
+
+    config.add_source("clean_source", ext_source);
+    config.add_source("internal_logs", internal_source);
+    config.add_sink("wave1_sink", &["clean_source"], wave1_sink);
+    config.add_sink("internal_sink", &["internal_logs"], internal_sink);
+
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
+
+    internal_tx
+        .send_event(Event::Log(LogEvent::from("internal")))
+        .await
+        .unwrap();
+    drop(ext_tx);
+    drop(internal_tx);
+
+    let capture = ComponentsClosedCapture::default();
+    let gracefully_closed = capture.capture(topology.stop()).await;
+    assert!(gracefully_closed);
+
+    assert_eq!(
+        capture.field("force_terminated_sources").as_deref(),
+        Some("[]")
+    );
+    assert_eq!(
+        capture.field("force_terminated_sinks").as_deref(),
+        Some("[]")
+    );
+    assert_eq!(
+        capture.field("force_terminated_source_count").as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        capture.field("force_terminated_sink_count").as_deref(),
+        Some("0")
     );
 }
 
