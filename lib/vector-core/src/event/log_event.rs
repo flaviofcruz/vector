@@ -47,6 +47,9 @@ static VECTOR_SOURCE_TYPE_PATH: LazyLock<Option<OwnedTargetPath>> = LazyLock::ne
     )))
 });
 
+const _: () = assert!(AtomicCell::<Option<NonZeroUsize>>::is_lock_free());
+const _: () = assert!(AtomicCell::<Option<NonZeroJsonSize>>::is_lock_free());
+
 #[derive(Debug, Deserialize)]
 struct Inner {
     #[serde(flatten)]
@@ -935,6 +938,27 @@ mod test {
         let (actual_value, _) = base.into_parts();
 
         assert_eq!(expected_value, actual_value);
+    }
+
+    #[test]
+    fn json_size_cache_is_invalidated_without_changing_a_clone() {
+        let mut log = LogEvent::from("before");
+        assert!(!log.estimated_json_encoded_size_is_cached());
+        let before = log.estimated_json_encoded_size_of();
+        assert!(log.estimated_json_encoded_size_is_cached());
+        assert_eq!(log.estimated_json_encoded_size_of(), before);
+
+        let original = log.clone();
+        log.insert("message", "a considerably longer message");
+        assert!(!log.estimated_json_encoded_size_is_cached());
+        let after = log.estimated_json_encoded_size_of();
+        assert!(after > before);
+        assert!(log.estimated_json_encoded_size_is_cached());
+        assert_eq!(original.estimated_json_encoded_size_of(), before);
+
+        log.remove("message");
+        assert!(!log.estimated_json_encoded_size_is_cached());
+        assert!(log.estimated_json_encoded_size_of() < after);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::{
     fmt,
     iter::Sum,
+    num::NonZeroUsize,
     ops::{Add, AddAssign, Sub},
 };
 
@@ -85,21 +86,40 @@ impl JsonSize {
     }
 }
 
+/// Keeps the optional cached size pointer-sized so its atomic cell remains lock-free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(clippy::module_name_repetitions)]
-pub struct NonZeroJsonSize(JsonSize);
+pub struct NonZeroJsonSize(NonZeroUsize);
 
 impl NonZeroJsonSize {
     #[must_use]
     #[inline]
     pub fn new(size: JsonSize) -> Option<Self> {
-        (size.0 > 0).then_some(NonZeroJsonSize(size))
+        NonZeroUsize::new(size.0).map(Self)
     }
 }
 
 impl From<NonZeroJsonSize> for JsonSize {
     #[inline]
     fn from(value: NonZeroJsonSize) -> Self {
-        value.0
+        Self(value.0.get())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JsonSize, NonZeroJsonSize};
+
+    #[test]
+    fn zero_has_no_cached_nonzero_size() {
+        assert_eq!(NonZeroJsonSize::new(JsonSize::zero()), None);
+    }
+
+    #[test]
+    fn nonzero_sizes_round_trip_without_truncation() {
+        for size in [1, 42, usize::MAX] {
+            let cached = NonZeroJsonSize::new(JsonSize::new(size)).unwrap();
+            assert_eq!(JsonSize::from(cached).get(), size);
+        }
     }
 }

@@ -1,0 +1,1 @@
+Backport upstream Vector PR 26713: represent nonzero cached JSON sizes with `NonZeroUsize` so optional size caches remain lock-free, with compile-time assertions for both atomic cache layouts. Preserve exact size values, clone isolation, and mutation-driven cache invalidation. https://github.com/databricks-eng/vector/pull/844
