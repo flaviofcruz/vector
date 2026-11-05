@@ -1,0 +1,2 @@
+Add optional `stream_options.multiplexed_streams` (default 1) to the `databricks_zerobus` sink. Values above 1 spread Arrow batches across that many DoPut streams via the Zerobus SDK `MultiplexedArrowStream`, each awaiting its own durable ack; `bytes_sent` is not reported on multiplexed streams. The sink warns at startup when `multiplexed_streams` exceeds the request concurrency limit, since extra lanes would sit idle.
+https://github.com/databricks-eng/vector/pull/895

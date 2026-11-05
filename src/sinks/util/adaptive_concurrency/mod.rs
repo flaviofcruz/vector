@@ -116,3 +116,10 @@ impl Default for AdaptiveConcurrencySettings {
         }
     }
 }
+
+impl AdaptiveConcurrencySettings {
+    /// The ceiling ARC never raises the in-flight request limit above.
+    pub(crate) const fn max_concurrency_limit(&self) -> usize {
+        self.max_concurrency_limit
+    }
+}

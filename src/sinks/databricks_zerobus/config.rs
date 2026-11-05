@@ -161,7 +161,30 @@ pub struct ZerobusStreamOptions {
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
     pub grpc_compression: GrpcCompression,
+
+    /// Number of Arrow Flight streams (lanes) the sink spreads this table's batches across.
+    ///
+    /// The Zerobus server processes each stream strictly serially, so one stream caps a
+    /// pod's throughput for wide tables regardless of request concurrency. With more than
+    /// one lane, whole batches are distributed round-robin across independent streams, so
+    /// batches are no longer written in submission order. Each batch is still acknowledged
+    /// only once durable on its own lane.
+    ///
+    /// Values above 1 use the SDK's Beta multiplexed Arrow stream: a terminal failure on any
+    /// lane closes and recreates all lanes, and a lane that cannot accept a batch within 30
+    /// seconds fails that request with a retryable error. The default of 1 keeps the
+    /// single-stream path.
+    ///
+    /// Each lane only progresses while a request is in flight on it, so keep this at or
+    /// below `request.concurrency` (ideally equal); extra lanes sit idle.
+    #[serde(default = "default_multiplexed_streams")]
+    #[configurable(metadata(docs::examples = 1))]
+    #[configurable(metadata(docs::examples = 4))]
+    pub multiplexed_streams: usize,
 }
+
+/// Upper bound on `multiplexed_streams`; the SDK encodes the lane index in 6 bits.
+pub const MAX_MULTIPLEXED_STREAMS: usize = 64;
 
 impl ZerobusStreamOptions {
     /// The single SDK compression mode these options select.
@@ -182,6 +205,7 @@ impl Default for ZerobusStreamOptions {
             server_lack_of_ack_timeout_ms: default_server_ack_timeout_ms(),
             compression: Compression::None,
             grpc_compression: GrpcCompression::None,
+            multiplexed_streams: default_multiplexed_streams(),
         }
     }
 }
@@ -328,6 +352,16 @@ impl GenerateConfig for ZerobusSinkConfig {
 impl SinkConfig for ZerobusSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         self.validate()?;
+
+        let max_in_flight = self.max_in_flight_requests();
+        if self.stream_options.multiplexed_streams > max_in_flight {
+            warn!(
+                message = "stream_options.multiplexed_streams exceeds the request concurrency limit; extra lanes stay idle. Set multiplexed_streams <= request.concurrency.",
+                multiplexed_streams = self.stream_options.multiplexed_streams,
+                max_in_flight_requests = max_in_flight,
+                table_name = %self.table_name,
+            );
+        }
 
         let service = ZerobusService::new(self.clone(), cx.proxy()).await?;
         let healthcheck_service = service.clone();
@@ -494,6 +528,15 @@ impl ZerobusSinkConfig {
             });
         }
 
+        if !(1..=MAX_MULTIPLEXED_STREAMS).contains(&self.stream_options.multiplexed_streams) {
+            return Err(ZerobusSinkError::ConfigError {
+                message: format!(
+                    "stream_options.multiplexed_streams must be between 1 and {MAX_MULTIPLEXED_STREAMS}, got {}",
+                    self.stream_options.multiplexed_streams
+                ),
+            });
+        }
+
         if let Some(max_bytes) = self.batch.max_bytes {
             // Zerobus SDK limits max bytes to 10MB.
             // NOTE: The size of the batch in Vector is not exactly the same as the size of the
@@ -508,6 +551,15 @@ impl ZerobusSinkConfig {
         }
 
         Ok(())
+    }
+
+    /// The most requests that can ever be in flight at once. Under ARC the live limit
+    /// moves at runtime, so only its configured ceiling bounds it for the whole run.
+    fn max_in_flight_requests(&self) -> usize {
+        self.request
+            .concurrency
+            .parse_concurrency()
+            .unwrap_or_else(|| self.request.adaptive_concurrency.max_concurrency_limit())
     }
 
     /// The user-agent suffix to hand the Zerobus SDK: `Vector/<version>`
@@ -529,6 +581,10 @@ const fn default_flush_timeout_ms() -> u64 {
 
 const fn default_server_ack_timeout_ms() -> u64 {
     60000
+}
+
+const fn default_multiplexed_streams() -> usize {
+    1
 }
 
 fn default_batch_encoding() -> BatchSerializerConfig {
@@ -617,6 +673,43 @@ mod tests {
             config.stream_options.arrow_compression(),
             ArrowCompression::Uncompressed
         );
+    }
+
+    #[test]
+    fn multiplexed_streams_defaults_to_one() {
+        let config: ZerobusSinkConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        assert_eq!(config.stream_options.multiplexed_streams, 1);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn multiplexed_streams_bounds_are_validated() {
+        for (value, ok) in [(0, false), (1, true), (4, true), (64, true), (65, false)] {
+            let config =
+                parse_with_stream_options(&format!("multiplexed_streams = {value}")).unwrap();
+            assert_eq!(
+                config.validate().is_ok(),
+                ok,
+                "multiplexed_streams = {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_in_flight_requests_follows_request_concurrency() {
+        for (request, expected) in [
+            ("", 200),
+            (
+                "concurrency = \"adaptive\"\nadaptive_concurrency.max_concurrency_limit = 3",
+                3,
+            ),
+            ("concurrency = \"none\"", 1),
+            ("concurrency = 8", 8),
+        ] {
+            let config: ZerobusSinkConfig =
+                toml::from_str(&format!("{MINIMAL_TOML}\n[request]\n{request}")).unwrap();
+            assert_eq!(config.max_in_flight_requests(), expected, "{request}");
+        }
     }
 
     #[test]

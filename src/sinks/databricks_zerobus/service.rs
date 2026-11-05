@@ -11,8 +11,8 @@ use crate::internal_events::{
 use crate::sinks::util::retries::RetryLogic;
 use crate::tls::TlsSettings;
 use databricks_zerobus_ingest_sdk::{
-    ConnectorFactory, HeadersProvider, OffsetId, ProxyConnector, StatsExporter, StreamStat,
-    ZerobusArrowStream, ZerobusSdk,
+    ConnectorFactory, HeadersProvider, MultiplexedArrowStream, OffsetId, ProxyConnector,
+    StatsExporter, StreamStat, ZerobusArrowStream, ZerobusError, ZerobusSdk,
 };
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -202,6 +202,11 @@ enum ActiveStream {
         RwLock<Option<Box<ZerobusArrowStream>>>,
         Arc<WireBytesExporter>,
     ),
+    /// Several Arrow Flight lanes behind one handle, used when `multiplexed_streams > 1`.
+    ///
+    /// The SDK's multiplexed stream rejects a stats exporter, so batches sent through it
+    /// report no wire size.
+    ArrowMux(RwLock<Option<Box<MultiplexedArrowStream>>>),
     /// Test-only variant that returns a pre-configured error on ingest.
     #[cfg(test)]
     Mock(MockStream),
@@ -210,6 +215,10 @@ enum ActiveStream {
 impl ActiveStream {
     fn arrow(stream: ZerobusArrowStream, stats: Arc<WireBytesExporter>) -> Self {
         ActiveStream::Arrow(RwLock::new(Some(Box::new(stream))), stats)
+    }
+
+    fn arrow_mux(stream: MultiplexedArrowStream) -> Self {
+        ActiveStream::ArrowMux(RwLock::new(Some(Box::new(stream))))
     }
 
     /// Gracefully flush and close the underlying SDK stream.
@@ -224,6 +233,13 @@ impl ActiveStream {
     async fn close(&self) {
         let result = match self {
             ActiveStream::Arrow(lock, _) => {
+                let taken = lock.write().await.take();
+                match taken {
+                    Some(mut stream) => stream.close().await,
+                    None => return,
+                }
+            }
+            ActiveStream::ArrowMux(lock) => {
                 let taken = lock.write().await.take();
                 match taken {
                     Some(mut stream) => stream.close().await,
@@ -727,8 +743,8 @@ impl ZerobusService {
 
         let result = match stream_guard.as_ref() {
             Some(pinned) => Ok(Arc::clone(&pinned.stream)),
-            None => self.build_stream(schema).await.map(|(created, stats)| {
-                let stream = Arc::new(ActiveStream::arrow(created, stats));
+            None => self.build_stream(schema).await.map(|created| {
+                let stream = Arc::new(created);
                 *stream_guard = Some(PinnedStream {
                     schema: Arc::clone(schema),
                     stream: Arc::clone(&stream),
@@ -766,9 +782,8 @@ impl ZerobusService {
     async fn build_stream(
         &self,
         schema: &ResolvedSchema,
-    ) -> Result<(ZerobusArrowStream, Arc<WireBytesExporter>), ZerobusSinkError> {
+    ) -> Result<ActiveStream, ZerobusSinkError> {
         let options = &self.config.stream_options;
-        let stats = Arc::new(WireBytesExporter::default());
         let builder = self
             .sdk
             .stream_builder()
@@ -797,16 +812,29 @@ impl ZerobusService {
             }
         };
 
-        builder
+        let builder = builder
             .arrow(Arc::clone(&schema.arrow_schema))
             .server_lack_of_ack_timeout_ms(options.server_lack_of_ack_timeout_ms)
             .flush_timeout_ms(options.flush_timeout_ms)
-            .compression(options.arrow_compression())
-            .stats_exporter(Arc::clone(&stats))
-            .build_arrow()
-            .await
-            .map(|stream| (stream, stats))
-            .map_err(|e| ZerobusSinkError::StreamInitError { source: e })
+            .compression(options.arrow_compression());
+
+        // One lane keeps the plain stream (and its wire-size stats) so the default
+        // configuration is unchanged by the multiplexed option existing.
+        if options.multiplexed_streams > 1 {
+            builder
+                .multiplexed(options.multiplexed_streams)
+                .build_arrow()
+                .await
+                .map(ActiveStream::arrow_mux)
+        } else {
+            let stats = Arc::new(WireBytesExporter::default());
+            builder
+                .stats_exporter(Arc::clone(&stats))
+                .build_arrow()
+                .await
+                .map(|stream| ActiveStream::arrow(stream, stats))
+        }
+        .map_err(|e| ZerobusSinkError::StreamInitError { source: e })
     }
 
     /// Gracefully close and remove the active stream.
@@ -950,6 +978,28 @@ impl ZerobusService {
                     Err(e) => Err(e),
                 }
             }
+            ActiveStream::ArrowMux(lock) => {
+                let guard = lock.read().await;
+                let Some(s) = guard.as_ref() else {
+                    return Err(ZerobusSinkError::StreamClosed);
+                };
+                // Ack durability is per lane, so waiting on this batch's message id
+                // (not `flush`, which would wait on every lane) keeps the ack semantics
+                // of the single-stream path.
+                let acked = match s.ingest_batch(record_batch).await {
+                    Ok(id) => s.wait_for_message_id(id).await,
+                    Err(e) => Err(e),
+                };
+                if acked.is_ok() {
+                    ack_times.record_acked(&self.config.table_name);
+                }
+                if let Err(e) = &acked
+                    && !mux_should_discard(e, s.is_closed())
+                {
+                    return Err(ZerobusSinkError::IngestionError { source: e.clone() });
+                }
+                acked.map(|_| None)
+            }
             #[cfg(test)]
             ActiveStream::Mock(mock) => {
                 let acked = mock.try_ingest().await;
@@ -975,6 +1025,17 @@ impl ZerobusService {
             }
         }
     }
+}
+
+/// Whether a failed multiplexed ingest must drop the mux so the next attempt rebuilds it.
+///
+/// A capacity or ack-wait timeout leaves the lanes usable; only a poisoned (closed) mux
+/// must be rebuilt, which recreates all lanes. Non-retryable errors never discard,
+/// matching the single-stream path. After an ack-wait timeout the batch stays queued on
+/// its lane and may still land, so the retry can duplicate it; delivery is at-least-once
+/// either way, since the single-stream close also keeps acking until its flush deadline.
+fn mux_should_discard(err: &ZerobusError, mux_closed: bool) -> bool {
+    err.is_retryable() && mux_closed
 }
 
 impl Service<ZerobusRequest> for ZerobusService {
@@ -1383,6 +1444,27 @@ mod tests {
         let resp = ZerobusResponse::delivered(GroupedCountByteSize::new_untagged(), Some(42));
         assert_eq!(resp.bytes_sent(), Some(42));
         assert_eq!(ZerobusResponse::errored().bytes_sent(), None);
+    }
+
+    #[test]
+    fn mux_discards_only_on_retryable_error_from_closed_mux() {
+        let retryable = ZerobusError::ChannelCreationError("lane failed".to_string());
+        let non_retryable = ZerobusError::InvalidArgument("bad field".to_string());
+        assert!(retryable.is_retryable());
+        assert!(!non_retryable.is_retryable());
+
+        for (err, closed, expected) in [
+            (&retryable, false, false),
+            (&retryable, true, true),
+            (&non_retryable, false, false),
+            (&non_retryable, true, false),
+        ] {
+            assert_eq!(
+                mux_should_discard(err, closed),
+                expected,
+                "{err:?}, closed = {closed}"
+            );
+        }
     }
 
     #[tokio::test]
