@@ -1,7 +1,6 @@
 use std::{future::Future, pin::pin, sync::Arc, time::Duration};
 
 use futures_util::FutureExt as _;
-use metrics::gauge;
 use tokio::sync::{Mutex, MutexGuard};
 
 #[cfg(feature = "api")]
@@ -9,7 +8,9 @@ use crate::api;
 use crate::{
     config,
     extra_context::ExtraContext,
-    internal_events::{VectorRecoveryError, VectorReloadError, VectorReloaded},
+    internal_events::{
+        VectorRecoveryError, VectorReloadError, VectorReloaded, set_config_reload_in_progress,
+    },
     signal::ShutdownError,
     topology::{ReloadError, RunningTopology},
 };
@@ -71,7 +72,7 @@ async fn with_reload_in_progress_gauge<F: Future>(reload: F, refresh: Duration) 
     struct ResetOnDrop;
     impl Drop for ResetOnDrop {
         fn drop(&mut self) {
-            gauge!("config_reload_in_progress").set(0.0);
+            set_config_reload_in_progress(0.0);
         }
     }
     let _reset = ResetOnDrop;
@@ -81,7 +82,7 @@ async fn with_reload_in_progress_gauge<F: Future>(reload: F, refresh: Duration) 
     loop {
         tokio::select! {
             output = &mut reload => return output,
-            _ = refresh.tick() => gauge!("config_reload_in_progress").set(1.0),
+            _ = refresh.tick() => set_config_reload_in_progress(1.0),
         }
     }
 }
@@ -231,12 +232,62 @@ impl TopologyController {
 mod tests {
     use std::time::Duration;
 
+    use metrics_tracing_context::MetricsLayer;
+    use tracing::Instrument;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
     use vector_lib::{
         event::{Metric, MetricValue},
         metrics::Controller,
     };
 
     use super::with_reload_in_progress_gauge;
+
+    /// Every `config_reload_in_progress` series as (tags, value).
+    fn reload_in_progress_series() -> Vec<(Vec<(String, String)>, f64)> {
+        Controller::get()
+            .unwrap()
+            .capture_metrics()
+            .into_iter()
+            .filter(|metric: &Metric| metric.name() == "config_reload_in_progress")
+            .map(|metric| {
+                let tags = metric
+                    .tags()
+                    .into_iter()
+                    .flat_map(|tags| tags.iter_single())
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect();
+                let value = match metric.value() {
+                    MetricValue::Gauge { value } => *value,
+                    other => panic!("unexpected metric value {other:?}"),
+                };
+                (tags, value)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn gauge_ignores_caller_component_span() {
+        vector_lib::metrics::init_test();
+        // Span fields become labels only through the metrics tracing layer.
+        let _subscriber =
+            tracing::subscriber::set_default(Registry::default().with(MetricsLayer::new()));
+        let controller = Controller::get().unwrap();
+        controller.reset();
+        controller.set_expiry(Some(0.2), Vec::new()).unwrap();
+
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let component = error_span!("sink", component_kind = "sink", component_id = "leaky_sink");
+        let reload = tokio::spawn(
+            with_reload_in_progress_gauge(finished, Duration::from_millis(50))
+                .instrument(component),
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(reload_in_progress_series(), vec![(Vec::new(), 1.0)]);
+
+        finish.send(()).unwrap();
+        reload.await.unwrap().unwrap();
+        assert_eq!(reload_in_progress_series(), vec![(Vec::new(), 0.0)]);
+    }
 
     fn reload_in_progress() -> Option<f64> {
         Controller::get()

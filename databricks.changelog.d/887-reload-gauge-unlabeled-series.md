@@ -1,0 +1,2 @@
+Fix `config_reload_in_progress` so it always reports on a single unlabeled series per pod. Topology building held component span guards across awaits, so the gauge's refresh during a sink build was tagged with that sink's `component_id` and left a labeled `1` series that the reset never cleared. Build awaits now use instrumented futures, and gauge writes suppress span labels.
+https://github.com/databricks-eng/vector/pull/887

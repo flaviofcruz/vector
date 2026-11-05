@@ -4,6 +4,16 @@ use vector_lib::internal_event::{InternalEvent, error_stage, error_type};
 
 use crate::{built_info, config};
 
+/// Writes `config_reload_in_progress`, which must remain one unlabeled series per pod.
+pub(crate) fn set_config_reload_in_progress(value: f64) {
+    // The metrics tracing layer copies labels from the innermost entered span, so a write made
+    // under a component span would create a labeled series that is never reset. A no-op
+    // dispatcher leaves no span to read, regardless of the caller or log filters.
+    tracing::dispatcher::with_default(&tracing::Dispatch::none(), || {
+        gauge!("config_reload_in_progress").set(value);
+    });
+}
+
 #[derive(Debug, NamedInternalEvent)]
 pub struct VectorStarted;
 
@@ -23,7 +33,7 @@ impl InternalEvent for VectorStarted {
         counter!("reloaded_total").increment(0);
         gauge!("last_config_reload_success").set(1.0);
         // Initialize reload-in-progress gauge so the series exists at first scrape.
-        gauge!("config_reload_in_progress").set(0.0);
+        set_config_reload_in_progress(0.0);
     }
 }
 

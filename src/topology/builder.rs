@@ -465,7 +465,11 @@ impl<'a> Builder<'a> {
                 schema: self.config.schema,
                 extra_context: self.extra_context.clone(),
             };
-            let source = source.inner.build(context).await;
+            // Release the span across the await: a guard held here stays current on this thread
+            // while the task is parked, leaking the span into unrelated work.
+            drop(_entered_span);
+            let source = source.inner.build(context).instrument(span.clone()).await;
+            let _entered_span = span.enter();
             let server = match source {
                 Err(error) => {
                     self.errors.push(format!("Source \"{key}\": {error}"));
@@ -615,6 +619,8 @@ impl<'a> Builder<'a> {
             let node =
                 TransformNode::from_parts(key.clone(), &context, transform, &input_definitions);
 
+            // See the source site: the guard must not be held across the await.
+            drop(_span);
             let transform = match transform
                 .inner
                 .build(&context)
@@ -627,6 +633,7 @@ impl<'a> Builder<'a> {
                 }
                 Ok(transform) => transform,
             };
+            let _span = span.enter();
 
             let metrics = ChannelMetricMetadata::new(TRANSFORM_CHANNEL_METRIC_PREFIX, None);
             let (input_tx, input_rx) = TopologyBuilder::standalone_memory(
@@ -682,17 +689,19 @@ impl<'a> Builder<'a> {
                 component_id = %key.id(),
                 component_type = %sink.inner.get_component_name(),
             );
-            let _entered_span = span.enter();
-
             // At this point, we've validated that all transforms are valid, including any
             // transform that mutates the schema provided by their sources. We can now validate the
             // schema expectations of each individual sink.
-            if let Err(mut err) = schema::validate_sink_expectations(
-                key,
-                sink,
-                self.config,
-                enrichment_tables.clone(),
-            ) {
+            //
+            // Sink setup awaits buffer and sink construction, so the span scopes only sync steps.
+            if let Err(mut err) = span.in_scope(|| {
+                schema::validate_sink_expectations(
+                    key,
+                    sink,
+                    self.config,
+                    enrichment_tables.clone(),
+                )
+            }) {
                 self.errors.append(&mut err);
             };
 
@@ -704,7 +713,7 @@ impl<'a> Builder<'a> {
                             BufferType::Memory { .. } => "memory",
                             BufferType::DiskV2 { .. } => "disk",
                         };
-                    let buffer_span = error_span!("sink", buffer_type);
+                    let buffer_span = error_span!(parent: &span, "sink", buffer_type);
                     let buffer = sink
                         .buffer
                         .build(
@@ -712,6 +721,7 @@ impl<'a> Builder<'a> {
                             key.to_string(),
                             buffer_span,
                         )
+                        .instrument(span.clone())
                         .await;
                     match buffer {
                         Err(error) => {
@@ -731,7 +741,7 @@ impl<'a> Builder<'a> {
                 self.sink_flush_signals.insert(key.clone(), flush_signal);
             }
 
-            let cx = SinkContext {
+            let cx = span.in_scope(|| SinkContext {
                 healthcheck,
                 globals: self.config.global.clone(),
                 enrichment_tables: enrichment_tables.clone(),
@@ -741,9 +751,9 @@ impl<'a> Builder<'a> {
                 app_name: crate::get_app_name().to_string(),
                 app_name_slug: crate::get_slugified_app_name(),
                 extra_context: self.extra_context.clone(),
-            };
+            });
 
-            let (sink, healthcheck) = match sink.inner.build(cx).await {
+            let (sink, healthcheck) = match sink.inner.build(cx).instrument(span.clone()).await {
                 Err(error) => {
                     self.errors.push(format!("Sink \"{key}\": {error}"));
                     continue;
@@ -755,7 +765,7 @@ impl<'a> Builder<'a> {
 
             let utilization_sender = self
                 .utilization_registry
-                .add_component(key.clone(), gauge!("utilization"));
+                .add_component(key.clone(), span.in_scope(|| gauge!("utilization")));
             let component_key = key.clone();
             let sink = async move {
                 debug!("Sink starting.");
@@ -1421,5 +1431,101 @@ mod buffer_size_tests {
         // The caller turns `None` into a startup panic; here we just assert the
         // mutually-exclusive pair is refused.
         assert_eq!(resolve_buffer_size_from(Some(42), Some(4096), 100), None);
+    }
+}
+
+#[cfg(test)]
+mod span_isolation_tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use futures::{FutureExt, StreamExt, stream::BoxStream};
+    use tokio::sync::oneshot;
+    use tracing::Span;
+    use vector_lib::{
+        config::{AcknowledgementsConfig, Input},
+        configurable::configurable_component,
+        event::Event,
+        sink::{StreamSink, VectorSink},
+    };
+
+    use super::TopologyPiecesBuilder;
+    use crate::{
+        config::{Config, ConfigDiff, SinkConfig, SinkContext},
+        sinks::Healthcheck,
+        test_util::mock::basic_source,
+    };
+
+    /// Sink whose build parks on a task that records the span current on this thread.
+    #[configurable_component(sink("test_span_probe", "Test (span probe)."))]
+    #[derive(Clone, Debug, Default)]
+    struct SpanProbeSinkConfig {
+        #[serde(skip)]
+        observed: Arc<Mutex<Option<Option<&'static str>>>>,
+    }
+
+    impl_generate_config_from_default!(SpanProbeSinkConfig);
+
+    #[async_trait]
+    #[typetag::serde(name = "test_span_probe")]
+    impl SinkConfig for SpanProbeSinkConfig {
+        async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+            let (probe_tx, probe_rx) = oneshot::channel();
+            // Tasks on a current-thread runtime share this thread's span stack, so the probe sees
+            // any span the builder left entered while this build is parked on `probe_rx`.
+            tokio::spawn(async move {
+                _ = probe_tx.send(Span::current().metadata().map(|metadata| metadata.name()));
+            });
+            let seen = probe_rx
+                .await
+                .expect("probe task sends while build is parked");
+            *self.observed.lock().unwrap() = Some(seen);
+
+            Ok((
+                VectorSink::from_event_streamsink(NullSink),
+                async { Ok(()) }.boxed(),
+            ))
+        }
+
+        fn input(&self) -> Input {
+            Input::all()
+        }
+
+        fn acknowledgements(&self) -> &AcknowledgementsConfig {
+            &AcknowledgementsConfig::DEFAULT
+        }
+    }
+
+    struct NullSink;
+
+    #[async_trait]
+    impl StreamSink<Event> for NullSink {
+        async fn run(self: Box<Self>, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
+            while input.next().await.is_some() {}
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_build_does_not_leak_span_across_await() {
+        // Spans are only tracked with a subscriber installed; without one there is nothing to leak.
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+
+        let sink = SpanProbeSinkConfig::default();
+        let observed = Arc::clone(&sink.observed);
+
+        let (_tx, source) = basic_source();
+        let mut config = Config::builder();
+        config.add_source("in", source);
+        config.add_sink("out", &["in"], sink);
+        let config = config.build().unwrap();
+        let diff = ConfigDiff::initial(&config);
+
+        TopologyPiecesBuilder::new(&config, &diff)
+            .build()
+            .await
+            .expect("pieces build");
+
+        assert_eq!(*observed.lock().unwrap(), Some(None));
     }
 }
