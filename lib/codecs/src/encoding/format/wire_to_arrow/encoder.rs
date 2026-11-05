@@ -7,10 +7,11 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use prost_reflect::MessageDescriptor;
+use prost_reflect::{DynamicMessage, MessageDescriptor};
 
 use super::builders::BuilderNodeList;
 use super::errors::{Result, WireToArrowError};
+use super::normalize::normalize_message;
 use super::plan::MessagePlan;
 use super::scan::{BuiltVariants, scan_message, validate_message};
 
@@ -20,6 +21,7 @@ use super::scan::{BuiltVariants, scan_message, validate_message};
 pub struct WireToArrowEncoder {
     plan: Arc<MessagePlan>,
     schema: Arc<Schema>,
+    descriptor: MessageDescriptor,
 }
 
 impl std::fmt::Debug for WireToArrowEncoder {
@@ -40,6 +42,7 @@ impl WireToArrowEncoder {
         Ok(Self {
             plan: Arc::new(plan),
             schema: Arc::new(schema),
+            descriptor: descriptor.clone(),
         })
     }
 
@@ -71,7 +74,32 @@ impl WireToArrowEncoder {
             // nested-struct `finalize_row` calls inside `scan_message` are
             // not reversible, so an upfront validation pass is how we
             // isolate per-row decode failures.
-            if let Err(err) = validate_message(&self.plan, msg_bytes, &mut variants) {
+            let mut validation = validate_message(&self.plan, msg_bytes, &mut variants);
+            // Singular-field merges and oneof switches are legal protobuf. Normalize only
+            // these rows before touching Arrow builders, preserving explicit scalar defaults.
+            let canonical = if matches!(
+                &validation,
+                Err(WireToArrowError::DuplicateSingularField { .. }
+                    | WireToArrowError::OneofNeedsNormalization { .. })
+            ) {
+                match DynamicMessage::decode(self.descriptor.clone(), msg_bytes.clone())
+                    .map_err(|source| WireToArrowError::ProtoMessageDecode { source })
+                    .and_then(|_| normalize_message(&self.plan, msg_bytes))
+                {
+                    Ok(bytes) => Some(Bytes::from(bytes)),
+                    Err(err) => {
+                        validation = Err(err);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(bytes) = &canonical {
+                variants.clear();
+                validation = validate_message(&self.plan, bytes, &mut variants);
+            }
+            if let Err(err) = validation {
                 dropped += 1;
                 if sample_err.is_none() {
                     sample_err = Some(err);
@@ -79,7 +107,12 @@ impl WireToArrowEncoder {
                 continue;
             }
             builders.reset_present();
-            scan_message(&self.plan, msg_bytes, &mut builders, &mut variants)?;
+            scan_message(
+                &self.plan,
+                canonical.as_ref().unwrap_or(msg_bytes),
+                &mut builders,
+                &mut variants,
+            )?;
             builders.finalize_row(&self.plan);
         }
 

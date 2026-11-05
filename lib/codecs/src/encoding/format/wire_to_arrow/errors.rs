@@ -195,12 +195,26 @@ pub enum WireToArrowError {
     /// scalars, merge for sub-messages), but the encoder appends to
     /// Arrow column builders on every occurrence, which would diverge
     /// column lengths and fail batch assembly. Surfaced from
-    /// `validate_message` so the offending row is dropped via the normal
-    /// per-row isolation path instead of poisoning the whole batch.
+    /// `validate_message` so the encoder can canonicalize the row before
+    /// touching builders, preserving protobuf last-value and merge semantics.
     #[snafu(display("duplicate singular proto field {field_number} in one message"))]
     DuplicateSingularField {
         /// The proto field number whose tag appeared more than once.
         field_number: u32,
+    },
+
+    /// Multiple occurrences within a oneof need last-member/merge normalization.
+    #[snafu(display("multiple occurrences in proto oneof at field {field_number}"))]
+    OneofNeedsNormalization {
+        /// The field whose occurrence requires oneof normalization.
+        field_number: u32,
+    },
+
+    /// Canonicalizing a row with singular-field merges found malformed wire bytes.
+    #[snafu(display("proto message wire bytes failed to decode: {source}"))]
+    ProtoMessageDecode {
+        /// The underlying error from prost-reflect's decoder.
+        source: prost_reflect::prost::DecodeError,
     },
 
     /// Arrow Map's entry struct declares more fields than the proto MapEntry

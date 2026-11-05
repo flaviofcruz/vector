@@ -176,20 +176,25 @@ pub(super) fn validate_message(
     // column-length alignment downstream in scan_message. Proto3 parsers
     // are required to accept duplicate singular tags (last-wins for
     // scalars, merge for sub-messages), but Arrow `*Builder` types don't
-    // expose retraction, so implementing last-wins would require either
-    // per-row scratch buffers or a lookahead pass. Dropping the row
-    // preserves per-row isolation; the wire_to_arrow_rows_dropped metric
-    // gives operators a signal if real producers start tripping this.
+    // expose retraction. The encoder canonicalizes these rows and validates
+    // them again before scanning, leaving ordinary rows on the direct wire path.
     //
-    // Stack-allocated for plans with <=128 slots per level (covers every
-    // realistic Arrow schema we encode); heap-allocated bitvec for wider
-    // plans. Common case is zero allocations on the hot path.
-    let mut seen_singular = SeenSingular::with_capacity(plan.slots.len());
+    // Slots and oneof groups share 128 inline bits; wider plans use a heap bitvec.
+    // Common case is zero allocations on the hot path.
+    let mut seen_singular = SeenSingular::with_capacity(plan.slots.len() + plan.oneof_count);
 
     while !bytes.is_empty() {
         let (field, rest) = try_parse_field(bytes)?;
         bytes = rest;
         let field_number = field.field_num as usize;
+
+        if let Some(&oneof) = plan.oneof_by_proto_field.get(&(field.field_num as u32))
+            && seen_singular.test_and_set(plan.slots.len() + oneof)
+        {
+            return Err(WireToArrowError::OneofNeedsNormalization {
+                field_number: field.field_num as u32,
+            });
+        }
 
         let Some(&slot_idx) = plan.slot_by_proto_field.get(field_number) else {
             continue;

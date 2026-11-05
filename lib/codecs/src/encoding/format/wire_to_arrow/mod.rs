@@ -47,6 +47,7 @@ mod append;
 mod builders;
 mod encoder;
 mod errors;
+mod normalize;
 mod plan;
 mod scan;
 mod serializer;

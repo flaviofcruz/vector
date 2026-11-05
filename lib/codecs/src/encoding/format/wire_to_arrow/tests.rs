@@ -1154,6 +1154,312 @@ fn oneof_variants_map_to_separate_columns() {
     assert_eq!(b.value(1), "hello");
 }
 
+#[test]
+fn oneof_last_scalar_member_wins_and_preserves_defaults() {
+    let enc = WireToArrowEncoder::new(
+        &oneof_descriptor(),
+        Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::LargeUtf8, true),
+        ]),
+    )
+    .unwrap();
+    let batch = enc
+        .encode_batch(&[
+            Bytes::from_static(&[0x08, 42, 0x12, 1, b'x']),
+            Bytes::from_static(&[0x12, 1, b'x', 0x08, 42]),
+            Bytes::from_static(&[0x12, 1, b'x', 0x08, 0]),
+            Bytes::from_static(&[0x08, 42, 0x12, 0]),
+        ])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 4);
+    let a = batch
+        .column(0)
+        .as_primitive::<arrow::datatypes::Int32Type>();
+    let b = batch.column(1).as_string::<i64>();
+    assert_eq!(
+        a.iter().collect::<Vec<_>>(),
+        vec![None, Some(42), Some(0), None]
+    );
+    assert_eq!(
+        b.iter().collect::<Vec<_>>(),
+        vec![Some("x"), None, None, Some("")]
+    );
+}
+
+#[test]
+fn proto3_optional_preserves_presence_without_oneof_switch_tracking() {
+    let mut file = oneof_descriptor().parent_file_descriptor_proto().clone();
+    file.syntax = Some("proto3".into());
+    file.message_type[0].field.truncate(1);
+    file.message_type[0].field[0].proto3_optional = Some(true);
+    let pool = DescriptorPool::decode(
+        FileDescriptorSet { file: vec![file] }
+            .encode_to_vec()
+            .as_slice(),
+    )
+    .unwrap();
+    let desc = pool
+        .get_message_by_name("wire_to_arrow_poc_test.Choice")
+        .unwrap();
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+    assert!(plan.oneof_by_proto_field.is_empty());
+    assert_eq!(plan.oneof_count, 0);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+    let batch = enc
+        .encode_batch(&[
+            Bytes::new(),
+            Bytes::from_static(&[0x08, 0]),
+            Bytes::from_static(&[0x08, 42, 0x08, 0]),
+        ])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(
+        batch
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![None, Some(0), Some(0)]
+    );
+}
+
+#[test]
+fn oneof_hidden_members_clear_projected_values_in_wire_order() {
+    for hidden_tag in [2, 536_870_911] {
+        let mut file = oneof_descriptor().parent_file_descriptor_proto().clone();
+        file.message_type[0].field[1].number = Some(hidden_tag);
+        let pool = DescriptorPool::decode(
+            FileDescriptorSet { file: vec![file] }
+                .encode_to_vec()
+                .as_slice(),
+        )
+        .unwrap();
+        let desc = pool
+            .get_message_by_name("wire_to_arrow_poc_test.Choice")
+            .unwrap();
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+        assert_eq!(plan.slot_by_proto_field.len(), 2);
+        let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+        let mut hidden = encode_varint_for_test(((hidden_tag as u64) << 3) | 2);
+        hidden.extend([1, b'x']);
+        let a = [0x08, 42];
+        let batch = enc
+            .encode_batch(&[
+                Bytes::from([a.as_slice(), hidden.as_slice()].concat()),
+                Bytes::from([hidden.as_slice(), a.as_slice()].concat()),
+                Bytes::from([a.as_slice(), hidden.as_slice(), &[0x08, 0]].concat()),
+            ])
+            .unwrap();
+        assert_eq!(batch.num_rows(), 3, "hidden tag {hidden_tag}");
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some(42), Some(0)],
+            "hidden tag {hidden_tag}"
+        );
+    }
+}
+
+fn message_oneof_descriptor() -> MessageDescriptor {
+    let mut file = message_variant_descriptor_with_syntax("proto3")
+        .parent_file_descriptor_proto()
+        .clone();
+    let container = &mut file.message_type[0];
+    container.field[0].oneof_index = Some(0);
+    container.field.push(FieldDescriptorProto {
+        name: Some("choice".into()),
+        number: Some(3),
+        label: Some(Label::Optional as i32),
+        r#type: Some(ProtoType::Int32 as i32),
+        oneof_index: Some(0),
+        ..Default::default()
+    });
+    container.oneof_decl.push(OneofDescriptorProto {
+        name: Some("selection".into()),
+        ..Default::default()
+    });
+    DescriptorPool::decode(
+        FileDescriptorSet { file: vec![file] }
+            .encode_to_vec()
+            .as_slice(),
+    )
+    .unwrap()
+    .get_message_by_name("wire_to_arrow_msg_variant_test.Container")
+    .unwrap()
+}
+
+#[test]
+fn oneof_message_merges_until_another_member_resets_it() {
+    let fields = ArrowFields::from(vec![
+        Field::new("k", DataType::LargeUtf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]);
+    // Exercise both a mapped and a hidden switching member.
+    for project_choice in [false, true] {
+        let mut columns = vec![Field::new("single", DataType::Struct(fields.clone()), true)];
+        if project_choice {
+            columns.push(Field::new("choice", DataType::Int32, true));
+        }
+        let enc =
+            WireToArrowEncoder::new(&message_oneof_descriptor(), Schema::new(columns)).unwrap();
+        let first = [0x0a, 3, 0x0a, 1, b'x'];
+        let second = [0x0a, 2, 0x10, 7];
+        let batch = enc
+            .encode_batch(&[
+                Bytes::from([first.as_slice(), second.as_slice()].concat()),
+                Bytes::from([first.as_slice(), &[0x18, 1], second.as_slice()].concat()),
+                // An unrelated repeated-message field does not switch the oneof.
+                Bytes::from([first.as_slice(), &[0x12, 0], second.as_slice()].concat()),
+                Bytes::from([first.as_slice(), &[0x18, 0]].concat()),
+            ])
+            .unwrap();
+        assert_eq!(batch.num_rows(), 4);
+        let single = batch.column(0).as_struct();
+        assert_eq!(
+            single
+                .column(0)
+                .as_string::<i64>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("x"), None, Some("x"), None]
+        );
+        for row in 0..3 {
+            assert!(!single.is_null(row));
+            assert!(!single.column(1).is_null(row));
+            assert_eq!(
+                single
+                    .column(1)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .value(row),
+                7
+            );
+        }
+        assert!(single.is_null(3));
+        if project_choice {
+            assert_eq!(
+                batch
+                    .column(1)
+                    .as_primitive::<arrow::datatypes::Int32Type>()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![None, None, None, Some(0)]
+            );
+        }
+    }
+}
+
+#[test]
+fn oneof_state_is_isolated_between_nested_and_repeated_messages() {
+    let mut file = message_variant_descriptor_with_syntax("proto3")
+        .parent_file_descriptor_proto()
+        .clone();
+    let kv = &mut file.message_type[1];
+    kv.field[0].oneof_index = Some(0);
+    kv.field[1].oneof_index = Some(0);
+    kv.oneof_decl.push(OneofDescriptorProto {
+        name: Some("selection".into()),
+        ..Default::default()
+    });
+    let desc = DescriptorPool::decode(
+        FileDescriptorSet { file: vec![file] }
+            .encode_to_vec()
+            .as_slice(),
+    )
+    .unwrap()
+    .get_message_by_name("wire_to_arrow_msg_variant_test.Container")
+    .unwrap();
+    let fields = ArrowFields::from(vec![
+        Field::new("k", DataType::LargeUtf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]);
+    let enc = WireToArrowEncoder::new(
+        &desc,
+        Schema::new(vec![
+            Field::new("single", DataType::Struct(fields.clone()), true),
+            Field::new(
+                "many",
+                DataType::List(Arc::new(Field::new("item", DataType::Struct(fields), true))),
+                true,
+            ),
+        ]),
+    )
+    .unwrap();
+    let batch = enc
+        .encode_batch(&[
+            Bytes::from_static(&[
+                0x0a, 3, 0x0a, 1, b'x', 0x0a, 2, 0x10, 0, 0x12, 5, 0x0a, 1, b'a', 0x10, 1, 0x12, 5,
+                0x10, 2, 0x0a, 1, b'b',
+            ]),
+            Bytes::from_static(&[0x0a, 3, 0x0a, 1, b'c']),
+        ])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    let single = batch.column(0).as_struct();
+    assert_eq!(
+        single
+            .column(0)
+            .as_string::<i64>()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![None, Some("c")]
+    );
+    assert_eq!(
+        single
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int64Type>()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(0), None]
+    );
+    let many = batch.column(1).as_list::<i32>().value(0);
+    let many = many.as_struct();
+    assert_eq!(
+        many.column(0).as_string::<i64>().iter().collect::<Vec<_>>(),
+        vec![None, Some("b")]
+    );
+    assert_eq!(
+        many.column(1)
+            .as_primitive::<arrow::datatypes::Int64Type>()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(1), None]
+    );
+}
+
+#[test]
+fn oneof_overwrites_do_not_hide_malformed_members_or_poison_neighbors() {
+    for project_b in [false, true] {
+        let mut columns = vec![Field::new("a", DataType::Int32, true)];
+        if project_b {
+            columns.push(Field::new("b", DataType::LargeUtf8, true));
+        }
+        let enc = WireToArrowEncoder::new(&oneof_descriptor(), Schema::new(columns)).unwrap();
+        let batch = enc
+            .encode_batch(&[
+                Bytes::from_static(&[0x08, 7]),
+                // Switching must validate the overwritten UTF-8, even when b is hidden.
+                Bytes::from_static(&[0x08, 1, 0x12, 1, 0xff, 0x08, 2]),
+                Bytes::from_static(&[0x08, 9]),
+            ])
+            .unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(7), Some(9)]
+        );
+    }
+}
+
 /// `message Tree { Tree next = 1; int32 leaf = 2; }` — a proto that's
 /// self-referential by construction, used to drive deep plan/scan recursion.
 fn self_referential_descriptor() -> MessageDescriptor {
@@ -1613,12 +1919,7 @@ fn encode_batch_drops_packed_scalar_eof_row() {
 }
 
 #[test]
-fn encode_batch_drops_row_with_duplicate_singular_scalar_tag() {
-    // Proto3 parsers must accept duplicate singular tags (last-wins for
-    // scalars), but the encoder appends to Arrow column builders on every
-    // occurrence, so a second tag would diverge column lengths and fail
-    // `RecordBatch::try_new`. `validate_message` detects the duplicate and
-    // drops the row before any builder is touched.
+fn encode_batch_duplicate_singular_scalar_uses_last_value() {
     let desc = scalar_descriptor();
     let schema = Schema::new(vec![
         Field::new("name", DataType::LargeUtf8, true),
@@ -1641,8 +1942,7 @@ fn encode_batch_drops_row_with_duplicate_singular_scalar_tag() {
     // Hand-rolled bytes: two occurrences of singular tag 1 (`name`, LEN).
     //   0x0a 0x03 "bob"     — first occurrence, value "bob"
     //   0x0a 0x05 "alice"   — second occurrence, value "alice"
-    // Spec says last-wins ("alice"); the encoder cannot honor that without
-    // builder retraction, so the row must be dropped via validate.
+    // Spec says last-wins ("alice").
     let dup = vec![
         0x0a, 0x03, b'b', b'o', b'b', 0x0a, 0x05, b'a', b'l', b'i', b'c', b'e',
     ];
@@ -1650,15 +1950,17 @@ fn encode_batch_drops_row_with_duplicate_singular_scalar_tag() {
     let batch = enc
         .encode_batch(&[Bytes::from(buf_a), Bytes::from(dup), Bytes::from(buf_b)])
         .expect("duplicate-tag row must not fail the batch");
-    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch.num_rows(), 3);
     let names = batch.column(0).as_string::<i64>();
     assert_eq!(names.value(0), "alice");
-    assert_eq!(names.value(1), "bob");
+    assert_eq!(names.value(1), "alice");
+    assert_eq!(names.value(2), "bob");
     let ids = batch
         .column(1)
         .as_primitive::<arrow::datatypes::Int32Type>();
     assert_eq!(ids.value(0), 1);
-    assert_eq!(ids.value(1), 2);
+    assert!(ids.is_null(1));
+    assert_eq!(ids.value(2), 2);
 }
 
 #[test]
@@ -2169,10 +2471,15 @@ fn array_of_variant_from_repeated_json_strings() {
 }
 
 /// `message Container { KV single = 1; repeated KV many = 2; }` with
-/// `message KV { string k = 1; int64 n = 2; }` — a singular and a repeated
+/// `message KV { string k = 1; int64 n = 2; repeated int32 nums = 3; }` — a singular and a repeated
 /// nested-message field, for the message-backed VARIANT path.
 fn message_variant_descriptor() -> MessageDescriptor {
+    message_variant_descriptor_with_syntax("proto2")
+}
+
+fn message_variant_descriptor_with_syntax(syntax: &str) -> MessageDescriptor {
     let fd = FileDescriptorProto {
+        syntax: Some(syntax.into()),
         name: Some("wire_to_arrow_msg_variant_test.proto".into()),
         package: Some("wire_to_arrow_msg_variant_test".into()),
         message_type: vec![
@@ -2213,6 +2520,13 @@ fn message_variant_descriptor() -> MessageDescriptor {
                         number: Some(2),
                         label: Some(Label::Optional as i32),
                         r#type: Some(ProtoType::Int64 as i32),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("nums".into()),
+                        number: Some(3),
+                        label: Some(Label::Repeated as i32),
+                        r#type: Some(ProtoType::Int32 as i32),
                         ..Default::default()
                     },
                 ],
@@ -2364,11 +2678,215 @@ fn kv_message(kv: &MessageDescriptor, k: &str, n: i64) -> DynamicMessage {
 }
 
 #[test]
+fn duplicate_proto3_scalar_preserves_explicit_defaults_in_all_columns() {
+    let desc = kv_descriptor(&message_variant_descriptor_with_syntax("proto3"));
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::LargeUtf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+    // Both rows explicitly carry empty k and zero n. The second also carries
+    // an earlier k value; normalization must preserve presence in both columns.
+    let batch = enc
+        .encode_batch(&[
+            Bytes::from_static(&[0x0a, 0x00, 0x10, 0x00]),
+            Bytes::from_static(&[0x0a, 0x01, b'x', 0x0a, 0x00, 0x10, 0x00]),
+        ])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    for row in 0..2 {
+        assert!(!batch.column(0).is_null(row));
+        assert_eq!(batch.column(0).as_string::<i64>().value(row), "");
+        assert!(!batch.column(1).is_null(row));
+        assert_eq!(
+            batch
+                .column(1)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .value(row),
+            0
+        );
+    }
+}
+
+#[test]
+fn duplicate_singular_message_preserves_nested_explicit_defaults() {
+    let desc = message_variant_descriptor_with_syntax("proto3");
+    let fields = ArrowFields::from(vec![
+        Field::new("k", DataType::LargeUtf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]);
+    let enc = WireToArrowEncoder::new(
+        &desc,
+        Schema::new(vec![Field::new("single", DataType::Struct(fields), true)]),
+    )
+    .unwrap();
+    // single { n: 11 }, single { k: "", n: 0 }.
+    let batch = enc
+        .encode_batch(&[Bytes::from_static(&[
+            0x0a, 0x02, 0x10, 0x0b, 0x0a, 0x04, 0x0a, 0x00, 0x10, 0x00,
+        ])])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let single = batch.column(0).as_struct();
+    assert!(!single.column(0).is_null(0));
+    assert_eq!(single.column(0).as_string::<i64>().value(0), "");
+    assert!(!single.column(1).is_null(0));
+    assert_eq!(
+        single
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int64Type>()
+            .value(0),
+        0
+    );
+}
+
+#[test]
+fn duplicate_singular_message_concatenates_nested_repeated_fields() {
+    let desc = message_variant_descriptor();
+    let fields = ArrowFields::from(vec![Field::new(
+        "nums",
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(
+        &desc,
+        Schema::new(vec![Field::new("single", DataType::Struct(fields), true)]),
+    )
+    .unwrap();
+    // single { nums: [1, 2] }, single { nums: [3] }.
+    let batch = enc
+        .encode_batch(&[Bytes::from_static(&[
+            0x0a, 0x04, 0x18, 0x01, 0x18, 0x02, 0x0a, 0x02, 0x18, 0x03,
+        ])])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let nums = batch
+        .column(0)
+        .as_struct()
+        .column(0)
+        .as_list::<i32>()
+        .value(0);
+    assert_eq!(
+        nums.as_primitive::<arrow::datatypes::Int32Type>()
+            .values()
+            .as_ref(),
+        &[1, 2, 3]
+    );
+}
+
+#[test]
+fn duplicate_scalar_does_not_hide_malformed_overwritten_values() {
+    let desc = kv_descriptor(&message_variant_descriptor());
+    let enc = WireToArrowEncoder::new(
+        &desc,
+        Schema::new(vec![Field::new("k", DataType::LargeUtf8, true)]),
+    )
+    .unwrap();
+    let batch = enc
+        .encode_batch(&[
+            Bytes::from_static(&[0x0a, 0x01, b'a']),
+            // The duplicate is detected before reading the invalid UTF-8.
+            // Taking only the last value would hide this malformed occurrence.
+            Bytes::from_static(&[0x0a, 0x01, b'a', 0x0a, 0x01, 0xff, 0x0a, 0x01, b'b']),
+            Bytes::from_static(&[0x0a, 0x01, b'c']),
+        ])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch.column(0).as_string::<i64>().value(0), "a");
+    assert_eq!(batch.column(0).as_string::<i64>().value(1), "c");
+}
+
+#[test]
+fn duplicate_singular_message_merges_fields_and_preserves_repeated_order() {
+    let desc = message_variant_descriptor();
+    let kv = kv_descriptor(&desc);
+    let fields = ArrowFields::from(vec![
+        Field::new("k", DataType::LargeUtf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]);
+    let schema = Schema::new(vec![
+        Field::new("single", DataType::Struct(fields.clone()), true),
+        Field::new(
+            "many",
+            DataType::List(Arc::new(Field::new("item", DataType::Struct(fields), true))),
+            true,
+        ),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+    let mut first = DynamicMessage::new(desc.clone());
+    first.set_field_by_name("single", ProtoValue::Message(kv_message(&kv, "old", 11)));
+    first.set_field_by_name(
+        "many",
+        ProtoValue::List(vec![ProtoValue::Message(kv_message(&kv, "first", 1))]),
+    );
+    let mut second = DynamicMessage::new(desc);
+    second.set_field_by_name("single", ProtoValue::Message(kv_message(&kv, "new", 0)));
+    second.set_field_by_name(
+        "many",
+        ProtoValue::List(vec![ProtoValue::Message(kv_message(&kv, "second", 2))]),
+    );
+    let mut wire = encode_message(&first);
+    wire.extend(encode_message(&second));
+
+    let batch = enc.encode_batch(&[Bytes::from(wire)]).unwrap();
+
+    assert_eq!(batch.num_rows(), 1);
+    let single = batch.column(0).as_struct();
+    assert_eq!(single.column(0).as_string::<i64>().value(0), "new");
+    assert_eq!(
+        single
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int64Type>()
+            .value(0),
+        11
+    );
+    let many = batch.column(1).as_list::<i32>().value(0);
+    let many = many.as_struct();
+    assert_eq!(many.len(), 2);
+    assert_eq!(many.column(0).as_string::<i64>().value(0), "first");
+    assert_eq!(many.column(0).as_string::<i64>().value(1), "second");
+}
+
+#[test]
+fn duplicate_variant_message_merges_without_leaking_prevalidation_values() {
+    let desc = message_variant_descriptor();
+    let kv = kv_descriptor(&desc);
+    let enc =
+        WireToArrowEncoder::new(&desc, Schema::new(vec![variant_arrow_field("single")])).unwrap();
+    let single = |k: &str, n: i64| {
+        let mut message = DynamicMessage::new(desc.clone());
+        message.set_field_by_name("single", ProtoValue::Message(kv_message(&kv, k, n)));
+        encode_message(&message)
+    };
+    let mut duplicate = single("old", 11);
+    duplicate.extend(single("new", 0));
+
+    let batch = enc
+        .encode_batch(&[
+            Bytes::from(single("first", 1)),
+            Bytes::from(duplicate),
+            Bytes::from(single("last", 3)),
+        ])
+        .unwrap();
+
+    assert_eq!(batch.num_rows(), 3);
+    for (row, expected) in [
+        serde_json::json!({"k": "first", "n": 1}),
+        serde_json::json!({"k": "new", "n": 11}),
+        serde_json::json!({"k": "last", "n": 3}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(decode_variant_wire(batch.column(0), row), expected);
+    }
+}
+
+#[test]
 fn variant_row_dropped_after_its_variant_was_built_does_not_leak() {
     // The pre-pass builds a row's VARIANT values before the row can still be
-    // dropped by a later field. Here the bad row's first `single` validates and
-    // is built, then its second `single` drops the row as a duplicate singular
-    // tag. The next row must read its own value, not the dropped row's.
+    // dropped by a later field. The duplicate `single` has a truncated value,
+    // so canonicalization fails. The next row must read its own value.
     let desc = message_variant_descriptor();
     let kv = kv_descriptor(&desc);
     let schema = Schema::new(vec![variant_arrow_field("single")]);
@@ -2379,9 +2897,9 @@ fn variant_row_dropped_after_its_variant_was_built_does_not_leak() {
         msg.set_field_by_name("single", ProtoValue::Message(kv_message(&kv, k, 0)));
         encode_message(&msg)
     };
-    // Concatenated encodings repeat the `single` tag on the wire.
+    // Repeat `single` with a truncated nested varint.
     let mut bad = single("dropped");
-    bad.extend(single("dropped-again"));
+    bad.extend([0x0a, 0x01, 0x08]);
 
     let batch = enc
         .encode_batch(&[

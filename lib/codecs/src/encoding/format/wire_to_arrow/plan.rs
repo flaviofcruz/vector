@@ -3,7 +3,7 @@
 //!
 //! Built once per (proto descriptor, Arrow schema) pair. Immutable after build.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow::datatypes::{DataType, Fields, TimeUnit};
 use prost_reflect::{Cardinality, EnumDescriptor, Kind, MessageDescriptor};
@@ -221,6 +221,9 @@ pub struct MessagePlan {
     /// [`SLOT_UNKNOWN`] marking unknown / out-of-range fields. Dense vector,
     /// no hashing on the hot path.
     pub(crate) slot_by_proto_field: Vec<u32>,
+    /// Includes unprojected siblings, which still clear a projected oneof member.
+    pub(crate) oneof_by_proto_field: BTreeMap<u32, usize>,
+    pub(crate) oneof_count: usize,
     /// Arrow `Fields` at this level, kept for assembly of `StructArray` / `ListArray`.
     pub(crate) arrow_fields: Fields,
     /// True if this plan describes the entry sub-message of a `map<K, V>`
@@ -261,12 +264,9 @@ impl MessagePlan {
     ///
     /// # Oneof
     ///
-    /// Proto `oneof` is purely an annotation; on the wire each variant is a
-    /// normal singular field with its own tag, and the receiver takes
-    /// whichever variant appeared last in the bytes. No special handling is
-    /// needed at the plan level — each variant becomes its own `PlanSlot`
-    /// (Scalar / Struct / etc.) and the normal "absent slot => null"
-    /// machinery produces the correct Arrow output.
+    /// Each member gets its own Arrow slot, but only the last member on the
+    /// wire remains present. Track siblings even when they have no Arrow column
+    /// so validation can request normalization before any builder is mutated.
     pub fn build(descriptor: &MessageDescriptor, fields: &Fields) -> Result<Self> {
         Self::build_at_depth(descriptor, fields, 0, /* inside_map_entry */ false)
     }
@@ -607,6 +607,26 @@ impl MessagePlan {
             }
         }
 
+        let mut oneof_by_proto_field = BTreeMap::new();
+        let mut oneof_count = 0;
+        for oneof in descriptor.oneofs() {
+            // Synthetic proto3 optional groups need only singular-field tracking.
+            if oneof.fields().len() < 2 {
+                continue;
+            }
+            if !oneof.fields().any(|field| {
+                slot_by_proto_field
+                    .get(field.number() as usize)
+                    .is_some_and(|slot| *slot != SLOT_UNKNOWN)
+            }) {
+                continue;
+            }
+            for field in oneof.fields() {
+                oneof_by_proto_field.insert(field.number(), oneof_count);
+            }
+            oneof_count += 1;
+        }
+
         // Opposite-direction drift: proto fields the Arrow schema doesn't
         // carry. These would be silently skipped at scan time (matching
         // proto's standard "ignore unknown fields" behavior), but if the
@@ -643,6 +663,8 @@ impl MessagePlan {
         Ok(MessagePlan {
             slots,
             slot_by_proto_field,
+            oneof_by_proto_field,
+            oneof_count,
             arrow_fields: fields.clone(),
             inside_map_entry,
         })
@@ -694,6 +716,8 @@ impl MessagePlan {
         MessagePlan {
             slots,
             slot_by_proto_field: Vec::new(),
+            oneof_by_proto_field: BTreeMap::new(),
+            oneof_count: 0,
             arrow_fields: fields.clone(),
             inside_map_entry: false,
         }

@@ -1,0 +1,2 @@
+Preserve valid rows with duplicate singular protobuf fields and oneof switches in the wire-to-Arrow encoder by applying scalar last-value, nested-message merge and last-oneof-member semantics, including unprojected siblings, while retaining explicit scalar defaults and repeated-field order. Malformed rows remain isolated from the rest of the batch.
+https://github.com/databricks-eng/vector/pull/878
