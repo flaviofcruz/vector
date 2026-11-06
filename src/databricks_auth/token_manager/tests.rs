@@ -9,7 +9,7 @@ use prost_reflect::{
 use super::cache::CachedPrincipalContext;
 use super::config::{
     LoginServiceAuthConfig, LoginServiceConfig, MIN_TOKEN_VALIDITY, ServiceTlsConfig,
-    TOKEN_REFRESH_THRESHOLD, UcPermissionEntry, UserAuthInfo,
+    TOKEN_REFRESH_THRESHOLD, UserAuthInfo,
 };
 use super::error::TokenManagerError;
 use super::request::{PrincipalContextRequestKind, build_request_message};
@@ -44,13 +44,14 @@ fn get_message(name: &str) -> MessageDescriptor {
         .unwrap_or_else(|| panic!("{name} in principal-context descriptor set"))
 }
 
-fn cfg(workspace_id: i64, perms: Vec<UcPermissionEntry>) -> LoginServiceAuthConfig {
+fn cfg(workspace_id: i64) -> LoginServiceAuthConfig {
     LoginServiceAuthConfig {
         user: UserAuthInfo {
             workspace_id,
             service_principal_resource: "accounts/u/apps".into(),
             service_principal_type: 3,
-            uc_permissions: perms,
+            uc_read_operation: "ucread".into(),
+            zerobus_write_operation: "zerobuswrite".into(),
         },
         login_service: LoginServiceConfig {
             login_endpoint: "https://login:443".into(),
@@ -69,6 +70,8 @@ fn cfg(workspace_id: i64, perms: Vec<UcPermissionEntry>) -> LoginServiceAuthConf
     }
 }
 
+const TABLE: &str = "main.eng_hydra.pod_prime_raw";
+
 fn request_descriptor() -> MessageDescriptor {
     get_message("databricks.identity.PrincipalContextRequest")
 }
@@ -83,7 +86,8 @@ fn response_descriptor() -> MessageDescriptor {
 fn build_request_sets_workspace_scope_oneof() {
     let request_desc = request_descriptor();
     let msg = build_request_message(
-        &cfg(848_677_326_595_393, vec![]),
+        &cfg(848_677_326_595_393),
+        TABLE,
         &request_desc,
         PrincipalContextRequestKind::ServicePrincipal,
     )
@@ -105,7 +109,8 @@ fn build_request_sets_workspace_scope_oneof() {
 fn build_request_sets_service_method_oneof() {
     let request_desc = request_descriptor();
     let msg = build_request_message(
-        &cfg(1, vec![]),
+        &cfg(1),
+        TABLE,
         &request_desc,
         PrincipalContextRequestKind::ServicePrincipal,
     )
@@ -138,143 +143,107 @@ fn build_request_sets_service_method_oneof() {
     }
 }
 
-#[test]
-fn build_request_emits_one_uc_permission_per_entry() {
-    let perms = vec![
-        UcPermissionEntry {
-            privileges: vec!["USE_CATALOG".into()],
-            securable_type: "CATALOG".into(),
-            full_name: "main".into(),
-        },
-        UcPermissionEntry {
-            privileges: vec!["USE_SCHEMA".into()],
-            securable_type: "SCHEMA".into(),
-            full_name: "main.default".into(),
-        },
-        UcPermissionEntry {
-            privileges: vec!["SELECT".into(), "MODIFY".into()],
-            securable_type: "TABLE".into(),
-            full_name: "main.default.otel_logs".into(),
-        },
-    ];
-    let request_desc = request_descriptor();
-    let msg = build_request_message(
-        &cfg(1, perms),
-        &request_desc,
-        PrincipalContextRequestKind::ServicePrincipal,
-    )
-    .unwrap();
+fn table_binding_of(msg: &DynamicMessage) -> (String, String) {
+    let Value::Message(authz) = &*msg.get_field_by_name("authorization").unwrap() else {
+        panic!("expected authorization message");
+    };
+    let Value::Message(op_req) = &*authz
+        .get_field_by_name("ssp_authorization_operation_request")
+        .unwrap()
+    else {
+        panic!("expected operation request message");
+    };
+    let Value::List(bindings) = &*op_req.get_field_by_name("bindings").unwrap() else {
+        panic!("expected bindings list");
+    };
+    assert_eq!(bindings.len(), 1);
+    let Value::Message(entry) = &bindings[0] else {
+        panic!("expected binding entry message");
+    };
+    let text = |field: &str| match &*entry.get_field_by_name(field).unwrap() {
+        Value::String(s) => s.clone(),
+        other => panic!("expected {field} String, got {other:?}"),
+    };
+    (text("name"), text("single"))
+}
 
-    let authz = msg.get_field_by_name("authorization").unwrap();
-    let authz_msg = match &*authz {
+fn operation_of(msg: &DynamicMessage) -> String {
+    let authz = match &*msg.get_field_by_name("authorization").unwrap() {
         Value::Message(m) => m.clone(),
-        _ => panic!(),
+        other => panic!("expected authorization message, got {:?}", other),
     };
-    let constraint = authz_msg
-        .get_field_by_name("authorization_constraint")
-        .unwrap();
-    let constraint_msg = match &*constraint {
+    let op_req = match &*authz
+        .get_field_by_name("ssp_authorization_operation_request")
+        .unwrap()
+    {
         Value::Message(m) => m.clone(),
-        _ => panic!(),
+        other => panic!("expected operation request message, got {:?}", other),
     };
-    let uc_pc = constraint_msg
-        .get_field_by_name("uc_permission_constraint")
-        .unwrap();
-    let uc_pc_msg = match &*uc_pc {
-        Value::Message(m) => m.clone(),
-        _ => panic!(),
-    };
-    let perms_field = uc_pc_msg
-        .get_field_by_name("uc_securable_permission")
-        .unwrap();
-    let perm_list = match &*perms_field {
-        Value::List(l) => l.clone(),
-        other => panic!("expected list, got {:?}", other),
-    };
-    assert_eq!(perm_list.len(), 3);
-
-    // first entry
-    let first = match &perm_list[0] {
-        Value::Message(m) => m.clone(),
-        _ => panic!(),
-    };
-    let privileges = first.get_field_by_name("privileges").unwrap();
-    match &*privileges {
-        Value::List(l) => {
-            assert_eq!(l.len(), 1);
-            match &l[0] {
-                Value::String(s) => assert_eq!(s, "USE_CATALOG"),
-                _ => panic!(),
-            }
-        }
-        _ => panic!(),
-    }
-
-    // last entry: SELECT + MODIFY on the otel_logs table
-    let last = match &perm_list[2] {
-        Value::Message(m) => m.clone(),
-        _ => panic!(),
-    };
-    let privileges = last.get_field_by_name("privileges").unwrap();
-    match &*privileges {
-        Value::List(l) => {
-            assert_eq!(l.len(), 2);
-            let names: Vec<String> = l
-                .iter()
-                .map(|v| match v {
-                    Value::String(s) => s.clone(),
-                    _ => String::new(),
-                })
-                .collect();
-            assert_eq!(names, vec!["SELECT".to_string(), "MODIFY".to_string()]);
-        }
-        _ => panic!(),
-    }
-    let sec_ref = last.get_field_by_name("securable_reference").unwrap();
-    let sec_ref_msg = match &*sec_ref {
-        Value::Message(m) => m.clone(),
-        _ => panic!(),
-    };
-    let full_name = sec_ref_msg.get_field_by_name("full_name").unwrap();
-    match &*full_name {
-        Value::String(s) => assert_eq!(s, "main.default.otel_logs"),
-        _ => panic!(),
+    match &*op_req.get_field_by_name("operation").unwrap() {
+        Value::String(s) => s.clone(),
+        other => panic!("expected operation String, got {:?}", other),
     }
 }
 
 #[test]
-fn build_request_with_no_uc_permissions_omits_uc_permission_constraint() {
-    let request_desc = request_descriptor();
+fn service_principal_request_asks_for_the_uc_read_operation_only() {
     let msg = build_request_message(
-        &cfg(1, vec![]),
-        &request_desc,
+        &cfg(1),
+        TABLE,
+        &request_descriptor(),
         PrincipalContextRequestKind::ServicePrincipal,
     )
     .unwrap();
 
-    // authorization is set, with an (empty) authorization_constraint, but no
-    // uc_permission_constraint nested inside.
-    let authz = msg.get_field_by_name("authorization").unwrap();
-    let authz_msg = match &*authz {
+    assert_eq!(operation_of(&msg), "ucread");
+    assert_eq!(
+        table_binding_of(&msg),
+        ("tableFullName".into(), TABLE.into())
+    );
+    let authz = match &*msg.get_field_by_name("authorization").unwrap() {
         Value::Message(m) => m.clone(),
         _ => panic!(),
     };
-    let constraint = authz_msg
+    let constraint_field = authz
+        .descriptor()
         .get_field_by_name("authorization_constraint")
         .unwrap();
-    let constraint_msg = match &*constraint {
-        Value::Message(m) => m.clone(),
-        _ => panic!(),
-    };
-    // Field not set on the underlying message → has_field returns false.
-    let uc_pc_field = constraint_msg
-        .descriptor()
-        .get_field_by_name("uc_permission_constraint")
-        .expect("uc_permission_constraint field");
     assert!(
-        !constraint_msg.has_field(&uc_pc_field),
-        "uc_permission_constraint should not be set when uc_permissions is empty"
+        !authz.has_field(&constraint_field),
+        "a raw authorization_constraint would bypass the SSP policy"
     );
+}
+
+#[test]
+fn dp_auth_token_request_asks_for_the_zerobus_write_operation() {
+    let msg = build_request_message(
+        &cfg(1),
+        TABLE,
+        &request_descriptor(),
+        PrincipalContextRequestKind::DpAuthToken {
+            allowed_service_principal_resource_path: "workspaces/1/zerobusDirectWriteApi".into(),
+            metastore_id: "metastore-1".into(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(operation_of(&msg), "zerobuswrite");
+    assert_eq!(
+        table_binding_of(&msg),
+        ("tableFullName".into(), TABLE.into())
+    );
+}
+
+#[test]
+fn operations_default_when_omitted_from_config() {
+    let user: UserAuthInfo = serde_json::from_value(serde_json::json!({
+        "workspace_id": 1,
+        "service_principal_resource": "accounts/u/apps",
+    }))
+    .unwrap();
+
+    assert_eq!(user.uc_read_operation, "ucread");
+    assert_eq!(user.zerobus_write_operation, "zerobuswrite");
 }
 
 // ---- gRPC framing tests ----
@@ -459,10 +428,11 @@ fn unix_now() -> i64 {
 
 #[test]
 fn service_principal_request_omits_dp_auth_token_config_even_with_ssp_override() {
-    let mut config = cfg(1, vec![]);
+    let mut config = cfg(1);
     config.zerobus_ssp_resource_path = Some("workspaces/1/custom".into());
     let msg = build_request_message(
         &config,
+        TABLE,
         &request_descriptor(),
         PrincipalContextRequestKind::ServicePrincipal,
     )
@@ -472,9 +442,10 @@ fn service_principal_request_omits_dp_auth_token_config_even_with_ssp_override()
 
 #[test]
 fn dp_auth_token_request_sets_legacy_type_metastore_and_default_ssp_path() {
-    let config = cfg(42, vec![]);
+    let config = cfg(42);
     let msg = build_request_message(
         &config,
+        TABLE,
         &request_descriptor(),
         PrincipalContextRequestKind::dp_auth_token(&config),
     )
@@ -506,10 +477,11 @@ fn dp_auth_token_request_sets_legacy_type_metastore_and_default_ssp_path() {
 
 #[test]
 fn dp_auth_token_request_honors_ssp_path_override() {
-    let mut config = cfg(42, vec![]);
+    let mut config = cfg(42);
     config.zerobus_ssp_resource_path = Some("workspaces/42/custom".into());
     let msg = build_request_message(
         &config,
+        TABLE,
         &request_descriptor(),
         PrincipalContextRequestKind::dp_auth_token(&config),
     )
@@ -734,7 +706,7 @@ async fn login_and_uc_transport_uses_shared_tls_and_negotiates_h2() {
                 .await
                 .unwrap();
         });
-        let mut auth = cfg(1, vec![]);
+        let mut auth = cfg(1);
         auth.tls.crt_file = format!(
             "{}/tests/data/ca/intermediate_client/certs/localhost-chain.cert.pem",
             env!("CARGO_MANIFEST_DIR")

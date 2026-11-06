@@ -1,0 +1,2 @@
+Replace the `databricks_zerobus` Login auth `auth.user.uc_permissions` list with `auth.user.uc_read_operation` (default `ucread`) and `auth.user.zerobus_write_operation` (default `zerobuswrite`). Vector now sends a named `sspAuthorizationOperationRequest` so Login resolves the UC permissions from the SSP policy instead of accepting a raw constraint, binding the sink's `table_name` as `tableFullName`. Breaking config change.
+https://github.com/databricks-eng/vector/pull/897

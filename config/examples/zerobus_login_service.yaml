@@ -1,47 +1,29 @@
-# End-to-end test config for the databricks_zerobus sink with login_service auth.
+# Example config for the databricks_zerobus sink with login_service auth, as used by
+# vector-aggregator-metrics (VAM) to append pod metrics to main.eng_hydra.pod_prime_raw.
 #
-# Mints a JWT against the Databricks Login service via mTLS (s2s-proxy path),
-# then feeds records into Zerobus → Shinkansen → UC table. Used by the
-# bricklens-agent dblet to write OTel logs/metrics/traces into Unity Catalog.
+# Vector mints two principal contexts from Login via mTLS, each by requesting a named
+# operation from the VAM SSP policy (VectorAggregatorMetricsAuthzPolicy in universe):
+# `ucread` for the Unity Catalog schema fetch and `zerobuswrite` for Zerobus ingestion.
+# The sink's `table_name` is sent as the policy's `tableFullName` binding.
 #
-# This config is intended to run from inside a dev nimbus pod
-# (bricklens-agent-nimbus-* on dev-aws-uw2-s1-*) where the dbts2 UWI cert is
-# mounted at /databricks-infra/dbts2/creds.combined.pem.
-#
-# Replace ${WORKSPACE_ID} with the workspace ID encoded in the pod's UWI cert
-# SAN (OID 1.3.6.1.4.1.42.113.1). For dev pod bricklens-agent-nimbus-4b4p5 on
-# dev-aws-uw2-s1-0-z0ijvk this was 3481107950761530.
-#
-# See bricklens/.claude/skills/bricklens-zerobus-auth/SKILL.md (universe) for
-# the operational background.
+# Replace the ${...} placeholders with the target region's values. The SSP is only issued
+# for the allowlisted logfood accounts.
 
 sources:
-  demo_otel_logs:
+  demo_pod_metrics:
     type: demo_logs
     format: shuffle
     lines:
-      - '{"resource_attributes":{},"severity_text":"INFO","body":"hello from vector"}'
+      - '{"name":"example_metric","value":1}'
     sequence: true
     interval_secs: 5
-
-transforms:
-  shape_otel_log:
-    type: remap
-    inputs: [demo_otel_logs]
-    source: |
-      .observed_timestamp = now() |> to_unix_timestamp_nanos!()
-      .timestamp_nanos = .observed_timestamp
-      .severity_number = 9
-      .body_text = parse_json!(.message).body
-      .resource_attributes_json = "{}"
-      del(.message)
 
 sinks:
   zerobus:
     type: databricks_zerobus
-    inputs: [shape_otel_log]
-    table_name: main.default.otel_logs
-    ingestion_endpoint: "https://${WORKSPACE_ID}.zerobus.us-west-2.dev.databricks.com"
+    inputs: [demo_pod_metrics]
+    table_name: main.eng_hydra.pod_prime_raw
+    ingestion_endpoint: "${ZEROBUS_INGESTION_ENDPOINT}"
     # Optional: override ingestion SNI and the certificate DNS name checked by the SDK.
     # ingestion_domain_name: "regional-dp-apiproxy.service"
     unity_catalog_endpoint: "${UNITY_CATALOG_ENDPOINT}"
@@ -57,24 +39,11 @@ sinks:
       # Per-customer identity used when minting the principal context (UserAuthInfo).
       user:
         workspace_id: ${WORKSPACE_ID}
-        service_principal_resource: "accounts/0829fba4-55f5-4fef-9850-00f15b1a3d73/apps"
+        service_principal_resource: "accounts/${ACCOUNT_ID}/vector-aggregator-metrics"
         # service_principal_type defaults to SYSTEM (3); override only if needed.
-        uc_permissions:
-          - privileges: [USE_CATALOG]
-            securable_type: CATALOG
-            full_name: main
-          - privileges: [USE_SCHEMA]
-            securable_type: SCHEMA
-            full_name: main.default
-          - privileges: [SELECT, MODIFY]
-            securable_type: TABLE
-            full_name: main.default.otel_logs
-          - privileges: [SELECT, MODIFY]
-            securable_type: TABLE
-            full_name: main.default.otel_metrics
-          - privileges: [SELECT, MODIFY]
-            securable_type: TABLE
-            full_name: main.default.otel_spans
+        # Policy operations Login resolves into UC permissions; these are the defaults.
+        uc_read_operation: ucread
+        zerobus_write_operation: zerobuswrite
       # Shared by Login, internal Unity Catalog, and Zerobus ingestion.
       tls:
         crt_file: "/databricks-infra/dbts2/creds.combined.pem"
@@ -84,11 +53,11 @@ sinks:
         # Applies to Login and UC only; Zerobus always verifies its server name.
         verify_hostname: false
       login_service:
-        login_endpoint: "https://login-service-bricklens.privileged.dev.dbns.databricks.com:443"
-        login_server_name: "login-service-bricklens.privileged.dev.dbns.databricks.com"
+        login_endpoint: "${LOGIN_ENDPOINT}"
+        login_server_name: "${LOGIN_SERVER_NAME}"
         # FileDescriptorSet covering Login's PrincipalContextService. Built once from
         # universe protos (common/principal-context/api/proto/service.proto, with
-        # --include_imports) and mounted into the agent container alongside otel_logs.desc.
+        # --include_imports) and mounted into the container.
         proto_descriptor_path: "/etc/vector/principal_context_service.pb"
       unity_catalog:
         proto_descriptor_path: "/etc/vector/managed_catalog_service.pb"

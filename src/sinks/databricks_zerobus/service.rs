@@ -454,11 +454,11 @@ impl ZerobusService {
         // no snapshot of the proto via build-time codegen. See databricks_auth::TokenManager.
         let token_manager = match &config.auth {
             super::config::DatabricksAuthentication::LoginService(auth_config) => {
-                let tm = TokenManager::new(auth_config.clone()).await.map_err(|e| {
-                    ZerobusSinkError::ConfigError {
+                let tm = TokenManager::new(auth_config.clone(), config.table_name.clone())
+                    .await
+                    .map_err(|e| ZerobusSinkError::ConfigError {
                         message: format!("Failed to initialize TokenManager: {}", e),
-                    }
-                })?;
+                    })?;
                 Some(Arc::new(tm))
             }
             _ => None,

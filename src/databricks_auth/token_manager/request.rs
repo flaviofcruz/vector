@@ -5,6 +5,9 @@ use snafu::ResultExt;
 use super::config::{LoginServiceAuthConfig, SIGNED_PRINCIPAL_CONTEXT_TYPE};
 use super::error::{BuildRequestSnafu, TokenManagerError};
 
+/// Variable the SSP policy binds to the target table's full name.
+const TABLE_FULL_NAME_BINDING: &str = "tableFullName";
+
 pub(super) enum PrincipalContextRequestKind {
     ServicePrincipal,
     DpAuthToken {
@@ -46,28 +49,13 @@ impl PrincipalContextRequestKind {
 /// pool without an actual `TokenManager`.
 pub(super) fn build_request_message(
     config: &LoginServiceAuthConfig,
+    table_name: &str,
     request_desc: &MessageDescriptor,
     kind: PrincipalContextRequestKind,
 ) -> Result<DynamicMessage, TokenManagerError> {
-    let uc_securable_permission: Vec<_> = config
-        .user
-        .uc_permissions
-        .iter()
-        .map(|p| {
-            json!({
-                "privileges": &p.privileges,
-                "securableReference": {
-                    "type": &p.securable_type,
-                    "fullName": &p.full_name,
-                },
-            })
-        })
-        .collect();
-
-    let authorization_constraint = if uc_securable_permission.is_empty() {
-        json!({})
-    } else {
-        json!({ "ucPermissionConstraint": { "ucSecurablePermission": uc_securable_permission } })
+    let operation = match &kind {
+        PrincipalContextRequestKind::ServicePrincipal => &config.user.uc_read_operation,
+        PrincipalContextRequestKind::DpAuthToken { .. } => &config.user.zerobus_write_operation,
     };
 
     let mut request = json!({
@@ -78,7 +66,12 @@ pub(super) fn build_request_message(
                 "servicePrincipalResource": &config.user.service_principal_resource,
             },
         },
-        "authorization": { "authorizationConstraint": authorization_constraint },
+        "authorization": {
+            "sspAuthorizationOperationRequest": {
+                "operation": operation,
+                "bindings": [{ "name": TABLE_FULL_NAME_BINDING, "single": table_name }],
+            },
+        },
     });
     if let PrincipalContextRequestKind::DpAuthToken {
         allowed_service_principal_resource_path,

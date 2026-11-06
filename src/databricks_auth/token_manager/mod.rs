@@ -15,8 +15,8 @@ mod transport;
 
 pub(crate) use config::SIGNED_PRINCIPAL_CONTEXT_HEADER;
 pub use config::{
-    LoginServiceAuthConfig, LoginServiceConfig, ServiceTlsConfig, UcPermissionEntry,
-    UnityCatalogServiceConfig, UserAuthInfo,
+    LoginServiceAuthConfig, LoginServiceConfig, ServiceTlsConfig, UnityCatalogServiceConfig,
+    UserAuthInfo,
 };
 pub use error::TokenManagerError;
 pub use manager::TokenManager;

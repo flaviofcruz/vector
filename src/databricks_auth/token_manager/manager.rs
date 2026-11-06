@@ -41,6 +41,7 @@ pub(crate) struct PrincipalContextMetadata {
 /// and a legacy signed DP auth token for Zerobus.
 pub struct TokenManager {
     config: LoginServiceAuthConfig,
+    table_name: String,
     method: MethodDescriptor,
     client: GrpcHttpClient,
     endpoint: Uri,
@@ -59,7 +60,10 @@ impl TokenManager {
     /// identity-independent and could in principle be shared if a process ever ran many
     /// LoginService sinks, but that is a one-time startup cost (not per-request) and not worth
     /// optimizing while only a single sink is configured.
-    pub async fn new(config: LoginServiceAuthConfig) -> Result<Self, TokenManagerError> {
+    pub async fn new(
+        config: LoginServiceAuthConfig,
+        table_name: String,
+    ) -> Result<Self, TokenManagerError> {
         let pool = load_descriptor_pool(&config.login_service.proto_descriptor_path).await?;
         let svc = pool.get_service_by_name(PC_SERVICE_NAME).ok_or_else(|| {
             TokenManagerError::ServiceNotFound {
@@ -89,6 +93,7 @@ impl TokenManager {
 
         Ok(Self {
             config,
+            table_name,
             method,
             client,
             endpoint,
@@ -164,7 +169,8 @@ impl TokenManager {
         &self,
         kind: PrincipalContextRequestKind,
     ) -> Result<DynamicMessage, TokenManagerError> {
-        let request_msg = build_request_message(&self.config, &self.method.input(), kind)?;
+        let request_msg =
+            build_request_message(&self.config, &self.table_name, &self.method.input(), kind)?;
         grpc_unary_call(
             &self.client,
             grpc_method_uri(&self.endpoint, &self.method)?,

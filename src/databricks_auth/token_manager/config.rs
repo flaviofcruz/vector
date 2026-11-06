@@ -4,8 +4,8 @@
 //!
 //! A parallel implementation of this auth module exists in
 //! `bricklens/bricklens-ingest-external/src/databricks_auth/` in universe.
-//! The identity structs (`UserAuthInfo`, `UcPermissionEntry`)
-//! are intentionally kept in sync, but some fields differ for architectural
+//! The identity struct (`UserAuthInfo`)
+//! is intentionally kept in sync, but some fields differ for architectural
 //! reasons — vector is config-file driven so `LoginServiceConfig` carries
 //! `login_endpoint`, `login_server_name`, and `proto_descriptor_path`,
 //! while TLS is shared under `auth.tls`. The universe side derives connections from
@@ -57,24 +57,6 @@ pub(super) const MIN_TOKEN_VALIDITY: Duration = Duration::from_secs(60);
 /// enum and its `as i32` cast, matching `bricklens-ingest-external/src/databricks_auth/config.rs`.
 pub(super) const SERVICE_PRINCIPAL_TYPE_SYSTEM: i32 = 3;
 
-/// One UC permission entry: a set of privileges on a single securable.
-///
-/// The bricklens-agent flow currently sends 5 entries (USE_CATALOG on the catalog,
-/// USE_SCHEMA on the schema, SELECT+MODIFY on each of the 3 otel tables) per the
-/// apps SSP `ManageOtelTables` policy.
-#[configurable_component]
-#[derive(Clone, Debug)]
-pub struct UcPermissionEntry {
-    /// UC privilege names (e.g., `USE_CATALOG`, `USE_SCHEMA`, `SELECT`, `MODIFY`).
-    pub privileges: Vec<String>,
-
-    /// Securable type: `CATALOG` | `SCHEMA` | `TABLE`.
-    pub securable_type: String,
-
-    /// Full name of the securable (e.g., `main.default.otel_logs`).
-    pub full_name: String,
-}
-
 /// Per-customer identity for the Login `CreatePrincipalContext` request.
 ///
 /// Mirrors `bricklens-ingest-external/src/databricks_auth/config.rs::UserAuthInfo`
@@ -99,9 +81,15 @@ pub struct UserAuthInfo {
     #[serde(default = "default_sp_type")]
     pub service_principal_type: i32,
 
-    /// UC permission entries to include in `AuthorizationConstraint`.
-    #[serde(default)]
-    pub uc_permissions: Vec<UcPermissionEntry>,
+    /// SSP authorization-policy operation Login resolves into the UC permissions for the
+    /// service-principal context used for Unity Catalog reads.
+    #[serde(default = "default_uc_read_operation")]
+    pub uc_read_operation: String,
+
+    /// SSP authorization-policy operation Login resolves into the UC permissions and
+    /// operation constraint for the signed context Zerobus verifies on writes.
+    #[serde(default = "default_zerobus_write_operation")]
+    pub zerobus_write_operation: String,
 }
 
 /// Connection parameters for the Login service.
@@ -191,6 +179,17 @@ pub struct UnityCatalogServiceConfig {
 
 const fn default_verify_hostname() -> bool {
     true
+}
+
+const DEFAULT_UC_READ_OPERATION: &str = "ucread";
+const DEFAULT_ZEROBUS_WRITE_OPERATION: &str = "zerobuswrite";
+
+fn default_uc_read_operation() -> String {
+    DEFAULT_UC_READ_OPERATION.into()
+}
+
+fn default_zerobus_write_operation() -> String {
+    DEFAULT_ZEROBUS_WRITE_OPERATION.into()
 }
 
 const fn default_sp_type() -> i32 {

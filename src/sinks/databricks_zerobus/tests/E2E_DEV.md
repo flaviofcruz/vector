@@ -79,12 +79,6 @@ gzip -1 -k /tmp/vector.yaml
 POD=... CTX=... SRC_GZ=/tmp/vector.yaml.gz DST=/tmp/vector.yaml \
   /tmp/stream_to_pod.sh
 
-# Table schema descriptor (matching the target UC table exactly)
-gzip -1 -k /tmp/test_otel_logs.desc
-POD=... CTX=... SRC_GZ=/tmp/test_otel_logs.desc.gz DST=/tmp/test_otel_logs.desc \
-  /tmp/stream_to_pod.sh
-```
-
 If COPY_DONE doesn't appear, kill orphan decoder processes (they hold `/tmp/<dst>`
 open and block re-streams):
 
@@ -160,65 +154,50 @@ sources:
     sequence: true
     interval_secs: 5
 
-transforms:
-  shape:
-    type: remap
-    inputs: [one_shot]
-    source: |
-      .timestamp = to_unix_timestamp(now(), unit: "nanoseconds")
-      .body = "test event"
-      del(.message)
-      del(.timestamp_str)
-      del(.source_type)
-      del(.service)
-      del(.host)
-
 sinks:
   zerobus:
     type: databricks_zerobus
-    inputs: [shape]
-    table_name: shinkansen.default.test_otel_logs
+    inputs: [one_shot]
+    table_name: main.eng_hydra.pod_prime_raw
     ingestion_endpoint: "https://<workspace_id>.zerobus.us-west-2.dev.databricks.com"
-    unity_catalog_endpoint: "https://unused.dev.databricks.com"
+    unity_catalog_endpoint: "<internal managed-catalog endpoint>"
     schema:
-      type: path
-      path: /tmp/test_otel_logs.desc
-      message_type: otel.OtelLog
+      type: unity_catalog
     batch_encoding:
-      codec: proto_batch
+      codec: arrow_stream
     auth:
       strategy: login_service
-      workspace_id: <workspace_id>
-      service_principal_resource: "accounts/0829fba4-55f5-4fef-9850-00f15b1a3d73/apps"
-      login_endpoint: "https://login-service-bricklens.privileged.dev.dbns.databricks.com:443"
-      login_server_name: "login-service-bricklens.privileged.dev.dbns.databricks.com"
-      tls_crt_file: "/databricks-infra/dbts2/creds.combined.pem"
-      tls_key_file: "/databricks-infra/dbts2/creds.combined.pem"
-      tls_ca_file: "/databricks-infra/dbts2/creds.combined.pem"
-      proto_descriptor_path: "/tmp/principal_context_service.pb"
+      user:
+        workspace_id: <workspace_id>
+        service_principal_resource: "accounts/<account_id>/vector-aggregator-metrics"
+        # uc_read_operation: ucread
+        # zerobus_write_operation: zerobuswrite
+      tls:
+        crt_file: "/databricks-infra/dbts2/creds.combined.pem"
+        key_file: "/databricks-infra/dbts2/creds.combined.pem"
+        ca_file: "/databricks-infra/dbts2/creds.combined.pem"
+      login_service:
+        login_endpoint: "<login endpoint>"
+        login_server_name: "<login server name>"
+        proto_descriptor_path: "/tmp/principal_context_service.pb"
+      unity_catalog:
+        proto_descriptor_path: "/tmp/managed_catalog_service.pb"
       metastore_id: <metastore_id>
-      uc_permissions:
-        - privileges: [USE_CATALOG]
-          securable_type: CATALOG
-          full_name: shinkansen
-        - privileges: [USE_SCHEMA]
-          securable_type: SCHEMA
-          full_name: shinkansen.default
-        - privileges: [SELECT, MODIFY]
-          securable_type: TABLE
-          full_name: shinkansen.default.test_otel_logs
 ```
+
+The VAM SSP is only issued to the vector-aggregator-metrics service for allowlisted
+accounts, so this config must run from a VAM pod. The `ucread` and `zerobuswrite`
+operations come from `VectorAggregatorMetricsAuthzPolicy` in universe.
 
 **Config gotchas:**
 - `data_dir` must be a writable path; the container's default `/var/lib/vector/`
   doesn't exist on the bricklens-agent image.
-- `tls_ca_file` MUST be set. Vector's `openssl` rejects the Login server cert
+- `tls.ca_file` MUST be set. Vector's `openssl` rejects the Login server cert
   with `tlsv1 alert unknown ca` because the container's `/etc/ssl/certs` lacks
   the Databricks "Data Plane Misc Root". The `creds.combined.pem` already
-  bundles the root chain, so pointing `tls_ca_file` at the same file is fine.
-- The proto schema must match the UC table column-for-column.
-  `shinkansen.default.test_otel_logs` is just `{int64 timestamp, string body}`;
-  using a wider OtelLog fixture fails with Zerobus
+  bundles the root chain, so pointing `tls.ca_file` at the same file is fine.
+- The table schema is fetched from Unity Catalog, so the sink's `batch_encoding` must
+  match `main.eng_hydra.pod_prime_raw` column-for-column; otherwise Zerobus fails with
   `Error Code: 4027 Field "x" found in the proto definition, but not in the table schema`.
 
 ## Run vector inside the pod
@@ -261,7 +240,7 @@ What you should NOT see:
   carry the claim; this would be a regression of the PR #1855740 fix.
 - `Invalid token audience` → the audience SAFE flag isn't enabled for this
   workspace, or `workspace_id` doesn't match the cert.
-- `tlsv1 alert unknown ca` → `tls_ca_file` not set (see Config gotchas).
+- `tlsv1 alert unknown ca` → `tls.ca_file` not set (see Config gotchas).
 - `Field "x" found in the proto definition, but not in the table schema` →
   the descriptor at `schema.path` doesn't match the UC table.
 
@@ -275,7 +254,7 @@ use the curl harness in
 
 ```bash
 bin/dbctl exec -t $CTX -n logging-agent $POD -c vector-daemon --dbcert -- \
-  rm -f /tmp/vector /tmp/vector.yaml /tmp/principal_context_service.pb /tmp/test_otel_logs.desc
+  rm -f /tmp/vector /tmp/vector.yaml /tmp/principal_context_service.pb
 ```
 
 Also restore the node's original `orgId` label if you relabelled it.

@@ -9,7 +9,7 @@ mod token_manager;
 pub use headers_provider::LoginServiceHeadersProvider;
 pub use token_manager::{
     LoginServiceAuthConfig, LoginServiceConfig, ServiceTlsConfig, TokenManager, TokenManagerError,
-    UcPermissionEntry, UnityCatalogServiceConfig, UserAuthInfo,
+    UnityCatalogServiceConfig, UserAuthInfo,
 };
 
 pub(crate) use token_manager::{
