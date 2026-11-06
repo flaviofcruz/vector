@@ -4,6 +4,7 @@
 //! via the Zerobus/Shinkansen ingestion service.
 
 mod config;
+mod encoding;
 mod error;
 mod freshness;
 mod headers;

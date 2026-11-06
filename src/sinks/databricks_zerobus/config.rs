@@ -1,6 +1,6 @@
 //! Configuration for the Zerobus sink.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use vector_lib::configurable::configurable_component;
 use vector_lib::sensitive_string::SensitiveString;
@@ -295,6 +295,14 @@ pub struct ZerobusSinkConfig {
     #[serde(default = "default_batch_encoding")]
     pub batch_encoding: BatchSerializerConfig,
 
+    /// Maximum number of batches encoded on blocking workers at once, shared by this sink's requests.
+    ///
+    /// Omit to encode inline. This limit is independent of request concurrency: a worker is released
+    /// after encoding, while the request remains in flight until acknowledgment. Running encoding
+    /// jobs retain their worker permit if their caller is cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding_concurrency: Option<NonZeroUsize>,
+
     #[configurable(derived)]
     #[serde(default)]
     pub batch: BatchConfig<RealtimeSizeBasedDefaultBatchSettings>,
@@ -338,6 +346,7 @@ impl GenerateConfig for ZerobusSinkConfig {
             schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
             batch_encoding: default_batch_encoding(),
+            encoding_concurrency: None,
             batch: BatchConfig::default(),
             request: TowerRequestConfig::default(),
             recover_from_schema_rejection: false,
@@ -394,6 +403,14 @@ impl SinkConfig for ZerobusSinkConfig {
 
 impl ZerobusSinkConfig {
     pub fn validate(&self) -> Result<(), ZerobusSinkError> {
+        if self
+            .encoding_concurrency
+            .is_some_and(|limit| limit.get() > tokio::sync::Semaphore::MAX_PERMITS)
+        {
+            return Err(ZerobusSinkError::ConfigError {
+                message: "encoding_concurrency exceeds the supported worker limit".to_string(),
+            });
+        }
         if self.ingestion_endpoint.is_empty() {
             return Err(ZerobusSinkError::ConfigError {
                 message: "ingestion_endpoint cannot be empty".to_string(),
@@ -612,6 +629,7 @@ mod tests {
             schema: SchemaSource::UnityCatalog,
             stream_options: ZerobusStreamOptions::default(),
             batch_encoding: default_batch_encoding(),
+            encoding_concurrency: None,
             batch: Default::default(),
             request: Default::default(),
             recover_from_schema_rejection: false,
@@ -651,6 +669,32 @@ mod tests {
         auth.client_id = "id"
         auth.client_secret = "secret"
     "#;
+
+    #[test]
+    fn encoding_workers_are_opt_in_and_nonzero() {
+        let config: ZerobusSinkConfig = toml::from_str(MINIMAL_TOML).unwrap();
+        assert_eq!(config.encoding_concurrency, None);
+        for workers in [1, 4] {
+            let config: ZerobusSinkConfig =
+                toml::from_str(&format!("{MINIMAL_TOML}\nencoding_concurrency = {workers}"))
+                    .unwrap();
+            assert_eq!(config.encoding_concurrency.unwrap().get(), workers);
+            assert!(config.validate().is_ok());
+        }
+        assert!(
+            toml::from_str::<ZerobusSinkConfig>(&format!(
+                "{MINIMAL_TOML}\nencoding_concurrency = 0"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn encoding_worker_limit_cannot_panic_at_startup() {
+        let mut config = create_test_config();
+        config.encoding_concurrency = NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1);
+        assert!(config.validate().is_err());
+    }
 
     fn parse_with_stream_options(
         stream_options: &str,

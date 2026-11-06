@@ -1,5 +1,22 @@
 # Zerobus authentication
 
+## Encoding workers
+
+Set `encoding_concurrency = 2` on the sink to run Arrow encoding on up to two
+blocking workers shared by that sink's requests. Omit it to keep inline encoding.
+This lets concurrent requests encode in parallel even when the sink driver polls
+them on one task. The request concurrency limit still bounds outstanding requests;
+the encoding limit only bounds CPU jobs, including jobs whose callers timed out.
+
+`zerobus_encoding_seconds` measures encoding time and
+`zerobus_encoding_wait_seconds` measures permit waiting and blocking-pool scheduling delay.
+Increasing encoding workers does not increase the request limit or the number of
+Zerobus streams. Size those limits and the memory budget together: concurrent raw
+events, Arrow batches, and SDK replay data all consume memory. Delivery still waits
+for a Zerobus acknowledgment.
+
+## Authentication settings
+
 With `auth.strategy = "login_service"`, configure the shared TLS identity and trust
 under `auth.tls`. Login, Unity Catalog, and Zerobus ingestion all present its
 required `crt_file` and `key_file`. The optional `ca_file` supplies the server trust

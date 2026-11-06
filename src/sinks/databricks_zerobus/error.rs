@@ -20,6 +20,10 @@ pub enum ZerobusSinkError {
         schema_constraint: bool,
     },
 
+    /// A blocking encoding worker failed before it returned a batch.
+    #[snafu(display("Encoding worker failed: {}", message))]
+    EncodingTaskFailed { message: String },
+
     /// Zerobus SDK error.
     #[snafu(display("Zerobus error: {}", source))]
     ZerobusError { source: ZerobusError },
@@ -90,7 +94,7 @@ impl ZerobusSinkError {
             Self::ZerobusError { source }
             | Self::StreamInitError { source }
             | Self::IngestionError { source } => source.is_retryable(),
-            Self::StreamClosed => true,
+            Self::StreamClosed | Self::EncodingTaskFailed { .. } => true,
             Self::SchemaError { retryable, .. } => *retryable,
             Self::SchemaReloaded { .. } => true,
             Self::ConfigError { .. } | Self::EncodingError { .. } => false,
@@ -104,6 +108,7 @@ impl ZerobusSinkError {
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::ConfigError { .. } => "config",
+            Self::EncodingTaskFailed { .. } => "encoding_worker_failed",
             Self::EncodingError {
                 schema_constraint: true,
                 ..

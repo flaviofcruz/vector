@@ -27,8 +27,9 @@ use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, Reques
 use vector_lib::stream::DriverResponse;
 
 use super::{
-    config::ZerobusSinkConfig, error::ZerobusSinkError, freshness, headers,
-    ingest_tls::ingestion_tls_settings, uc_client::UnityCatalogClient, unity_catalog_schema,
+    config::ZerobusSinkConfig, encoding::EncodingExecutor, error::ZerobusSinkError, freshness,
+    headers, ingest_tls::ingestion_tls_settings, uc_client::UnityCatalogClient,
+    unity_catalog_schema,
 };
 
 /// Build a connector factory that routes Zerobus gRPC traffic through
@@ -378,6 +379,7 @@ struct PinnedStream {
 
 /// Service for handling Zerobus requests.
 pub struct ZerobusService {
+    encoding: EncodingExecutor,
     sdk: Arc<ZerobusSdk>,
     config: Arc<ZerobusSinkConfig>,
     http_client: HttpClient,
@@ -482,6 +484,7 @@ impl ZerobusService {
         let oauth_provider = headers::build_oauth_provider(&config, custom_headers);
 
         Ok(Self {
+            encoding: EncodingExecutor::new(config.encoding_concurrency),
             sdk: Arc::new(sdk),
             config: Arc::new(config),
             http_client,
@@ -1057,16 +1060,22 @@ impl Service<ZerobusRequest> for ZerobusService {
 
         Box::pin(async move {
             let schema = service.ensure_schema().await?;
-            let BatchOutput::Arrow(record_batch) = schema
-                .encoder
-                .encode_batch(&request.events)
-                .map_err(|e| ZerobusSinkError::EncodingError {
-                    schema_constraint: matches!(
-                        e,
-                        vector_lib::codecs::encoding::Error::SchemaConstraintViolation(_)
-                    ),
-                    message: format!("Failed to encode batch: {}", e),
-                })?;
+            let encoding_schema = Arc::clone(&schema);
+            let BatchOutput::Arrow(record_batch) = service
+                .encoding
+                .run(move || {
+                    encoding_schema
+                        .encoder
+                        .encode_batch(&request.events)
+                        .map_err(|e| ZerobusSinkError::EncodingError {
+                            schema_constraint: matches!(
+                                e,
+                                vector_lib::codecs::encoding::Error::SchemaConstraintViolation(_)
+                            ),
+                            message: format!("Failed to encode batch: {}", e),
+                        })
+                })
+                .await?;
             let payload = ZerobusPayload(record_batch);
 
             // Both legs below can surface the server's schema rejection: stream
@@ -1096,6 +1105,7 @@ impl Service<ZerobusRequest> for ZerobusService {
 impl Clone for ZerobusService {
     fn clone(&self) -> Self {
         Self {
+            encoding: self.encoding.clone(),
             sdk: Arc::clone(&self.sdk),
             config: Arc::clone(&self.config),
             http_client: self.http_client.clone(),
@@ -1156,6 +1166,7 @@ impl ZerobusService {
         };
 
         Ok(Self {
+            encoding: EncodingExecutor::new(config.encoding_concurrency),
             sdk: Arc::new(sdk),
             config,
             http_client,
@@ -1395,6 +1406,7 @@ mod tests {
             batch_encoding: vector_lib::codecs::encoding::BatchSerializerConfig::ArrowStream(
                 Default::default(),
             ),
+            encoding_concurrency: None,
             batch: Default::default(),
             request: Default::default(),
             // The reload/pin tests exercise the recovery path, so the gate is on
@@ -1640,6 +1652,57 @@ mod tests {
             Field::new("level", DataType::Utf8, true),
             Field::new("count", DataType::Int64, true),
         ])
+    }
+
+    #[tokio::test]
+    async fn worker_encoding_matches_inline_arrow_output() {
+        let schema = ZerobusService::build_test_schema(&test_config(), freshness_perf_schema());
+        let events: Vec<Event> = (0..500)
+            .map(|i| {
+                let mut log = vector_lib::event::LogEvent::default();
+                log.insert("message", format!("query profile {i}"));
+                log.insert("count", i);
+                log.insert(
+                    "_log_metadata.service_metadata.log_timestamp_ms",
+                    1_700_000_000_000_i64 + i,
+                );
+                Event::Log(log)
+            })
+            .collect();
+        let BatchOutput::Arrow(expected) = schema.encoder.encode_batch(&events).unwrap();
+        let executor = EncodingExecutor::new(std::num::NonZeroUsize::new(2));
+        let BatchOutput::Arrow(actual) = executor
+            .run(move || Ok(schema.encoder.encode_batch(&events).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn offloaded_encoding_still_waits_for_delivery_ack() {
+        use futures::FutureExt;
+
+        let mut config = test_config();
+        config.encoding_concurrency = std::num::NonZeroUsize::new(2);
+        // Only the remote transport is gated: the request runs the real schema and encoder path.
+        let (mock, gate) = MockStream::succeeding().with_gate();
+        let mut service = ZerobusService::new_with_mock(config, mock).await.unwrap();
+        service.seed_schema(narrow_schema()).await;
+        service.pin_stream_to_cached_schema().await;
+        let mut log = vector_lib::event::LogEvent::default();
+        log.insert("status", 200_i64);
+        let mut request = dummy_request();
+        request.events = Arc::new(vec![Event::Log(log)]);
+        let mut response = tokio::spawn(service.call(request));
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_for_started(1))
+            .await
+            .unwrap();
+        assert!((&mut response).now_or_never().is_none());
+        gate.release(1);
+        assert_eq!(
+            response.await.unwrap().unwrap().status,
+            vector_lib::event::EventStatus::Delivered
+        );
     }
 
     /// Timing proof: the freshness step against `encode_batch` on the same 5,000-row batch.
