@@ -1099,8 +1099,11 @@ impl IngestorProcess {
         // deleted, so nothing is in flight while we wait to honor the byte rate.
         self.state.rate_limiter.pace(self.byte_counter.take()).await;
 
-        // Wait for next poll interval
-        tokio::time::sleep(Duration::from_secs(self.state.poll_secs)).await;
+        // poll_secs is idle/error backoff. A drained batch can immediately make room
+        // for more work; byte-rate pacing above still limits productive polling.
+        if !delivered || deleted_count == 0 {
+            tokio::time::sleep(Duration::from_secs(self.state.poll_secs)).await;
+        }
     }
 
     /// Deletes a received batch without fetching any blobs (the table is disabled).
@@ -3285,6 +3288,93 @@ mod drain_tests {
 
     fn disabled_gate() -> DrainGate {
         gate("span", false, &[(ENABLED_LIST_KEY, Value::from("qpl"))])
+    }
+
+    #[tokio::test]
+    async fn productive_poll_does_not_wait_for_idle_backoff() {
+        let server = mock_queue(&ingest_message_text(), 204, blob_ok()).await;
+        let (mut process, sink) = process_with_admission(
+            &server,
+            None,
+            None,
+            true,
+            None,
+            Some(EventStatus::Delivered),
+        )
+        .await;
+        // Arc clones are only held by the process after the helper drops its ingestor.
+        Arc::get_mut(&mut process.state).unwrap().poll_secs = 60;
+        tokio::time::timeout(Duration::from_secs(5), process.run_once())
+            .await
+            .expect("a delivered and deleted batch should repoll without the 60-second idle delay");
+        assert_eq!(requests(&server).await, (1, 1));
+        drop(process);
+        sink.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_or_undeleted_poll_retains_backoff() {
+        for (delete_message, status) in [
+            (true, EventStatus::Errored),
+            (false, EventStatus::Delivered),
+        ] {
+            let server = mock_queue(&ingest_message_text(), 204, blob_ok()).await;
+            let (mut process, sink) =
+                process_with_admission(&server, None, None, delete_message, None, Some(status))
+                    .await;
+            Arc::get_mut(&mut process.state).unwrap().poll_secs = 60;
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), process.run_once())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(requests(&server).await, (1, 0));
+            drop(process);
+            sink.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_poll_retains_idle_backoff() {
+        let server = mock_queue_and_blob().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/q/messages$"))
+            .respond_with(
+                storage_headers(ResponseTemplate::new(200))
+                    .insert_header("content-type", "application/xml")
+                    .set_body_string("<QueueMessagesList/>"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let (mut process, sink) =
+            process_with_admission(&server, None, None, true, None, None).await;
+        Arc::get_mut(&mut process.state).unwrap().poll_secs = 60;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), process.run_once())
+                .await
+                .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        drop(process);
+        sink.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleted_permanent_failure_still_backs_off() {
+        let server = mock_queue_and_blob().await;
+        let (mut process, sink) =
+            process_with_admission(&server, None, None, true, None, None).await;
+        Arc::get_mut(&mut process.state).unwrap().poll_secs = 60;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), process.run_once())
+                .await
+                .is_err()
+        );
+        // A missing blob is deleted, but deletion alone must not count as successful processing.
+        assert_eq!(requests(&server).await, (1, 1));
+        drop(process);
+        sink.await.unwrap();
     }
 
     #[tokio::test]
