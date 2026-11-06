@@ -1,6 +1,7 @@
 //! Schema fetching and Arrow schema construction for ClickHouse tables.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use arrow::datatypes::{Field, Schema};
 use async_trait::async_trait;
@@ -11,7 +12,14 @@ use vector_lib::codecs::encoding::format::{
     ArrowEncodingError, COERCE_DEFAULT_METADATA_KEY, SchemaProvider,
 };
 
-use crate::http::{Auth, HttpClient};
+use crate::{
+    common::backoff::ExponentialBackoff,
+    http::{Auth, HttpClient},
+    sinks::{
+        clickhouse::service::ClickhouseRetryLogic,
+        util::{TowerRequestSettings, http::HttpResponse, retries::RetryLogic},
+    },
+};
 
 use super::parser::{clickhouse_type_to_arrow, unwrap_type_modifiers};
 
@@ -27,14 +35,127 @@ fn url_encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-/// Fetches the schema for a ClickHouse table and converts it to an Arrow schema.
-pub async fn fetch_table_schema(
+/// Retry policy for the startup schema fetch.
+///
+/// If every attempt fails the sink falls back to JSONEachRow until restart. Sinks are built one at
+/// a time, so this budget also delays topology start.
+#[derive(Clone, Copy, Debug)]
+pub struct SchemaFetchRetryPolicy {
+    /// Total attempts, including the first. At least 1.
+    pub max_attempts: usize,
+    /// Delay before the first retry; doubles on each subsequent retry.
+    pub initial_backoff: Duration,
+    /// Upper bound on any single retry delay.
+    pub max_backoff: Duration,
+    /// Deadline for one attempt (request + body). `HttpClient` has no timeout of its own, so a
+    /// blackholed endpoint would otherwise hang sink construction indefinitely.
+    pub attempt_timeout: Duration,
+}
+
+impl SchemaFetchRetryPolicy {
+    /// The production policy. The fetch bypasses the sink's Tower stack, so its timeout and
+    /// backoff settings are applied here instead.
+    pub const fn from_request_settings(
+        request: &TowerRequestSettings,
+        max_attempts: usize,
+    ) -> Self {
+        Self {
+            max_attempts,
+            initial_backoff: request.retry_initial_backoff,
+            max_backoff: request.retry_max_duration,
+            attempt_timeout: request.timeout,
+        }
+    }
+}
+
+/// Outcome of a single failed schema-fetch attempt.
+#[derive(Debug)]
+enum SchemaFetchAttemptError {
+    /// Transport error, timeout, truncated body, or a status the insert path would retry.
+    Retriable(String),
+    /// Deterministic failure (4xx, non-retriable ClickHouse code, unparseable or unsupported
+    /// schema) that would fail identically on every attempt.
+    Permanent(String),
+}
+
+/// Longest error-body excerpt carried into log lines; ClickHouse exceptions can embed stack traces.
+const MAX_ERROR_BODY_CHARS: usize = 512;
+
+/// Fetches the table schema, retrying retriable failures per `policy`. Permanent failures and
+/// exhausted retries return the last error, and the caller falls back to JSONEachRow.
+pub async fn fetch_table_schema_with_retry(
     client: &HttpClient,
     endpoint: &str,
     database: &str,
     table: &str,
     auth: Option<&Auth>,
+    retry_logic: &ClickhouseRetryLogic,
+    policy: SchemaFetchRetryPolicy,
 ) -> crate::Result<Schema> {
+    let max_attempts = policy.max_attempts.max(1);
+    // `from_millis(2)` doubles each step; `factor` scales it so the first delay is `initial_backoff`.
+    let mut backoff = ExponentialBackoff::from_millis(2)
+        .factor((policy.initial_backoff.as_millis() as u64 / 2).max(1))
+        .max_delay(policy.max_backoff);
+
+    for attempt in 1..=max_attempts {
+        let result = tokio::time::timeout(
+            policy.attempt_timeout,
+            fetch_table_schema(client, endpoint, database, table, auth, retry_logic),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(SchemaFetchAttemptError::Retriable(format!(
+                "schema fetch timed out after {:?}",
+                policy.attempt_timeout
+            )))
+        });
+
+        match result {
+            Ok(schema) => {
+                if attempt > 1 {
+                    info!(
+                        message = "ClickHouse Arrow schema fetch succeeded after retry.",
+                        attempt, max_attempts,
+                    );
+                }
+                return Ok(schema);
+            }
+            Err(SchemaFetchAttemptError::Permanent(error)) => return Err(error.into()),
+            Err(SchemaFetchAttemptError::Retriable(error)) if attempt == max_attempts => {
+                return Err(format!("{error} (gave up after {attempt} attempts)").into());
+            }
+            Err(SchemaFetchAttemptError::Retriable(error)) => {
+                let delay = backoff.next().expect("ExponentialBackoff is unbounded");
+                warn!(
+                    message = "ClickHouse Arrow schema fetch failed; retrying.",
+                    attempt,
+                    max_attempts,
+                    retry_in_ms = delay.as_millis() as u64,
+                    %error,
+                    // At most `max_attempts - 1` lines per sink build; the default limiter would
+                    // hide every retry after the first.
+                    internal_log_rate_limit = false,
+                );
+                metrics::counter!("clickhouse_arrow_schema_fetch_retries_total").increment(1);
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    unreachable!("loop returns on the final attempt")
+}
+
+/// One attempt at fetching the schema for a ClickHouse table and converting it to an Arrow schema.
+async fn fetch_table_schema(
+    client: &HttpClient,
+    endpoint: &str,
+    database: &str,
+    table: &str,
+    auth: Option<&Auth>,
+    retry_logic: &ClickhouseRetryLogic,
+) -> Result<Schema, SchemaFetchAttemptError> {
+    use SchemaFetchAttemptError::{Permanent, Retriable};
+
     // Skip non-insertable columns (MATERIALIZED/ALIAS/EPHEMERAL): the stream matches columns by
     // name, so including them fails the insert.
     let query = "SELECT name, type \
@@ -58,20 +179,48 @@ pub async fn fetch_table_schema(
         auth.apply(&mut request);
     }
 
-    let response = client.send(request).await?;
-
-    match response.status() {
-        StatusCode::OK => {
-            let body_bytes = http_body::Body::collect(response.into_body())
-                .await?
-                .to_bytes();
-            let body_str = String::from_utf8(body_bytes.into())
-                .map_err(|e| format!("Failed to parse response as UTF-8: {}", e))?;
-
-            parse_schema_from_response(&body_str)
+    let response = client.send(request).await.map_err(|error| {
+        let message = format!("Failed to fetch schema from ClickHouse: {error}");
+        if error.is_retriable() {
+            Retriable(message)
+        } else {
+            Permanent(message)
         }
-        status => Err(format!("Failed to fetch schema from ClickHouse: HTTP {}", status).into()),
+    })?;
+
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    // A body cut off mid-read (`unexpected EOF`, connection reset) is a transport blip.
+    let body_bytes = http_body::Body::collect(body)
+        .await
+        .map_err(|e| Retriable(format!("Failed to read schema response body: {e}")))?
+        .to_bytes();
+
+    if status != StatusCode::OK {
+        let excerpt: String = String::from_utf8_lossy(&body_bytes)
+            .trim()
+            .chars()
+            .take(MAX_ERROR_BODY_CHARS)
+            .collect();
+        let message = format!("Failed to fetch schema from ClickHouse: HTTP {status}: {excerpt}");
+        // Classify exactly as the insert path would, so `non_retriable_error_codes` applies here too.
+        let probe = HttpResponse {
+            http_response: http::Response::from_parts(parts, body_bytes),
+            events_byte_size: Default::default(),
+            raw_byte_size: 0,
+        };
+        return Err(
+            if retry_logic.should_retry_response(&probe).is_retryable() {
+                Retriable(message)
+            } else {
+                Permanent(message)
+            },
+        );
     }
+
+    let body_str = String::from_utf8(body_bytes.into())
+        .map_err(|e| Permanent(format!("Failed to parse response as UTF-8: {e}")))?;
+    parse_schema_from_response(&body_str).map_err(|e| Permanent(e.to_string()))
 }
 
 /// Parses the JSON response from ClickHouse and builds an Arrow schema.
@@ -167,6 +316,8 @@ pub struct ClickHouseSchemaProvider {
     database: String,
     table: String,
     auth: Option<Auth>,
+    retry_logic: ClickhouseRetryLogic,
+    retry_policy: SchemaFetchRetryPolicy,
 }
 
 impl ClickHouseSchemaProvider {
@@ -177,6 +328,8 @@ impl ClickHouseSchemaProvider {
         database: String,
         table: String,
         auth: Option<Auth>,
+        retry_logic: ClickhouseRetryLogic,
+        retry_policy: SchemaFetchRetryPolicy,
     ) -> Self {
         Self {
             client,
@@ -184,6 +337,8 @@ impl ClickHouseSchemaProvider {
             database,
             table,
             auth,
+            retry_logic,
+            retry_policy,
         }
     }
 }
@@ -191,12 +346,14 @@ impl ClickHouseSchemaProvider {
 #[async_trait]
 impl SchemaProvider for ClickHouseSchemaProvider {
     async fn get_schema(&self) -> Result<Schema, ArrowEncodingError> {
-        fetch_table_schema(
+        fetch_table_schema_with_retry(
             &self.client,
             &self.endpoint,
             &self.database,
             &self.table,
             self.auth.as_ref(),
+            &self.retry_logic,
+            self.retry_policy,
         )
         .await
         .map_err(|e| ArrowEncodingError::SchemaFetchError {
@@ -341,5 +498,184 @@ mod tests {
         assert_eq!(schema.field(3).data_type(), &DataType::Int64);
         assert_eq!(schema.field(4).data_type(), &DataType::Float64);
         assert_eq!(schema.field(5).data_type(), &DataType::Boolean);
+    }
+
+    mod fetch_retry {
+        use std::convert::Infallible;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Response, Server};
+
+        use super::super::{
+            ClickhouseRetryLogic, SchemaFetchRetryPolicy, fetch_table_schema_with_retry,
+        };
+        use crate::http::HttpClient;
+        use crate::test_util::addr::{PortGuard, next_addr};
+        use crate::tls::TlsSettings;
+
+        const SCHEMA_BODY: &str = r#"{"name":"message","type":"String"}"#;
+
+        /// A scripted response: `None` never answers (blackholed request).
+        type Step = Option<(u16, &'static str)>;
+
+        /// Serves `script` in order (the last step repeats). Returns the port reservation (keep
+        /// it alive for the test), the endpoint, and the request counter.
+        fn spawn_server(script: Vec<Step>) -> (PortGuard, String, Arc<AtomicUsize>) {
+            let (guard, addr) = next_addr();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let script = Arc::new(script);
+            let hits_srv = Arc::clone(&hits);
+            let make = make_service_fn(move |_| {
+                let hits = Arc::clone(&hits_srv);
+                let script = Arc::clone(&script);
+                async move {
+                    Ok::<_, Infallible>(service_fn(move |_req| {
+                        let n = hits.fetch_add(1, Ordering::SeqCst);
+                        let step = script[n.min(script.len() - 1)];
+                        async move {
+                            let Some((status, body)) = step else {
+                                std::future::pending::<()>().await;
+                                unreachable!()
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .body(Body::from(body))
+                                    .unwrap(),
+                            )
+                        }
+                    }))
+                }
+            });
+            // Bind before returning so the first request can't race the listener.
+            let server = Server::bind(&addr).serve(make);
+            tokio::spawn(async move {
+                let _ = server.await;
+            });
+            (guard, format!("http://{addr}/"), hits)
+        }
+
+        fn policy(max_attempts: usize) -> SchemaFetchRetryPolicy {
+            SchemaFetchRetryPolicy {
+                max_attempts,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(5),
+                attempt_timeout: Duration::from_millis(500),
+            }
+        }
+
+        async fn fetch(
+            endpoint: &str,
+            policy: SchemaFetchRetryPolicy,
+        ) -> crate::Result<arrow::datatypes::Schema> {
+            let client = HttpClient::new(TlsSettings::default(), &Default::default()).unwrap();
+            fetch_table_schema_with_retry(
+                &client,
+                endpoint,
+                "db",
+                "tbl",
+                None,
+                &ClickhouseRetryLogic::default(),
+                policy,
+            )
+            .await
+        }
+
+        #[test]
+        fn production_policy_uses_request_settings() {
+            let request: crate::sinks::util::TowerRequestConfig = toml::from_str(
+                "timeout_secs = 7\nretry_initial_backoff_secs = 2\nretry_max_duration_secs = 9",
+            )
+            .unwrap();
+            let policy = SchemaFetchRetryPolicy::from_request_settings(&request.into_settings(), 4);
+            assert_eq!(policy.max_attempts, 4);
+            assert_eq!(policy.attempt_timeout, Duration::from_secs(7));
+            assert_eq!(policy.initial_backoff, Duration::from_secs(2));
+            assert_eq!(policy.max_backoff, Duration::from_secs(9));
+        }
+
+        #[tokio::test]
+        async fn retries_transient_failures_until_success() {
+            // Proxy-relayed TOO_MANY_SIMULTANEOUS_QUERIES, then a 503, then the schema.
+            let (_guard, endpoint, hits) = spawn_server(vec![
+                Some((
+                    500,
+                    "Code: 202. DB::Exception: Too many simultaneous queries.",
+                )),
+                Some((503, "")),
+                Some((200, SCHEMA_BODY)),
+            ]);
+            let schema = fetch(&endpoint, policy(5))
+                .await
+                .expect("third attempt succeeds");
+            assert_eq!(schema.field(0).name(), "message");
+            assert_eq!(hits.load(Ordering::SeqCst), 3);
+        }
+
+        #[tokio::test]
+        async fn gives_up_after_max_attempts() {
+            let (_guard, endpoint, hits) = spawn_server(vec![Some((503, "unavailable"))]);
+            let err = fetch(&endpoint, policy(3)).await.unwrap_err().to_string();
+            assert_eq!(hits.load(Ordering::SeqCst), 3);
+            assert!(err.contains("HTTP 503"), "{err}");
+            assert!(
+                err.contains("unavailable"),
+                "error should carry the body: {err}"
+            );
+            assert!(err.contains("gave up after 3 attempts"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn max_attempts_one_disables_retries() {
+            let (_guard, endpoint, hits) = spawn_server(vec![Some((503, ""))]);
+            fetch(&endpoint, policy(1)).await.unwrap_err();
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn does_not_retry_permanent_failures() {
+            for step in [
+                // 4xx, e.g. UNKNOWN_TABLE / auth failure.
+                (404, "Code: 60. DB::Exception: Table db.tbl does not exist."),
+                // 500 carrying a code in the non-retriable set.
+                (500, "Code: 469. DB::Exception: Constraint violated."),
+                // Schema that can never be encoded.
+                (
+                    200,
+                    r#"{"name":"c","type":"AggregateFunction(uniq, String)"}"#,
+                ),
+                // Table exists in no form the query can see.
+                (200, ""),
+            ] {
+                let (_guard, endpoint, hits) = spawn_server(vec![Some(step)]);
+                fetch(&endpoint, policy(5)).await.unwrap_err();
+                assert_eq!(hits.load(Ordering::SeqCst), 1, "retried {step:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn retries_attempt_timeout() {
+            let (_guard, endpoint, hits) = spawn_server(vec![None, Some((200, SCHEMA_BODY))]);
+            let policy = SchemaFetchRetryPolicy {
+                attempt_timeout: Duration::from_millis(100),
+                ..policy(2)
+            };
+            fetch(&endpoint, policy)
+                .await
+                .expect("second attempt succeeds");
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn retries_connection_errors() {
+            // Nothing listens here: every attempt is connection-refused.
+            let (_guard, addr) = next_addr();
+            let endpoint = format!("http://{addr}/");
+            let err = fetch(&endpoint, policy(2)).await.unwrap_err().to_string();
+            assert!(err.contains("gave up after 2 attempts"), "{err}");
+        }
     }
 }

@@ -244,7 +244,27 @@ pub struct ClickhouseConfig {
     #[serde(default)]
     #[configurable(metadata(docs::examples = "example_non_retriable_error_codes()"))]
     pub non_retriable_error_codes: Option<Vec<u32>>,
+
+    /// Total attempts for the ArrowStream table-schema fetch done when the sink is built,
+    /// including the first. If every attempt fails, the sink falls back to JSONEachRow until
+    /// restart.
+    ///
+    /// The per-attempt timeout and backoff come from `request.timeout_secs`,
+    /// `request.retry_initial_backoff_secs` (doubling) and `request.retry_max_duration_secs`.
+    /// Sinks are built one at a time and Vector reports healthy only once all are built, so every
+    /// extra attempt can delay startup. Defaults to `3`; must be between 1 and 10, and `1`
+    /// disables retries. This is separate from `request.retry_attempts`, which defaults to
+    /// effectively unlimited.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = 3))]
+    pub arrow_schema_fetch_max_attempts: Option<usize>,
 }
+
+/// Default for `arrow_schema_fetch_max_attempts`.
+const DEFAULT_ARROW_SCHEMA_FETCH_MAX_ATTEMPTS: usize = 3;
+
+/// Upper bound for `arrow_schema_fetch_max_attempts`, so a typo can't stall startup for minutes.
+const MAX_ARROW_SCHEMA_FETCH_MAX_ATTEMPTS: usize = 10;
 
 fn example_non_retriable_error_codes() -> Vec<u32> {
     vec![469, 70, 69, 407, 131]
@@ -346,6 +366,8 @@ impl SinkConfig for ClickhouseConfig {
                 .expect("'default' should be a valid template")
         });
 
+        self.validate_arrow_schema_fetch_max_attempts()?;
+
         if self.use_headless_service {
             self.validate_headless_config(&endpoint)?;
         } else {
@@ -430,6 +452,16 @@ impl ClickhouseConfig {
             return Err("'fallback_secondary_max_attempts' must be greater than 0".into());
         }
         Ok(())
+    }
+
+    fn validate_arrow_schema_fetch_max_attempts(&self) -> crate::Result<()> {
+        match self.arrow_schema_fetch_max_attempts {
+            Some(n) if !(1..=MAX_ARROW_SCHEMA_FETCH_MAX_ATTEMPTS).contains(&n) => Err(format!(
+                "'arrow_schema_fetch_max_attempts' must be between 1 and {MAX_ARROW_SCHEMA_FETCH_MAX_ATTEMPTS}, got {n}"
+            )
+            .into()),
+            _ => Ok(()),
+        }
     }
 
     /// Builds the direct single-endpoint sink (no headless routing).
@@ -765,6 +797,12 @@ impl ClickhouseConfig {
             database_str.to_string(),
             table_str.to_string(),
             auth.cloned(),
+            ClickhouseRetryLogic::new(self.non_retriable_error_codes.clone()),
+            arrow::SchemaFetchRetryPolicy::from_request_settings(
+                &self.request.into_settings(),
+                self.arrow_schema_fetch_max_attempts
+                    .unwrap_or(DEFAULT_ARROW_SCHEMA_FETCH_MAX_ATTEMPTS),
+            ),
         );
 
         let schema = provider.get_schema().await.map_err(|e| {
@@ -993,6 +1031,38 @@ mod tests {
             get_healthcheck_uri(&"http://localhost:8123/path/".parse().unwrap()),
             "http://localhost:8123/path/?query=SELECT%201"
         );
+    }
+
+    #[test]
+    fn arrow_schema_fetch_max_attempts_bounds() {
+        let with = |n: Option<usize>| ClickhouseConfig {
+            arrow_schema_fetch_max_attempts: n,
+            ..Default::default()
+        };
+        for ok in [None, Some(1), Some(3), Some(10)] {
+            assert!(
+                with(ok).validate_arrow_schema_fetch_max_attempts().is_ok(),
+                "{ok:?} should be accepted"
+            );
+        }
+        for bad in [Some(0), Some(11)] {
+            assert!(
+                with(bad)
+                    .validate_arrow_schema_fetch_max_attempts()
+                    .is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+
+        let config: ClickhouseConfig = toml::from_str(
+            r#"
+            endpoint = "http://localhost:8123"
+            table = "t"
+            arrow_schema_fetch_max_attempts = 4
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.arrow_schema_fetch_max_attempts, Some(4));
     }
 
     #[test]
