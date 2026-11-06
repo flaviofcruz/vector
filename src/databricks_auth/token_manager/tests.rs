@@ -654,6 +654,40 @@ fn malformed_principal_context_error_is_not_retryable() {
     assert!(TokenManagerError::ResponseTooShort.is_retryable());
 }
 
+/// Test server context with the same material as `TlsConfig::test_config` plus client-CA
+/// verification and h2 ALPN. Built directly because `TlsSettings::acceptor` uses
+/// `mozilla_intermediate`, which disables TLS 1.3 and so cannot serve a TLS 1.3-only client.
+fn tls_test_acceptor(max_version: Option<openssl::ssl::SslVersion>) -> openssl::ssl::SslContext {
+    use openssl::ssl::{AlpnError, SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
+
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    acceptor
+        .set_certificate_chain_file(format!(
+            "{root}/tests/data/ca/intermediate_server/certs/localhost-chain.cert.pem"
+        ))
+        .unwrap();
+    acceptor
+        .set_private_key_file(
+            format!("{root}/tests/data/ca/intermediate_server/private/localhost.key.pem"),
+            SslFiletype::PEM,
+        )
+        .unwrap();
+    acceptor
+        .set_ca_file(format!(
+            "{root}/tests/data/ca/intermediate_client/certs/ca-chain.cert.pem"
+        ))
+        .unwrap();
+    acceptor.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    acceptor.set_alpn_select_callback(|_, protocols| {
+        openssl::ssl::select_next_proto(b"\x02h2", protocols).ok_or(AlpnError::NOACK)
+    });
+    if let Some(version) = max_version {
+        acceptor.set_max_proto_version(Some(version)).unwrap();
+    }
+    acceptor.build().into_context()
+}
+
 #[tokio::test]
 #[allow(deprecated)] // Hyper 0.14 supplies the Tokio executor for this test server.
 async fn login_and_uc_transport_uses_shared_tls_and_negotiates_h2() {
@@ -665,7 +699,6 @@ async fn login_and_uc_transport_uses_shared_tls_and_negotiates_h2() {
     use tokio_openssl::SslStream;
 
     use super::transport::build_hyper_openssl_client;
-    use crate::tls::{TlsConfig, TlsSettings};
 
     for (verify_hostname, server_name, endpoint_host, should_succeed) in [
         (true, "localhost", "localhost", true),
@@ -673,13 +706,8 @@ async fn login_and_uc_transport_uses_shared_tls_and_negotiates_h2() {
         (true, "localhost", "127.0.0.1", false),
         (false, "different.example", "127.0.0.1", true),
     ] {
-        let mut server_tls = TlsConfig::test_config();
-        server_tls.ca_file =
-            Some("tests/data/ca/intermediate_client/certs/ca-chain.cert.pem".into());
-        server_tls.alpn_protocols = Some(vec!["h2".to_string()]);
-        let settings = TlsSettings::from_options(Some(&server_tls)).unwrap();
-        let acceptor = settings.acceptor().unwrap().into_context();
-        // Use the configured acceptor's ALPN list; a client without ALPN would leave this unset.
+        let acceptor = tls_test_acceptor(None);
+        // The acceptor selects h2 via ALPN; a client without ALPN would leave it unset.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -743,4 +771,49 @@ async fn login_and_uc_transport_uses_shared_tls_and_negotiates_h2() {
             .unwrap()
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn login_and_uc_transport_refuses_tls_1_2_only_server() {
+    use std::pin::Pin;
+
+    use openssl::ssl::Ssl;
+    use tokio::net::TcpListener;
+    use tokio_openssl::SslStream;
+
+    use super::transport::build_hyper_openssl_client;
+
+    let root = env!("CARGO_MANIFEST_DIR");
+    let acceptor = tls_test_acceptor(Some(openssl::ssl::SslVersion::TLS1_2));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = SslStream::new(Ssl::new(&acceptor).unwrap(), stream).unwrap();
+        Pin::new(&mut stream).accept().await
+    });
+
+    let mut auth = cfg(1);
+    auth.tls.crt_file =
+        format!("{root}/tests/data/ca/intermediate_client/certs/localhost-chain.cert.pem");
+    auth.tls.key_file =
+        format!("{root}/tests/data/ca/intermediate_client/private/localhost.key.pem");
+    auth.tls.ca_file = Some(format!(
+        "{root}/tests/data/ca/intermediate_server/certs/ca-chain.cert.pem"
+    ));
+    let client = build_hyper_openssl_client(&auth.tls, "localhost").unwrap();
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get(format!("https://localhost:{port}/").parse().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert!(response.is_err(), "TLS 1.2-only server must be refused");
+    let handshake = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(handshake.is_err(), "server must not complete a handshake");
 }

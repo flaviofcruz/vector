@@ -35,7 +35,7 @@ pub(crate) async fn load_descriptor_pool(path: &Path) -> Result<DescriptorPool, 
 /// to the request URI; SNI is set to `server_name` for the s2s-proxy sidecar to
 /// route correctly. Hostname verification checks the request URI's hostname,
 /// independently of SNI. With `verify_hostname` false the certificate chain is
-/// still verified, but not its hostname.
+/// still verified, but not its hostname. The connection requires TLS 1.3.
 pub(crate) fn build_hyper_openssl_client(
     tls: &ServiceTlsConfig,
     server_name: &str,
@@ -47,6 +47,11 @@ pub(crate) fn build_hyper_openssl_client(
     http_connector.enforce_http(false);
 
     let mut ssl_builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
+        .context(SslBuilderSnafu)?;
+
+    // Login and UC are internal hops, so refuse to negotiate anything below TLS 1.3.
+    ssl_builder
+        .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))
         .context(SslBuilderSnafu)?;
 
     ssl_builder

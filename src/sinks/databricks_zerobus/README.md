@@ -85,3 +85,7 @@ the internal managed-catalog HTTPS gRPC URL; its hostname supplies the TLS serve
 and its port supplies the connection port. Login uses the descriptor under
 `auth.unity_catalog` and the shared `auth.tls` settings for UC requests. Fields from
 the other auth strategy are rejected during config loading.
+
+Login and UC connections require TLS 1.3, so the peer (typically the s2s-proxy sidecar)
+must offer it. The Zerobus ingestion channel still uses the SDK's default protocol
+versions: the SDK's `TlsSettings` and tonic's `ClientTlsConfig` expose no version setting.
