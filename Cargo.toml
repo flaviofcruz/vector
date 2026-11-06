@@ -455,6 +455,8 @@ hickory-proto = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 # Matches the Zerobus SDK endpoint type used by its TLS hook.
 tonic-014 = { package = "tonic", version = "0.14.6", default-features = false, features = ["transport", "tls-native-roots"], optional = true }
+# Wraps principal-context bytes to redact Debug and zeroize on drop.
+secrecy = { version = "0.10", optional = true }
 # Already pinned transitively by the SDK; validates ingestion TLS names and PEM certificates.
 rustls = { version = "=0.23.36", default-features = false, features = ["ring", "std"], optional = true }
 thread_local = { version = "1.1.9", default-features = false, optional = true }
@@ -961,7 +963,7 @@ sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost"]
 sinks-websocket = ["dep:tokio-tungstenite"]
 sinks-websocket-server = ["dep:tokio-tungstenite", "sources-utils-http-auth", "sources-utils-http-error", "sources-utils-http-prelude"]
 sinks-webhdfs = ["dep:opendal"]
-sinks-databricks-zerobus = ["dep:databricks-zerobus-ingest-sdk", "codecs-arrow", "arrow/ipc_compression", "dep:base64", "dep:prost", "dep:prost-reflect", "dep:tonic-014", "dep:rustls"]
+sinks-databricks-zerobus = ["dep:databricks-zerobus-ingest-sdk", "codecs-arrow", "arrow/ipc_compression", "dep:base64", "dep:prost", "dep:prost-reflect", "dep:tonic-014", "dep:rustls", "dep:secrecy"]
 
 # Identifies that the build is a nightly build
 nightly = []

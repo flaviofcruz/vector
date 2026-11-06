@@ -4,6 +4,7 @@ use std::time::Instant;
 use base64::Engine;
 use http::Uri;
 use prost_reflect::{DynamicMessage, MethodDescriptor};
+use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -120,15 +121,17 @@ impl TokenManager {
             .min()
             .unwrap_or_else(|| Instant::now() + DEFAULT_TOKEN_LIFETIME);
         let cached = CachedPrincipalContext {
-            principal_context: message_field_bytes(&service_principal, "principal_context")?,
+            principal_context: message_field_bytes(&service_principal, "principal_context")?.into(),
             signed_principal_context: message_field_bytes(
                 &dp_auth_token,
                 "signed_principal_context",
-            )?,
+            )?
+            .into(),
             signed_principal_context_v2: optional_message_field_bytes(
                 &service_principal,
                 "signed_principal_context_v2",
-            ),
+            )
+            .map(Into::into),
             expires_at,
         };
 
@@ -214,7 +217,7 @@ impl TokenManager {
     pub async fn get_signed_principal_context(&self) -> Result<String, TokenManagerError> {
         let cached = self.get_principal_context().await?;
         Ok(base64::engine::general_purpose::STANDARD_NO_PAD
-            .encode(&cached.signed_principal_context))
+            .encode(cached.signed_principal_context.expose_secret()))
     }
 
     /// Read both headers from the same bootstrap so a refresh cannot mix contexts.
@@ -223,11 +226,11 @@ impl TokenManager {
     ) -> Result<PrincipalContextMetadata, TokenManagerError> {
         let cached = self.get_principal_context().await?;
         Ok(PrincipalContextMetadata {
-            unsigned: cached.principal_context.clone(),
+            unsigned: cached.principal_context.expose_secret().to_vec(),
             signed_v2: cached
                 .signed_principal_context_v2
-                .as_deref()
-                .map(principal_context_v2_wire_bytes),
+                .as_ref()
+                .map(|v2| principal_context_v2_wire_bytes(v2.expose_secret())),
         })
     }
 }

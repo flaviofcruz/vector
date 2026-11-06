@@ -303,8 +303,8 @@ fn parse_grpc_response_message_rejects_compressed_flag() {
 fn cached_token_is_valid_far_in_future() {
     let now = Instant::now();
     let cached = CachedPrincipalContext {
-        principal_context: vec![],
-        signed_principal_context: vec![],
+        principal_context: vec![].into(),
+        signed_principal_context: vec![].into(),
         signed_principal_context_v2: None,
         expires_at: now + Duration::from_secs(3600),
     };
@@ -315,8 +315,8 @@ fn cached_token_is_valid_far_in_future() {
 fn cached_token_not_valid_when_already_expired() {
     let now = Instant::now();
     let cached = CachedPrincipalContext {
-        principal_context: vec![],
-        signed_principal_context: vec![],
+        principal_context: vec![].into(),
+        signed_principal_context: vec![].into(),
         signed_principal_context_v2: None,
         // Saturating-sub keeps this on the past side of `now` without panicking
         // on monotonic clocks that can't represent times before the process start.
@@ -330,8 +330,8 @@ fn cached_token_not_valid_within_refresh_threshold() {
     let now = Instant::now();
     // Expires just inside the refresh threshold → should refresh.
     let cached = CachedPrincipalContext {
-        principal_context: vec![],
-        signed_principal_context: vec![],
+        principal_context: vec![].into(),
+        signed_principal_context: vec![].into(),
         signed_principal_context_v2: None,
         expires_at: now + TOKEN_REFRESH_THRESHOLD - Duration::from_secs(1),
     };
@@ -342,8 +342,8 @@ fn cached_token_not_valid_within_refresh_threshold() {
 fn cached_token_valid_just_past_refresh_threshold() {
     let now = Instant::now();
     let cached = CachedPrincipalContext {
-        principal_context: vec![],
-        signed_principal_context: vec![],
+        principal_context: vec![].into(),
+        signed_principal_context: vec![].into(),
         signed_principal_context_v2: None,
         expires_at: now + TOKEN_REFRESH_THRESHOLD + Duration::from_secs(1),
     };
@@ -356,8 +356,8 @@ fn cached_token_below_min_validity_is_rejected() {
     // A freshly minted token with less than MIN_TOKEN_VALIDITY remaining must not be served:
     // bootstrap() rejects it as TokenTooShortLived rather than risk a mid-write expiry.
     let cached = CachedPrincipalContext {
-        principal_context: vec![],
-        signed_principal_context: vec![],
+        principal_context: vec![].into(),
+        signed_principal_context: vec![].into(),
         signed_principal_context_v2: None,
         expires_at: now + MIN_TOKEN_VALIDITY - Duration::from_secs(1),
     };
@@ -368,8 +368,8 @@ fn cached_token_below_min_validity_is_rejected() {
 fn cached_token_above_min_validity_is_accepted() {
     let now = Instant::now();
     let cached = CachedPrincipalContext {
-        principal_context: vec![],
-        signed_principal_context: vec![],
+        principal_context: vec![].into(),
+        signed_principal_context: vec![].into(),
         signed_principal_context_v2: None,
         expires_at: now + MIN_TOKEN_VALIDITY + Duration::from_secs(1),
     };
