@@ -21,9 +21,12 @@ const DEFAULT_PRIORITY: Bytes = Bytes::from_static(b"INFO");
 /// Parser for structured and/or unstructured Databricks logs.
 ///
 /// Expects logs to arrive in a structured or unstructured format. This parser never fails a parse;
-/// instead, we will just pass on the message without transformation. If no timestamp can be
-/// extracted from the log line, the event retains whatever timestamp was set at creation time
-/// (the ingest timestamp), matching the behavior of the file source.
+/// instead, we will just pass on the message without transformation.
+///
+/// Raw files have no CRI/Docker prefix, so no timestamp is parsed, and in the legacy namespace the
+/// event has none either (`create_event` leaves it to the CRI/Docker parsers). We stamp the read
+/// time when the event has no timestamp and keep an existing one. The vector namespace already
+/// carries `vector.ingest_timestamp`, so it is left alone.
 #[derive(Clone, Derivative)]
 #[derivative(Debug)]
 pub(super) struct DatabricksParser {
@@ -66,6 +69,14 @@ impl FunctionTransform for DatabricksParser {
                         log_schema().timestamp_key().map(LegacyKey::Overwrite),
                         path!(TIMESTAMP_KEY),
                         Value::Timestamp(ts),
+                    );
+                } else if self.log_namespace == LogNamespace::Legacy {
+                    self.log_namespace.insert_source_metadata(
+                        Config::NAME,
+                        log,
+                        log_schema().timestamp_key().map(LegacyKey::InsertIfEmpty),
+                        path!(TIMESTAMP_KEY),
+                        Value::Timestamp(Utc::now()),
                     );
                 }
                 let priority = if parsed_log.priority.is_empty() {
@@ -287,6 +298,49 @@ pub mod tests {
                 );
             }
             other => panic!("expected Timestamp value, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_legacy_timestamp_fallback() {
+        use vector_lib::lookup::event_path;
+
+        let preset = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // (message, timestamp already on the event, expected timestamp; None = read time)
+        let cases = [
+            ("WARNING: sun.misc.Unsafe has been called", None, None),
+            ("/databricks/chauffeur-jars/a.jar", None, None),
+            (
+                "WARNING: sun.misc.Unsafe has been called",
+                Some(preset),
+                Some(preset),
+            ),
+        ];
+
+        for (message, existing, expected) in cases {
+            let mut log = LogEvent::default();
+            log.insert(event_path!("message"), message);
+            if let Some(ts) = existing {
+                log.insert(event_path!("timestamp"), ts);
+            }
+
+            let before = Utc::now();
+            let mut output = OutputBuffer::default();
+            DatabricksParser::new(LogNamespace::Legacy).transform(&mut output, Event::Log(log));
+            let after = Utc::now();
+
+            let events: Vec<_> = output.into_events().collect();
+            let Some(Value::Timestamp(actual)) = events[0].as_log().get(event_path!("timestamp"))
+            else {
+                panic!("{message}: timestamp missing");
+            };
+            match expected {
+                Some(want) => assert_eq!(*actual, want, "{message}"),
+                None => assert!((before..=after).contains(actual), "{message}: {actual}"),
+            }
         }
     }
 
