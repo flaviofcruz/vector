@@ -287,9 +287,9 @@ pub(super) fn append_scalar_from_wire(
 
 /// Render a proto enum varint into a `LargeUtf8` builder as its enum-value
 /// *name* (e.g. `1` -> `"SUCCESS"`), matching the classic Lumberjack ETL
-/// (`ScalaPbValueFormatter`). Parity rules:
-///   - out-of-range value -> `UNKNOWN_ENUM_VALUE_<enum>_<n>` placeholder, never
-///     a row drop (matches ScalaPB's `generate_unrecognized_enum_value` codegen);
+/// (its generated proto value formatter). Parity rules:
+///   - out-of-range value -> `UNRECOGNIZED`, never a row drop (see
+///     [`UNRECOGNIZED_ENUM_NAME`]);
 ///   - a wrong wire type (enum must be a varint) -> `WireTypeMismatch`.
 ///     The absent/proto3-default case (elided zero value -> null) is handled by the
 ///     builder-tree's `finalize_row`, not here.
@@ -657,11 +657,9 @@ pub(super) fn append_repeated_enum_string(
 }
 
 /// Look up `raw`'s enum-value name and append it to a `LargeUtf8` builder.
-/// A value with no matching descriptor entry renders the same synthetic
-/// placeholder ScalaPB emits (see [`unknown_enum_placeholder`]), so a proto
-/// enum value added upstream after this binary was built lands as a string
-/// instead of dropping the row — matching the classic Lumberjack ETL, whose
-/// log protos are compiled with `generate_unrecognized_enum_value = true`.
+/// A value with no matching descriptor entry renders [`UNRECOGNIZED_ENUM_NAME`],
+/// so a proto enum value added upstream after this binary was built lands as a
+/// string instead of dropping the row.
 /// Shared by the singular and repeated enum-string paths.
 #[inline]
 fn append_enum_name(
@@ -677,19 +675,17 @@ fn append_enum_name(
     };
     match desc.get_value(value) {
         Some(v) => b.append_value(v.name()),
-        None => b.append_value(unknown_enum_placeholder(desc, value)),
+        None => b.append_value(UNRECOGNIZED_ENUM_NAME),
     }
     Ok(())
 }
 
-/// The placeholder string ScalaPB's `findValueByNumberCreatingIfUnknown`
-/// produces for an unrecognized enum value: `UNKNOWN_ENUM_VALUE_<enum>_<n>`,
-/// where `<enum>` is the enum's simple (unqualified) name. `desc.name()` from
-/// prost-reflect is that same simple name, so the two paths are byte-identical.
-#[inline]
-fn unknown_enum_placeholder(desc: &prost_reflect::EnumDescriptor, value: i32) -> String {
-    format!("UNKNOWN_ENUM_VALUE_{}_{}", desc.name(), value)
-}
+/// What the classic Lumberjack ETL writes for an unrecognized enum value: its
+/// generated formatter (universe `GenerateProtoValueFormatter`) emits ScalaPB's
+/// `GeneratedEnum.name`, which is the constant `"UNRECOGNIZED"` for
+/// `Unrecognized(n)`. The reflective `UNKNOWN_ENUM_VALUE_<enum>_<n>` form is not
+/// what lands in classic tables.
+const UNRECOGNIZED_ENUM_NAME: &str = "UNRECOGNIZED";
 
 /// Mirror of [`append_repeated_enum_string`] that walks the value (or packed
 /// blob) without appending — used by the pre-validate pass. Runs the same

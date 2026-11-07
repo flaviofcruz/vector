@@ -2160,11 +2160,10 @@ fn enum_to_string_absent_is_null() {
 }
 
 #[test]
-fn enum_to_string_unknown_value_renders_placeholder() {
+fn enum_to_string_unknown_value_renders_unrecognized() {
     // An out-of-range enum number (e.g. a value added upstream after this
     // binary was built) has no descriptor entry. The classic Lumberjack ETL
-    // renders ScalaPB's `UNKNOWN_ENUM_VALUE_<enum>_<n>` placeholder rather than
-    // dropping the row, so we match it byte-for-byte and keep the row.
+    // writes ScalaPB's `UNRECOGNIZED` rather than dropping the row.
     let desc = singular_enum_descriptor();
     let schema = Schema::new(vec![Field::new("outcome", DataType::LargeUtf8, true)]);
     let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
@@ -2185,7 +2184,7 @@ fn enum_to_string_unknown_value_renders_placeholder() {
     assert_eq!(batch.num_rows(), 2, "the unknown-enum row must be kept");
     let col = batch.column(0).as_string::<i64>();
     assert_eq!(col.value(0), "FAILURE");
-    assert_eq!(col.value(1), "UNKNOWN_ENUM_VALUE_Outcome_99");
+    assert_eq!(col.value(1), "UNRECOGNIZED");
 }
 
 #[test]
@@ -2279,7 +2278,7 @@ fn repeated_enum_to_string_unknown_value_renders_placeholder() {
     let strs = strs.as_string::<i64>();
     assert_eq!(strs.len(), 2);
     assert_eq!(strs.value(0), "SUCCESS");
-    assert_eq!(strs.value(1), "UNKNOWN_ENUM_VALUE_Outcome_99");
+    assert_eq!(strs.value(1), "UNRECOGNIZED");
 }
 
 // -------------------------------------------------------------------------
