@@ -281,15 +281,6 @@ where
 
         let mut stats = TimingStats::default();
 
-        // Wrap the checkpointer in Arc so the drain path can write
-        // checkpoints while the checkpoint_writer task is still running.
-        let checkpointer = Arc::new(checkpointer);
-        let drain_checkpointer = if self.drain_on_shutdown {
-            Some(Arc::clone(&checkpointer))
-        } else {
-            None
-        };
-
         // Spawn the checkpoint writer task
         let checkpoint_task_handle = tokio::spawn(checkpoint_writer(
             checkpointer,
@@ -716,10 +707,13 @@ where
             match select(shutdown_data, sleep).await {
                 Either::Left((_, _)) => {
                     if self.drain_on_shutdown {
-                        let drain_checkpointer = drain_checkpointer.as_ref().expect(
-                            "drain_checkpointer must be set when drain_on_shutdown is true",
-                        );
                         info!(message = "Shutdown signal received, draining files before exit.");
+
+                        // The drain deliberately never touches checkpoints. A checkpoint may only
+                        // move past a line once downstream has taken it (the source's map closure
+                        // does that as it pulls events), and a send here can still fail or be
+                        // dropped at the reload deadline. The final `write_checkpoints` below
+                        // then persists exactly what the consumer has taken.
 
                         // Snapshot current EOF of each watched file as the drain target.
                         //
@@ -815,16 +809,6 @@ where
                                             // `target` is the size of a different file now at the same
                                             // path, which this handle can never reach.
                                             drain_targets.swap_remove(&file_id);
-                                            checkpoints
-                                                .update(file_id, watcher.get_checkpoint_position());
-                                            if let Err(error) =
-                                                drain_checkpointer.write_checkpoints().await
-                                            {
-                                                error!(
-                                                    ?error,
-                                                    "Error writing checkpoints during drain"
-                                                );
-                                            }
                                             progress = true;
                                             break;
                                         }
@@ -837,16 +821,11 @@ where
                                 }
                                 progress |= bytes_read > 0;
 
-                                // Persist checkpoint once a file reaches its drain target.
+                                // The file reached its drain target.
                                 if drain_targets.contains_key(&file_id)
                                     && watcher.get_checkpoint_position() >= target
                                 {
                                     drain_targets.swap_remove(&file_id);
-                                    checkpoints.update(file_id, watcher.get_checkpoint_position());
-                                    if let Err(error) = drain_checkpointer.write_checkpoints().await
-                                    {
-                                        error!(?error, "Error writing checkpoints during drain");
-                                    }
                                     progress = true;
                                 }
                             }
@@ -1064,11 +1043,12 @@ fn unwatched_info(
 }
 
 async fn checkpoint_writer(
-    checkpointer: Arc<Checkpointer>,
+    checkpointer: Checkpointer,
     sleep_duration: Duration,
     mut shutdown: impl Future + Unpin,
     emitter: impl FileSourceInternalEvents,
 ) -> Arc<Checkpointer> {
+    let checkpointer = Arc::new(checkpointer);
     loop {
         let sleep = sleep(sleep_duration);
         tokio::select! {
@@ -2217,19 +2197,26 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
 
         let shutdown_data = futures::future::ready(());
-        let shutdown_checkpointer = futures::future::ready(());
         let checkpointer = Checkpointer::new(data_dir.as_path());
 
+        // Like the source's map closure, the consumer is what advances checkpoints. The
+        // checkpoint writer is only released once the consumer is done.
+        let view = checkpointer.view();
+        let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
         let collector = tokio::spawn(async move {
             let mut lines = Vec::new();
             while let Some(batch) = rx.next().await {
+                for line in &batch {
+                    view.update(line.file_id, line.end_offset);
+                }
                 lines.extend(batch);
             }
+            let _ = done_tx.send(());
             lines
         });
 
         let result = file_server
-            .run(tx, shutdown_data, shutdown_checkpointer, checkpointer)
+            .run(tx, shutdown_data, done_rx, checkpointer)
             .await;
         assert!(result.is_ok());
 
@@ -3483,6 +3470,94 @@ mod tests {
         );
     }
 
+    /// The drain must not persist a checkpoint past lines downstream has not taken. Here the
+    /// consumer never polls while the server shuts down, then goes away (a reload whose deadline
+    /// dropped the stream). Every file's persisted checkpoint must stay at what was consumed (0),
+    /// and a restart must deliver every line again.
+    #[tokio::test]
+    async fn drain_on_shutdown_does_not_checkpoint_past_undelivered_lines() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        // Small files so the first read pass and the drain cover them completely.
+        let names = ["a", "b", "c"];
+        let mut paths = Vec::new();
+        for name in names {
+            let path = tmp.path().join(format!("{name}.log"));
+            let content: String = (0..30)
+                .map(|i| format!("{name} line {i:03} padding\n"))
+                .collect();
+            fs::write(&path, content).await.unwrap();
+            paths.push(path);
+        }
+
+        // Run 1: stalled consumer. Nothing is polled until the server has exited.
+        let file_server = make_file_server(paths.clone(), data_dir.clone(), true);
+        let (tx, rx) = mpsc::channel::<Vec<Line>>(8);
+        let result = file_server
+            .run(
+                tx,
+                futures::future::ready(()),
+                futures::future::ready(()),
+                Checkpointer::new(data_dir.as_path()),
+            )
+            .await;
+        assert!(result.is_ok());
+        drop(rx);
+
+        let mut persisted = Checkpointer::new(data_dir.as_path());
+        persisted.read_checkpoints(None).await;
+        let mut fingerprinter = Fingerprinter::new(
+            FingerprintStrategy::FirstLinesChecksum {
+                ignored_header_bytes: 0,
+                lines: 1,
+            },
+            1024,
+            true,
+        );
+        let mut known_small_files = HashMap::new();
+        for path in &paths {
+            let fingerprint = fingerprinter
+                .fingerprint_or_emit(path, &mut known_small_files, &NoErrors)
+                .await
+                .expect("should be able to fingerprint the file");
+            let position = persisted.view().get(fingerprint).unwrap_or(0);
+            assert_eq!(
+                position, 0,
+                "{path:?}: checkpoint advanced to {position} although downstream consumed nothing"
+            );
+        }
+
+        // Run 2: restart. Nothing was checkpointed, so every line is delivered again.
+        let file_server = make_file_server(paths, data_dir.clone(), true);
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+        let collector = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Some(batch) = rx.next().await {
+                lines.extend(batch);
+            }
+            lines
+        });
+        file_server
+            .run(
+                tx,
+                futures::future::ready(()),
+                futures::future::ready(()),
+                Checkpointer::new(data_dir.as_path()),
+            )
+            .await
+            .expect("FileServer::run failed");
+        let received = collector.await.unwrap();
+        for name in names {
+            let count = received
+                .iter()
+                .filter(|line| line.filename.ends_with(&format!("{name}.log")))
+                .count();
+            assert_eq!(count, 30, "{name}.log lines lost across restart");
+        }
+    }
+
     /// A live (still findable) file whose last bytes at shutdown are an unterminated line: the
     /// drain must emit those buffered bytes before completing, and must not checkpoint past
     /// bytes it hasn't emitted, so the next run neither loses nor re-delivers them.
@@ -3500,20 +3575,23 @@ mod tests {
             let file_server =
                 make_file_server(vec![log_path.to_path_buf()], data_dir.to_path_buf(), true);
             let (tx, mut rx) = mpsc::channel::<Vec<Line>>(2);
+            let checkpointer = Checkpointer::new(data_dir);
+            // The consumer advances checkpoints, as the source's map closure does.
+            let view = checkpointer.view();
+            let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
             let collector = tokio::spawn(async move {
                 let mut lines = Vec::new();
                 while let Some(batch) = rx.next().await {
+                    for line in &batch {
+                        view.update(line.file_id, line.end_offset);
+                    }
                     lines.extend(batch.into_iter().map(|line| line.text));
                 }
+                let _ = done_tx.send(());
                 lines
             });
             file_server
-                .run(
-                    tx,
-                    futures::future::ready(()),
-                    futures::future::ready(()),
-                    Checkpointer::new(data_dir),
-                )
+                .run(tx, futures::future::ready(()), done_rx, checkpointer)
                 .await
                 .expect("FileServer::run failed");
             collector.await.unwrap()

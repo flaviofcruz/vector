@@ -473,9 +473,9 @@ pub struct Config {
     /// before closing the output channel.
     ///
     /// When enabled, the file server will snapshot each file's size at shutdown
-    /// time and continue reading until every file has been read up to that point,
-    /// persisting checkpoints per-file so progress is not lost even if the process
-    /// is killed mid-drain.
+    /// time and continue reading until every file has been read up to that point.
+    /// The drain does not write checkpoints; the consumer advances them only for lines
+    /// downstream has taken, so lines in flight when a send fails are re-read on restart.
     #[serde(default = "default_drain_on_shutdown")]
     drain_on_shutdown: bool,
 
