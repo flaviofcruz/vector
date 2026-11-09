@@ -22,7 +22,7 @@ use tower::{Layer, Service, timeout::error::Elapsed};
 use tracing::{info, warn};
 use vector_lib::codecs::encoding::{BatchEncoder, BatchOutput, BatchSerializerConfig};
 use vector_lib::finalization::{EventFinalizers, Finalizable};
-use vector_lib::internal_event::CodedError;
+use vector_lib::internal_event::{CodedError, ComponentEventsDropped, UNINTENTIONAL};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 
@@ -109,6 +109,15 @@ impl ZerobusResponse {
             status: vector_lib::event::EventStatus::Delivered,
             bytes_sent,
         }
+    }
+
+    /// `Delivered` so the source acks the batch, but with a zero sent count: nothing
+    /// reached the table, and the dropped rows are reported as discarded instead.
+    fn delivered_nothing_sent() -> Self {
+        Self::delivered(
+            vector_lib::config::telemetry().create_request_count_byte_size(),
+            None,
+        )
     }
 
     /// Synthesize a response signalling a transient failure that exhausted the
@@ -1060,6 +1069,7 @@ impl Service<ZerobusRequest> for ZerobusService {
 
         Box::pin(async move {
             let schema = service.ensure_schema().await?;
+            let event_count = request.events.len();
             let encoding_schema = Arc::clone(&schema);
             let BatchOutput::Arrow(record_batch) = service
                 .encoding
@@ -1076,6 +1086,18 @@ impl Service<ZerobusRequest> for ZerobusService {
                         })
                 })
                 .await?;
+            // A 0-row batch means the encoder dropped every row (wire_to_arrow per-row
+            // validation, counted in wire_to_arrow_rows_dropped), so nothing is left to deliver.
+            // The SDK rejects empty batches as a non-retryable InvalidArgument; letting that
+            // through would mark the events Rejected, and ack-enabled sources that keep failed
+            // messages would redeliver the whole object, re-ingesting its valid rows each time.
+            if record_batch.num_rows() == 0 {
+                emit!(ComponentEventsDropped::<UNINTENTIONAL> {
+                    count: event_count,
+                    reason: "wire_to_arrow dropped every row in the batch",
+                });
+                return Ok(ZerobusResponse::delivered_nothing_sent());
+            }
             let payload = ZerobusPayload(record_batch);
 
             // Both legs below can surface the server's schema rejection: stream
@@ -2610,5 +2632,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status, vector_lib::event::EventStatus::Delivered);
+    }
+
+    /// When wire_to_arrow drops every row, the batch must be acknowledged as
+    /// Delivered without reaching the stream: the SDK rejects 0-row batches as a
+    /// non-retryable InvalidArgument, which would mark the events Rejected and make
+    /// sources that keep failed messages redeliver (and re-ingest) the object.
+    #[cfg(feature = "codecs-arrow")]
+    #[tokio::test]
+    async fn all_rows_dropped_by_codec_is_delivered_without_ingest() {
+        use super::super::unity_catalog_schema::{UnityCatalogColumn, UnityCatalogTableSchema};
+        use bytes::Bytes;
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::prost_types::field_descriptor_proto::{Label, Type as ProtoType};
+        use prost_reflect::prost_types::{
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        };
+        use tower::Service as _;
+        use vector_lib::codecs::encoding::WireToArrowSerializerConfig;
+        use vector_lib::event::LogEvent;
+        use vector_lib::json_size::JsonSize;
+
+        let uc_schema = UnityCatalogTableSchema {
+            name: "test_table".into(),
+            catalog_name: "test_cat".into(),
+            schema_name: "test_sch".into(),
+            columns: vec![UnityCatalogColumn {
+                name: "name".into(),
+                type_text: "string".into(),
+                type_name: "STRING".into(),
+                position: 0,
+                nullable: true,
+                type_json: String::new(),
+            }],
+        };
+        let arrow_schema = databricks_zerobus_ingest_sdk::schema::arrow_schema_from_uc_schema(
+            &uc_schema.to_sdk_uc_schema(),
+        )
+        .unwrap();
+
+        let set = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("all_rows_dropped_test.proto".into()),
+                package: Some("all_rows_dropped_test".into()),
+                message_type: vec![DescriptorProto {
+                    name: Some("Row".into()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("name".into()),
+                        number: Some(1),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::String as i32),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut set_bytes = Vec::new();
+        set.encode(&mut set_bytes).unwrap();
+        let desc_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(desc_file.path(), &set_bytes).unwrap();
+
+        // Fail any ingest the way the SDK does for a 0-row batch, so the test
+        // fails if the empty batch reaches the stream.
+        let mut service = ZerobusService::new_with_mock(
+            test_config(),
+            MockStream::failing(ZerobusError::InvalidArgument(
+                "Cannot ingest an empty RecordBatch (zero rows)".to_string(),
+            )),
+        )
+        .await
+        .unwrap();
+        // Swap in wire_to_arrow only after construction: new_with_mock builds a
+        // placeholder encoder from an empty schema, which wire_to_arrow rejects.
+        let mut config = test_config();
+        config.batch_encoding = BatchSerializerConfig::WireToArrow(WireToArrowSerializerConfig {
+            desc_file: desc_file.path().to_path_buf(),
+            message_type: "all_rows_dropped_test.Row".into(),
+            schema: None,
+        });
+        service.config = Arc::new(config);
+        service.script_schema_fetches([arrow_schema]);
+        service.ensure_schema().await.unwrap();
+        service.pin_stream_to_cached_schema().await;
+
+        // `name` (tag 0x0a, LEN, length 1) carries a lone 0xff, which is not valid
+        // UTF-8, so wire_to_arrow's per-row validation drops the only row.
+        let mut log = LogEvent::default();
+        log.insert("message", Bytes::from_static(&[0x0a, 0x01, 0xff]));
+
+        let event = Event::from(log);
+        let mut events_byte_size = GroupedCountByteSize::new_untagged();
+        events_byte_size.add_event(&event, JsonSize::new(16));
+
+        let resp = service
+            .call(ZerobusRequest {
+                events: Arc::new(vec![event]),
+                metadata: RequestMetadata::new(1, 16, 16, 16, events_byte_size),
+                finalizers: EventFinalizers::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.status, vector_lib::event::EventStatus::Delivered);
+        // Nothing reached the table, so the driver must not count the batch as sent.
+        assert_eq!(resp.events_byte_size.size().unwrap().0, 0);
+        assert_eq!(resp.bytes_sent(), None);
+        assert!(
+            service.has_active_stream().await,
+            "stream must not be discarded"
+        );
     }
 }
