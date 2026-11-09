@@ -9,7 +9,7 @@ use file_source_common::{FileStat, ReadFrom};
 use quickcheck::{Arbitrary, Gen};
 use tokio::time::Instant;
 
-use super::{EOF_READ_BACKOFF_MAX, EOF_READ_BACKOFF_MIN, FileWatcher, null_reader};
+use super::{EOF_READ_BACKOFF_MAX, EOF_READ_BACKOFF_MIN, FileWatcher, UnreadCheck, null_reader};
 
 // Welcome.
 //
@@ -203,7 +203,63 @@ fn watcher_for_timing() -> FileWatcher {
         bytes_read: 0,
         last_seen_stat: FileStat::default(),
         buffered_line_start: None,
+        unread_check: None,
     }
+}
+
+#[test]
+fn unread_age_is_how_long_ago_the_file_was_written_while_bytes_are_unread() {
+    let mut watcher = watcher_for_timing();
+    watcher.unread_check = Some(UnreadCheck::Size);
+    watcher.last_seen_stat = FileStat {
+        mtime_ms: Some(1_000),
+        size_bytes: Some(100),
+    };
+
+    watcher.file_position = 40;
+    assert_eq!(watcher.unread_age(61_000), Some(Duration::from_secs(60)));
+    // Caught up to the size the last discovery pass saw.
+    watcher.file_position = 100;
+    assert_eq!(watcher.unread_age(61_000), Some(Duration::ZERO));
+    // An mtime after `now` reads as zero rather than underflowing.
+    watcher.file_position = 40;
+    assert_eq!(watcher.unread_age(0), Some(Duration::ZERO));
+}
+
+#[test]
+fn unread_age_skips_untracked_files_and_incomplete_stats() {
+    let mut watcher = watcher_for_timing();
+    watcher.last_seen_stat = FileStat {
+        mtime_ms: Some(0),
+        size_bytes: Some(100),
+    };
+    assert_eq!(watcher.unread_age(60_000), None);
+
+    watcher.unread_check = Some(UnreadCheck::Size);
+    watcher.last_seen_stat.mtime_ms = None;
+    assert_eq!(watcher.unread_age(60_000), None);
+    watcher.last_seen_stat = FileStat {
+        mtime_ms: Some(0),
+        size_bytes: None,
+    };
+    assert_eq!(watcher.unread_age(60_000), None);
+}
+
+#[test]
+fn gzipped_file_is_unread_until_its_reader_reaches_the_end() {
+    let mut watcher = watcher_for_timing();
+    watcher.unread_check = Some(UnreadCheck::Eof);
+    // Compressed size and decompressed position are not comparable, so neither is consulted.
+    watcher.last_seen_stat = FileStat {
+        mtime_ms: Some(1_000),
+        size_bytes: Some(10),
+    };
+    watcher.file_position = 500;
+
+    watcher.reached_eof = false;
+    assert_eq!(watcher.unread_age(61_000), Some(Duration::from_secs(60)));
+    watcher.reached_eof = true;
+    assert_eq!(watcher.unread_age(61_000), Some(Duration::ZERO));
 }
 
 #[test]

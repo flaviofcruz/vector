@@ -746,6 +746,8 @@ mod test {
             Box::new(|_| {})
         }
 
+        fn emit_backlog_max_age(&self, _: Duration) {}
+
         fn emit_file_line_too_long(&self, _: &BytesMut, _: usize, _: usize) {
             panic!()
         }

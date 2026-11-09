@@ -437,6 +437,15 @@ where
                 }
                 stats.record("discovery", start.elapsed());
 
+                // This pass has just refreshed each found file's stat.
+                let now_ms = Utc::now().timestamp_millis();
+                let max_unread_age = fp_map
+                    .values()
+                    .filter_map(|watcher| watcher.unread_age(now_ms))
+                    .max()
+                    .unwrap_or_default();
+                self.emitter.emit_backlog_max_age(max_unread_age);
+
                 let pass_end = time::Instant::now();
                 set_last_discovery_pass(unix_now_seconds());
                 let scheduled = next_glob_time;
@@ -1294,6 +1303,7 @@ mod tests {
         fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
             Box::new(|_| {})
         }
+        fn emit_backlog_max_age(&self, _: Duration) {}
         fn emit_file_line_too_long(&self, _: &BytesMut, _: usize, _: usize) {
             panic!("unexpected line too long");
         }
@@ -1349,6 +1359,9 @@ mod tests {
         }
         fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
             NoErrors.discovery_pass_timestamp()
+        }
+        fn emit_backlog_max_age(&self, age: Duration) {
+            NoErrors.emit_backlog_max_age(age);
         }
         fn emit_file_line_too_long(&self, bytes: &BytesMut, limit: usize, size: usize) {
             NoErrors.emit_file_line_too_long(bytes, limit, size);
@@ -1408,6 +1421,69 @@ mod tests {
         fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
             let pass_timestamps = Arc::clone(&self.pass_timestamps);
             Box::new(move |timestamp| pass_timestamps.lock().unwrap().push(timestamp))
+        }
+        fn emit_backlog_max_age(&self, age: Duration) {
+            NoErrors.emit_backlog_max_age(age);
+        }
+        fn emit_file_line_too_long(&self, bytes: &BytesMut, limit: usize, size: usize) {
+            NoErrors.emit_file_line_too_long(bytes, limit, size);
+        }
+    }
+
+    // Records the per-pass backlog age reports; everything else behaves like `NoErrors`.
+    #[derive(Clone, Default)]
+    struct BacklogEvents {
+        ages: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl FileSourceInternalEvents for BacklogEvents {
+        fn emit_file_added(&self, path: &Path) {
+            NoErrors.emit_file_added(path);
+        }
+        fn emit_file_resumed(&self, path: &Path, position: u64) {
+            NoErrors.emit_file_resumed(path, position);
+        }
+        fn emit_file_watch_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_watch_error(path, error);
+        }
+        fn emit_file_read_started(&self, path: &Path, info: &FileReadStartedInfo) {
+            NoErrors.emit_file_read_started(path, info);
+        }
+        fn emit_file_unwatched(&self, path: &Path, info: &FileUnwatchedInfo) {
+            NoErrors.emit_file_unwatched(path, info);
+        }
+        fn emit_file_deleted(&self, path: &Path) {
+            NoErrors.emit_file_deleted(path);
+        }
+        fn emit_file_delete_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_delete_error(path, error);
+        }
+        fn emit_file_fingerprint_read_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_fingerprint_read_error(path, error);
+        }
+        fn emit_file_checkpointed(&self, count: usize, duration: Duration) {
+            NoErrors.emit_file_checkpointed(count, duration);
+        }
+        fn emit_file_checksum_failed(&self, path: &Path) {
+            NoErrors.emit_file_checksum_failed(path);
+        }
+        fn emit_file_checkpoint_write_error(&self, error: Error) {
+            NoErrors.emit_file_checkpoint_write_error(error);
+        }
+        fn emit_files_open(&self, count: usize) {
+            NoErrors.emit_files_open(count);
+        }
+        fn emit_path_globbing_failed(&self, path: &Path, error: &Error) {
+            NoErrors.emit_path_globbing_failed(path, error);
+        }
+        fn emit_discovery_pass_delayed(&self) {
+            NoErrors.emit_discovery_pass_delayed();
+        }
+        fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
+            NoErrors.discovery_pass_timestamp()
+        }
+        fn emit_backlog_max_age(&self, age: Duration) {
+            self.ages.lock().unwrap().push(age);
         }
         fn emit_file_line_too_long(&self, bytes: &BytesMut, limit: usize, size: usize) {
             NoErrors.emit_file_line_too_long(bytes, limit, size);
@@ -1473,6 +1549,9 @@ mod tests {
         }
         fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
             NoErrors.discovery_pass_timestamp()
+        }
+        fn emit_backlog_max_age(&self, age: Duration) {
+            NoErrors.emit_backlog_max_age(age);
         }
         fn emit_file_line_too_long(&self, bytes: &BytesMut, limit: usize, size: usize) {
             NoErrors.emit_file_line_too_long(bytes, limit, size);
@@ -1793,6 +1872,100 @@ mod tests {
         running.await.unwrap();
         // The setter goes when `run` returns, so a removed source's gauge can expire.
         assert_eq!(Arc::strong_count(&probe), 2);
+    }
+
+    #[tokio::test]
+    async fn backlog_reports_a_stale_file_until_it_is_read() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+        let log_path = tmp.path().join("a.log");
+        fs::write(&log_path, "line\n".repeat(10)).await.unwrap();
+        // Written ten minutes ago and not read yet.
+        std::fs::File::options()
+            .write(true)
+            .open(&log_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+
+        let events = BacklogEvents::default();
+        let file_server =
+            make_file_server_with_emitter(vec![log_path], data_dir.clone(), false, events.clone());
+        let (tx, rx) = mpsc::channel::<Vec<Line>>(16);
+        let collector = tokio::spawn(rx.collect::<Vec<_>>());
+        let shutdown = Box::pin(tokio::time::sleep(Duration::from_millis(500)));
+        file_server
+            .run(
+                tx,
+                shutdown,
+                futures::future::ready(()),
+                Checkpointer::new(&data_dir),
+            )
+            .await
+            .unwrap();
+        collector.await.unwrap();
+
+        // The first pass runs before the first read, so the file's unread bytes are ten minutes
+        // old; later passes see it caught up.
+        let ages = events.ages.lock().unwrap().clone();
+        assert!(ages.len() >= 2, "{ages:?}");
+        let first = ages[0];
+        assert!(
+            first >= Duration::from_secs(600) && first < Duration::from_secs(660),
+            "{ages:?}"
+        );
+        assert_eq!(ages.last(), Some(&Duration::ZERO), "{ages:?}");
+    }
+
+    #[tokio::test]
+    async fn backlog_reports_an_unfinished_gzipped_file_until_it_is_read() {
+        use std::io::Write;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+        // A rotated, compressed hourly file, written ten minutes ago and not read yet.
+        let gz_path = tmp.path().join("a.log.gz");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all("line\n".repeat(10).as_bytes()).unwrap();
+        fs::write(&gz_path, encoder.finish().unwrap())
+            .await
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&gz_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+
+        let events = BacklogEvents::default();
+        let file_server =
+            make_file_server_with_emitter(vec![gz_path], data_dir.clone(), false, events.clone());
+        let (tx, rx) = mpsc::channel::<Vec<Line>>(16);
+        let collector = tokio::spawn(rx.collect::<Vec<_>>());
+        let shutdown = Box::pin(tokio::time::sleep(Duration::from_millis(500)));
+        file_server
+            .run(
+                tx,
+                shutdown,
+                futures::future::ready(()),
+                Checkpointer::new(&data_dir),
+            )
+            .await
+            .unwrap();
+        let lines: usize = collector.await.unwrap().iter().map(Vec::len).sum();
+        assert_eq!(lines, 10);
+
+        // Unread on the first pass; once read to the end it is done and no longer counted.
+        let ages = events.ages.lock().unwrap().clone();
+        assert!(ages.len() >= 2, "{ages:?}");
+        let first = ages[0];
+        assert!(
+            first >= Duration::from_secs(600) && first < Duration::from_secs(660),
+            "{ages:?}"
+        );
+        assert_eq!(ages.last(), Some(&Duration::ZERO), "{ages:?}");
     }
 
     fn make_file_server(

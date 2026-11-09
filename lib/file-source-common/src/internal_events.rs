@@ -110,6 +110,10 @@ pub trait FileSourceInternalEvents: Send + Sync + Clone + 'static {
     /// keeps exporting its last, increasingly stale, timestamp.
     fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync>;
 
+    /// After each discovery pass: the largest unread-byte age (a lower bound) among the source's
+    /// watched files, zero when every file is caught up. Reported every pass.
+    fn emit_backlog_max_age(&self, age: Duration);
+
     fn emit_file_line_too_long(
         &self,
         truncated_bytes: &BytesMut,

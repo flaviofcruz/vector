@@ -507,6 +507,35 @@ mod source {
         }
     }
 
+    /// `file_backlog_behind{over}` thresholds: a source is behind by more than one when its
+    /// largest unread-byte age is.
+    pub const BACKLOG_BEHIND_THRESHOLDS: [(&str, Duration); 2] = [
+        ("900s", Duration::from_secs(900)),
+        ("3600s", Duration::from_secs(3600)),
+    ];
+
+    /// For each of `BACKLOG_BEHIND_THRESHOLDS`, 1 if `age` is past it and 0 otherwise.
+    pub fn backlog_behind(age: Duration) -> [(&'static str, f64); 2] {
+        BACKLOG_BEHIND_THRESHOLDS
+            .map(|(label, threshold)| (label, if age > threshold { 1.0 } else { 0.0 }))
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
+    pub struct FileBacklogMaxAge {
+        pub age: Duration,
+    }
+
+    impl InternalEvent for FileBacklogMaxAge {
+        fn emit(self) {
+            gauge!("file_backlog_max_age_seconds").set(self.age.as_secs_f64());
+            // Always set, including 0, so `avg` across sources is the fraction behind and `sum`
+            // the number behind.
+            for (over, behind) in backlog_behind(self.age) {
+                gauge!("file_backlog_behind", "over" => over).set(behind);
+            }
+        }
+    }
+
     #[derive(Debug, NamedInternalEvent)]
     pub struct FileDiscoveryPassDelayed;
 
@@ -697,6 +726,10 @@ mod source {
             Box::new(move |timestamp| gauge.set(timestamp))
         }
 
+        fn emit_backlog_max_age(&self, age: Duration) {
+            emit!(FileBacklogMaxAge { age });
+        }
+
         fn emit_file_line_too_long(
             &self,
             truncated_bytes: &bytes::BytesMut,
@@ -838,5 +871,19 @@ mod tests {
         assert_eq!(field(&fields, "num_bytes_read"), Some("90"));
         assert_eq!(field(&fields, "file_mtime_ms"), None);
         assert_eq!(field(&fields, "file_size_bytes"), None);
+    }
+
+    #[test]
+    fn backlog_behind_flags_each_threshold_strictly_exceeded() {
+        use std::time::Duration;
+
+        use super::backlog_behind;
+
+        let flags = |secs| backlog_behind(Duration::from_secs(secs));
+        assert_eq!(flags(0), [("900s", 0.0), ("3600s", 0.0)]);
+        assert_eq!(flags(900), [("900s", 0.0), ("3600s", 0.0)]);
+        assert_eq!(flags(901), [("900s", 1.0), ("3600s", 0.0)]);
+        assert_eq!(flags(3600), [("900s", 1.0), ("3600s", 0.0)]);
+        assert_eq!(flags(3601), [("900s", 1.0), ("3600s", 1.0)]);
     }
 }

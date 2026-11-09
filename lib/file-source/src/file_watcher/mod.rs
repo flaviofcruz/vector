@@ -42,6 +42,23 @@ pub struct RawLineResult {
     pub discarded_for_size_and_truncated: Vec<BytesMut>,
 }
 
+/// How a watcher tells whether its file has unread bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnreadCheck {
+    /// The read position is below the size the last discovery pass saw.
+    Size,
+    /// The reader has not reached the end of the file yet. Used for gzipped files, whose read
+    /// position counts decompressed bytes while their size is compressed; a gzipped file is not
+    /// appended to, so it has unread bytes until it has been read to the end.
+    Eof,
+}
+
+impl UnreadCheck {
+    fn for_file(gzipped: bool) -> Self {
+        if gzipped { Self::Eof } else { Self::Size }
+    }
+}
+
 /// The `FileWatcher` struct defines the polling based state machine which reads
 /// from a file path, transparently updating the underlying file descriptor when
 /// the file has been rolled over, as is common for logs.
@@ -75,6 +92,9 @@ pub struct FileWatcher {
     last_seen_stat: FileStat,
     /// Start offset retained with a partial line across EOF polling.
     buffered_line_start: Option<FilePosition>,
+    /// How `unread_age` tells whether this file has unread bytes; `None` for files this watcher
+    /// skips.
+    unread_check: Option<UnreadCheck>,
 }
 
 impl FileWatcher {
@@ -196,6 +216,7 @@ impl FileWatcher {
         let read_started_pending = reads_file && file_position == 0;
 
         let last_seen_stat = FileStat::from_metadata(&metadata);
+        let unread_check = reads_file.then(|| UnreadCheck::for_file(gzipped));
         let ts = metadata
             .modified()
             .ok()
@@ -226,6 +247,7 @@ impl FileWatcher {
             lines_read: 0,
             bytes_read: 0,
             last_seen_stat,
+            unread_check,
         })
     }
 
@@ -243,6 +265,7 @@ impl FileWatcher {
                 Box::new(reader)
             };
             self.reader = new_reader;
+            self.unread_check = Some(UnreadCheck::for_file(gzipped));
 
             let file_info = file_handle.file_info().await?;
             self.devno = file_info.portable_dev();
@@ -313,6 +336,27 @@ impl FileWatcher {
         if let Some(stat) = stat {
             self.last_seen_stat = stat;
         }
+    }
+
+    /// A lower bound on the age of this file's oldest unread byte at `now_ms`: how long ago the
+    /// file was last written if it has unread bytes (see `UnreadCheck`), and zero otherwise.
+    /// `None` when this watcher skips the file or the stat it needs is missing.
+    ///
+    /// The newest write happened at the mtime, so every unread byte is at least that old. A file
+    /// that is still being written therefore reads close to zero however far behind it is; its
+    /// backlog only ages once writes stop, for example after an hourly file has rotated and been
+    /// compressed.
+    pub fn unread_age(&self, now_ms: i64) -> Option<Duration> {
+        let mtime_ms = self.last_seen_stat.mtime_ms?;
+        let unread = match self.unread_check? {
+            UnreadCheck::Size => self.last_seen_stat.size_bytes? > self.file_position,
+            UnreadCheck::Eof => !self.reached_eof,
+        };
+        if !unread {
+            return Some(Duration::ZERO);
+        }
+        let age_ms = u64::try_from(now_ms.saturating_sub(mtime_ms)).unwrap_or(0);
+        Some(Duration::from_millis(age_ms))
     }
 
     /// Read a single line from the underlying file
