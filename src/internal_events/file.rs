@@ -110,7 +110,7 @@ mod source {
     use std::{io::Error, path::Path, time::Duration};
 
     use bytes::BytesMut;
-    use metrics::counter;
+    use metrics::{counter, gauge};
     use vector_lib::{
         NamedInternalEvent, emit,
         file_source_common::internal_events::{
@@ -508,6 +508,15 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
+    pub struct FileDiscoveryPassDelayed;
+
+    impl InternalEvent for FileDiscoveryPassDelayed {
+        fn emit(self) {
+            counter!("file_discovery_passes_delayed_total").increment(1);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
     pub struct FileCheckpointWriteError {
         pub error: Error,
     }
@@ -677,6 +686,15 @@ mod source {
 
         fn emit_path_globbing_failed(&self, path: &Path, error: &Error) {
             emit!(PathGlobbingError { path, error });
+        }
+
+        fn emit_discovery_pass_delayed(&self) {
+            emit!(FileDiscoveryPassDelayed);
+        }
+
+        fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
+            let gauge = gauge!("file_discovery_last_pass_timestamp_seconds");
+            Box::new(move |timestamp| gauge.set(timestamp))
         }
 
         fn emit_file_line_too_long(

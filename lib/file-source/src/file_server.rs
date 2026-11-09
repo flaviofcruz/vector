@@ -209,6 +209,12 @@ where
         S1: Future + Unpin + Send + 'static,
         S2: Future + Unpin + Send + 'static,
     {
+        // When the last discovery pass finished. Holding the setter for the whole run keeps the
+        // gauge from expiring while this server is stuck in a pass, a drain, or a blocked send, so
+        // its staleness stays visible. Set now so the startup scan counts from the start of `run`.
+        let set_last_discovery_pass = self.emitter.discovery_pass_timestamp();
+        set_last_discovery_pass(unix_now_seconds());
+
         let mut fp_map: IndexMap<FileFingerprint, FileWatcher> = Default::default();
 
         let mut backoff_cap: usize = 1;
@@ -430,6 +436,7 @@ where
                 stats.record("discovery", start.elapsed());
 
                 let pass_end = time::Instant::now();
+                set_last_discovery_pass(unix_now_seconds());
                 let scheduled = next_glob_time;
                 next_glob_time = next_discovery_time(
                     now_time,
@@ -437,7 +444,9 @@ where
                     next_glob_time,
                     self.glob_minimum_cooldown,
                 );
-                if next_glob_time > scheduled {
+                // With a zero cooldown the floor is the pass end itself, which is no rest at all.
+                if !self.glob_minimum_cooldown.is_zero() && next_glob_time > scheduled {
+                    self.emitter.emit_discovery_pass_delayed();
                     debug!(
                         message = "Slow discovery pass; delaying the next one.",
                         pass_duration_ms = pass_end.duration_since(now_time).as_millis() as u64,
@@ -1206,6 +1215,10 @@ fn next_discovery_time(
     }
 }
 
+fn unix_now_seconds() -> f64 {
+    Utc::now().timestamp_millis() as f64 / 1000.0
+}
+
 #[derive(Debug)]
 pub struct Line {
     pub text: Bytes,
@@ -1271,6 +1284,10 @@ mod tests {
         fn emit_path_globbing_failed(&self, _: &Path, _: &Error) {
             panic!("unexpected path globbing failure");
         }
+        fn emit_discovery_pass_delayed(&self) {}
+        fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
+            Box::new(|_| {})
+        }
         fn emit_file_line_too_long(&self, _: &BytesMut, _: usize, _: usize) {
             panic!("unexpected line too long");
         }
@@ -1320,6 +1337,71 @@ mod tests {
         }
         fn emit_path_globbing_failed(&self, path: &Path, error: &Error) {
             NoErrors.emit_path_globbing_failed(path, error);
+        }
+        fn emit_discovery_pass_delayed(&self) {
+            NoErrors.emit_discovery_pass_delayed();
+        }
+        fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
+            NoErrors.discovery_pass_timestamp()
+        }
+        fn emit_file_line_too_long(&self, bytes: &BytesMut, limit: usize, size: usize) {
+            NoErrors.emit_file_line_too_long(bytes, limit, size);
+        }
+    }
+
+    // Records the discovery events; everything else behaves like `NoErrors`.
+    #[derive(Clone, Default)]
+    struct DiscoveryEvents {
+        delayed: Arc<Mutex<usize>>,
+        pass_timestamps: Arc<Mutex<Vec<f64>>>,
+    }
+
+    impl FileSourceInternalEvents for DiscoveryEvents {
+        fn emit_file_added(&self, path: &Path) {
+            NoErrors.emit_file_added(path);
+        }
+        fn emit_file_resumed(&self, path: &Path, position: u64) {
+            NoErrors.emit_file_resumed(path, position);
+        }
+        fn emit_file_watch_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_watch_error(path, error);
+        }
+        fn emit_file_read_started(&self, path: &Path, info: &FileReadStartedInfo) {
+            NoErrors.emit_file_read_started(path, info);
+        }
+        fn emit_file_unwatched(&self, path: &Path, info: &FileUnwatchedInfo) {
+            NoErrors.emit_file_unwatched(path, info);
+        }
+        fn emit_file_deleted(&self, path: &Path) {
+            NoErrors.emit_file_deleted(path);
+        }
+        fn emit_file_delete_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_delete_error(path, error);
+        }
+        fn emit_file_fingerprint_read_error(&self, path: &Path, error: Error) {
+            NoErrors.emit_file_fingerprint_read_error(path, error);
+        }
+        fn emit_file_checkpointed(&self, count: usize, duration: Duration) {
+            NoErrors.emit_file_checkpointed(count, duration);
+        }
+        fn emit_file_checksum_failed(&self, path: &Path) {
+            NoErrors.emit_file_checksum_failed(path);
+        }
+        fn emit_file_checkpoint_write_error(&self, error: Error) {
+            NoErrors.emit_file_checkpoint_write_error(error);
+        }
+        fn emit_files_open(&self, count: usize) {
+            NoErrors.emit_files_open(count);
+        }
+        fn emit_path_globbing_failed(&self, path: &Path, error: &Error) {
+            NoErrors.emit_path_globbing_failed(path, error);
+        }
+        fn emit_discovery_pass_delayed(&self) {
+            *self.delayed.lock().unwrap() += 1;
+        }
+        fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
+            let pass_timestamps = Arc::clone(&self.pass_timestamps);
+            Box::new(move |timestamp| pass_timestamps.lock().unwrap().push(timestamp))
         }
         fn emit_file_line_too_long(&self, bytes: &BytesMut, limit: usize, size: usize) {
             NoErrors.emit_file_line_too_long(bytes, limit, size);
@@ -1379,6 +1461,12 @@ mod tests {
         }
         fn emit_path_globbing_failed(&self, path: &Path, error: &Error) {
             NoErrors.emit_path_globbing_failed(path, error);
+        }
+        fn emit_discovery_pass_delayed(&self) {
+            NoErrors.emit_discovery_pass_delayed();
+        }
+        fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
+            NoErrors.discovery_pass_timestamp()
         }
         fn emit_file_line_too_long(&self, bytes: &BytesMut, limit: usize, size: usize) {
             NoErrors.emit_file_line_too_long(bytes, limit, size);
@@ -1536,6 +1624,7 @@ mod tests {
         delay: Duration,
         cooldown: Duration,
         run_for: Duration,
+        emitter: impl FileSourceInternalEvents,
     ) -> Vec<(time::Instant, time::Instant)> {
         let tmp = tempdir().unwrap();
         let data_dir = tmp.path().join("data");
@@ -1560,7 +1649,7 @@ mod tests {
             fingerprinter: base.fingerprinter,
             oldest_first: base.oldest_first,
             remove_after: base.remove_after,
-            emitter: base.emitter,
+            emitter,
             rotate_wait: base.rotate_wait,
             ttl_removal_config: base.ttl_removal_config,
             source_context: base.source_context,
@@ -1584,7 +1673,13 @@ mod tests {
     #[tokio::test]
     async fn fast_discovery_passes_run_once_per_cooldown() {
         let cooldown = Duration::from_millis(100);
-        let calls = discovery_passes(Duration::ZERO, cooldown, Duration::from_millis(1_000)).await;
+        let calls = discovery_passes(
+            Duration::ZERO,
+            cooldown,
+            Duration::from_millis(1_000),
+            NoErrors,
+        )
+        .await;
         assert!(calls.len() >= 3, "only {} passes", calls.len());
         for pair in calls.windows(2) {
             assert!(pair[1].0.duration_since(pair[0].0) >= cooldown);
@@ -1597,7 +1692,7 @@ mod tests {
         // one read-loop backoff (1, 2, 4, ... ms) after the previous one ended.
         let delay = Duration::from_millis(150);
         let cooldown = Duration::from_millis(100);
-        let calls = discovery_passes(delay, cooldown, Duration::from_millis(1_500)).await;
+        let calls = discovery_passes(delay, cooldown, Duration::from_millis(1_500), NoErrors).await;
         assert!(calls.len() >= 3, "only {} passes", calls.len());
         for pair in calls.windows(2) {
             let (prev_start, prev_end) = pair[0];
@@ -1608,6 +1703,89 @@ mod tests {
                 prev_end.duration_since(prev_start)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fast_discovery_passes_report_nothing() {
+        let events = DiscoveryEvents::default();
+        let calls = discovery_passes(
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+            events.clone(),
+        )
+        .await;
+        assert!(calls.len() >= 3, "only {} passes", calls.len());
+        assert_eq!(*events.delayed.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn slow_discovery_passes_are_counted_as_delayed() {
+        let events = DiscoveryEvents::default();
+        let calls = discovery_passes(
+            Duration::from_millis(150),
+            Duration::from_millis(100),
+            Duration::from_millis(1_000),
+            events.clone(),
+        )
+        .await;
+        assert!(calls.len() >= 2, "only {} passes", calls.len());
+        assert_eq!(*events.delayed.lock().unwrap(), calls.len());
+    }
+
+    #[tokio::test]
+    async fn zero_cooldown_passes_are_not_counted_as_delayed() {
+        let events = DiscoveryEvents::default();
+        let calls = discovery_passes(
+            Duration::from_millis(5),
+            Duration::ZERO,
+            Duration::from_millis(200),
+            events.clone(),
+        )
+        .await;
+        assert!(calls.len() >= 2, "only {} passes", calls.len());
+        assert_eq!(*events.delayed.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn discovery_pass_timestamp_is_set_at_start_and_after_each_pass() {
+        let before = super::unix_now_seconds();
+        let events = DiscoveryEvents::default();
+        let calls = discovery_passes(
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+            events.clone(),
+        )
+        .await;
+        let after = super::unix_now_seconds();
+
+        let timestamps = events.pass_timestamps.lock().unwrap().clone();
+        // Once at the start of `run`, then once per pass.
+        assert_eq!(timestamps.len(), calls.len() + 1, "{timestamps:?}");
+        assert!(
+            timestamps.windows(2).all(|w| w[0] <= w[1]),
+            "{timestamps:?}"
+        );
+        assert!(timestamps[0] >= before && *timestamps.last().unwrap() <= after);
+    }
+
+    #[tokio::test]
+    async fn discovery_pass_timestamp_handle_lives_as_long_as_the_file_server() {
+        let events = DiscoveryEvents::default();
+        let probe = Arc::clone(&events.pass_timestamps);
+        let running = tokio::spawn(discovery_passes(
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+            events.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // `events`, `probe`, the server's emitter, and the setter the server holds.
+        assert_eq!(Arc::strong_count(&probe), 4);
+        running.await.unwrap();
+        // The setter goes when `run` returns, so a removed source's gauge can expire.
+        assert_eq!(Arc::strong_count(&probe), 2);
     }
 
     fn make_file_server(

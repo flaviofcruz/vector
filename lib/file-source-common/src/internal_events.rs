@@ -100,6 +100,16 @@ pub trait FileSourceInternalEvents: Send + Sync + Clone + 'static {
 
     fn emit_path_globbing_failed(&self, path: &Path, error: &Error);
 
+    /// A discovery pass was slow enough that the next one was pushed back past its usual
+    /// schedule.
+    fn emit_discovery_pass_delayed(&self);
+
+    /// Registers the gauge for when the source's last discovery pass finished and returns its
+    /// setter, which takes unix seconds. The file server holds the setter for as long as it runs:
+    /// Vector does not expire a metric while a handle to it is alive, so a server stuck mid-run
+    /// keeps exporting its last, increasingly stale, timestamp.
+    fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync>;
+
     fn emit_file_line_too_long(
         &self,
         truncated_bytes: &BytesMut,

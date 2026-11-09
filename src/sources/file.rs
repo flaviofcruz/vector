@@ -2023,8 +2023,10 @@ mod tests {
         writeln!(&mut file, "the line").unwrap();
         file.flush().unwrap();
 
-        // First time server runs it picks up existing lines.
-        let received = run_file_source(
+        // First time server runs it picks up existing lines. Keep its events, still unacknowledged,
+        // until the end of the test: a dropped event counts as delivered, and the first file
+        // server can still be writing its final checkpoint when `run_file_source` returns.
+        let first_received = run_file_source(
             &config,
             false,
             Unfinalized,
@@ -2032,7 +2034,17 @@ mod tests {
             sleep(Duration::from_secs(5)),
         )
         .await;
-        let lines = extract_messages_string(received);
+        let lines: Vec<String> = first_received
+            .iter()
+            .map(|event| {
+                event
+                    .as_log()
+                    .get_message()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
         assert_eq!(lines, vec!["the line"]);
 
         // Restart server, it re-reads file since the events were not acknowledged before shutdown

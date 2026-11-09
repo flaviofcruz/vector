@@ -740,6 +740,12 @@ mod test {
             panic!()
         }
 
+        fn emit_discovery_pass_delayed(&self) {}
+
+        fn discovery_pass_timestamp(&self) -> Box<dyn Fn(f64) + Send + Sync> {
+            Box::new(|_| {})
+        }
+
         fn emit_file_line_too_long(&self, _: &BytesMut, _: usize, _: usize) {
             panic!()
         }
