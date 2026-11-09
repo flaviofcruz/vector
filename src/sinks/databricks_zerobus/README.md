@@ -60,8 +60,6 @@ disabled. Each failed hostname validation, and the system trust store did not tr
 chain. The VAM bundle at `/databricks-infra/dbts2/creds.cert.pem` contained the required
 trust chain; deployments must provide the corresponding bundle for their environment.
 
-The pinned Zerobus SDK does not yet support binary principal-context metadata, so config
-validation still rejects `login_service` at startup until the SDK fix is pinned.
 SDK 3.x also replaced its custom TLS endpoint hook with a settings API that cannot
 disable hostname verification. Direct ingestion listeners with URI-only certificates
 cannot be used with a DNS-name override; use an endpoint whose certificate has a

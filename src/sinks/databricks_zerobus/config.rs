@@ -489,15 +489,6 @@ impl ZerobusSinkConfig {
                         message: "auth.tls.crt_file and key_file are required".to_string(),
                     });
                 }
-                // Zerobus authenticates this strategy from `s2s-principal-context-sig-bin`,
-                // which the pinned SDK cannot send: it adds every header as ASCII metadata and
-                // rejects `-bin` keys, so each stream create would fail and discard its batch.
-                // Fail at startup instead until the SDK sends `-bin` headers as binary metadata.
-                return Err(ZerobusSinkError::ConfigError {
-                    message: "LoginService auth requires Zerobus SDK support for binary \
-                              (`-bin`) metadata headers, which the pinned SDK lacks"
-                        .to_string(),
-                });
             }
         }
 
@@ -1120,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn login_service_rejected_until_sdk_sends_binary_headers() {
+    fn login_service_config_validates() {
         let config = login_config();
         let serialized = toml::Value::try_from(&config).unwrap();
         assert_eq!(
@@ -1132,11 +1123,7 @@ mod tests {
             Some("/dev/null")
         );
         let config: ZerobusSinkConfig = serialized.try_into().unwrap();
-        let err = config.validate().unwrap_err();
-        assert!(
-            matches!(err, ZerobusSinkError::ConfigError { message } if message.contains("binary")),
-            "expected login_service startup rejection"
-        );
+        config.validate().unwrap();
     }
 
     #[test]
@@ -1151,16 +1138,8 @@ mod tests {
             let mut config: ZerobusSinkConfig = serialized.try_into().unwrap();
             if let DatabricksAuthentication::LoginService(auth) = &mut config.auth {
                 auth.tls.verify_hostname = false;
-                assert!(
-                    config
-                        .validate()
-                        .unwrap_err()
-                        .to_string()
-                        .contains("binary")
-                );
-            } else {
-                config.validate().unwrap();
             }
+            config.validate().unwrap();
             assert_eq!(
                 config.ingestion_domain_name.as_deref(),
                 Some("regional-dp-apiproxy.service")
@@ -1397,15 +1376,15 @@ mod tests {
 
     #[test]
     fn custom_headers_reserved_name_rejected() {
-        let mut config = create_test_config();
-        config
-            .custom_headers
-            .insert("authorization".into(), "Bearer x".into());
-        let err = config.validate().unwrap_err();
-        assert!(
-            matches!(err, ZerobusSinkError::ConfigError { message } if message.contains("reserved")),
-            "expected reserved-header rejection"
-        );
+        for bad in ["authorization", "s2s-principal-context-sig-bin"] {
+            let mut config = create_test_config();
+            config.custom_headers.insert(bad.into(), "v".into());
+            let err = config.validate().unwrap_err();
+            assert!(
+                matches!(err, ZerobusSinkError::ConfigError { message } if message.contains("reserved")),
+                "expected reserved rejection for {bad}"
+            );
+        }
     }
 
     #[test]
