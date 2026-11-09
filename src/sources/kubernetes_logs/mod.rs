@@ -322,6 +322,13 @@ pub struct Config {
     #[configurable(metadata(docs::human_name = "Idle Read Interval"))]
     idle_read_interval_ms: Duration,
 
+    /// Maximum sleep between read-loop passes when the source is idle.
+    ///
+    /// Lower values reduce idle wake-up latency and increase polling overhead. Per-file EOF
+    /// retries (up to 250 ms), `idle_read_interval_ms`, and file discovery can add further delay.
+    #[configurable(metadata(docs::type_unit = "milliseconds"))]
+    read_loop_max_backoff_ms: std::num::NonZeroUsize,
+
     /// Overrides the name of the log field used to add the ingestion timestamp to each event.
     ///
     /// This is useful to compute the latency between important event processing
@@ -562,6 +569,7 @@ impl Default for Config {
             fingerprint_lines: default_fingerprint_lines(),
             glob_minimum_cooldown_ms: default_glob_minimum_cooldown_ms(),
             idle_read_interval_ms: default_idle_read_interval_ms(),
+            read_loop_max_backoff_ms: default_read_loop_max_backoff_ms(),
             ingestion_timestamp_field: None,
             timezone: None,
             kube_config_file: None,
@@ -888,6 +896,7 @@ struct Source {
     fingerprint_lines: usize,
     glob_minimum_cooldown: Duration,
     idle_read_interval: Duration,
+    read_loop_max_backoff: usize,
     ingestion_timestamp_field: Option<OwnedTargetPath>,
     include_file_metric_tag: bool,
     rotate_wait: Duration,
@@ -1216,6 +1225,7 @@ impl Source {
             fingerprint_lines: config.fingerprint_lines,
             glob_minimum_cooldown,
             idle_read_interval,
+            read_loop_max_backoff: config.read_loop_max_backoff_ms.get(),
             ingestion_timestamp_field,
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
@@ -1271,6 +1281,7 @@ impl Source {
             fingerprint_lines,
             glob_minimum_cooldown,
             idle_read_interval,
+            read_loop_max_backoff,
             ingestion_timestamp_field,
             include_file_metric_tag,
             rotate_wait,
@@ -1405,6 +1416,7 @@ impl Source {
             archive_extensions,
             source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
             read_loop_min_backoff: 1,
+            read_loop_max_backoff,
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
@@ -1772,6 +1784,10 @@ const fn default_idle_read_interval_ms() -> Duration {
     Duration::from_secs(10)
 }
 
+const fn default_read_loop_max_backoff_ms() -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(2_048).expect("default read-loop backoff is positive")
+}
+
 const fn default_fingerprint_lines() -> usize {
     1
 }
@@ -2017,6 +2033,15 @@ mod tests {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<Config>();
+    }
+
+    #[test]
+    fn read_loop_backoff_config_preserves_default_and_rejects_zero() {
+        let default: Config = toml::from_str("").unwrap();
+        assert_eq!(default.read_loop_max_backoff_ms.get(), 2_048);
+        let configured: Config = toml::from_str("read_loop_max_backoff_ms = 100").unwrap();
+        assert_eq!(configured.read_loop_max_backoff_ms.get(), 100);
+        assert!(toml::from_str::<Config>("read_loop_max_backoff_ms = 0").is_err());
     }
 
     #[test]

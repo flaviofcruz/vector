@@ -89,6 +89,8 @@ where
     /// Minimum backoff cap for the read loop (reset value after a non-empty
     /// read). Defaults to `1`.
     pub read_loop_min_backoff: usize,
+    /// Maximum read-loop backoff in milliseconds. Must be positive.
+    pub read_loop_max_backoff: usize,
 }
 
 /// `FileServer` as Source
@@ -692,13 +694,13 @@ where
 
             let start = time::Instant::now();
             // When no lines have been read we kick the backup_cap up by twice,
-            // limited by the hard-coded cap. Else, we set the backup_cap to its
+            // limited by the configured cap. Else, we set the backup_cap to its
             // minimum on the assumption that next time through there will be
             // more lines to read promptly.
             backoff_cap = if global_bytes_read == 0 {
-                cmp::min(2_048, backoff_cap.saturating_mul(2))
+                cmp::min(self.read_loop_max_backoff, backoff_cap.saturating_mul(2))
             } else {
-                self.read_loop_min_backoff
+                cmp::min(self.read_loop_min_backoff, self.read_loop_max_backoff)
             };
             let backoff = backoff_cap.saturating_sub(global_bytes_read);
 
@@ -1658,6 +1660,7 @@ mod tests {
             archive_extensions: base.archive_extensions,
             source_type: base.source_type,
             read_loop_min_backoff: base.read_loop_min_backoff,
+            read_loop_max_backoff: base.read_loop_max_backoff,
         };
         let (tx, _rx) = mpsc::channel::<Vec<Line>>(16);
         let shutdown = Box::pin(tokio::time::sleep(run_for));
@@ -1833,7 +1836,85 @@ mod tests {
             archive_extensions: vec!["gz".to_string()],
             source_type: "file",
             read_loop_min_backoff: 1,
+            read_loop_max_backoff: 2_048,
         }
+    }
+
+    #[tokio::test]
+    async fn capped_backoff_reads_idle_appends_in_order_and_shuts_down() {
+        use tokio::{io::AsyncWriteExt, sync::oneshot};
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+        let path = tmp.path().join("active.log");
+        fs::write(&path, b"warmup\n").await.unwrap();
+        let mut file_server = make_file_server(vec![path.clone()], data_dir.clone(), false);
+        file_server.read_loop_max_backoff = 50;
+        file_server.idle_read_interval = Duration::from_millis(50);
+
+        let (tx, mut rx) = mpsc::channel::<Vec<Line>>(8);
+        let (lines_tx, mut lines_rx) = tokio::sync::mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            while let Some(batch) = rx.next().await {
+                for line in batch {
+                    lines_tx.send(line.text).unwrap();
+                }
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(file_server.run(
+            tx,
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+            }),
+            futures::future::ready(()),
+            Checkpointer::new(&data_dir),
+        ));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), lines_rx.recv())
+                .await
+                .unwrap(),
+            Some(Bytes::from("warmup")),
+        );
+        // Let both exponential backoffs mature. Without the cap an append at this phase
+        // waits for the remainder of a 2,048 ms sleep.
+        tokio::time::sleep(Duration::from_millis(4_300)).await;
+        let mut writer = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let expected: Vec<_> = (0..20)
+            .map(|i| Bytes::from(format!("record-{i}")))
+            .collect();
+        for line in &expected {
+            writer.write_all(line).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        }
+        writer.flush().await.unwrap();
+        let received = tokio::time::timeout(Duration::from_millis(600), async {
+            let mut received = Vec::new();
+            for _ in &expected {
+                received.push(lines_rx.recv().await.unwrap());
+            }
+            received
+        })
+        .await
+        .expect("idle append exceeded the EOF retry plus polling budget");
+        assert_eq!(received, expected);
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        collector.await.unwrap();
+        assert_eq!(
+            lines_rx.recv().await,
+            None,
+            "duplicate records after shutdown"
+        );
     }
 
     async fn assert_small_files_survive_ttl(ttl_removal_config: Option<FileTTLRemovalConfig>) {
@@ -3175,6 +3256,7 @@ mod tests {
             archive_extensions: vec!["gz".to_string()],
             source_type: "file",
             read_loop_min_backoff: 2000,
+            read_loop_max_backoff: 2_048,
         };
 
         let (tx, rx) = mpsc::channel::<Vec<Line>>(32);
@@ -3421,6 +3503,7 @@ mod tests {
             archive_extensions: vec!["gz".to_string()],
             source_type: "file",
             read_loop_min_backoff: 1,
+            read_loop_max_backoff: 2_048,
         };
 
         let (tx, rx) = mpsc::channel::<Vec<Line>>(32);

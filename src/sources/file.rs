@@ -204,6 +204,14 @@ pub struct FileConfig {
     #[configurable(metadata(docs::human_name = "Idle Read Interval"))]
     pub idle_read_interval_ms: Duration,
 
+    /// Maximum sleep between read-loop passes when the source is idle.
+    ///
+    /// Lower values reduce idle wake-up latency and increase polling overhead. Per-file EOF
+    /// retries (up to 250 ms), `idle_read_interval_ms`, and file discovery can add further delay.
+    #[serde(default = "default_read_loop_max_backoff_ms")]
+    #[configurable(metadata(docs::type_unit = "milliseconds"))]
+    pub read_loop_max_backoff_ms: std::num::NonZeroUsize,
+
     #[configurable(derived)]
     #[serde(alias = "fingerprinting", default)]
     fingerprint: FingerprintConfig,
@@ -348,6 +356,10 @@ const fn default_idle_read_interval_ms() -> Duration {
     Duration::from_secs(10)
 }
 
+const fn default_read_loop_max_backoff_ms() -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(2_048).expect("default read-loop backoff is positive")
+}
+
 const fn default_multi_line_timeout() -> u64 {
     1000
 } // deprecated
@@ -466,6 +478,7 @@ impl Default for FileConfig {
             data_dir: None,
             glob_minimum_cooldown_ms: default_glob_minimum_cooldown_ms(),
             idle_read_interval_ms: default_idle_read_interval_ms(),
+            read_loop_max_backoff_ms: default_read_loop_max_backoff_ms(),
             message_start_indicator: None,
             multi_line_timeout: default_multi_line_timeout(), // millis
             multiline: None,
@@ -676,6 +689,7 @@ pub fn file_source(
         archive_extensions: config.archive_extensions.clone(),
         source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
         read_loop_min_backoff: 1,
+        read_loop_max_backoff: config.read_loop_max_backoff_ms.get(),
     };
 
     let event_metadata = EventMetadata {
@@ -1110,6 +1124,22 @@ mod tests {
 
     async fn sleep_500_millis() {
         sleep(Duration::from_millis(500)).await;
+    }
+
+    #[test]
+    fn read_loop_backoff_config_preserves_default_and_rejects_zero() {
+        let default: FileConfig = toml::from_str("include = [\"/var/log/test.log\"]").unwrap();
+        assert_eq!(default.read_loop_max_backoff_ms.get(), 2_048);
+        let configured: FileConfig =
+            toml::from_str("include = [\"/var/log/test.log\"]\nread_loop_max_backoff_ms = 100")
+                .unwrap();
+        assert_eq!(configured.read_loop_max_backoff_ms.get(), 100);
+        assert!(
+            toml::from_str::<FileConfig>(
+                "include = [\"/var/log/test.log\"]\nread_loop_max_backoff_ms = 0"
+            )
+            .is_err()
+        );
     }
 
     #[test]
