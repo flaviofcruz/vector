@@ -645,7 +645,11 @@ where
             // from fp_map without calling checkpoints.set_dead so that the done/
             // archive_paths entries survive until remove_after actually deletes the file.
             for (fng, path) in done_archives {
-                if let Some(watcher) = fp_map.swap_remove(&fng) {
+                // shift_remove, not swap_remove: swap_remove moves the newest watcher (the hot active file) into the
+                // removed slot, which puts it first in the read order. With `oldest_first` the loop stops after the first
+                // file that exhausts its read budget, so a hot file at the front starves every older rotated segment
+                // until the kubelet deletes it unread.
+                if let Some(watcher) = fp_map.shift_remove(&fng) {
                     let info = unwatched_info(fng, &watcher, FileStopReason::ArchiveDone);
                     self.emitter.emit_file_unwatched(&path, &info);
                 }
@@ -2959,6 +2963,86 @@ mod tests {
         assert_eq!(stopped.end_offset, payload.len() as u64);
         assert_eq!((stopped.lines_read, stopped.bytes_read), (2, 21));
         assert_eq!(stopped.stat.size_bytes, Some(gz_bytes.len() as u64));
+    }
+
+    // With `oldest_first`, finishing an archive must not move the newest (hot, active) file ahead
+    // of the older archives still being read. Otherwise the active file exhausts the per-file read
+    // budget every cycle, the loop stops after it, and the remaining archives starve.
+    #[tokio::test]
+    async fn oldest_first_order_survives_finished_archive() {
+        use async_compression::tokio::bufread::GzipEncoder;
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::oneshot;
+
+        fn numbered_lines(prefix: &str, count: usize) -> String {
+            (0..count)
+                .map(|i| format!("{prefix}-{i:04} {}\n", "x".repeat(40)))
+                .collect()
+        }
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        // Each file is larger than `max_read_bytes` (2048), so it takes several read cycles.
+        let mut paths = Vec::new();
+        for name in ["a1", "a2", "a3"] {
+            let path = tmp.path().join(format!("app.log.{name}.gz"));
+            let mut gz_bytes = Vec::new();
+            GzipEncoder::new(numbered_lines(name, 100).as_bytes())
+                .read_to_end(&mut gz_bytes)
+                .await
+                .unwrap();
+            fs::write(&path, &gz_bytes).await.unwrap();
+            paths.push(path);
+        }
+        let active_path = tmp.path().join("app.log");
+        fs::write(&active_path, numbered_lines("active", 400))
+            .await
+            .unwrap();
+        paths.push(active_path);
+
+        let mut file_server = make_file_server(paths, data_dir.clone(), false);
+        file_server.oldest_first = true;
+        let (tx, rx) = mpsc::channel::<Vec<Line>>(64);
+        let collector = tokio::spawn(rx.collect::<Vec<_>>());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_data: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+            });
+        let driver = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _ = shutdown_tx.send(());
+        });
+        file_server
+            .run(
+                tx,
+                shutdown_data,
+                futures::future::ready(()),
+                Checkpointer::new(data_dir.as_path()),
+            )
+            .await
+            .unwrap();
+        driver.await.unwrap();
+
+        let texts: Vec<String> = collector
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|line| String::from_utf8_lossy(&line.text).into_owned())
+            .collect();
+        let expected: Vec<String> = [("a1", 100), ("a2", 100), ("a3", 100), ("active", 400)]
+            .into_iter()
+            .flat_map(|(prefix, count)| {
+                (0..count).map(move |i| format!("{prefix}-{i:04} {}", "x".repeat(40)))
+            })
+            .collect();
+        assert_eq!(
+            texts, expected,
+            "files must be delivered oldest first, each in full"
+        );
     }
 
     // A file removed by `remove_after` while it ends in an unterminated line reports an
