@@ -11,8 +11,8 @@ use crate::internal_events::{
 use crate::sinks::util::retries::RetryLogic;
 use crate::tls::TlsSettings;
 use databricks_zerobus_ingest_sdk::{
-    ConnectorFactory, HeadersProvider, MultiplexedArrowStream, OffsetId, ProxyConnector,
-    StatsExporter, StreamStat, ZerobusArrowStream, ZerobusError, ZerobusSdk,
+    BatchStats, ConnectorFactory, HeadersProvider, MultiplexedArrowStream, OffsetId,
+    ProxyConnector, StatsExporter, StreamStat, ZerobusArrowStream, ZerobusError, ZerobusSdk,
 };
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -153,17 +153,33 @@ impl DriverResponse for ZerobusResponse {
 /// `record` runs inline on the SDK's IO tasks; it only does a map insert.
 #[derive(Default)]
 struct WireBytesExporter {
-    bytes_by_offset: std::sync::Mutex<HashMap<OffsetId, u64>>,
+    bytes_by_offset: std::sync::Mutex<HashMap<OffsetId, BatchSizes>>,
 }
 
 impl WireBytesExporter {
-    /// Remove and return the recorded wire bytes for `offset`.
-    fn take(&self, offset: OffsetId) -> Option<usize> {
+    /// Remove and return the recorded sizes for `offset`.
+    fn take(&self, offset: OffsetId) -> Option<BatchSizes> {
         self.bytes_by_offset
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&offset)
-            .map(|bytes| bytes as usize)
+    }
+}
+
+/// The two byte sizes the SDK reports per sent batch: post-compression
+/// `wire_bytes` (approximate) and pre-compression `uncompressed_bytes`.
+#[derive(Debug, PartialEq, Eq)]
+struct BatchSizes {
+    wire_bytes: usize,
+    uncompressed_bytes: usize,
+}
+
+impl From<BatchStats> for BatchSizes {
+    fn from(stats: BatchStats) -> Self {
+        Self {
+            wire_bytes: stats.approximate_wire_bytes as usize,
+            uncompressed_bytes: stats.uncompressed_bytes as usize,
+        }
     }
 }
 
@@ -177,7 +193,7 @@ impl StatsExporter for WireBytesExporter {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entry(offset)
-                .or_insert(stats.approximate_wire_bytes);
+                .or_insert(BatchSizes::from(stats));
         }
     }
 }
@@ -214,8 +230,8 @@ enum ActiveStream {
     ),
     /// Several Arrow Flight lanes behind one handle, used when `multiplexed_streams > 1`.
     ///
-    /// The SDK's multiplexed stream rejects a stats exporter, so batches sent through it
-    /// report no wire size.
+    /// The SDK's multiplexed stream rejects a stats exporter, so no wire size exists to
+    /// report as `bytes_sent`; only the uncompressed size is emitted, as its own counter.
     ArrowMux(RwLock<Option<Box<MultiplexedArrowStream>>>),
     /// Test-only variant that returns a pre-configured error on ingest.
     #[cfg(test)]
@@ -984,8 +1000,13 @@ impl ZerobusService {
                             ack_times.record_acked(&self.config.table_name);
                         }
                         // Take on every outcome so failed offsets don't linger in the map.
-                        let bytes_sent = stats.take(offset);
-                        acked.map(|_| bytes_sent)
+                        let sizes = stats.take(offset);
+                        acked.map(|_| {
+                            if let Some(sizes) = &sizes {
+                                record_uncompressed_bytes(sizes.uncompressed_bytes);
+                            }
+                            sizes.map(|sizes| sizes.wire_bytes)
+                        })
                     }
                     Err(e) => Err(e),
                 }
@@ -995,6 +1016,8 @@ impl ZerobusService {
                 let Some(s) = guard.as_ref() else {
                     return Err(ZerobusSinkError::StreamClosed);
                 };
+                // Measured before the batch is moved into the SDK; no exporter exists to ask afterwards.
+                let uncompressed = uncompressed_batch_bytes(&record_batch);
                 // Ack durability is per lane, so waiting on this batch's message id
                 // (not `flush`, which would wait on every lane) keeps the ack semantics
                 // of the single-stream path.
@@ -1010,7 +1033,10 @@ impl ZerobusService {
                 {
                     return Err(ZerobusSinkError::IngestionError { source: e.clone() });
                 }
-                acked.map(|_| None)
+                acked.map(|_| {
+                    record_uncompressed_bytes(uncompressed);
+                    None
+                })
             }
             #[cfg(test)]
             ActiveStream::Mock(mock) => {
@@ -1037,6 +1063,31 @@ impl ZerobusService {
             }
         }
     }
+}
+
+/// Counts pre-compression Arrow bytes of an acked batch.
+///
+/// Paired with `component_sent_bytes_total` (post-compression) on the single-stream path,
+/// this gives a compression ratio; multiplexed streams only get this one.
+fn record_uncompressed_bytes(bytes: usize) {
+    metrics::counter!("databricks_zerobus_uncompressed_bytes_total").increment(bytes as u64);
+}
+
+/// Sums a batch's logical Arrow buffer bytes, matching the SDK's `uncompressed_bytes`
+/// before per-buffer IPC compression (IPC framing excluded).
+///
+/// Used where the SDK exposes no stats (multiplexed streams); measuring the compressed
+/// size instead would mean compressing the batch a second time.
+fn uncompressed_batch_bytes(batch: &arrow::record_batch::RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|column| {
+            let data = column.to_data();
+            data.get_slice_memory_size()
+                .unwrap_or_else(|_| data.get_array_memory_size())
+        })
+        .sum()
 }
 
 /// Whether a failed multiplexed ingest must drop the mux so the next attempt rebuilds it.
@@ -1467,10 +1518,54 @@ mod tests {
         exporter.record(batch_sent(2, 0, 7));
         exporter.record(StreamStat::BatchAcked { offset: 1 });
 
-        assert_eq!(exporter.take(1), Some(100));
+        assert_eq!(
+            exporter.take(1),
+            Some(BatchSizes {
+                wire_bytes: 100,
+                uncompressed_bytes: 200
+            })
+        );
         assert_eq!(exporter.take(1), None);
-        assert_eq!(exporter.take(2), Some(7));
+        assert_eq!(
+            exporter.take(2),
+            Some(BatchSizes {
+                wire_bytes: 7,
+                uncompressed_bytes: 14
+            })
+        );
         assert_eq!(exporter.take(3), None);
+    }
+
+    #[test]
+    fn uncompressed_batch_bytes_counts_column_buffers() {
+        use arrow::array::{Int64Array, StringArray};
+        let ids = Int64Array::from(vec![1, 2, 3, 4]);
+        let names = StringArray::from(vec!["a", "bb", "ccc", "dddd"]);
+        let batch = arrow::record_batch::RecordBatch::try_from_iter([
+            ("id", Arc::new(ids) as arrow::array::ArrayRef),
+            ("name", Arc::new(names) as arrow::array::ArrayRef),
+        ])
+        .unwrap();
+        // 4 * 8 (i64) + 5 * 4 (string offsets) + 10 (string data), without buffer padding.
+        assert_eq!(uncompressed_batch_bytes(&batch), 32 + 20 + 10);
+    }
+
+    #[test]
+    fn uncompressed_bytes_counter_accumulates() {
+        vector_lib::metrics::init_test();
+        let controller = vector_lib::metrics::Controller::get().unwrap();
+        controller.reset();
+        record_uncompressed_bytes(100);
+        record_uncompressed_bytes(23);
+        let metrics = controller.capture_metrics();
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "databricks_zerobus_uncompressed_bytes_total",
+                None
+            ),
+            123.0
+        );
     }
 
     #[test]

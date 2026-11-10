@@ -1,0 +1,2 @@
+Add `databricks_zerobus_uncompressed_bytes_total` to the `databricks_zerobus` sink: the pre-compression Arrow buffer bytes of each acked batch. Pair it with `component_sent_bytes_total` (post-compression) for a compression ratio on single-stream sinks. Sinks with `stream_options.multiplexed_streams` > 1 still emit no `component_sent_bytes_total`, because the SDK exposes no wire-size stats for multiplexed streams, but do emit this counter.
+https://github.com/databricks-eng/vector/pull/912
