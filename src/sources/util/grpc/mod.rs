@@ -93,11 +93,20 @@ pub async fn run_grpc_server_with_routes(
     address: SocketAddr,
     listener: MaybeTlsListener,
     routes: Routes,
+    authenticate_peer: bool,
     shutdown: ShutdownSignal,
 ) -> crate::Result<()> {
     let span = Span::current();
     let (tx, rx) = tokio::sync::oneshot::channel::<ShutdownSignalToken>();
-    let stream = listener.accept_stream();
+    // Tonic snapshots Connected before reading, so authenticate before yielding.
+    // Keep accepting while handshakes run; saturated peers are closed rather than
+    // holding the listener's backlog until the handshake timeout.
+    let stream = authenticated_incoming(
+        listener,
+        authenticate_peer,
+        std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+        Duration::from_secs(10),
+    );
 
     info!(%address, "Building gRPC server.");
 
@@ -111,6 +120,60 @@ pub async fn run_grpc_server_with_routes(
     drop(rx.await);
 
     Ok(())
+}
+
+fn authenticated_incoming(
+    mut listener: MaybeTlsListener,
+    authenticate_peer: bool,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    handshake_timeout: Duration,
+) -> impl futures::Stream<
+    Item = Result<crate::tls::MaybeTlsIncomingStream<tokio::net::TcpStream>, crate::tls::TlsError>,
+> {
+    async_stream::stream! {
+        let mut handshakes = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let mut stream = match result {
+                        Ok(stream) => stream,
+                        Err(error) => { yield Err(error); continue; }
+                    };
+                    if !authenticate_peer {
+                        yield Ok(stream);
+                        continue;
+                    }
+                    let peer_addr = stream.peer_addr();
+                    let Ok(permit) = std::sync::Arc::clone(&permits).try_acquire_owned() else {
+                        warn!(message = "gRPC TLS handshake capacity reached.", %peer_addr, internal_log_rate_limit = true);
+                        continue;
+                    };
+                    handshakes.spawn(async move {
+                        let result = match tokio::time::timeout(handshake_timeout, stream.handshake()).await {
+                            Ok(Ok(())) => Some(stream),
+                            Ok(Err(error)) => {
+                                warn!(message = "gRPC TLS handshake failed.", %peer_addr, %error, internal_log_rate_limit = true);
+                                None
+                            }
+                            Err(error) => {
+                                warn!(message = "gRPC TLS handshake timed out.", %peer_addr, %error, internal_log_rate_limit = true);
+                                None
+                            }
+                        };
+                        // Bound completed handshakes waiting to be yielded as well as active ones.
+                        (result, permit)
+                    });
+                }
+                Some(result) = handshakes.join_next(), if !handshakes.is_empty() => {
+                    match result {
+                        Ok((Some(stream), _permit)) => yield Ok(stream),
+                        Ok((None, _permit)) => {}
+                        Err(error) => error!(message = "gRPC TLS handshake task failed.", %error),
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Builds a [TraceLayer] configured for a gRPC server.
@@ -153,4 +216,78 @@ pub fn build_grpc_trace_layer(
         .on_failure(())
         .on_body_chunk(())
         .on_eos(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::sync::Arc;
+    use tokio::{io::AsyncReadExt, sync::Semaphore};
+
+    async fn wait_for_permits(permits: &Semaphore, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while permits.available_permits() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn saturated_handshakes_close_excess_peers_and_recover_after_timeout() {
+        let settings = MaybeTlsSettings::from_config(
+            Some(&crate::tls::TlsEnableableConfig::test_config()),
+            true,
+        )
+        .unwrap();
+        let listener = settings
+            .bind(&"127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let permits = Arc::new(Semaphore::new(1));
+        let stream = authenticated_incoming(
+            listener,
+            true,
+            Arc::clone(&permits),
+            Duration::from_millis(500),
+        );
+        let server = tokio::spawn(async move {
+            futures::pin_mut!(stream);
+            stream.next().await.unwrap().unwrap()
+        });
+        let idle = tokio::net::TcpStream::connect(address).await.unwrap();
+        wait_for_permits(&permits, 0).await;
+        let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
+        let read = tokio::time::timeout(Duration::from_millis(300), excess.read(&mut [0]))
+            .await
+            .expect("accept must drain excess connections before the handshake timeout");
+        assert!(matches!(read, Ok(0) | Err(_)));
+        wait_for_permits(&permits, 1).await;
+        drop(idle);
+        let client = tokio::task::spawn_blocking(move || {
+            let mut connector =
+                openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()).unwrap();
+            connector
+                .cert_store_mut()
+                .add_cert(
+                    openssl::x509::X509::from_pem(
+                        &std::fs::read(crate::tls::TEST_PEM_CA_PATH).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            connector
+                .build()
+                .connect("localhost", std::net::TcpStream::connect(address).unwrap())
+                .unwrap()
+        });
+        let _accepted = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let _client = client.await.unwrap();
+    }
 }

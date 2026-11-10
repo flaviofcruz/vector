@@ -6,6 +6,7 @@ mod tests;
 pub mod config;
 mod grpc;
 mod http;
+mod identity;
 mod reply;
 mod status;
 

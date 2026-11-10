@@ -1072,6 +1072,7 @@ fn get_source_config_with_headers(
 ) -> OpentelemetryConfig {
     OpentelemetryConfig {
         grpc: GrpcConfig {
+            client_identity: None,
             address: grpc_addr,
             tls: Default::default(),
         },
@@ -1088,6 +1089,7 @@ fn get_source_config_with_headers(
         acknowledgements: Default::default(),
         log_namespace: Default::default(),
         use_otlp_decoding,
+        tls_snapshot: Default::default(),
     }
 }
 
@@ -1252,6 +1254,7 @@ pub async fn build_otlp_test_env(
 
     let config = OpentelemetryConfig {
         grpc: GrpcConfig {
+            client_identity: None,
             address: grpc_addr,
             tls: Default::default(),
         },
@@ -1264,6 +1267,7 @@ pub async fn build_otlp_test_env(
         acknowledgements: Default::default(),
         log_namespace,
         use_otlp_decoding: false,
+        tls_snapshot: Default::default(),
     };
 
     let (sender, output, _) = new_source(EventStatus::Delivered, event_name.to_string());
@@ -1331,6 +1335,7 @@ async fn http_logs_use_otlp_decoding_emits_metric() {
 
     let source = OpentelemetryConfig {
         grpc: GrpcConfig {
+            client_identity: None,
             address: grpc_addr,
             tls: Default::default(),
         },
@@ -1343,6 +1348,7 @@ async fn http_logs_use_otlp_decoding_emits_metric() {
         acknowledgements: Default::default(),
         log_namespace: None,
         use_otlp_decoding: true,
+        tls_snapshot: Default::default(),
     };
 
     let (sender, logs_output, _) = new_source(EventStatus::Delivered, LOGS.to_string());
@@ -1533,4 +1539,489 @@ async fn reload_rejects_occupied_otlp_listener_and_restores_previous_source(#[ca
     wait_for_tcp(grpc_addr).await;
     wait_for_tcp(http_addr).await;
     topology.stop().await;
+}
+
+#[tokio::test]
+async fn uwi_identity_requires_explicit_verified_tls() {
+    use crate::databricks_uwi::UwiIdentityConfig;
+    use vector_lib::tls::TlsEnableableConfig;
+
+    let (_grpc_guard, grpc_addr) = next_addr();
+    let (_http_guard, http_addr) = next_addr();
+    for tls in [
+        None,
+        Some(TlsEnableableConfig::default()),
+        Some(TlsEnableableConfig::enabled()),
+        Some(TlsEnableableConfig::test_config()),
+        Some({
+            let mut tls = TlsEnableableConfig::test_config();
+            tls.options.verify_certificate = Some(false);
+            tls
+        }),
+        Some({
+            let mut tls = TlsEnableableConfig::test_config();
+            tls.options.verify_certificate = Some(true);
+            tls.options.ca_file = None;
+            tls
+        }),
+    ] {
+        let mut config = get_source_config_with_headers(grpc_addr, http_addr, false);
+        config.grpc.tls = tls;
+        config.grpc.client_identity = Some(super::identity::ClientIdentityConfig::DatabricksUwi(
+            UwiIdentityConfig {
+                trust_domains: vec!["serverless.databricks.com".into()],
+                region_uri: "region:test".into(),
+                allowed_apps: vec!["test-app".into()],
+            },
+        ));
+        let (sender, _, _) = new_source(EventStatus::Delivered, LOGS.into());
+        let expected = if config.grpc.tls.is_none() {
+            "Client identity requires TLS"
+        } else {
+            "verify_certificate: true and an explicit client ca_file"
+        };
+        let error = config
+            .build(SourceContext::new_test(sender, None))
+            .await
+            .err()
+            .expect("UWI mode must reject an unverified receiver");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn uwi_identity_rejects_missing_connection_identity_for_every_signal() {
+    use super::grpc::Service;
+    use crate::databricks_uwi::UwiIdentityConfig;
+    use vector_lib::opentelemetry::proto::collector::{
+        logs::v1::logs_service_server::LogsService,
+        metrics::v1::metrics_service_server::MetricsService,
+        trace::v1::{ExportTraceServiceRequest, trace_service_server::TraceService},
+    };
+    for decoding in [false, true] {
+        for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
+            let (pipeline, _, _) = new_source(EventStatus::Delivered, LOGS.into());
+            let service = Service {
+                pipeline,
+                acknowledgements: false,
+                events_received: register!(crate::internal_events::EventsReceived),
+                log_namespace: namespace,
+                deserializer: if decoding {
+                    Some(
+                        vector_lib::codecs::decoding::OtlpDeserializer::new_with_signals(
+                            Default::default(),
+                        ),
+                    )
+                } else {
+                    None
+                },
+                client_identity: Some(super::identity::ClientIdentityConfig::DatabricksUwi(
+                    UwiIdentityConfig {
+                        trust_domains: vec!["serverless.databricks.com".into()],
+                        region_uri: "region:test".into(),
+                        allowed_apps: vec!["test-app".into()],
+                    },
+                )),
+            };
+            let logs =
+                LogsService::export(&service, Request::new(ExportLogsServiceRequest::default()))
+                    .await
+                    .unwrap_err();
+            let metrics = MetricsService::export(
+                &service,
+                Request::new(ExportMetricsServiceRequest::default()),
+            )
+            .await
+            .unwrap_err();
+            let traces =
+                TraceService::export(&service, Request::new(ExportTraceServiceRequest::default()))
+                    .await
+                    .unwrap_err();
+            for status in [logs, metrics, traces] {
+                assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn uwi_metadata_uses_verified_workspace_despite_payload_and_header_claims() {
+    use super::grpc::Service;
+    use crate::databricks_uwi::{UwiIdentityConfig, assigned_test_certificate};
+    use vector_lib::{
+        codecs::decoding::{OtlpDeserializer, OtlpSignalType},
+        lookup::owned_value_path,
+        opentelemetry::proto::collector::logs::v1::logs_service_server::LogsService,
+        tls::MaybeTlsConnectInfo,
+    };
+    for decoding in [false, true] {
+        for namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
+            let (pipeline, output, _) = new_source(EventStatus::Delivered, LOGS.into());
+            let service = Service {
+                pipeline,
+                acknowledgements: false,
+                events_received: register!(crate::internal_events::EventsReceived),
+                log_namespace: namespace,
+                deserializer: decoding.then(|| {
+                    OtlpDeserializer::new_with_signals(vector_config::indexmap::IndexSet::from([
+                        OtlpSignalType::Logs,
+                    ]))
+                }),
+                client_identity: Some(super::identity::ClientIdentityConfig::DatabricksUwi(
+                    UwiIdentityConfig {
+                        trust_domains: vec!["serverless.databricks.com".into()],
+                        region_uri: "region:test".into(),
+                        allowed_apps: vec!["test-app".into()],
+                    },
+                )),
+            };
+            let mut request = create_test_logs_request();
+            request.get_mut().resource_logs[0]
+                .resource
+                .as_mut()
+                .unwrap()
+                .attributes
+                .push(KeyValue {
+                    key: "workspace_id".into(),
+                    value: Some(AnyValue {
+                        value: Some(StringValue("99999".into())),
+                    }),
+                });
+            request
+                .metadata_mut()
+                .insert("workspace-id", "99999".parse().unwrap());
+            // The TLS transport produces this context; callers cannot populate request extensions.
+            request.extensions_mut().insert(MaybeTlsConnectInfo {
+                remote_addr: "127.0.0.1:1234".parse().unwrap(),
+                peer_certs: None,
+                verified_peer_certificate_der: Some(assigned_test_certificate()),
+            });
+            LogsService::export(&service, request).await.unwrap();
+            let events = test_util::collect_ready(output).await;
+            assert!(!events.is_empty());
+            for event in events {
+                let metadata = event.metadata().value();
+                assert_eq!(
+                    metadata.get(&owned_value_path!("opentelemetry", "uwi", "workspace_id")),
+                    Some(&Value::from("12345"))
+                );
+                assert_eq!(
+                    metadata.get(&owned_value_path!("opentelemetry", "uwi", "authenticated")),
+                    Some(&Value::Boolean(true))
+                );
+            }
+        }
+    }
+}
+
+fn uwi_test_policy() -> crate::databricks_uwi::UwiIdentityConfig {
+    crate::databricks_uwi::UwiIdentityConfig {
+        trust_domains: vec!["serverless.databricks.com".into()],
+        region_uri: "region:test".into(),
+        allowed_apps: vec!["test-app".into()],
+    }
+}
+
+fn mtls_test_config() -> crate::tls::TlsEnableableConfig {
+    let mut tls = crate::tls::TlsEnableableConfig::test_config();
+    tls.options.crt_file = Some("tests/data/databricks/ingest-server.cert.pem".into());
+    tls.options.alpn_protocols = Some(vec!["h2".into()]);
+    tls
+}
+
+async fn mtls_channel(
+    address: net::SocketAddr,
+    cert: Vec<u8>,
+    key: Vec<u8>,
+) -> tonic::transport::Channel {
+    use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+    Endpoint::from_shared(format!("https://{address}"))
+        .unwrap()
+        .tls_config(
+            ClientTlsConfig::new()
+                .domain_name("localhost")
+                .ca_certificate(Certificate::from_pem(
+                    std::fs::read(crate::tls::TEST_PEM_CA_PATH).unwrap(),
+                ))
+                .identity(Identity::from_pem(cert, key)),
+        )
+        .unwrap()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .connect()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn uwi_built_source_rejects_non_uwi_clients_on_every_signal_and_leaves_http_unbound() {
+    use vector_lib::opentelemetry::proto::collector::trace::v1::{
+        ExportTraceServiceRequest, trace_service_client::TraceServiceClient,
+    };
+    for decoding in [false, true] {
+        let (_grpc_guard, grpc_addr) = next_addr();
+        let (_http_guard, http_addr) = next_addr();
+        let mut config = get_source_config_with_headers(grpc_addr, http_addr, decoding);
+        let mut tls = mtls_test_config();
+        tls.options.verify_certificate = Some(true);
+        config.grpc.tls = Some(tls);
+        config.grpc.client_identity = Some(super::identity::ClientIdentityConfig::DatabricksUwi(
+            uwi_test_policy(),
+        ));
+        let (sender, output, _) = new_source(EventStatus::Delivered, LOGS.into());
+        let source = config
+            .build(SourceContext::new_test(sender, None))
+            .await
+            .unwrap();
+        assert!(net::TcpListener::bind(grpc_addr).is_err());
+        let http_listener =
+            net::TcpListener::bind(http_addr).expect("UWI mode must leave HTTP unbound");
+        let server = tokio::spawn(source);
+        let channel = mtls_channel(
+            grpc_addr,
+            std::fs::read(crate::tls::TEST_PEM_CLIENT_CRT_PATH).unwrap(),
+            std::fs::read(crate::tls::TEST_PEM_CLIENT_KEY_PATH).unwrap(),
+        )
+        .await;
+        let logs = LogsServiceClient::new(channel.clone())
+            .export(create_test_logs_request())
+            .await
+            .unwrap_err();
+        let metrics = MetricsServiceClient::new(channel.clone())
+            .export(ExportMetricsServiceRequest::default())
+            .await
+            .unwrap_err();
+        let traces = TraceServiceClient::new(channel)
+            .export(ExportTraceServiceRequest::default())
+            .await
+            .unwrap_err();
+        for status in [logs, metrics, traces] {
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        }
+        server.abort();
+        let _ = server.await;
+        assert!(test_util::collect_ready(output).await.is_empty());
+        drop(http_listener);
+    }
+}
+
+#[tokio::test]
+async fn uwi_built_source_authenticates_real_mtls_after_a_failed_handshake() {
+    use crate::databricks_uwi::assigned_test_client_identity;
+    let (ca, client_cert, client_key) = assigned_test_client_identity();
+    for decoding in [false, true] {
+        let (_grpc_guard, grpc_addr) = next_addr();
+        let (_http_guard, http_addr) = next_addr();
+        let mut config = get_source_config_with_headers(grpc_addr, http_addr, decoding);
+        let mut tls = mtls_test_config();
+        tls.options.verify_certificate = Some(true);
+        tls.options.ca_file = Some(String::from_utf8(ca.clone()).unwrap().into());
+        config.grpc.tls = Some(tls);
+        config.grpc.client_identity = Some(super::identity::ClientIdentityConfig::DatabricksUwi(
+            uwi_test_policy(),
+        ));
+        let (sender, output, _) = new_source(EventStatus::Delivered, LOGS.into());
+        let source = config
+            .build(SourceContext::new_test(sender, None))
+            .await
+            .unwrap();
+        let server = tokio::spawn(source);
+        // A malformed TLS connection is dropped without ending the server's accept stream.
+        let mut invalid = tokio::net::TcpStream::connect(grpc_addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut invalid, b"invalid tls")
+            .await
+            .unwrap();
+        drop(invalid);
+        let channel = mtls_channel(grpc_addr, client_cert.clone(), client_key.clone()).await;
+        LogsServiceClient::new(channel)
+            .export(create_test_logs_request())
+            .await
+            .unwrap();
+        let events = test_util::collect_ready(output).await;
+        assert!(!events.is_empty());
+        for event in events {
+            assert_eq!(
+                event
+                    .metadata()
+                    .value()
+                    .get(path!("opentelemetry", "uwi", "workspace_id")),
+                Some(&Value::from("12345"))
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn uwi_service_rejects_verified_policy_mismatches_and_unverified_chain_context() {
+    use super::grpc::Service;
+    use crate::databricks_uwi::assigned_test_certificate;
+    use vector_lib::{
+        opentelemetry::proto::collector::{
+            logs::v1::logs_service_server::LogsService,
+            metrics::v1::metrics_service_server::MetricsService,
+            trace::v1::{ExportTraceServiceRequest, trace_service_server::TraceService},
+        },
+        tls::MaybeTlsConnectInfo,
+    };
+    for mode in ["app", "region", "chain-only"] {
+        let mut policy = uwi_test_policy();
+        if mode == "app" {
+            policy.allowed_apps = vec!["other-app".into()];
+        }
+        if mode == "region" {
+            policy.region_uri = "region:other".into();
+        }
+        let certificate = assigned_test_certificate();
+        let context = MaybeTlsConnectInfo {
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            peer_certs: Some(vec![tonic::transport::Certificate::from_pem(
+                openssl::x509::X509::from_der(&certificate)
+                    .unwrap()
+                    .to_pem()
+                    .unwrap(),
+            )]),
+            verified_peer_certificate_der: (mode != "chain-only").then_some(certificate),
+        };
+        let (pipeline, output, _) = new_source(EventStatus::Delivered, LOGS.into());
+        let service = Service {
+            pipeline,
+            acknowledgements: false,
+            events_received: register!(crate::internal_events::EventsReceived),
+            log_namespace: LogNamespace::Vector,
+            deserializer: None,
+            client_identity: Some(super::identity::ClientIdentityConfig::DatabricksUwi(policy)),
+        };
+        let mut logs = create_test_logs_request();
+        logs.extensions_mut().insert(context.clone());
+        let mut metrics = Request::new(ExportMetricsServiceRequest::default());
+        metrics.extensions_mut().insert(context.clone());
+        let mut traces = Request::new(ExportTraceServiceRequest::default());
+        traces.extensions_mut().insert(context);
+        for status in [
+            LogsService::export(&service, logs).await.unwrap_err(),
+            MetricsService::export(&service, metrics).await.unwrap_err(),
+            TraceService::export(&service, traces).await.unwrap_err(),
+        ] {
+            assert_eq!(status.code(), tonic::Code::Unauthenticated, "{mode}");
+        }
+        drop(service);
+        assert!(test_util::collect_ready(output).await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn prepared_tls_identity_survives_file_replacement_and_rejected_preparation() {
+    let directory = tempfile::tempdir().unwrap();
+    let certificate = directory.path().join("tls.crt");
+    let key = directory.path().join("tls.key");
+    std::fs::copy(crate::tls::TEST_PEM_CRT_PATH, &certificate).unwrap();
+    std::fs::copy(crate::tls::TEST_PEM_KEY_PATH, &key).unwrap();
+    let (_grpc_guard, grpc_addr) = next_addr();
+    let (_http_guard, http_addr) = next_addr();
+    let mut config = get_source_config_with_headers(grpc_addr, http_addr, false);
+    let mut tls = crate::tls::TlsEnableableConfig::test_config();
+    tls.options.crt_file = Some(certificate.clone());
+    tls.options.key_file = Some(key.clone());
+    config.grpc.tls = Some(tls);
+    config.prepare_reload().unwrap();
+    for replacement in [
+        b"incomplete replacement".to_vec(),
+        std::fs::read(crate::tls::TEST_PEM_CLIENT_KEY_PATH).unwrap(),
+    ] {
+        let mut candidate = config.clone();
+        std::fs::write(&key, replacement).unwrap();
+        assert!(candidate.prepare_reload().is_err());
+    }
+    std::fs::remove_file(&key).unwrap();
+    assert!(config.clone().prepare_reload().is_err());
+    let (sender, _, _) = new_source(EventStatus::Delivered, LOGS.into());
+    let source = config
+        .build(SourceContext::new_test(sender, None))
+        .await
+        .unwrap();
+    assert!(net::TcpListener::bind(grpc_addr).is_err());
+    drop(source);
+    std::fs::remove_file(certificate).unwrap();
+    // Rollback builds from parsed TLS objects, never from the failed replacement files.
+    let (sender, _, _) = new_source(EventStatus::Delivered, LOGS.into());
+    let source = config
+        .build(SourceContext::new_test(sender, None))
+        .await
+        .unwrap();
+    assert!(net::TcpListener::bind(grpc_addr).is_err());
+    drop(source);
+}
+
+#[tokio::test]
+async fn invalid_credential_reload_keeps_the_running_otlp_source_serving() {
+    use crate::{
+        config::{ComponentKey, Config},
+        test_util::{mock::basic_sink, start_topology, wait_for_tcp},
+        topology::ReloadError,
+    };
+    test_util::trace_init();
+    let directory = tempfile::tempdir().unwrap();
+    let key = directory.path().join("tls.key");
+    std::fs::copy(crate::tls::TEST_PEM_KEY_PATH, &key).unwrap();
+    let (_grpc_guard, grpc_addr) = next_addr();
+    let (_http_guard, http_addr) = next_addr();
+    let mut source = get_source_config_with_headers(grpc_addr, http_addr, false);
+    let mut tls = mtls_test_config();
+    tls.options.key_file = Some(key.clone());
+    source.grpc.tls = Some(tls);
+    let (_events, sink) = basic_sink(1);
+    let mut builder = Config::builder();
+    builder.add_source("in", source);
+    builder.add_sink("out", &["in.logs"], sink);
+    let (mut topology, _crash) = start_topology(builder.clone().build().unwrap(), false).await;
+    wait_for_tcp(grpc_addr).await;
+    std::fs::write(&key, b"incomplete replacement").unwrap();
+    // A fresh configuration has no parsed credentials until the live source supplies them.
+    let fresh: crate::config::ConfigBuilder =
+        serde_json::from_value(serde_json::to_value(&builder).unwrap()).unwrap();
+    topology
+        .reload_config_and_respawn(fresh.build().unwrap(), Default::default())
+        .await
+        .unwrap();
+    let rollback = topology
+        .config()
+        .source(&ComponentKey::from("in"))
+        .unwrap()
+        .inner
+        .clone();
+    topology.extend_reload_set(std::collections::HashSet::from([ComponentKey::from("in")]));
+    assert!(matches!(
+        topology
+            .reload_config_and_respawn(builder.clone().build().unwrap(), Default::default())
+            .await,
+        Err(ReloadError::TopologyBuildFailed)
+    ));
+    let channel = mtls_channel(
+        grpc_addr,
+        std::fs::read(crate::tls::TEST_PEM_CLIENT_CRT_PATH).unwrap(),
+        std::fs::read(crate::tls::TEST_PEM_CLIENT_KEY_PATH).unwrap(),
+    )
+    .await;
+    LogsServiceClient::new(channel)
+        .export(create_test_logs_request())
+        .await
+        .unwrap();
+    std::fs::copy(crate::tls::TEST_PEM_KEY_PATH, &key).unwrap();
+    topology.extend_reload_set(std::collections::HashSet::from([ComponentKey::from("in")]));
+    topology
+        .reload_config_and_respawn(builder.build().unwrap(), Default::default())
+        .await
+        .unwrap();
+    wait_for_tcp(grpc_addr).await;
+    topology.stop().await;
+    std::fs::remove_file(key).unwrap();
+    let (sender, _, _) = new_source(EventStatus::Delivered, LOGS.into());
+    let source = rollback
+        .build(SourceContext::new_test(sender, None))
+        .await
+        .expect("rollback must retain the parsed credentials across an unchanged reload");
+    assert!(net::TcpListener::bind(grpc_addr).is_err());
+    drop(source);
 }

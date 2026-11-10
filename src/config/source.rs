@@ -102,6 +102,16 @@ pub trait SourceConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sy
     /// returned.
     async fn build(&self, cx: SourceContext) -> crate::Result<Source>;
 
+    /// Validate and snapshot reloadable credentials before the running source stops.
+    fn prepare_reload(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// Opt in to retaining runtime state across reloads that leave this source unchanged.
+    fn reload_snapshot(&self) -> Option<BoxedSource> {
+        None
+    }
+
     /// Gets the list of outputs exposed by this source.
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput>;
 

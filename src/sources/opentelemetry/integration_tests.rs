@@ -51,6 +51,7 @@ async fn receive_logs_legacy_namespace() {
 
         let config = OpentelemetryConfig {
             grpc: GrpcConfig {
+                client_identity: None,
                 address: source_grpc_address().parse().unwrap(),
                 tls: Default::default(),
             },
@@ -63,6 +64,7 @@ async fn receive_logs_legacy_namespace() {
             acknowledgements: Default::default(),
             log_namespace: Default::default(),
             use_otlp_decoding: false,
+            tls_snapshot: Default::default(),
         };
 
         let (sender, logs_output, _) = new_source(EventStatus::Delivered, LOGS.to_string());
@@ -150,6 +152,7 @@ async fn receive_trace() {
 
         let config = OpentelemetryConfig {
             grpc: GrpcConfig {
+                client_identity: None,
                 address: source_grpc_address().parse().unwrap(),
                 tls: Default::default(),
             },
@@ -162,6 +165,7 @@ async fn receive_trace() {
             acknowledgements: Default::default(),
             log_namespace: Default::default(),
             use_otlp_decoding: false,
+            tls_snapshot: Default::default(),
         };
 
         let (sender, trace_output, _) = new_source(EventStatus::Delivered, TRACES.to_string());
@@ -255,6 +259,7 @@ async fn receive_metric() {
 
         let config = OpentelemetryConfig {
             grpc: GrpcConfig {
+                client_identity: None,
                 address: source_grpc_address().parse().unwrap(),
                 tls: Default::default(),
             },
@@ -267,6 +272,7 @@ async fn receive_metric() {
             acknowledgements: Default::default(),
             log_namespace: Default::default(),
             use_otlp_decoding: false,
+            tls_snapshot: Default::default(),
         };
 
         let (sender, metrics_output, _) = new_source(EventStatus::Delivered, METRICS.to_string());

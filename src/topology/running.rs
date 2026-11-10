@@ -1043,7 +1043,7 @@ impl RunningTopology {
     /// If the restore also fails, `ReloadError::FailedToRestore` is returned.
     pub async fn reload_config_and_respawn(
         &mut self,
-        new_config: Config,
+        mut new_config: Config,
         extra_context: ExtraContext,
     ) -> Result<(), ReloadError> {
         info!("Reloading running topology with new configuration.");
@@ -1065,6 +1065,22 @@ impl RunningTopology {
         } else {
             ConfigDiff::new(&self.config, &new_config, HashSet::new())
         };
+        for (key, source) in new_config.sources_mut() {
+            if diff.sources.contains_new(key) {
+                if let Err(error) = source.inner.prepare_reload() {
+                    error!(component_id = %key, %error, "Source reload preparation failed; keeping the running topology.");
+                    return Err(ReloadError::TopologyBuildFailed);
+                }
+            } else if let Some(snapshot) = self
+                .config
+                .source(key)
+                .and_then(|current| current.inner.reload_snapshot())
+            {
+                // Preserve runtime snapshots for sources that remain running through
+                // an unrelated reload; their next rollback must use the live identity.
+                source.inner = snapshot;
+            }
+        }
         let buffers = self.shutdown_diff(&diff, &new_config).await;
 
         // Gives windows some time to make available any port

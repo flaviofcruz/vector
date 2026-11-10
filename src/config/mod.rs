@@ -185,6 +185,12 @@ impl Config {
         self.sources.iter()
     }
 
+    pub(crate) fn sources_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&ComponentKey, &mut SourceOuter)> {
+        self.sources.iter_mut()
+    }
+
     pub fn source(&self, id: &ComponentKey) -> Option<&SourceOuter> {
         self.sources.get(id)
     }

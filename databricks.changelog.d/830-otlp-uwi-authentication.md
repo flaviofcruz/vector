@@ -1,0 +1,2 @@
+Add opt-in OTLP gRPC `client_identity` providers with Databricks UWI policy isolated from the generic receiver. Authenticate producers from the verified UWI client leaf and attach authoritative identity metadata to all signals. Disable HTTP in authenticated mode, bound TLS handshakes, validate replacement credentials before stopping the receiver and retain parsed TLS credentials for rollback.
+https://github.com/databricks-eng/vector/pull/830

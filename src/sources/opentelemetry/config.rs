@@ -1,4 +1,7 @@
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     config::{
@@ -13,6 +16,7 @@ use crate::{
         opentelemetry::{
             grpc::Service,
             http::{build_warp_filter, run_http_server},
+            identity::ClientIdentityConfig,
         },
         util::grpc::run_grpc_server_with_routes,
     },
@@ -75,6 +79,9 @@ pub struct OpentelemetryConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub use_otlp_decoding: bool,
+
+    #[serde(skip)]
+    pub(super) tls_snapshot: Arc<Mutex<Option<(MaybeTlsSettings, MaybeTlsSettings)>>>,
 }
 
 /// Configuration for the `opentelemetry` gRPC server.
@@ -92,12 +99,19 @@ pub struct GrpcConfig {
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsEnableableConfig>,
+
+    /// Require a verified client certificate identity and attach provider metadata to events.
+    /// When configured, the HTTP listener is disabled. Requires explicit client CA trust.
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_identity: Option<ClientIdentityConfig>,
 }
 
 fn example_grpc_config() -> GrpcConfig {
     GrpcConfig {
         address: "0.0.0.0:4317".parse().unwrap(),
         tls: None,
+        client_identity: None,
     }
 }
 
@@ -153,12 +167,28 @@ impl GenerateConfig for OpentelemetryConfig {
             acknowledgements: Default::default(),
             log_namespace: None,
             use_otlp_decoding: false,
+            tls_snapshot: Default::default(),
         })
         .unwrap()
     }
 }
 
 impl OpentelemetryConfig {
+    fn load_tls_settings(&self) -> crate::Result<(MaybeTlsSettings, MaybeTlsSettings)> {
+        let grpc = MaybeTlsSettings::from_config(self.grpc.tls.as_ref(), true)?;
+        let http = if self.grpc.client_identity.is_some() {
+            MaybeTlsSettings::Raw(())
+        } else {
+            MaybeTlsSettings::from_config(self.http.tls.as_ref(), true)?
+        };
+        for settings in [&grpc, &http] {
+            if let MaybeTlsSettings::Tls(tls) = settings {
+                tls.acceptor()?;
+            }
+        }
+        Ok((grpc, http))
+    }
+
     fn get_signal_deserializer(
         &self,
         signal_type: OtlpSignalType,
@@ -176,12 +206,51 @@ impl OpentelemetryConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "opentelemetry")]
 impl SourceConfig for OpentelemetryConfig {
+    fn reload_snapshot(&self) -> Option<crate::config::BoxedSource> {
+        Some(Box::new(self.clone()))
+    }
+
+    fn prepare_reload(&mut self) -> crate::Result<()> {
+        // Replace the Arc so cloned configs retain their last working credentials
+        // for rollback, while this candidate uses one coherent validated snapshot.
+        self.tls_snapshot = Arc::new(Mutex::new(Some(self.load_tls_settings()?)));
+        Ok(())
+    }
+
     async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
+        if let Some(policy) = &self.grpc.client_identity {
+            policy.validate()?;
+            let tls = self
+                .grpc
+                .tls
+                .as_ref()
+                .ok_or("Client identity requires TLS")?;
+            if tls.enabled != Some(true)
+                || tls.options.verify_certificate != Some(true)
+                || tls.options.ca_file.is_none()
+            {
+                return Err("Client identity requires TLS, verify_certificate: true and an explicit client ca_file".into());
+            }
+        }
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
         let events_received = register!(EventsReceived);
         let log_namespace = cx.log_namespace(self.log_namespace);
 
-        let grpc_tls_settings = MaybeTlsSettings::from_config(self.grpc.tls.as_ref(), true)?;
+        let (grpc_tls_settings, http_tls_settings) = {
+            let mut snapshot = self
+                .tls_snapshot
+                .lock()
+                .expect("TLS snapshot lock poisoned");
+            if snapshot.is_none() {
+                *snapshot = Some(self.load_tls_settings()?);
+            }
+            snapshot.as_ref().expect("TLS snapshot initialized").clone()
+        };
+        if self.grpc.client_identity.is_some()
+            && !matches!(&grpc_tls_settings, MaybeTlsSettings::Tls(tls) if tls.has_explicit_authorities())
+        {
+            return Err("Client identity requires a nonempty explicit client CA bundle".into());
+        }
 
         let logs_deserializer = self.get_signal_deserializer(OtlpSignalType::Logs)?;
         let metrics_deserializer = self.get_signal_deserializer(OtlpSignalType::Metrics)?;
@@ -193,6 +262,7 @@ impl SourceConfig for OpentelemetryConfig {
             log_namespace,
             events_received: events_received.clone(),
             deserializer: logs_deserializer.clone(),
+            client_identity: self.grpc.client_identity.clone(),
         })
         .accept_compressed(CompressionEncoding::Gzip)
         .max_decoding_message_size(usize::MAX);
@@ -203,6 +273,7 @@ impl SourceConfig for OpentelemetryConfig {
             log_namespace,
             events_received: events_received.clone(),
             deserializer: metrics_deserializer.clone(),
+            client_identity: self.grpc.client_identity.clone(),
         })
         .accept_compressed(CompressionEncoding::Gzip)
         .max_decoding_message_size(usize::MAX);
@@ -213,6 +284,7 @@ impl SourceConfig for OpentelemetryConfig {
             log_namespace,
             events_received: events_received.clone(),
             deserializer: traces_deserializer.clone(),
+            client_identity: self.grpc.client_identity.clone(),
         })
         .accept_compressed(CompressionEncoding::Gzip)
         .max_decoding_message_size(usize::MAX);
@@ -223,22 +295,25 @@ impl SourceConfig for OpentelemetryConfig {
             .add_service(metrics_service)
             .add_service(trace_service);
 
-        let http_tls_settings = MaybeTlsSettings::from_config(self.http.tls.as_ref(), true)?;
-        let protocol = http_tls_settings.http_protocol_name();
-
         // Surface bind and TLS acceptor errors while the topology can still reject the build.
         let grpc_listener = grpc_tls_settings.bind(&self.grpc.address).await?;
-        let http_listener = http_tls_settings.bind(&self.http.address).await?;
 
         let grpc_source = run_grpc_server_with_routes(
             self.grpc.address,
             grpc_listener,
             builder.routes(),
+            self.grpc.client_identity.is_some(),
             cx.shutdown.clone(),
         )
         .map_err(|error| {
             error!(message = "Source future failed.", %error);
         });
+
+        if self.grpc.client_identity.is_some() {
+            return Ok(grpc_source.boxed());
+        }
+        let protocol = http_tls_settings.http_protocol_name();
+        let http_listener = http_tls_settings.bind(&self.http.address).await?;
 
         let bytes_received = register!(BytesReceived::from(Protocol::from(protocol)));
         let headers =
@@ -348,6 +423,16 @@ impl SourceConfig for OpentelemetryConfig {
             )
             .with_standard_vector_source_metadata();
 
+        let schema_definition = if let Some(identity) = &self.grpc.client_identity {
+            schema_definition.with_metadata_field(
+                &identity.metadata_path(),
+                Kind::object(Collection::from_unknown(Kind::any())).or_undefined(),
+                None,
+            )
+        } else {
+            schema_definition
+        };
+
         let schema_definition = match log_namespace {
             LogNamespace::Vector => {
                 schema_definition.with_meaning(OwnedTargetPath::event_root(), "message")
@@ -370,10 +455,11 @@ impl SourceConfig for OpentelemetryConfig {
     }
 
     fn resources(&self) -> Vec<Resource> {
-        vec![
-            Resource::tcp(self.grpc.address),
-            Resource::tcp(self.http.address),
-        ]
+        let mut resources = vec![Resource::tcp(self.grpc.address)];
+        if self.grpc.client_identity.is_none() {
+            resources.push(Resource::tcp(self.http.address));
+        }
+        resources
     }
 
     fn can_acknowledge(&self) -> bool {

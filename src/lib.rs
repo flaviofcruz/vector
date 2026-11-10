@@ -81,7 +81,6 @@ pub mod cpu_time;
 #[cfg(feature = "sinks-databricks-zerobus")]
 pub mod databricks_auth;
 #[cfg(feature = "sources-opentelemetry")]
-#[allow(dead_code)]
 pub mod databricks_uwi;
 pub mod encoding_transcode;
 pub mod enrichment_tables;
