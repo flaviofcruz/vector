@@ -37,6 +37,25 @@ struct ReduceState {
     metadata: EventMetadata,
 }
 
+/// True when `path` is a single plain field at the event root and no other strategy path nests below it.
+fn is_removable_top_level_strategy(
+    path: &OwnedTargetPath,
+    strategies: &IndexMap<OwnedTargetPath, MergeStrategy>,
+) -> bool {
+    use vector_lib::lookup::{PathPrefix, lookup_v2::OwnedSegment};
+    if path.prefix != PathPrefix::Event || path.path.segments.len() != 1 {
+        return false;
+    }
+    let OwnedSegment::Field(field) = &path.path.segments[0] else {
+        return false;
+    };
+    strategies.keys().all(|other| {
+        other.prefix != PathPrefix::Event
+            || other.path.segments.len() <= 1
+            || !matches!(&other.path.segments[0], OwnedSegment::Field(f) if f == field)
+    })
+}
+
 fn is_covered_by_strategy(
     path: &OwnedTargetPath,
     strategies: &IndexMap<OwnedTargetPath, MergeStrategy>,
@@ -64,7 +83,11 @@ impl ReduceState {
         }
     }
 
-    fn add_event(&mut self, e: LogEvent, strategies: &IndexMap<OwnedTargetPath, MergeStrategy>) {
+    fn add_event(
+        &mut self,
+        mut e: LogEvent,
+        strategies: &IndexMap<OwnedTargetPath, MergeStrategy>,
+    ) {
         self.delivery_event_count = self
             .delivery_event_count
             .saturating_add(e.metadata().delivery_event_count());
@@ -98,9 +121,18 @@ impl ReduceState {
         self.metadata.merge(metadata);
 
         for (path, strategy) in strategies {
-            if let Some(value) = e.get(path) {
+            // The field loop below skips everything under a strategy path, so a top-level strategy field can be
+            // moved out of the event instead of deep-cloned (e.g. the whole `kubernetes` object, once per event) and
+            // its leaves are never enumerated or path-parsed. Not done when another strategy path nests under it,
+            // since that strategy must still find its value in the event.
+            let value = if is_removable_top_level_strategy(path, strategies) {
+                e.remove(path)
+            } else {
+                e.get(path).cloned()
+            };
+            if let Some(value) = value {
                 match self.fields.entry(path.clone()) {
-                    Entry::Vacant(entry) => match get_value_merger(value.clone(), strategy) {
+                    Entry::Vacant(entry) => match get_value_merger(value, strategy) {
                         Ok(m) => {
                             entry.insert(m);
                         }
@@ -109,7 +141,7 @@ impl ReduceState {
                         }
                     },
                     Entry::Occupied(mut entry) => {
-                        if let Err(error) = entry.get_mut().add(value.clone()) {
+                        if let Err(error) = entry.get_mut().add(value) {
                             warn!(message = "Failed to merge value.", %error);
                         }
                     }
@@ -1117,6 +1149,134 @@ merge_strategies.bar = "concat"
             assert_eq!(out.recv().await, None);
         })
         .await;
+    }
+
+    // Top-level strategy fields are moved out of the event rather than cloned; the merged output must
+    // be identical, including for fields that have no strategy.
+    #[tokio::test]
+    async fn top_level_strategy_fields_merge_as_before() {
+        let reduce_config = toml::from_str::<ReduceConfig>(indoc!(
+            r#"
+            group_by = [ "id" ]
+
+            # A slow machine can gap the two events past the default 30 s staleness,
+            # which would flush the group early and split the merge.
+            expire_after_ms = 3600000
+
+            merge_strategies.id = "discard"
+            merge_strategies.kubernetes = "discard"
+            merge_strategies.count = "sum"
+            merge_strategies.tags = "array"
+
+            [ends_when]
+              type = "vrl"
+              source = "exists(.test_end)"
+            "#,
+        ))
+        .unwrap();
+
+        assert_transform_compliance(async move {
+            let (tx, rx) = mpsc::channel(1);
+
+            let (topology, mut out) = create_topology(ReceiverStream::new(rx), reduce_config).await;
+
+            let e_1 = LogEvent::from(Value::from(btreemap! {
+                "id" => 1,
+                "kubernetes" => btreemap! { "pod_name" => "first", "labels" => btreemap! { "a" => "b" } },
+                "count" => 1,
+                "tags" => "x",
+                "other" => "first",
+            }));
+            tx.send(e_1.into()).await.unwrap();
+
+            let e_2 = LogEvent::from(Value::from(btreemap! {
+                "id" => 1,
+                "kubernetes" => btreemap! { "pod_name" => "second" },
+                "count" => 2,
+                "tags" => "y",
+                "other" => "second",
+                "test_end" => "done",
+            }));
+            tx.send(e_2.into()).await.unwrap();
+
+            let mut output = out.recv().await.unwrap().into_log();
+            output.remove_timestamp();
+            output.remove("timestamp_end");
+
+            assert_eq!(
+                *output.value(),
+                btreemap! {
+                    "id" => 1,
+                    "kubernetes" => btreemap! { "pod_name" => "first", "labels" => btreemap! { "a" => "b" } },
+                    "count" => 3,
+                    "tags" => vec!["x", "y"],
+                    "other" => "first",
+                    "test_end" => "done",
+                }
+                .into()
+            );
+
+            drop(tx);
+            topology.stop().await;
+            assert_eq!(out.recv().await, None);
+        })
+        .await;
+    }
+
+    #[test]
+    fn top_level_strategy_is_not_removable_when_another_strategy_nests_below_it() {
+        let strategies: IndexMap<OwnedTargetPath, MergeStrategy> = [
+            ("message", MergeStrategy::Discard),
+            ("message.a", MergeStrategy::Array),
+            ("id", MergeStrategy::Discard),
+        ]
+        .into_iter()
+        .map(|(path, strategy)| (vrl::path::parse_target_path(path).unwrap(), strategy))
+        .collect();
+        let removable = |path: &str| {
+            is_removable_top_level_strategy(
+                &vrl::path::parse_target_path(path).unwrap(),
+                &strategies,
+            )
+        };
+
+        assert!(!removable("message"));
+        assert!(!removable("message.a"));
+        assert!(removable("id"));
+    }
+
+    // A parent strategy listed before its nested child must not remove the value the child still
+    // needs. Asserted on the merge state rather than the flushed output: the flush inserts the
+    // parent's retained map and the child's merged value in HashMap order, so either can win for
+    // the `message.a` path even when the child was fed correctly.
+    #[test]
+    fn parent_strategy_does_not_starve_nested_child_strategy() {
+        let strategies: IndexMap<OwnedTargetPath, MergeStrategy> = [
+            ("id", MergeStrategy::Discard),
+            ("message", MergeStrategy::Discard),
+            ("message.a", MergeStrategy::Array),
+        ]
+        .into_iter()
+        .map(|(path, strategy)| (vrl::path::parse_target_path(path).unwrap(), strategy))
+        .collect();
+
+        let mut state = ReduceState::new();
+        for a in 1..=2 {
+            state.add_event(
+                LogEvent::from(Value::from(btreemap! {
+                    "id" => 1,
+                    "message" => btreemap! { "a" => a },
+                })),
+                &strategies,
+            );
+        }
+
+        // A starved child strategy never receives a value, so its merger is never created.
+        assert!(
+            state
+                .fields
+                .contains_key(&vrl::path::parse_target_path("message.a").unwrap())
+        );
     }
 
     #[test]
