@@ -9,7 +9,7 @@ use super::{
     AddCertToStoreSnafu, AddExtraChainCertSnafu, CaStackPushSnafu, EncodeAlpnProtocolsSnafu,
     FileOpenFailedSnafu, FileReadFailedSnafu, MaybeTls, NewCaStackSnafu, NewStoreBuilderSnafu,
     ParsePkcs12Snafu, PrivateKeyParseSnafu, Result, SetAlpnProtocolsSnafu, SetCertificateSnafu,
-    SetPrivateKeySnafu, SetVerifyCertSnafu, TlsError, X509ParseSnafu,
+    SetPrivateKeySnafu, SetVerifyCertSnafu, SslBuildSnafu, TlsError, X509ParseSnafu,
 };
 use cfg_if::cfg_if;
 use lookup::lookup_v2::OptionalValuePath;
@@ -189,6 +189,11 @@ pub(super) struct IdentityStore {
 }
 
 impl TlsSettings {
+    /// Whether the configuration supplied nonempty certificate authorities instead of system roots.
+    pub fn has_explicit_authorities(&self) -> bool {
+        !self.authorities.is_empty()
+    }
+
     /// Generate a filled out settings struct from the given optional
     /// option set, interpreted as client options. If `options` is
     /// `None`, the result is set to defaults (ie empty).
@@ -276,6 +281,16 @@ impl TlsSettings {
         } else {
             SslVerifyMode::NONE
         });
+        if for_server && self.verify_certificate {
+            // OpenSSL requires a session context for resumable mTLS. Isolate each
+            // acceptor so credential or trust-policy reloads require fresh authentication.
+            // A collision can reuse old authentication only with shared session state or ticket keys.
+            let mut session_context = [0u8; 32];
+            openssl::rand::rand_bytes(&mut session_context).context(SslBuildSnafu)?;
+            context
+                .set_session_id_context(&session_context)
+                .context(SslBuildSnafu)?;
+        }
         if let Some(identity) = &self.identity {
             context
                 .set_certificate(&identity.cert)

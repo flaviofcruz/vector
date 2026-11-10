@@ -15,9 +15,12 @@ use crate::tcp::{self, TcpKeepaliveConfig};
 mod incoming;
 mod maybe_tls;
 mod outgoing;
+mod peer_identity;
 mod settings;
 
-pub use incoming::{CertificateMetadata, MaybeTlsIncomingStream, MaybeTlsListener};
+pub use incoming::{
+    CertificateMetadata, MaybeTlsConnectInfo, MaybeTlsIncomingStream, MaybeTlsListener,
+};
 pub use maybe_tls::MaybeTls;
 pub use settings::{
     MaybeTlsSettings, PEM_START_MARKER, TEST_PEM_CA_PATH, TEST_PEM_CLIENT_CRT_PATH,
@@ -81,6 +84,8 @@ pub enum TlsError {
     MissingRequiredIdentity,
     #[snafu(display("TLS handshake failed: {}", source))]
     Handshake { source: openssl::ssl::Error },
+    #[snafu(display("Verified client certificate is expired or not yet valid"))]
+    InvalidPeerCertificate,
     #[snafu(display("Incoming listener failed: {}", source))]
     IncomingListener { source: tokio::io::Error },
     #[snafu(display("Creating the TLS acceptor failed: {}", source))]
