@@ -67,6 +67,8 @@ const ALL_SOURCE_PODS_ID: &str = "__all_source_pods__";
 /// with the woodchuck VRL's per-source fallback behavior.
 pub const SOURCE_TYPE_FILE: &str = "file";
 pub const SOURCE_TYPE_KUBERNETES_LOGS: &str = "kubernetes_logs";
+/// The `vector` source receiving diskless structured-log batches over gRPC.
+pub const SOURCE_TYPE_VECTOR: &str = "vector";
 
 /// Bounded reason label for records rejected by a file-backed source before
 /// they can enter the event pipeline.
@@ -80,6 +82,7 @@ pub const REJECTION_REASON_LINE_TOO_LONG: &str = "line_too_long";
 /// `*_log_daemon_wrapper.libsonnet`, `diskless.libsonnet`,
 /// `application_heartbeats.libsonnet`, `file_based_raw_proto_streaming.libsonnet`.
 pub const DELIVERY_METHOD_FILE: &str = "VECTOR_WOODCHUCK_V2_FILE";
+pub const DELIVERY_METHOD_DISKLESS: &str = "VECTOR_WOODCHUCK_V2_DISKLESS";
 
 /// Extracts a Lumberjack topic from a source filename of either the active
 /// form (`<TableNameCamelCase>[LaMigration].pb[.base64][.gz]`) or the
@@ -184,8 +187,8 @@ fn topic_from_value_map(value_map: &HashMap<String, String>) -> String {
 /// Mirrors `topic_from_value_map` / `time_parity_from_value_map`. Splitting
 /// the completeness ratio by this label distinguishes file-source deliveries
 /// (`VECTOR_WOODCHUCK_V2_FILE`) from diskless gRPC deliveries
-/// (`VECTOR_WOODCHUCK_V2_DISKLESS`), which is necessary because diskless
-/// events have no corresponding read-side counter.
+/// (`VECTOR_WOODCHUCK_V2_DISKLESS`), each of which has its own read-side
+/// counter (file-backed sources vs the `vector` source's diskless reads).
 fn delivery_method_from_value_map(value_map: &HashMap<String, String>) -> String {
     value_map
         .get("deliveryMethod")
@@ -244,11 +247,13 @@ pub fn source_pod_id_from_file_path(path: &str) -> Option<&str> {
 /// taxonomy. Both the `file` source and the Databricks fork's `kubernetes_logs`
 /// source read from files (the latter reads Lumberjack proto files, and pod
 /// stdout, from container directories), so both map to `DELIVERY_METHOD_FILE`.
-/// The diskless gRPC source emits no read event, so reads are always
-/// file-based; the `_` arm is a defensive fallback for any unexpected source.
+/// The `vector` source reads diskless gRPC batches, so it maps to
+/// `DELIVERY_METHOD_DISKLESS`; the `_` arm is a defensive fallback for any
+/// unexpected source.
 fn delivery_method_for_source_type(source_type: &str) -> &'static str {
     match source_type {
         SOURCE_TYPE_FILE | SOURCE_TYPE_KUBERNETES_LOGS => DELIVERY_METHOD_FILE,
+        SOURCE_TYPE_VECTOR => DELIVERY_METHOD_DISKLESS,
         _ => "unknown",
     }
 }
@@ -421,8 +426,11 @@ pub fn emit_read_event_after_multiline_agg() -> bool {
 /// `file_server.rs` and the per-line post-multiline spots in `file.rs` /
 /// `kubernetes_logs`) route through the singleton; this keeps exactly one of
 /// them active for a given config.
-fn read_should_emit(emitted_after_multiline_agg: bool) -> bool {
-    (emitted_after_multiline_agg && emit_read_event_after_multiline_agg())
+fn read_should_emit(source_type: &str, emitted_after_multiline_agg: bool) -> bool {
+    // Diskless batches never pass through multiline aggregation, so their
+    // single read spot always emits.
+    source_type == SOURCE_TYPE_VECTOR
+        || (emitted_after_multiline_agg && emit_read_event_after_multiline_agg())
         || (!emitted_after_multiline_agg && !emit_read_event_after_multiline_agg())
 }
 
@@ -585,7 +593,7 @@ impl DeliveryEventSingleton {
         delivery_paths: Option<&DeliveryPathAccounting>,
         workspace_id: Option<&str>,
     ) {
-        if !read_should_emit(emitted_after_multiline_agg) {
+        if !read_should_emit(source_type, emitted_after_multiline_agg) {
             return;
         }
 
@@ -1375,8 +1383,29 @@ mod topic_inference_tests {
     }
 
     #[test]
+    fn diskless_reads_emit_regardless_of_multiline_read_spot() {
+        // The vector source's diskless read is its only read spot, so it must
+        // emit whichever file-source spot EMIT_READ_EVENT_AFTER_MULTILINE_AGG selects.
+        assert!(read_should_emit(SOURCE_TYPE_VECTOR, false));
+        assert!(read_should_emit(SOURCE_TYPE_VECTOR, true));
+        // File-backed sources still emit at exactly one of their two spots.
+        assert_ne!(
+            read_should_emit(SOURCE_TYPE_FILE, false),
+            read_should_emit(SOURCE_TYPE_FILE, true)
+        );
+    }
+
+    #[test]
+    fn delivery_method_for_source_type_vector_is_diskless() {
+        assert_eq!(
+            delivery_method_for_source_type(SOURCE_TYPE_VECTOR),
+            DELIVERY_METHOD_DISKLESS
+        );
+    }
+
+    #[test]
     fn delivery_method_for_source_type_unknown_falls_back() {
-        assert_eq!(delivery_method_for_source_type("vector"), "unknown");
+        assert_eq!(delivery_method_for_source_type("http_server"), "unknown");
         assert_eq!(delivery_method_for_source_type(""), "unknown");
     }
 
