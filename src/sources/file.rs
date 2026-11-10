@@ -690,6 +690,7 @@ pub fn file_source(
         source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_FILE,
         read_loop_min_backoff: 1,
         read_loop_max_backoff: config.read_loop_max_backoff_ms.get(),
+        admission: None,
     };
 
     let event_metadata = EventMetadata {
@@ -922,6 +923,8 @@ pub fn wrap_with_line_agg(
                 end_offset: lastline_context.map_or(initial_end, |(_, _, lastline_end_offset)| {
                     lastline_end_offset
                 }),
+                admission_key: None,
+                checkpoint_gate: vector_lib::file_source::admission::CheckpointGate::Open,
             },
         ),
     )

@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+#[cfg(feature = "test-support")]
+use std::{future::Future, pin::Pin};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -27,6 +29,13 @@ pub const CHECKPOINT_FILE_NAME: &str = "checkpoints.json";
 /// `Checkpointer::with_dead_retention` to bridge the gap until a rotated `.gz`
 /// (same fingerprint) appears.
 pub const DEFAULT_DEAD_RETENTION: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Fault-injection seam for validating the atomic checkpoint replacement boundary.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub trait CheckpointWriteHook: Send + Sync {
+    fn after_temporary_file_sync(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
 
 /// This enum represents the file format of checkpoints persisted to disk. Right
 /// now there is only one variant, but any incompatible changes will require and
@@ -66,6 +75,8 @@ pub struct Checkpointer {
     /// Defaults to [`DEFAULT_DEAD_RETENTION`]; override with
     /// [`Checkpointer::with_dead_retention`].
     dead_retention: chrono::Duration,
+    #[cfg(feature = "test-support")]
+    write_hook: Option<Arc<dyn CheckpointWriteHook>>,
 }
 
 /// A thread-safe handle for reading and writing checkpoints in-memory across
@@ -267,7 +278,17 @@ impl Checkpointer {
             checkpoints: Arc::new(CheckpointsView::default()),
             last: Mutex::new(None),
             dead_retention: DEFAULT_DEAD_RETENTION,
+            #[cfg(feature = "test-support")]
+            write_hook: None,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_write_hook(mut self, write_hook: Arc<dyn CheckpointWriteHook>) -> Self {
+        self.write_hook = Some(write_hook);
+        self
     }
 
     /// Override how long a reaped file's checkpoint is retained before cleanup.
@@ -321,6 +342,11 @@ impl Checkpointer {
             })
             .await
             .map_err(io::Error::other)??;
+
+            #[cfg(feature = "test-support")]
+            if let Some(write_hook) = &self.write_hook {
+                write_hook.after_temporary_file_sync().await;
+            }
 
             // Once the temp file is fully flushed, rename the tmp file to replace
             // the previous stable file. This is an atomic operation on POSIX

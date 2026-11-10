@@ -82,7 +82,10 @@ use crate::{
 };
 use std::sync::{Arc, Mutex};
 use vector_lib::file_source::{
-    TTLRemovalConfig, convert_to_file_ttl_removal_config, paths_provider::LogFileInfo,
+    TTLRemovalConfig,
+    admission::{CheckpointGate, CheckpointGateResult},
+    convert_to_file_ttl_removal_config,
+    paths_provider::LogFileInfo,
 };
 
 mod k8s_paths_provider;
@@ -102,6 +105,11 @@ use self::{
     node_metadata_annotator::NodeMetadataAnnotator, parser::Parser,
     pod_metadata_annotator::PodMetadataAnnotator,
 };
+
+async fn actor_acknowledged_line(mut line: Line) -> Option<Line> {
+    let gate = std::mem::replace(&mut line.checkpoint_gate, CheckpointGate::Open);
+    (gate.wait().await == CheckpointGateResult::ActorAcknowledged).then_some(line)
+}
 
 /// The `self_node_name` value env var key.
 const SELF_NODE_NAME_ENV_KEY: &str = "VECTOR_SELF_NODE_NAME";
@@ -1417,6 +1425,7 @@ impl Source {
             source_type: vector_common::internal_event::vector_event::delivery_event::SOURCE_TYPE_KUBERNETES_LOGS,
             read_loop_min_backoff: 1,
             read_loop_max_backoff,
+            admission: None,
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
@@ -1426,6 +1435,8 @@ impl Source {
         let mut encoding_decoder = encoding_charset.map(Decoder::new);
         let events = file_source_rx
             .flat_map(futures::stream::iter)
+            .filter_map(actor_acknowledged_line)
+            .boxed()
             .map(move |mut line| {
                 let byte_size = line.text.len();
                 bytes_received.emit(ByteSize(byte_size));
@@ -1584,12 +1595,14 @@ impl Source {
         };
 
         let mut lifecycle = Lifecycle::new();
+        let (events_done, checkpoint_shutdown) = util::events_done();
         {
             let (slot, shutdown) = lifecycle.add();
             let fut = util::run_file_server(
                 file_server,
                 file_source_tx,
                 shutdown,
+                checkpoint_shutdown,
                 checkpointer,
                 async_file_server,
             )
@@ -1624,7 +1637,7 @@ impl Source {
                     }),
                 };
             });
-            slot.bind(Box::pin(fut));
+            slot.bind(Box::pin(events_done.after(fut)));
         }
 
         // Hold the token until cleanup is done; dropping it reports this source as shut down.

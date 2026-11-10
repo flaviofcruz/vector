@@ -63,6 +63,7 @@ default-features = false
 features = []
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
+file-source-common = { path = "../file-source-common", features = ["test-support"] }
 quickcheck = "1"
 tempfile.workspace = true

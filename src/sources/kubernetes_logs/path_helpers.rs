@@ -78,6 +78,7 @@ pub(super) fn parse_log_file_path(path: &str) -> Option<LogFileInfo> {
         container_name: container_name.to_string(),
         service_system: None,
         source_pod_id: None,
+        admission_metadata: None,
     })
 }
 
@@ -165,6 +166,7 @@ mod tests {
                     container_name: "sandbox0-container0-name".to_string(),
                     service_system: None,
                     source_pod_id: None,
+                    admission_metadata: None,
                 }),
             ),
             // Invalid inputs.

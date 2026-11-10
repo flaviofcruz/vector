@@ -359,6 +359,35 @@ impl FileWatcher {
         Some(Duration::from_millis(age_ms))
     }
 
+    /// Reopens this watcher's path at `file_position` so a rejected record is read again.
+    /// Fails if the path now holds a different file (rotated away and recreated before discovery
+    /// moved the watcher): seeking that file to an offset of the old one would read the wrong
+    /// bytes under this watcher's fingerprint and checkpoint.
+    pub(super) async fn rewind_to(&mut self, file_position: FilePosition) -> io::Result<()> {
+        let file = File::open(&self.path).await?;
+        let file_info = file.file_info().await?;
+        if (file_info.portable_dev(), file_info.portable_ino()) != (self.devno, self.inode) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "file at the watched path was replaced; cannot rewind to a rejected record",
+            ));
+        }
+        let mut reader = BufReader::new(file);
+        let gzipped = is_gzipped(&mut reader).await?;
+        self.reader = if gzipped {
+            gzip_reader_at_offset(reader, file_position).await?
+        } else {
+            reader.seek(io::SeekFrom::Start(file_position)).await?;
+            Box::new(reader)
+        };
+        self.file_position = file_position;
+        self.buf.clear();
+        self.buffered_line_start = None;
+        self.reached_eof = false;
+        self.read_retry_delay = EOF_READ_BACKOFF_MIN;
+        Ok(())
+    }
+
     /// Read a single line from the underlying file
     ///
     /// This function will attempt to read a new line from its file, blocking,

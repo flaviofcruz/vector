@@ -1,21 +1,27 @@
 use std::{
     cmp,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{self, Duration},
 };
 
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use file_source_common::CheckpointWriteHook;
 use file_source_common::{
     FileFingerprint, FileReadStartedInfo, FileSourceInternalEvents, FileStopReason,
     FileUnwatchedInfo, Fingerprinter, ReadFrom,
     checkpointer::{Checkpointer, CheckpointsView},
 };
 use futures::{
-    Future, Sink, SinkExt,
-    future::{Either, select},
+    Future, FutureExt, Sink, SinkExt, StreamExt,
+    future::{AbortHandle, Abortable, BoxFuture, Either, select},
+    stream::FuturesUnordered,
 };
 use futures_util::future::join_all;
 use indexmap::IndexMap;
@@ -36,6 +42,10 @@ use vector_common::internal_event::{
 
 use crate::{
     FileTTLAction, FileTTLRemovalConfig,
+    admission::{
+        AdmissionError, AdmissionKey, CheckpointGate, CheckpointGateResolver, CheckpointGateResult,
+        FileSourceAdmission, FileSourceBacklogLease, OwnedFileSourceAdmissionPermit,
+    },
     file_watcher::{FileWatcher, RawLineResult},
     paths_provider::{LogFileInfo, PathsProvider},
 };
@@ -91,6 +101,684 @@ where
     pub read_loop_min_backoff: usize,
     /// Maximum read-loop backoff in milliseconds. Must be positive.
     pub read_loop_max_backoff: usize,
+    /// Optional process-scoped admission controller.
+    pub admission: Option<Arc<dyn FileSourceAdmission>>,
+    #[cfg(test)]
+    test_readiness_hook: Option<TestReadinessHook>,
+    #[cfg(test)]
+    test_line_admission_hook: Option<TestLineAdmissionHook>,
+    #[cfg(test)]
+    test_before_send_hook: Option<TestBeforeSendHook>,
+    #[cfg(test)]
+    test_checkpoint_flush_hook: Option<Arc<TestCheckpointFlushHook>>,
+}
+
+#[cfg(test)]
+type TestReadinessHook = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+#[cfg(test)]
+type TestLineAdmissionHook = Arc<dyn Fn(Line) -> Option<Line> + Send + Sync>;
+#[cfg(test)]
+type TestBeforeSendHook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
+#[cfg(test)]
+struct TestCheckpointFlushHook {
+    armed: std::sync::atomic::AtomicBool,
+    unarmed_temporary_file_synced: tokio::sync::Semaphore,
+    started: tokio::sync::Semaphore,
+    resume: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl TestCheckpointFlushHook {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            unarmed_temporary_file_synced: tokio::sync::Semaphore::new(0),
+            started: tokio::sync::Semaphore::new(0),
+            resume: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    fn arm(&self) {
+        assert!(!self.armed.swap(true, Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+impl CheckpointWriteHook for TestCheckpointFlushHook {
+    fn after_temporary_file_sync(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if !self.armed.swap(false, Ordering::SeqCst) {
+                self.unarmed_temporary_file_synced.add_permits(1);
+                return;
+            }
+            self.started.add_permits(1);
+            self.resume.acquire().await.unwrap().forget();
+        })
+    }
+}
+
+// Request IDs must be unique across FileServer instances: multiple source components can observe
+// different paths for one pod and share one process-scoped admission coordinator.
+static NEXT_ADMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_admission_request_id() -> Option<u64> {
+    NEXT_ADMISSION_REQUEST_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .ok()
+}
+
+/// Seeded multiplicative hasher for the dispatcher's per-record map operations. The keys are small
+/// integers (fingerprints, offsets); SipHash costs more than the rest of a lookup, and a per-process
+/// random seed keeps colliding keys unpredictable.
+#[derive(Clone, Copy)]
+struct DispatcherBuildHasher(u64);
+
+impl Default for DispatcherBuildHasher {
+    fn default() -> Self {
+        static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        Self(*SEED.get_or_init(|| {
+            use std::hash::BuildHasher;
+            std::collections::hash_map::RandomState::new().hash_one(0_u8) | 1
+        }))
+    }
+}
+
+impl std::hash::BuildHasher for DispatcherBuildHasher {
+    type Hasher = DispatcherHasher;
+
+    fn build_hasher(&self) -> DispatcherHasher {
+        DispatcherHasher(self.0)
+    }
+}
+
+struct DispatcherHasher(u64);
+
+impl DispatcherHasher {
+    const MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::MULTIPLIER);
+    }
+}
+
+impl std::hash::Hasher for DispatcherHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0_u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.mix(u64::from_le_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.mix(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.mix(u64::from(value));
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.mix(value as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
+}
+
+type DispatcherMap<K, V> = HashMap<K, V, DispatcherBuildHasher>;
+type DispatcherSet<K> = HashSet<K, DispatcherBuildHasher>;
+
+struct ReadyAdmission {
+    line: Line,
+    permit: Result<OwnedFileSourceAdmissionPermit, AdmissionError>,
+    gate: CheckpointGateResolver,
+}
+
+struct CompletedAdmissionWait {
+    file_id: FileFingerprint,
+    start_offset: u64,
+    ready: Option<ReadyAdmission>,
+}
+
+/// One file's records sent together, in offset order, so they are finished in that order.
+struct AcknowledgedAdmission {
+    file_id: FileFingerprint,
+    records: Vec<AcknowledgedRecord>,
+}
+
+struct AcknowledgedRecord {
+    start_offset: u64,
+    gate: CheckpointGateResolver,
+    result: CheckpointGateResult,
+}
+
+struct PreparedLine {
+    line: Line,
+    payload_bytes: usize,
+    pending: Option<(
+        Box<dyn crate::admission::PendingAdmission>,
+        CheckpointGateResolver,
+    )>,
+}
+
+enum PrepareLineResult {
+    Line(PreparedLine),
+    NoLine,
+    ReadError,
+    AdmissionDeferred,
+}
+
+/// Keeps one file's throttled backlog from occupying the process-wide admission bound. This is a
+/// refillable scheduling tranche, not an entitlement or service-weight quota.
+const ADMISSION_READ_AHEAD_PER_FILE: usize = 4;
+/// Bounds one file's granted records awaiting send or acknowledgement. Granted records hold no
+/// pre-read reservation, so an unthrottled file may run this far ahead of its waits; one
+/// acknowledgement round trip then covers many records instead of capping the file's rate.
+const ADMISSION_IN_FLIGHT_PER_FILE: usize = 32;
+const MAX_ADMISSION_RESERVATION_TRANCHE_SIZE: usize = 64;
+/// Most records one file visit may admit. A visit keeps reading only while each permit is issued
+/// without waiting, so the per-visit work (metrics, stats, scan bookkeeping) is shared by the run
+/// while a throttled file still yields after its first waiting record. The budget bounds how long
+/// one file can hold the scan loop ahead of the others (they each get a visit per pass) and is
+/// half the in-flight bound so two files can fill their windows from one pass. It replaces
+/// `max_read_bytes` for admitted reads, which would otherwise end the visit after one record.
+const ADMISSION_VISIT_LINE_BUDGET: usize = 16;
+
+/// Independently polls entitlement waits so one pod cannot block another pod's ready permit.
+pub struct AdmissionDispatcher {
+    reservation_tranche_size: usize,
+    pending: FuturesUnordered<BoxFuture<'static, CompletedAdmissionWait>>,
+    pending_abort_handles: DispatcherMap<FileFingerprint, Vec<(u64, AbortHandle)>>,
+    ready_by_file: DispatcherMap<FileFingerprint, BTreeMap<u64, ReadyAdmission>>,
+    ready_files: VecDeque<(FileFingerprint, u64)>,
+    ready_file_set: DispatcherSet<FileFingerprint>,
+    ready_file_generations: DispatcherMap<FileFingerprint, u64>,
+    acknowledgements: FuturesUnordered<BoxFuture<'static, AcknowledgedAdmission>>,
+    pending_files: DispatcherSet<FileFingerprint>,
+    pending_replays: DispatcherMap<FileFingerprint, u64>,
+    pending_offsets: DispatcherMap<FileFingerprint, VecDeque<u64>>,
+    /// How many of the file's front pending offsets are sent and awaiting acknowledgement.
+    acknowledging_files: DispatcherMap<FileFingerprint, usize>,
+    refresh_after_acknowledgement: DispatcherSet<FileFingerprint>,
+    backlog_leases: DispatcherMap<FileFingerprint, RetainedFileBacklog>,
+    admission_tranches: DispatcherMap<FileFingerprint, RetainedAdmissionTranche>,
+}
+
+struct RetainedFileBacklog {
+    metadata: crate::admission::AdmissionMetadata,
+    _lease: Box<dyn FileSourceBacklogLease>,
+}
+
+struct RetainedAdmissionTranche {
+    metadata: crate::admission::AdmissionMetadata,
+    reservations: VecDeque<Box<dyn crate::admission::PendingAdmission>>,
+}
+
+impl AdmissionDispatcher {
+    fn new(reservation_tranche_size: usize) -> Self {
+        assert!(
+            (1..=MAX_ADMISSION_RESERVATION_TRANCHE_SIZE).contains(&reservation_tranche_size),
+            "admission reservation tranche size exceeds the supported bound"
+        );
+        Self {
+            reservation_tranche_size,
+            pending: FuturesUnordered::new(),
+            pending_abort_handles: Default::default(),
+            ready_by_file: Default::default(),
+            ready_files: VecDeque::new(),
+            ready_file_set: Default::default(),
+            ready_file_generations: Default::default(),
+            acknowledgements: FuturesUnordered::new(),
+            pending_files: Default::default(),
+            pending_replays: Default::default(),
+            pending_offsets: Default::default(),
+            acknowledging_files: Default::default(),
+            refresh_after_acknowledgement: Default::default(),
+            backlog_leases: Default::default(),
+            admission_tranches: Default::default(),
+        }
+    }
+
+    async fn retain_file_backlog(
+        &mut self,
+        file_id: FileFingerprint,
+        admission: Arc<dyn FileSourceAdmission>,
+        metadata: crate::admission::AdmissionMetadata,
+    ) -> Result<(), AdmissionError> {
+        if self
+            .backlog_leases
+            .get(&file_id)
+            .is_some_and(|retained| retained.metadata == metadata)
+        {
+            return Ok(());
+        }
+        self.backlog_leases.remove(&file_id);
+        if let Some(lease) = admission.retain_backlog(metadata.clone()).await? {
+            self.backlog_leases.insert(
+                file_id,
+                RetainedFileBacklog {
+                    metadata,
+                    _lease: lease,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn clear_file_backlog(&mut self, file_id: FileFingerprint) {
+        self.backlog_leases.remove(&file_id);
+        self.admission_tranches.remove(&file_id);
+    }
+
+    async fn take_or_reserve_file_credit(
+        &mut self,
+        file_id: FileFingerprint,
+        admission: Arc<dyn FileSourceAdmission>,
+        metadata: crate::admission::AdmissionMetadata,
+        max_line_bytes: u64,
+    ) -> Result<Box<dyn crate::admission::PendingAdmission>, AdmissionError> {
+        if self
+            .admission_tranches
+            .get(&file_id)
+            .is_some_and(|tranche| tranche.metadata != metadata)
+        {
+            self.admission_tranches.remove(&file_id);
+        }
+        if let Some(reservation) = self
+            .admission_tranches
+            .get_mut(&file_id)
+            .and_then(|tranche| tranche.reservations.pop_front())
+        {
+            return Ok(reservation);
+        }
+
+        let request_ids = (0..self.reservation_tranche_size)
+            .map(|_| next_admission_request_id().ok_or(AdmissionError::Internal))
+            .collect::<Result<Vec<_>, _>>()?;
+        let reservations = admission
+            .reserve_tranche(metadata.clone(), request_ids, max_line_bytes)
+            .await?;
+        let mut reservations = VecDeque::from(reservations);
+        let reservation = reservations
+            .pop_front()
+            .ok_or(AdmissionError::BoundsExceeded)?;
+        self.admission_tranches.insert(
+            file_id,
+            RetainedAdmissionTranche {
+                metadata,
+                reservations,
+            },
+        );
+        Ok(reservation)
+    }
+
+    fn insert_ready(&mut self, ready: ReadyAdmission) {
+        let file_id = ready.line.file_id;
+        let start_offset = ready.line.start_offset;
+        let previous = self
+            .ready_by_file
+            .entry(file_id)
+            .or_default()
+            .insert(start_offset, ready);
+        debug_assert!(previous.is_none());
+        self.queue_ready_file(file_id);
+    }
+
+    /// Starts the same per-line wait protocol for normal reads and shutdown drain. Returns whether
+    /// the permit was issued without waiting.
+    fn enqueue(
+        &mut self,
+        line: Line,
+        mut reservation: Box<dyn crate::admission::PendingAdmission>,
+        gate: CheckpointGateResolver,
+    ) -> bool {
+        let file_id = line.file_id;
+        let start_offset = line.start_offset;
+        self.pending_files.insert(file_id);
+        self.pending_replays.entry(file_id).or_insert(start_offset);
+        self.pending_offsets
+            .entry(file_id)
+            .or_default()
+            .push_back(start_offset);
+        // A reservation whose permit needs no waiting skips the wait machinery (boxed future,
+        // abort handle, `FuturesUnordered` round trip) but is ordered exactly like a completed wait.
+        if let Some(permit) = reservation.try_wait() {
+            self.insert_ready(ReadyAdmission { line, permit, gate });
+            return true;
+        }
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        self.pending_abort_handles
+            .entry(file_id)
+            .or_default()
+            .push((start_offset, abort_handle));
+        self.pending.push(
+            async move {
+                let ready = Abortable::new(
+                    async {
+                        ReadyAdmission {
+                            line,
+                            permit: reservation.wait().await,
+                            gate,
+                        }
+                    },
+                    abort_registration,
+                )
+                .await
+                .ok();
+                CompletedAdmissionWait {
+                    file_id,
+                    start_offset,
+                    ready,
+                }
+            }
+            .boxed(),
+        );
+        false
+    }
+
+    fn queue_ready_file(&mut self, file_id: FileFingerprint) {
+        if self.acknowledging_files.contains_key(&file_id) {
+            return;
+        }
+        let Some(start_offset) = self
+            .pending_offsets
+            .get(&file_id)
+            .and_then(|offsets| offsets.front())
+        else {
+            return;
+        };
+        if !self
+            .ready_by_file
+            .get(&file_id)
+            .is_some_and(|ready| ready.contains_key(start_offset))
+        {
+            return;
+        }
+        if self.ready_file_set.insert(file_id) {
+            let generation = *self.ready_file_generations.entry(file_id).or_default();
+            self.ready_files.push_back((file_id, generation));
+        }
+    }
+
+    fn poll_waits(&mut self) {
+        while let Some(Some(completed)) = self.pending.next().now_or_never() {
+            self.record_completed_wait(completed);
+        }
+    }
+
+    fn record_completed_wait(&mut self, completed: CompletedAdmissionWait) {
+        // An emptied entry stays until the file's last record resolves (`finish_file`) so a steady
+        // stream of waits does not reallocate it per record.
+        if let Some(handles) = self.pending_abort_handles.get_mut(&completed.file_id)
+            && let Some(position) = handles
+                .iter()
+                .position(|(offset, _)| *offset == completed.start_offset)
+        {
+            handles.swap_remove(position);
+        }
+        if let Some(ready) = completed.ready {
+            self.insert_ready(ready);
+        }
+    }
+
+    fn has_outstanding_work(&self) -> bool {
+        !self.pending.is_empty() || !self.acknowledgements.is_empty()
+    }
+
+    /// Resolves when an admission wait or acknowledgement completes. A completed wait is recorded
+    /// as ready; an acknowledgement is returned for the caller to finish. Both arms are
+    /// cancellation safe, so a losing timer never drops a disposition.
+    async fn wait_for_progress(&mut self) -> Option<AcknowledgedAdmission> {
+        tokio::select! {
+            Some(completed) = self.pending.next(), if !self.pending.is_empty() => {
+                self.record_completed_wait(completed);
+                None
+            }
+            Some(acknowledgement) = self.acknowledgements.next(), if !self.acknowledgements.is_empty() => {
+                Some(acknowledgement)
+            }
+            else => None,
+        }
+    }
+
+    fn next_ready(&mut self) -> Option<ReadyAdmission> {
+        self.next_ready_run(1).pop()
+    }
+
+    /// Returns one file's ready front record and, when every permit supports batching, the ready
+    /// records contiguous behind it. Sending them together lets one acknowledgement round trip
+    /// cover the whole read-ahead tranche instead of one record per read pass.
+    fn next_ready_run(&mut self, limit: usize) -> Vec<ReadyAdmission> {
+        // One global ready queue registers all new waits and only repolls woken waits. Completed
+        // later offsets remain buffered until the ordered front is sent and acknowledged.
+        self.poll_waits();
+        while let Some((file_id, generation)) = self.ready_files.pop_front() {
+            if self
+                .ready_file_generations
+                .get(&file_id)
+                .copied()
+                .unwrap_or_default()
+                != generation
+                || !self.ready_file_set.remove(&file_id)
+                || self.acknowledging_files.contains_key(&file_id)
+            {
+                continue;
+            }
+            let (Some(offsets), Some(ready_offsets)) = (
+                self.pending_offsets.get(&file_id),
+                self.ready_by_file.get_mut(&file_id),
+            ) else {
+                continue;
+            };
+            let mut run: Vec<ReadyAdmission> = Vec::new();
+            for start_offset in offsets.iter().take(limit) {
+                let batchable = |ready: &ReadyAdmission| {
+                    ready
+                        .permit
+                        .as_ref()
+                        .is_ok_and(|permit| permit.supports_batch())
+                };
+                if run.first().is_some_and(|front| !batchable(front))
+                    || ready_offsets
+                        .get(start_offset)
+                        .is_none_or(|ready| !run.is_empty() && !batchable(ready))
+                {
+                    break;
+                }
+                let ready = ready_offsets
+                    .remove(start_offset)
+                    .expect("checked ready offset");
+                debug_assert_eq!(*start_offset, ready.line.start_offset);
+                run.push(ready);
+            }
+            if !run.is_empty() {
+                return run;
+            }
+        }
+        Vec::new()
+    }
+
+    fn next_ready_batch(&mut self) -> Vec<ReadyAdmission> {
+        let mut ready = Vec::new();
+        loop {
+            let run = self.next_ready_run(usize::MAX);
+            if run.is_empty() {
+                return ready;
+            }
+            ready.extend(run);
+        }
+    }
+
+    fn next_acknowledged(&mut self) -> Option<AcknowledgedAdmission> {
+        self.acknowledgements.next().now_or_never().flatten()
+    }
+
+    fn file_has_read_ahead_capacity(&self, file_id: FileFingerprint) -> bool {
+        let has_cached_reservation = self
+            .admission_tranches
+            .get(&file_id)
+            .is_some_and(|tranche| !tranche.reservations.is_empty());
+        let pending_offsets = self.pending_offsets.get(&file_id).map_or(0, VecDeque::len);
+        let unresolved_waits = self.pending_abort_handles.get(&file_id).map_or(0, Vec::len);
+        pending_offsets < ADMISSION_IN_FLIGHT_PER_FILE
+            && unresolved_waits < ADMISSION_READ_AHEAD_PER_FILE
+            && (has_cached_reservation
+                || self.reservation_tranche_size == 1
+                || unresolved_waits == 0)
+    }
+
+    fn finish_file(&mut self, file_id: FileFingerprint) {
+        self.pending_abort_handles.remove(&file_id);
+        self.ready_by_file.remove(&file_id);
+        if self.ready_file_set.remove(&file_id) {
+            self.ready_files.retain(|(queued, _)| *queued != file_id);
+        }
+        self.ready_file_generations.remove(&file_id);
+        self.pending_files.remove(&file_id);
+        self.pending_replays.remove(&file_id);
+        self.pending_offsets.remove(&file_id);
+        self.acknowledging_files.remove(&file_id);
+        self.refresh_after_acknowledgement.remove(&file_id);
+    }
+
+    async fn refresh_file_metadata(&mut self, file_id: FileFingerprint) -> Option<u64> {
+        if !self.pending_files.contains(&file_id) {
+            self.clear_file_backlog(file_id);
+            return None;
+        }
+        if self.acknowledging_files.contains_key(&file_id) {
+            self.refresh_after_acknowledgement.insert(file_id);
+            self.clear_file_backlog(file_id);
+            return None;
+        }
+        let replay_offset = self.pending_replays.get(&file_id).copied();
+        self.cancel_file(file_id).await;
+        replay_offset
+    }
+
+    async fn cancel_file(&mut self, file_id: FileFingerprint) {
+        if let Some(abort_handles) = self.pending_abort_handles.remove(&file_id) {
+            for (_, abort_handle) in abort_handles {
+                abort_handle.abort();
+            }
+        }
+        self.poll_waits();
+        let ready = self.ready_by_file.remove(&file_id).unwrap_or_default();
+        self.admission_tranches.remove(&file_id);
+        self.finish_file(file_id);
+        self.clear_file_backlog(file_id);
+        let cancellations = ready.into_values().filter_map(|ready| match ready {
+            ReadyAdmission {
+                permit: Ok(permit), ..
+            } => Some(permit.cancel()),
+            ReadyAdmission { permit: Err(_), .. } => None,
+        });
+        join_all(cancellations).await;
+    }
+
+    async fn cancel_all(&mut self) {
+        let file_ids = self
+            .pending_offsets
+            .keys()
+            .chain(self.backlog_leases.keys())
+            .copied()
+            .collect::<HashSet<_>>();
+        for file_id in file_ids {
+            self.cancel_file(file_id).await;
+        }
+    }
+
+    fn start_acknowledgement(&mut self, file_id: FileFingerprint, start_offset: u64) {
+        self.pending_files.insert(file_id);
+        self.pending_replays.entry(file_id).or_insert(start_offset);
+        let offsets = self.pending_offsets.entry(file_id).or_default();
+        let acknowledging = self.acknowledging_files.entry(file_id).or_default();
+        if offsets.get(*acknowledging).copied() != Some(start_offset) {
+            debug_assert!(offsets.is_empty() && *acknowledging == 0);
+            offsets.push_back(start_offset);
+        }
+        *acknowledging += 1;
+    }
+
+    fn finish_acknowledgement(
+        &mut self,
+        file_id: FileFingerprint,
+        start_offset: u64,
+        result: CheckpointGateResult,
+    ) -> Option<u64> {
+        if result == CheckpointGateResult::Rejected {
+            self.finish_file(file_id);
+            return None;
+        }
+        let acknowledging = self
+            .acknowledging_files
+            .get_mut(&file_id)
+            .expect("acknowledged file has sent records");
+        *acknowledging -= 1;
+        let run_finished = *acknowledging == 0;
+        if run_finished {
+            self.acknowledging_files.remove(&file_id);
+        }
+        let offsets = self
+            .pending_offsets
+            .get_mut(&file_id)
+            .expect("acknowledged file has a pending offset queue");
+        let completed_offset = offsets.pop_front();
+        debug_assert_eq!(completed_offset, Some(start_offset));
+        if !run_finished {
+            return None;
+        }
+        if self.refresh_after_acknowledgement.remove(&file_id) {
+            let replay_offset = offsets.front().copied();
+            if replay_offset.is_none() {
+                self.finish_file(file_id);
+            }
+            return replay_offset;
+        }
+        if let Some(next_offset) = offsets.front().copied() {
+            self.pending_replays.insert(file_id, next_offset);
+            self.queue_ready_file(file_id);
+        } else {
+            self.finish_file(file_id);
+        }
+        None
+    }
+}
+
+struct AbortTaskOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortTaskOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn take(&mut self) -> tokio::task::JoinHandle<T> {
+        self.0.take().expect("task handle taken once")
+    }
+}
+
+impl<T> Drop for AbortTaskOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
 }
 
 /// `FileServer` as Source
@@ -111,7 +799,483 @@ where
     PP: PathsProvider,
     E: FileSourceInternalEvents,
 {
+    /// Delivers one resolved admission through the source boundary. Both normal reads and
+    /// shutdown drain use this protocol so send/acknowledgement failures always resolve the
+    /// gate and restore the same replay offset.
+    async fn dispatch_ready_admission<C>(
+        &self,
+        chans: &mut C,
+        dispatcher: &mut AdmissionDispatcher,
+        mut watcher: Option<&mut FileWatcher>,
+        mut watchers: Option<&mut IndexMap<FileFingerprint, FileWatcher>>,
+        ready: ReadyAdmission,
+    ) -> Result<bool, C::Error>
+    where
+        C: Sink<Vec<Line>> + Unpin,
+        C::Error: std::error::Error,
+    {
+        let file_id = ready.line.file_id;
+        let start_offset = ready.line.start_offset;
+        let permit = match ready.permit {
+            Ok(permit) => permit,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    ?file_id,
+                    "Admission wait failed; preserving replay boundary"
+                );
+                let watcher = if let Some(watchers) = watchers.as_deref_mut() {
+                    watchers.get_mut(&file_id)
+                } else {
+                    watcher.as_deref_mut()
+                };
+                if let Some(watcher) = watcher
+                    && let Err(rewind_error) = watcher.rewind_to(start_offset).await
+                {
+                    self.emitter
+                        .emit_file_watch_error(&watcher.path, rewind_error);
+                    watcher.set_dead();
+                }
+                ready.gate.resolve(CheckpointGateResult::Rejected);
+                dispatcher.cancel_file(file_id).await;
+                return Ok(false);
+            }
+        };
+        #[cfg(test)]
+        if let Some(hook) = &self.test_before_send_hook {
+            hook().await;
+        }
+        let mut send = Box::pin(chans.send(vec![ready.line]));
+        let send_result = loop {
+            if dispatcher.acknowledgements.is_empty() {
+                break send.as_mut().await;
+            }
+            tokio::select! {
+                result = send.as_mut() => break result,
+                acknowledgement = dispatcher.acknowledgements.next() => {
+                    let acknowledgement = acknowledgement
+                        .expect("nonempty acknowledgement dispatcher returned no result");
+                    let acknowledged_watcher = if let Some(watchers) = watchers.as_deref_mut() {
+                        watchers.get_mut(&acknowledgement.file_id)
+                    } else {
+                        debug_assert_eq!(acknowledgement.file_id, file_id);
+                        watcher.as_deref_mut()
+                    };
+                    self.finish_admission_acknowledgement(
+                        dispatcher,
+                        acknowledged_watcher,
+                        acknowledgement,
+                    )
+                    .await;
+                }
+            }
+        };
+        if let Err(error) = send_result {
+            let _ = permit.cancel().await;
+            let watcher = if let Some(watchers) = watchers {
+                watchers.get_mut(&file_id)
+            } else {
+                watcher
+            };
+            if let Some(watcher) = watcher
+                && let Err(rewind_error) = watcher.rewind_to(start_offset).await
+            {
+                self.emitter
+                    .emit_file_watch_error(&watcher.path, rewind_error);
+                watcher.set_dead();
+            }
+            ready.gate.resolve(CheckpointGateResult::Rejected);
+            dispatcher.cancel_file(file_id).await;
+            return Err(error);
+        }
+        dispatcher.start_acknowledgement(file_id, start_offset);
+        let acknowledgement = permit.sent();
+        dispatcher.acknowledgements.push(
+            async move {
+                let result = if acknowledgement.await.is_ok() {
+                    CheckpointGateResult::ActorAcknowledged
+                } else {
+                    CheckpointGateResult::Rejected
+                };
+                AcknowledgedAdmission {
+                    file_id,
+                    records: vec![AcknowledgedRecord {
+                        start_offset,
+                        gate: ready.gate,
+                        result,
+                    }],
+                }
+            }
+            .boxed(),
+        );
+        Ok(true)
+    }
+
+    async fn dispatch_ready_admission_batch<C>(
+        &self,
+        chans: &mut C,
+        dispatcher: &mut AdmissionDispatcher,
+        watchers: &mut IndexMap<FileFingerprint, FileWatcher>,
+        ready: Vec<ReadyAdmission>,
+    ) -> Result<usize, C::Error>
+    where
+        C: Sink<Vec<Line>> + Unpin,
+        C::Error: std::error::Error,
+    {
+        debug_assert!(!ready.is_empty());
+        debug_assert!(ready.iter().all(|admission| {
+            admission
+                .permit
+                .as_ref()
+                .is_ok_and(|permit| permit.supports_batch())
+        }));
+        #[cfg(test)]
+        if let Some(hook) = &self.test_before_send_hook {
+            for _ in 0..ready.len() {
+                hook().await;
+            }
+        }
+        let mut lines = Vec::with_capacity(ready.len());
+        let mut permits = Vec::with_capacity(ready.len());
+        let mut metadata = Vec::with_capacity(ready.len());
+        for ready in ready {
+            let file_id = ready.line.file_id;
+            let start_offset = ready.line.start_offset;
+            let permit = ready
+                .permit
+                .expect("batch-ready admission must hold a permit");
+            lines.push(ready.line);
+            permits.push(permit);
+            metadata.push((file_id, start_offset, ready.gate));
+        }
+        let admitted = metadata.len();
+        let mut send = Box::pin(chans.send(lines));
+        let send_result = loop {
+            if dispatcher.acknowledgements.is_empty() {
+                break send.as_mut().await;
+            }
+            tokio::select! {
+                result = send.as_mut() => break result,
+                acknowledgement = dispatcher.acknowledgements.next() => {
+                    let acknowledgement = acknowledgement
+                        .expect("nonempty acknowledgement dispatcher returned no result");
+                    let watcher = watchers.get_mut(&acknowledgement.file_id);
+                    self.finish_admission_acknowledgement(
+                        dispatcher,
+                        watcher,
+                        acknowledgement,
+                    )
+                    .await;
+                }
+            }
+        };
+        if let Err(error) = send_result {
+            let first = permits.remove(0);
+            let _ = first.cancel_many(permits).await;
+            // A file's records are in offset order: rewind to its first only, since a later
+            // rewind would move the reader forward past the earlier unsent records.
+            let mut rewound = HashSet::new();
+            for (file_id, start_offset, gate) in metadata {
+                if rewound.insert(file_id)
+                    && let Some(watcher) = watchers.get_mut(&file_id)
+                    && let Err(rewind_error) = watcher.rewind_to(start_offset).await
+                {
+                    self.emitter
+                        .emit_file_watch_error(&watcher.path, rewind_error);
+                    watcher.set_dead();
+                }
+                gate.resolve(CheckpointGateResult::Rejected);
+                dispatcher.cancel_file(file_id).await;
+            }
+            return Err(error);
+        }
+
+        for (file_id, start_offset, _) in &metadata {
+            dispatcher.start_acknowledgement(*file_id, *start_offset);
+        }
+        let first = permits.remove(0);
+        let acknowledgements = first.sent_many(permits);
+        // A file's run is contiguous here, and its records must finish in offset order.
+        let mut runs: Vec<(FileFingerprint, Vec<(u64, CheckpointGateResolver)>)> = Vec::new();
+        for (file_id, start_offset, gate) in metadata {
+            match runs.last_mut() {
+                Some((run_file, records)) if *run_file == file_id => {
+                    records.push((start_offset, gate))
+                }
+                _ => runs.push((file_id, vec![(start_offset, gate)])),
+            }
+        }
+        let mut result_senders = Vec::with_capacity(runs.len());
+        for (file_id, records) in runs {
+            let (send, receive) =
+                tokio::sync::oneshot::channel::<Vec<Result<(), AdmissionError>>>();
+            result_senders.push((send, records.len()));
+            dispatcher.acknowledgements.push(
+                async move {
+                    let results = receive.await.unwrap_or_default();
+                    let records = records
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (start_offset, gate))| AcknowledgedRecord {
+                            start_offset,
+                            gate,
+                            result: match results.get(index) {
+                                Some(Ok(())) => CheckpointGateResult::ActorAcknowledged,
+                                Some(Err(_)) | None => CheckpointGateResult::Rejected,
+                            },
+                        })
+                        .collect();
+                    AcknowledgedAdmission { file_id, records }
+                }
+                .boxed(),
+            );
+        }
+        tokio::spawn(async move {
+            let mut results = acknowledgements.await.into_iter();
+            for (send, len) in result_senders {
+                let _ = send.send(results.by_ref().take(len).collect());
+            }
+        });
+        Ok(admitted)
+    }
+
+    async fn finish_admission_acknowledgement(
+        &self,
+        dispatcher: &mut AdmissionDispatcher,
+        mut watcher: Option<&mut FileWatcher>,
+        acknowledgement: AcknowledgedAdmission,
+    ) {
+        let file_id = acknowledgement.file_id;
+        let mut records = acknowledgement.records.into_iter();
+        while let Some(record) = records.next() {
+            if record.result == CheckpointGateResult::Rejected {
+                // Later records in the run were already sent; replaying from the first rejection
+                // keeps the checkpoint from passing it, at the cost of resending those records.
+                if let Some(watcher) = watcher.as_deref_mut()
+                    && let Err(error) = watcher.rewind_to(record.start_offset).await
+                {
+                    self.emitter.emit_file_watch_error(&watcher.path, error);
+                    watcher.set_dead();
+                }
+                record.gate.resolve(CheckpointGateResult::Rejected);
+                for later in records {
+                    later.gate.resolve(CheckpointGateResult::Rejected);
+                }
+                dispatcher.cancel_file(file_id).await;
+                return;
+            }
+            record.gate.resolve(record.result);
+            if let Some(replay_offset) =
+                dispatcher.finish_acknowledgement(file_id, record.start_offset, record.result)
+            {
+                if let Some(watcher) = watcher.as_deref_mut()
+                    && let Err(error) = watcher.rewind_to(replay_offset).await
+                {
+                    self.emitter.emit_file_watch_error(&watcher.path, error);
+                    watcher.set_dead();
+                }
+                dispatcher.cancel_file(file_id).await;
+            }
+        }
+    }
+
+    /// Reserves capacity before touching the reader, then constructs the one line boundary used
+    /// by both the steady-state loop and shutdown drain. A failed reconciliation always restores
+    /// the exact pre-read offset before the caller can consider a later record from this file.
+    fn admission_metadata_for(
+        &self,
+        watcher: &FileWatcher,
+    ) -> Option<crate::admission::AdmissionMetadata> {
+        // Clone only the metadata: this runs for every record and the whole `LogFileInfo` holds
+        // several owned strings.
+        let admission = self.admission.as_ref()?;
+        let metadata = self.file_to_pod_map.as_ref().and_then(|map| {
+            map.lock()
+                .ok()?
+                .get(&watcher.path)?
+                .admission_metadata
+                .clone()
+        });
+        Some(metadata.unwrap_or_else(|| admission.unattributed_metadata()))
+    }
+
+    fn admission_metadata_from_file_info(
+        &self,
+        file_info: Option<&LogFileInfo>,
+    ) -> Option<crate::admission::AdmissionMetadata> {
+        self.admission.as_ref().map(|admission| {
+            file_info
+                .and_then(|info| info.admission_metadata.clone())
+                .unwrap_or_else(|| admission.unattributed_metadata())
+        })
+    }
+
+    async fn refresh_pending_file_metadata(
+        &self,
+        dispatcher: &mut AdmissionDispatcher,
+        file_id: FileFingerprint,
+        watcher: &mut FileWatcher,
+        current_metadata: Option<crate::admission::AdmissionMetadata>,
+        replacement_metadata: Option<crate::admission::AdmissionMetadata>,
+    ) {
+        if current_metadata == replacement_metadata {
+            return;
+        }
+        if let Some(replay_offset) = dispatcher.refresh_file_metadata(file_id).await
+            && let Err(error) = watcher.rewind_to(replay_offset).await
+        {
+            self.emitter.emit_file_watch_error(&watcher.path, error);
+            watcher.set_dead();
+        }
+    }
+
+    async fn prepare_line(
+        &self,
+        watcher: &mut FileWatcher,
+        file_id: FileFingerprint,
+        dispatcher: &mut AdmissionDispatcher,
+    ) -> PrepareLineResult {
+        let admission_metadata = self.admission_metadata_for(watcher);
+        let reservation = if let (Some(admission), Some(metadata)) =
+            (&self.admission, admission_metadata.clone())
+        {
+            match dispatcher
+                .take_or_reserve_file_credit(
+                    file_id,
+                    Arc::clone(admission),
+                    metadata,
+                    self.max_line_bytes as u64,
+                )
+                .await
+            {
+                Ok(reservation) => Some(reservation),
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        ?file_id,
+                        "Deferring file after admission reservation failure"
+                    );
+                    return PrepareLineResult::AdmissionDeferred;
+                }
+            }
+        } else {
+            None
+        };
+
+        self.prepare_line_with_reservation(
+            watcher,
+            file_id,
+            dispatcher,
+            admission_metadata,
+            reservation,
+        )
+        .await
+    }
+
+    async fn prepare_line_with_reservation(
+        &self,
+        watcher: &mut FileWatcher,
+        file_id: FileFingerprint,
+        dispatcher: &mut AdmissionDispatcher,
+        admission_metadata: Option<crate::admission::AdmissionMetadata>,
+        mut reservation: Option<Box<dyn crate::admission::PendingAdmission>>,
+    ) -> PrepareLineResult {
+        let raw = match watcher.read_line().await {
+            Ok(RawLineResult {
+                raw_line: Some(line),
+                discarded_for_size_and_truncated,
+            }) => {
+                self.emit_line_too_long_events(&watcher.path, &discarded_for_size_and_truncated);
+                line
+            }
+            Ok(_) => {
+                dispatcher.clear_file_backlog(file_id);
+                return PrepareLineResult::NoLine;
+            }
+            Err(error) => {
+                dispatcher.clear_file_backlog(file_id);
+                self.emitter.emit_file_watch_error(&watcher.path, error);
+                return PrepareLineResult::ReadError;
+            }
+        };
+        let reconciliation = match reservation.as_mut() {
+            Some(reservation) => {
+                let actual_payload_bytes = raw.bytes.len() as u64;
+                match reservation.try_reconcile_payload_bytes(actual_payload_bytes) {
+                    Some(result) => result,
+                    None => {
+                        reservation
+                            .reconcile_payload_bytes(actual_payload_bytes)
+                            .await
+                    }
+                }
+            }
+            None => Ok(()),
+        };
+        if let Err(error) = reconciliation {
+            warn!(
+                ?error,
+                ?file_id,
+                "Deferring file after admission reconciliation failure"
+            );
+            if let Err(rewind_error) = watcher.rewind_to(raw.offset).await {
+                self.emitter
+                    .emit_file_watch_error(&watcher.path, rewind_error);
+                watcher.set_dead();
+            }
+            return PrepareLineResult::AdmissionDeferred;
+        }
+        if let (Some(admission), Some(metadata)) = (&self.admission, admission_metadata.clone())
+            && let Err(error) = dispatcher
+                .retain_file_backlog(file_id, Arc::clone(admission), metadata)
+                .await
+        {
+            warn!(
+                ?error,
+                ?file_id,
+                "Deferring file after backlog retention failure"
+            );
+            if let Err(rewind_error) = watcher.rewind_to(raw.offset).await {
+                self.emitter
+                    .emit_file_watch_error(&watcher.path, rewind_error);
+                watcher.set_dead();
+            }
+            return PrepareLineResult::AdmissionDeferred;
+        }
+
+        let payload_bytes = raw.bytes.len();
+        let (checkpoint_gate, gate) = if reservation.is_some() {
+            let (gate, resolver) = CheckpointGate::closed();
+            (gate, Some(resolver))
+        } else {
+            (CheckpointGate::Open, None)
+        };
+        PrepareLineResult::Line(PreparedLine {
+            line: Line {
+                text: raw.bytes,
+                filename: watcher.path.to_str().expect("not a valid path").to_owned(),
+                file_id,
+                start_offset: raw.offset,
+                end_offset: watcher.get_file_position(),
+                admission_key: admission_metadata.map(|metadata| metadata.key),
+                checkpoint_gate,
+            },
+            payload_bytes,
+            pending: reservation.map(|reservation| {
+                (
+                    reservation,
+                    gate.expect("admitted line has a closed checkpoint gate"),
+                )
+            }),
+        })
+    }
+
     fn emit_line_too_long_events(&self, path: &Path, discarded: &[BytesMut]) {
+        // Called for every line read; nearly all have nothing discarded, and the delivery event
+        // below ignores a zero count after the costly label lookup.
+        if discarded.is_empty() {
+            return;
+        }
         for buf in discarded {
             self.emitter
                 .emit_file_line_too_long(buf, self.max_line_bytes, buf.len());
@@ -221,6 +1385,13 @@ where
 
         let mut backoff_cap: usize = 1;
         let mut lines = Vec::new();
+        let reservation_tranche_size = self
+            .admission
+            .as_ref()
+            .map_or(ADMISSION_READ_AHEAD_PER_FILE, |admission| {
+                admission.reservation_tranche_size()
+            });
+        let mut admission_dispatcher = AdmissionDispatcher::new(reservation_tranche_size);
 
         checkpointer.read_checkpoints(self.ignore_before).await;
 
@@ -289,13 +1460,21 @@ where
 
         let mut stats = TimingStats::default();
 
+        #[cfg(test)]
+        let checkpointer = match &self.test_checkpoint_flush_hook {
+            Some(hook) => {
+                checkpointer.with_write_hook(Arc::clone(hook) as Arc<dyn CheckpointWriteHook>)
+            }
+            None => checkpointer,
+        };
+
         // Spawn the checkpoint writer task
-        let checkpoint_task_handle = tokio::spawn(checkpoint_writer(
+        let mut checkpoint_task_handle = AbortTaskOnDrop::new(tokio::spawn(checkpoint_writer(
             checkpointer,
             self.glob_minimum_cooldown,
             shutdown_checkpointer,
             self.emitter.clone(),
-        ));
+        )));
 
         // Alright friends, how does this work?
         //
@@ -307,6 +1486,7 @@ where
         // we do not re-scan for major file changes (new files, moves, deletes),
         // or write new checkpoints, on every iteration.
         let mut next_glob_time = time::Instant::now();
+        let mut next_admission_scan_file = None;
         loop {
             // Glob find files to follow, but not too often.
             let now_time = time::Instant::now();
@@ -323,8 +1503,8 @@ where
                 }
 
                 // Search (glob) for files to detect major file changes.
-                let start = time::Instant::now();
-                for (_file_id, watcher) in &mut fp_map {
+                let start = stats.start();
+                for watcher in fp_map.values_mut() {
                     watcher.set_file_findable(false); // assume not findable until found
                 }
                 for (log_file_info_opt, path) in self.paths_provider.paths().into_iter() {
@@ -372,12 +1552,26 @@ where
                             // file fingerprint matches a watched file
                             let was_found_this_cycle = watcher.file_findable();
                             watcher.set_file_findable(true);
+                            let current_metadata = self.admission_metadata_for(watcher);
+                            let replacement_metadata = log_file_info_opt.as_ref().map_or_else(
+                                || current_metadata.clone(),
+                                |info| self.admission_metadata_from_file_info(Some(info)),
+                            );
                             if watcher.path == path {
                                 trace!(
                                     message = "Continue watching file.",
                                     path = ?path,
                                 );
                                 watcher.refresh_last_seen_stat(stat);
+                                self.refresh_pending_file_metadata(
+                                    &mut admission_dispatcher,
+                                    file_id,
+                                    watcher,
+                                    current_metadata,
+                                    replacement_metadata,
+                                )
+                                .await;
+                                self.update_file_to_pod_map(path, log_file_info_opt);
                             } else if !was_found_this_cycle {
                                 // matches a file with a different path
                                 info!(
@@ -388,6 +1582,15 @@ where
                                 let old_path = watcher.path.clone();
                                 if watcher.update_path(path.clone()).await.is_ok() {
                                     watcher.refresh_last_seen_stat(stat);
+                                    self.refresh_pending_file_metadata(
+                                        &mut admission_dispatcher,
+                                        file_id,
+                                        watcher,
+                                        current_metadata,
+                                        replacement_metadata,
+                                    )
+                                    .await;
+                                    admission_dispatcher.clear_file_backlog(file_id);
                                     self.update_file_to_pod_map_for_path_change(
                                         &old_path,
                                         path,
@@ -414,6 +1617,15 @@ where
                                     let old_path = watcher.path.clone();
                                     if watcher.update_path(path.clone()).await.is_ok() {
                                         watcher.refresh_last_seen_stat(stat);
+                                        self.refresh_pending_file_metadata(
+                                            &mut admission_dispatcher,
+                                            file_id,
+                                            watcher,
+                                            current_metadata,
+                                            replacement_metadata,
+                                        )
+                                        .await;
+                                        admission_dispatcher.clear_file_backlog(file_id);
                                         self.update_file_to_pod_map_for_path_change(
                                             &old_path,
                                             path,
@@ -435,7 +1647,7 @@ where
                         }
                     }
                 }
-                stats.record("discovery", start.elapsed());
+                stats.record(TimingSegment::Discovery, start);
 
                 // This pass has just refreshed each found file's stat.
                 let now_ms = Utc::now().timestamp_millis();
@@ -521,13 +1733,54 @@ where
             let mut maxed_out_reading_single_file = false;
             // Archives that reached EOF this cycle — removed from fp_map after the loop.
             let mut done_archives: Vec<(FileFingerprint, PathBuf)> = Vec::new();
-            for (&file_id, watcher) in &mut fp_map {
+            let scan_start = next_admission_scan_file
+                .and_then(|file_id| fp_map.get_index_of(&file_id))
+                .unwrap_or_default();
+            let scan_file_count = fp_map.len();
+            let mut last_reserved_scan_index = None;
+            for scan_offset in 0..scan_file_count {
+                let scan_index = (scan_start + scan_offset) % scan_file_count;
+                let (&file_id, watcher) = fp_map
+                    .get_index_mut(scan_index)
+                    .expect("file scan index must remain valid during one pass");
+                #[cfg(test)]
+                if self
+                    .test_readiness_hook
+                    .as_ref()
+                    .is_some_and(|hook| !hook(&watcher.path))
+                {
+                    continue;
+                }
+
+                // A failed rewind marks the watcher dead after this pass's reap. Its reader still
+                // sits past the rejected record, so reading it again would let later records
+                // advance the checkpoint over that record before the next reap.
+                if watcher.dead() {
+                    continue;
+                }
+
+                if self.admission.is_some()
+                    && !admission_dispatcher.file_has_read_ahead_capacity(file_id)
+                {
+                    continue;
+                }
+
+                // The current file contents were already read ahead to EOF. Wait for their
+                // ordered dispositions before probing EOF again; non-EOF files keep filling the
+                // bounded admission queue so same-file backlog remains visible.
+                if watcher.reached_eof() && admission_dispatcher.pending_files.contains(&file_id) {
+                    continue;
+                }
+
                 // Presence in fp_map means the file exists on disk; keep its
                 // checkpoint live (clear death mark, refresh `modified`) even if
                 // we don't read it this cycle.
                 checkpoints.clear_dead(file_id);
 
                 if !watcher.should_read() {
+                    if watcher.reached_eof() {
+                        admission_dispatcher.clear_file_backlog(file_id);
+                    }
                     continue;
                 }
 
@@ -535,45 +1788,66 @@ where
                 // to the removal logic below so TTL cleanup can proceed.
                 let is_done = !self.ignore_checkpoints && checkpoints.get_done(file_id);
 
-                let start = time::Instant::now();
+                let start = stats.start();
                 let mut bytes_read: usize = 0;
                 let mut lines_read: usize = 0;
-                while !is_done
-                    && let Ok(RawLineResult {
-                        raw_line: Some(line),
-                        discarded_for_size_and_truncated,
-                    }) = watcher.read_line().await
-                {
-                    self.emit_line_too_long_events(
-                        &watcher.path,
-                        &discarded_for_size_and_truncated,
-                    );
-
-                    let sz = line.bytes.len();
+                // `is_done` is fixed for this visit; the loop exits through its breaks.
+                loop {
+                    if is_done {
+                        break;
+                    }
+                    let prepared = self
+                        .prepare_line(watcher, file_id, &mut admission_dispatcher)
+                        .await;
+                    let PreparedLine {
+                        line,
+                        payload_bytes: sz,
+                        pending,
+                    } = match prepared {
+                        PrepareLineResult::Line(line) => line,
+                        PrepareLineResult::NoLine
+                        | PrepareLineResult::ReadError
+                        | PrepareLineResult::AdmissionDeferred => break,
+                    };
                     trace!(
                         message = "Read bytes.",
                         path = ?watcher.path,
                         bytes = ?sz
                     );
                     stats.record_bytes(sz);
-
                     bytes_read += sz;
                     lines_read += 1;
-
-                    lines.push(Line {
-                        text: line.bytes,
-                        filename: watcher.path.to_str().expect("not a valid path").to_owned(),
-                        file_id,
-                        start_offset: line.offset,
-                        end_offset: watcher.get_file_position(),
-                    });
+                    #[cfg(test)]
+                    let line = match &self.test_line_admission_hook {
+                        Some(hook) => match hook(line) {
+                            Some(admitted_line) => admitted_line,
+                            None => {
+                                maxed_out_reading_single_file = true;
+                                break;
+                            }
+                        },
+                        None => line,
+                    };
+                    if let Some((reservation, gate)) = pending {
+                        let immediate = admission_dispatcher.enqueue(line, reservation, gate);
+                        last_reserved_scan_index = Some(scan_index);
+                        // Keep reading this file only while permits cost no waiting.
+                        if !immediate
+                            || lines_read >= ADMISSION_VISIT_LINE_BUDGET
+                            || !admission_dispatcher.file_has_read_ahead_capacity(file_id)
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    lines.push(line);
 
                     if bytes_read > self.max_read_bytes {
                         maxed_out_reading_single_file = true;
                         break;
                     }
                 }
-                stats.record("reading", start.elapsed());
+                stats.record(TimingSegment::Reading, start);
                 if !is_done && watcher.take_read_started() {
                     let info = FileReadStartedInfo {
                         fingerprint: file_id,
@@ -605,7 +1879,13 @@ where
                         None,
                     );
                 }
-                if watcher.reached_eof() && self.is_archive(&watcher.path) {
+                if watcher.reached_eof()
+                    && self.is_archive(&watcher.path)
+                    && (self.admission.is_none()
+                        || checkpoints
+                            .get(file_id)
+                            .is_some_and(|offset| offset >= watcher.get_file_position()))
+                {
                     debug!(message = "File reached eof. Marking it done.", path = ?watcher.path);
                     checkpoints.set_done(file_id, &watcher.path);
                     done_archives.push((file_id, watcher.path.clone()));
@@ -649,6 +1929,13 @@ where
                     break;
                 }
             }
+            if let Some(last_reserved_scan_index) = last_reserved_scan_index {
+                // Resume after the last file that claimed a process slot. A static restart lets
+                // earlier files reclaim every freed slot before later files are visited.
+                next_admission_scan_file = fp_map
+                    .get_index((last_reserved_scan_index + 1) % scan_file_count)
+                    .map(|(file_id, _)| *file_id);
+            }
 
             // Drop done-archive watchers: emit unwatched metric and remove directly
             // from fp_map without calling checkpoints.set_dead so that the done/
@@ -658,13 +1945,14 @@ where
                 // removed slot, which puts it first in the read order. With `oldest_first` the loop stops after the first
                 // file that exhausts its read budget, so a hot file at the front starves every older rotated segment
                 // until the kubelet deletes it unread.
+                admission_dispatcher.clear_file_backlog(fng);
                 if let Some(watcher) = fp_map.shift_remove(&fng) {
                     let info = unwatched_info(fng, &watcher, FileStopReason::ArchiveDone);
                     self.emitter.emit_file_unwatched(&path, &info);
                 }
             }
 
-            for (_, watcher) in &mut fp_map {
+            for (file_id, watcher) in &mut fp_map {
                 // Reap a vanished archive immediately (terminal, no successor);
                 // give a non-archive the `rotate_wait` grace so a live watcher
                 // can hand its position to the rotated `.gz` via `update_path`.
@@ -673,7 +1961,7 @@ where
                 } else {
                     !watcher.file_findable() && watcher.last_seen().elapsed() > self.rotate_wait
                 };
-                if expired {
+                if expired && !admission_dispatcher.pending_files.contains(file_id) {
                     watcher.set_dead();
                 }
             }
@@ -682,6 +1970,7 @@ where
             // If the FileWatcher is dead we don't retain it; it will be deallocated.
             fp_map.retain(|file_id, watcher| {
                 if watcher.dead() {
+                    admission_dispatcher.clear_file_backlog(*file_id);
                     let info = unwatched_info(*file_id, watcher, FileStopReason::FileGone);
                     self.emitter.emit_file_unwatched(&watcher.path, &info);
                     checkpoints.set_dead(*file_id);
@@ -692,45 +1981,154 @@ where
             });
             self.emitter.emit_files_open(fp_map.len());
 
-            let start = time::Instant::now();
+            let start = stats.start();
+            let mut admission_progress = 0;
+            let mut batchable = Vec::new();
+            for ready in admission_dispatcher.next_ready_batch() {
+                if ready
+                    .permit
+                    .as_ref()
+                    .is_ok_and(|permit| permit.supports_batch())
+                {
+                    batchable.push(ready);
+                    continue;
+                }
+                if !batchable.is_empty() {
+                    admission_progress += self
+                        .dispatch_ready_admission_batch(
+                            &mut chans,
+                            &mut admission_dispatcher,
+                            &mut fp_map,
+                            std::mem::take(&mut batchable),
+                        )
+                        .await?;
+                }
+                admission_progress += usize::from(
+                    self.dispatch_ready_admission(
+                        &mut chans,
+                        &mut admission_dispatcher,
+                        None,
+                        Some(&mut fp_map),
+                        ready,
+                    )
+                    .await?,
+                );
+            }
+            if !batchable.is_empty() {
+                admission_progress += self
+                    .dispatch_ready_admission_batch(
+                        &mut chans,
+                        &mut admission_dispatcher,
+                        &mut fp_map,
+                        batchable,
+                    )
+                    .await?;
+            }
+            while let Some(acknowledgement) = admission_dispatcher.next_acknowledged() {
+                let watcher = fp_map.get_mut(&acknowledgement.file_id);
+                self.finish_admission_acknowledgement(
+                    &mut admission_dispatcher,
+                    watcher,
+                    acknowledgement,
+                )
+                .await;
+                admission_progress += 1;
+            }
             let to_send = std::mem::take(&mut lines);
 
-            let result = chans.send(to_send).await;
-            match result {
-                Ok(()) => {}
-                Err(error) => {
+            if !to_send.is_empty() {
+                #[cfg(test)]
+                if self.admission.is_none()
+                    && let Some(hook) = &self.test_before_send_hook
+                {
+                    hook().await;
+                }
+
+                if let Err(error) = chans.send(to_send).await {
                     error!(message = "Output channel closed.", %error);
                     return Err(error);
                 }
             }
-            stats.record("sending", start.elapsed());
+            stats.record(TimingSegment::Sending, start);
 
-            let start = time::Instant::now();
-            // When no lines have been read we kick the backup_cap up by twice,
-            // limited by the configured cap. Else, we set the backup_cap to its
-            // minimum on the assumption that next time through there will be
-            // more lines to read promptly.
-            backoff_cap = if global_bytes_read == 0 {
+            let start = stats.start();
+            // Admission sends and acknowledgements are active source progress even when a
+            // bounded read-ahead tranche cannot read another line in the same iteration.
+            let progress = global_bytes_read.saturating_add(admission_progress);
+            backoff_cap = if progress == 0 {
                 cmp::min(self.read_loop_max_backoff, backoff_cap.saturating_mul(2))
             } else {
                 cmp::min(self.read_loop_min_backoff, self.read_loop_max_backoff)
             };
-            let backoff = backoff_cap.saturating_sub(global_bytes_read);
+            let backoff = Duration::from_millis(backoff_cap.saturating_sub(progress) as u64);
 
             // This works only if run inside tokio context since we are using
             // tokio's Timer. Outside of such context, this will panic on the first
             // call. Also since we are using block_on here and in the above code,
             // this should be run in its own thread. `spawn_blocking` fulfills
             // all of these requirements.
-            let sleep = async move {
-                if backoff > 0 {
-                    sleep(Duration::from_millis(backoff as u64)).await;
+            //
+            // An admitted file cannot send its next record until the admission actor acknowledges
+            // the previous one, which it does only after this loop yields. Waking for that
+            // acknowledgement, or for a granted wait, keeps the backoff from costing every record.
+            let dispatcher = &mut admission_dispatcher;
+            let wait = Box::pin(async move {
+                if backoff.is_zero() {
+                    return None;
                 }
+                if !dispatcher.has_outstanding_work() {
+                    sleep(backoff).await;
+                    return None;
+                }
+                tokio::select! {
+                    acknowledgement = dispatcher.wait_for_progress() => acknowledgement,
+                    _ = sleep(backoff) => None,
+                }
+            });
+            // Bind the outcome first so the wait's dispatcher borrow ends before either branch.
+            //
+            // The shutdown output must stay alive until `run` returns: dropping it tells the
+            // topology this source has finished, before the final checkpoint write.
+            let (woke, _shutdown_token) = match select(&mut shutdown_data, wait).await {
+                Either::Left((token, _)) => (None, Some(token)),
+                Either::Right((acknowledgement, _)) => (Some(acknowledgement), None),
             };
-            futures::pin_mut!(sleep);
-            match select(shutdown_data, sleep).await {
-                Either::Left((_, _)) => {
+            match woke {
+                None => {
                     if self.drain_on_shutdown {
+                        // A line already crossed the source channel, so its actor disposition must
+                        // finish before shutdown can decide whether to checkpoint or replay it.
+                        while let Some(acknowledgement) =
+                            admission_dispatcher.acknowledgements.next().await
+                        {
+                            let watcher = fp_map.get_mut(&acknowledgement.file_id);
+                            self.finish_admission_acknowledgement(
+                                &mut admission_dispatcher,
+                                watcher,
+                                acknowledgement,
+                            )
+                            .await;
+                        }
+                        // A pending wait has advanced its reader but has not crossed the source
+                        // channel. Drop its reservation and restore the exact pre-read offset
+                        // before drain considers any later record from that file.
+                        let pending_replays =
+                            std::mem::take(&mut admission_dispatcher.pending_replays);
+                        admission_dispatcher.cancel_all().await;
+                        drop(admission_dispatcher);
+                        for (file_id, start_offset) in pending_replays {
+                            let Some(watcher) = fp_map.get_mut(&file_id) else {
+                                warn!(
+                                    ?file_id,
+                                    "Cannot restore pending admission: watcher disappeared"
+                                );
+                                continue;
+                            };
+                            if let Err(error) = watcher.rewind_to(start_offset).await {
+                                self.emitter.emit_file_watch_error(&watcher.path, error);
+                                watcher.set_dead();
+                            }
+                        }
                         info!(message = "Shutdown signal received, draining files before exit.");
 
                         // The drain deliberately never touches checkpoints. A checkpoint may only
@@ -755,6 +2153,9 @@ where
                         // (decompressed-stream EOF) as the completion signal.
                         let mut drain_targets: IndexMap<FileFingerprint, u64> = IndexMap::new();
                         for (&file_id, watcher) in &fp_map {
+                            if watcher.dead() {
+                                continue;
+                            }
                             if self.is_archive(&watcher.path) {
                                 drain_targets.insert(file_id, u64::MAX);
                             } else {
@@ -774,47 +2175,118 @@ where
                         }
 
                         // Round-robin drain loop.
+                        let mut drain_admission_dispatcher =
+                            AdmissionDispatcher::new(reservation_tranche_size);
                         while !drain_targets.is_empty() {
                             let mut progress = false;
+
+                            while let Some(acknowledgement) =
+                                drain_admission_dispatcher.next_acknowledged()
+                            {
+                                let watcher = fp_map.get_mut(&acknowledgement.file_id);
+                                self.finish_admission_acknowledgement(
+                                    &mut drain_admission_dispatcher,
+                                    watcher,
+                                    acknowledgement,
+                                )
+                                .await;
+                                progress = true;
+                            }
 
                             for file_id in drain_targets.keys().copied().collect::<Vec<_>>() {
                                 let Some(&target) = drain_targets.get(&file_id) else {
                                     continue;
                                 };
+                                if drain_admission_dispatcher.pending_files.contains(&file_id) {
+                                    continue;
+                                }
                                 let Some(watcher) = fp_map.get_mut(&file_id) else {
+                                    drain_admission_dispatcher.clear_file_backlog(file_id);
                                     drain_targets.swap_remove(&file_id);
                                     progress = true;
                                     continue;
                                 };
+                                // An acknowledgement handled above may have failed a rewind.
+                                if watcher.dead() {
+                                    drain_admission_dispatcher.clear_file_backlog(file_id);
+                                    drain_targets.swap_remove(&file_id);
+                                    progress = true;
+                                    continue;
+                                }
 
                                 let mut bytes_read: usize = 0;
                                 while watcher.get_checkpoint_position() < target {
-                                    match watcher.read_line().await {
-                                        Ok(RawLineResult {
-                                            raw_line: Some(line),
-                                            discarded_for_size_and_truncated,
+                                    match self
+                                        .prepare_line(
+                                            watcher,
+                                            file_id,
+                                            &mut drain_admission_dispatcher,
+                                        )
+                                        .await
+                                    {
+                                        PrepareLineResult::Line(PreparedLine {
+                                            line,
+                                            payload_bytes: line_bytes,
+                                            pending,
                                         }) => {
-                                            self.emit_line_too_long_events(
-                                                &watcher.path,
-                                                &discarded_for_size_and_truncated,
-                                            );
-                                            bytes_read += line.bytes.len();
-                                            lines.push(Line {
-                                                text: line.bytes,
-                                                filename: watcher
-                                                    .path
-                                                    .to_str()
-                                                    .expect("not a valid path")
-                                                    .to_owned(),
-                                                file_id,
-                                                start_offset: line.offset,
-                                                end_offset: watcher.get_file_position(),
-                                            });
+                                            if let Some((reservation, gate)) = pending {
+                                                let start_offset = line.start_offset;
+                                                let mut drain_dispatcher = AdmissionDispatcher::new(
+                                                    reservation_tranche_size,
+                                                );
+                                                drain_dispatcher.enqueue(line, reservation, gate);
+                                                let Some(ready) = drain_dispatcher.next_ready()
+                                                else {
+                                                    debug!(
+                                                        ?file_id,
+                                                        "Deferring drain while admission is unavailable"
+                                                    );
+                                                    if let Err(error) =
+                                                        watcher.rewind_to(start_offset).await
+                                                    {
+                                                        self.emitter.emit_file_watch_error(
+                                                            &watcher.path,
+                                                            error,
+                                                        );
+                                                        watcher.set_dead();
+                                                    }
+                                                    drain_targets.swap_remove(&file_id);
+                                                    progress = true;
+                                                    break;
+                                                };
+                                                let delivered = match self
+                                                    .dispatch_ready_admission(
+                                                        &mut chans,
+                                                        &mut drain_admission_dispatcher,
+                                                        Some(watcher),
+                                                        None,
+                                                        ready,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(delivered) => delivered,
+                                                    Err(error) => {
+                                                        error!(message = "Output channel closed during admitted drain.", %error);
+                                                        drain_targets.clear();
+                                                        break;
+                                                    }
+                                                };
+                                                if !delivered {
+                                                    drain_targets.swap_remove(&file_id);
+                                                    progress = true;
+                                                    break;
+                                                }
+                                                progress = true;
+                                                break;
+                                            } else {
+                                                lines.push(line);
+                                            }
+                                            bytes_read += line_bytes;
                                             if bytes_read > self.max_read_bytes {
                                                 break;
                                             }
                                         }
-                                        Ok(_) => {
+                                        PrepareLineResult::NoLine => {
                                             // EOF on this watcher's open file. If the watcher is still
                                             // findable, its internal buffer may hold an unterminated
                                             // partial line that `read_line()` hasn't yet emitted
@@ -836,7 +2308,9 @@ where
                                             progress = true;
                                             break;
                                         }
-                                        Err(_) => {
+                                        PrepareLineResult::ReadError
+                                        | PrepareLineResult::AdmissionDeferred => {
+                                            drain_admission_dispatcher.clear_file_backlog(file_id);
                                             drain_targets.swap_remove(&file_id);
                                             progress = true;
                                             break;
@@ -848,7 +2322,9 @@ where
                                 // The file reached its drain target.
                                 if drain_targets.contains_key(&file_id)
                                     && watcher.get_checkpoint_position() >= target
+                                    && !drain_admission_dispatcher.pending_files.contains(&file_id)
                                 {
+                                    drain_admission_dispatcher.clear_file_backlog(file_id);
                                     drain_targets.swap_remove(&file_id);
                                     progress = true;
                                 }
@@ -867,7 +2343,20 @@ where
                             }
                         }
 
+                        // A file only leaves the drain with acknowledgements outstanding after an
+                        // error. Its sent records hold closed gates that only the dispatcher can
+                        // resolve, and the event loop holding them must finish before the final
+                        // checkpoint write (see `shutdown_checkpointer`), so reject them for replay.
+                        drain_admission_dispatcher.cancel_all().await;
+                        drop(drain_admission_dispatcher);
+
                         info!(message = "Drain complete, shutting down file server.");
+                    } else {
+                        // Lines already sent hold closed gates that only the dispatcher can resolve.
+                        // The event loop holding them must finish before the final checkpoint write,
+                        // so release them as rejected: they are replayed from the checkpoint.
+                        admission_dispatcher.cancel_all().await;
+                        drop(admission_dispatcher);
                     }
 
                     // Close the output channel FIRST. This allows downstream
@@ -887,7 +2376,7 @@ where
                     // skip the final write rather than panicking ourselves --
                     // panicking here cascades through `handle_errors` and
                     // forces unnecessary container restarts.
-                    let checkpointer = match checkpoint_task_handle.await {
+                    let checkpointer = match checkpoint_task_handle.take().await {
                         Ok(checkpointer) => checkpointer,
                         Err(e) if e.is_cancelled() => {
                             warn!(
@@ -910,9 +2399,19 @@ where
                     }
                     return Ok(Shutdown);
                 }
-                Either::Right((_, future)) => shutdown_data = future,
+                Some(acknowledgement) => {
+                    if let Some(acknowledgement) = acknowledgement {
+                        let watcher = fp_map.get_mut(&acknowledgement.file_id);
+                        self.finish_admission_acknowledgement(
+                            &mut admission_dispatcher,
+                            watcher,
+                            acknowledgement,
+                        )
+                        .await;
+                    }
+                }
             }
-            stats.record("sleeping", start.elapsed());
+            stats.record(TimingSegment::Sleeping, start);
         }
     }
 
@@ -1134,17 +2633,50 @@ pub fn parse_start_reading_at(start_reading_at: Option<String>) -> Option<DateTi
 #[derive(Debug)]
 pub struct Shutdown;
 
+/// Loop segments timed for the debug-level throughput report.
+#[derive(Clone, Copy)]
+enum TimingSegment {
+    Discovery,
+    Reading,
+    Sending,
+    Sleeping,
+}
+
+impl TimingSegment {
+    const COUNT: usize = 4;
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::Reading => "reading",
+            Self::Sending => "sending",
+            Self::Sleeping => "sleeping",
+        }
+    }
+}
+
+/// Timings are only reported at debug level, so the clock is only read while that level is
+/// enabled (re-checked whenever the stats window restarts).
 struct TimingStats {
     started_at: time::Instant,
-    segments: BTreeMap<&'static str, Duration>,
+    enabled: bool,
+    segments: [Option<Duration>; TimingSegment::COUNT],
     events: usize,
     bytes: usize,
 }
 
 impl TimingStats {
-    fn record(&mut self, key: &'static str, duration: Duration) {
-        let segment = self.segments.entry(key).or_default();
-        *segment += duration;
+    /// Starts timing one segment; `None` when timings are not being collected.
+    #[inline]
+    fn start(&self) -> Option<time::Instant> {
+        self.enabled.then(time::Instant::now)
+    }
+
+    #[inline]
+    fn record(&mut self, segment: TimingSegment, start: Option<time::Instant>) {
+        if let Some(start) = start {
+            *self.segments[segment as usize].get_or_insert_default() += start.elapsed();
+        }
     }
 
     fn record_bytes(&mut self, bytes: usize) {
@@ -1153,17 +2685,24 @@ impl TimingStats {
     }
 
     fn report(&self) {
-        if !tracing::level_enabled!(tracing::Level::DEBUG) {
+        if !self.enabled {
             return;
         }
         let total = self.started_at.elapsed();
-        let counted: Duration = self.segments.values().sum();
+        let counted: Duration = self.segments.iter().flatten().sum();
         let other: Duration = total.saturating_sub(counted);
-        let mut ratios = self
-            .segments
-            .iter()
-            .map(|(k, v)| (*k, v.as_secs_f32() / total.as_secs_f32()))
-            .collect::<BTreeMap<_, _>>();
+        let mut ratios = [
+            TimingSegment::Discovery,
+            TimingSegment::Reading,
+            TimingSegment::Sending,
+            TimingSegment::Sleeping,
+        ]
+        .into_iter()
+        .filter_map(|segment| {
+            self.segments[segment as usize]
+                .map(|duration| (segment.name(), duration.as_secs_f32() / total.as_secs_f32()))
+        })
+        .collect::<BTreeMap<_, _>>();
         ratios.insert("other", other.as_secs_f32() / total.as_secs_f32());
         let (event_throughput, bytes_throughput) = if total.as_secs() > 0 {
             (
@@ -1192,6 +2731,7 @@ impl Default for TimingStats {
     fn default() -> Self {
         Self {
             started_at: time::Instant::now(),
+            enabled: tracing::level_enabled!(tracing::Level::DEBUG),
             segments: Default::default(),
             events: Default::default(),
             bytes: Default::default(),
@@ -1241,15 +2781,22 @@ pub struct Line {
     pub file_id: FileFingerprint,
     pub start_offset: u64,
     pub end_offset: u64,
+    /// Immutable admission identity used for the pre-read reservation, when enabled.
+    pub admission_key: Option<AdmissionKey>,
+    /// Closed until an enforcing permit is actor-acknowledged after channel send.
+    pub checkpoint_gate: CheckpointGate,
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         io::Error,
         path::{Path, PathBuf},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        },
         time::{self, Duration},
     };
 
@@ -1258,14 +2805,30 @@ mod tests {
         Checkpointer, FileReadStartedInfo, FileSourceInternalEvents, FileUnwatchedInfo,
         FingerprintStrategy, Fingerprinter, ReadFrom,
     };
-    use futures::{StreamExt, channel::mpsc};
+    use futures::{
+        StreamExt,
+        channel::mpsc,
+        future::{BoxFuture, FutureExt},
+    };
     use tempfile::tempdir;
-    use tokio::fs;
+    use tokio::{
+        fs,
+        sync::{OwnedSemaphorePermit, Semaphore},
+    };
 
     use crate::{
         FileTTLAction, FileTTLRemovalConfig,
-        file_server::{FileServer, Line, next_discovery_time},
-        paths_provider::PathsProvider,
+        admission::{
+            AdmissionError, AdmissionKey, AdmissionMetadata, CheckpointGate, CheckpointGateResult,
+            FileSourceAdmission, FileSourceAdmissionPermit, OwnedFileSourceAdmissionPermit,
+            PendingAdmission,
+        },
+        file_server::{
+            ADMISSION_IN_FLIGHT_PER_FILE, ADMISSION_READ_AHEAD_PER_FILE,
+            ADMISSION_VISIT_LINE_BUDGET, AdmissionDispatcher, FileServer, Line, ReadyAdmission,
+            TestCheckpointFlushHook, next_discovery_time,
+        },
+        paths_provider::{LogFileInfo, PathsProvider},
     };
 
     // No-op FileSourceInternalEvents implementation for testing.
@@ -1276,8 +2839,15 @@ mod tests {
     impl FileSourceInternalEvents for NoErrors {
         fn emit_file_added(&self, _: &Path) {}
         fn emit_file_resumed(&self, _: &Path, _: u64) {}
-        fn emit_file_watch_error(&self, _: &Path, _: Error) {
-            panic!("unexpected file watch error");
+        fn emit_file_watch_error(&self, _: &Path, error: Error) {
+            // A refused rewind (the path now holds a different file) is an expected, reported
+            // outcome that tests exercise on purpose.
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot rewind to a rejected record"),
+                "unexpected file watch error: {error}"
+            );
         }
         fn emit_file_read_started(&self, _: &Path, _: &FileReadStartedInfo) {}
         fn emit_file_unwatched(&self, _: &Path, _: &FileUnwatchedInfo) {}
@@ -1292,8 +2862,8 @@ mod tests {
         fn emit_file_checksum_failed(&self, _: &Path) {
             panic!("unexpected file checksum failure");
         }
-        fn emit_file_checkpoint_write_error(&self, _: Error) {
-            panic!("unexpected checkpoint write error");
+        fn emit_file_checkpoint_write_error(&self, error: Error) {
+            panic!("unexpected checkpoint write error: {error:?}");
         }
         fn emit_files_open(&self, _: usize) {}
         fn emit_path_globbing_failed(&self, _: &Path, _: &Error) {
@@ -1744,6 +3314,11 @@ mod tests {
             source_type: base.source_type,
             read_loop_min_backoff: base.read_loop_min_backoff,
             read_loop_max_backoff: base.read_loop_max_backoff,
+            admission: None,
+            test_readiness_hook: None,
+            test_line_admission_hook: None,
+            test_before_send_hook: None,
+            test_checkpoint_flush_hook: None,
         };
         let (tx, _rx) = mpsc::channel::<Vec<Line>>(16);
         let shutdown = Box::pin(tokio::time::sleep(run_for));
@@ -2014,6 +3589,11 @@ mod tests {
             source_type: "file",
             read_loop_min_backoff: 1,
             read_loop_max_backoff: 2_048,
+            admission: None,
+            test_readiness_hook: None,
+            test_line_admission_hook: None,
+            test_before_send_hook: None,
+            test_checkpoint_flush_hook: None,
         }
     }
 
@@ -2268,6 +3848,7 @@ mod tests {
             container_name: "DEFAULT_CONTAINER_NAME".to_string(),
             service_system: Some("spark-driver".to_string()),
             source_pod_id: Some("driver-pod".to_string()),
+            admission_metadata: None,
         }
     }
 
@@ -3514,6 +5095,11 @@ mod tests {
             source_type: "file",
             read_loop_min_backoff: 2000,
             read_loop_max_backoff: 2_048,
+            admission: None,
+            test_readiness_hook: None,
+            test_line_admission_hook: None,
+            test_before_send_hook: None,
+            test_checkpoint_flush_hook: None,
         };
 
         let (tx, rx) = mpsc::channel::<Vec<Line>>(32);
@@ -3761,6 +5347,11 @@ mod tests {
             source_type: "file",
             read_loop_min_backoff: 1,
             read_loop_max_backoff: 2_048,
+            admission: None,
+            test_readiness_hook: None,
+            test_line_admission_hook: None,
+            test_before_send_hook: None,
+            test_checkpoint_flush_hook: None,
         };
 
         let (tx, rx) = mpsc::channel::<Vec<Line>>(32);
@@ -4121,5 +5712,9 @@ mod tests {
         );
         // The checkpoint covers exactly what was emitted, so a restart re-delivers nothing.
         assert!(drain_once(&log_path, &data_dir).await.is_empty());
+    }
+
+    mod admission_tests {
+        include!("file_server_admission_tests.rs");
     }
 }

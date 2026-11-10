@@ -18,6 +18,10 @@ pub use self::{
     metadata_ext::{AsyncFileInfo, PortableFileExt},
 };
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use self::checkpointer::CheckpointWriteHook;
+
 pub type FilePosition = u64;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

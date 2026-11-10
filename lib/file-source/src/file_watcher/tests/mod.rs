@@ -467,6 +467,72 @@ async fn last_seen_stat_starts_from_the_opened_file() {
     );
 }
 
+#[tokio::test]
+async fn rewinding_a_rejected_partial_append_replays_the_complete_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("partial.log");
+    std::fs::write(&path, b"id-").unwrap();
+    let mut watcher = FileWatcher::new(
+        path.clone(),
+        file_source_common::ReadFrom::Beginning,
+        None,
+        None,
+        1_024,
+        Bytes::from_static(b"\n"),
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+
+    assert!(watcher.read_line().await.unwrap().raw_line.is_none());
+    std::fs::write(&path, b"id-1\n").unwrap();
+    let line = watcher.read_line().await.unwrap().raw_line.unwrap();
+    assert_eq!(line.offset, 0);
+    assert_eq!(line.bytes, Bytes::from_static(b"id-1"));
+
+    watcher.rewind_to(line.offset).await.unwrap();
+    let replay = watcher.read_line().await.unwrap().raw_line.unwrap();
+    assert_eq!(replay.offset, 0);
+    assert_eq!(replay.bytes, Bytes::from_static(b"id-1"));
+}
+
+#[tokio::test]
+async fn rewinding_refuses_a_path_that_now_holds_a_different_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("rotated.log");
+    std::fs::write(&path, b"old-1\nold-2\n").unwrap();
+    let mut watcher = FileWatcher::new(
+        path.clone(),
+        file_source_common::ReadFrom::Beginning,
+        None,
+        None,
+        1_024,
+        Bytes::from_static(b"\n"),
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    let first = watcher.read_line().await.unwrap().raw_line.unwrap();
+    assert_eq!(first.bytes, Bytes::from_static(b"old-1"));
+
+    // Rotation: the watched inode moves away and a new file takes its path.
+    let rotated = tmp.path().join("rotated.log.1");
+    std::fs::rename(&path, &rotated).unwrap();
+    std::fs::write(&path, b"new-A\nnew-B\nnew-C\n").unwrap();
+
+    watcher.rewind_to(first.offset).await.unwrap_err();
+    // The failed rewind leaves the open handle on the rotated file, so reads stay correct.
+    let next = watcher.read_line().await.unwrap().raw_line.unwrap();
+    assert_eq!(next.bytes, Bytes::from_static(b"old-2"));
+
+    // Once discovery has followed the rename, the path is the watched file again.
+    watcher.update_path(rotated).await.unwrap();
+    watcher.rewind_to(first.offset).await.unwrap();
+    let replay = watcher.read_line().await.unwrap().raw_line.unwrap();
+    assert_eq!(replay.offset, 0);
+    assert_eq!(replay.bytes, Bytes::from_static(b"old-1"));
+}
+
 #[inline]
 pub fn delay(attempts: u32) {
     let delay = match attempts {

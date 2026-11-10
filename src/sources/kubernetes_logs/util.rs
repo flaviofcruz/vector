@@ -41,10 +41,11 @@ use crate::SourceSender;
 /// and rampable via config. Errors are unified to `String` for the `KubernetesLifecycleError` log
 /// line: on the legacy path a sink error still becomes a panic surfaced as a `JoinError` (historical
 /// behavior); on the async path the sink error is returned directly.
-pub async fn run_file_server<PP, E, C, S>(
+pub async fn run_file_server<PP, E, C, S, K>(
     file_server: FileServer<PP, E>,
     chans: C,
     shutdown: S,
+    checkpoint_shutdown: K,
     checkpointer: Checkpointer,
     run_async: bool,
 ) -> Result<FileServerShutdown, String>
@@ -54,18 +55,14 @@ where
     C: Sink<Vec<Line>> + Unpin + Send + 'static,
     <C as Sink<Vec<Line>>>::Error: Error + Send,
     S: Future + Unpin + Send + 'static,
-    <S as Future>::Output: Clone + Send + Sync,
+    K: Future + Unpin + Send + 'static,
     <<PP as PathsProvider>::IntoIter as IntoIterator>::IntoIter: Send,
 {
     let span = info_span!("file_server");
-    // These will need to be separated when this source is updated to support
-    // end-to-end acknowledgements.
-    let shutdown = shutdown.shared();
-    let shutdown2 = shutdown.clone();
 
     if run_async {
         file_server
-            .run(chans, shutdown, shutdown2, checkpointer)
+            .run(chans, shutdown, checkpoint_shutdown, checkpointer)
             .instrument(span)
             .await
             .map_err(|error| error.to_string())
@@ -73,10 +70,37 @@ where
         let join_handle = tokio::task::spawn_blocking(move || {
             let _enter = span.enter();
             let rt = tokio::runtime::Handle::current();
-            rt.block_on(file_server.run(chans, shutdown, shutdown2, checkpointer))
+            rt.block_on(file_server.run(chans, shutdown, checkpoint_shutdown, checkpointer))
                 .expect("file server exited with an error")
         });
         join_handle.await.map_err(|error| error.to_string())
+    }
+}
+
+/// Lets the event loop's completion release the file server's final checkpoint write.
+///
+/// The event loop records each line's checkpoint when it maps the line, which can be after the file
+/// server has already closed its output channel. Writing the final checkpoint before the loop has
+/// drained that channel leaves the on-disk checkpoint behind lines the topology still delivers, so
+/// the next source instance (for example after a config reload) reads and delivers them again.
+/// Pass the returned signal as the file server's checkpoint shutdown and run the event loop
+/// through [`EventsDone::after`].
+pub fn events_done() -> (
+    EventsDone,
+    impl Future<Output = ()> + Unpin + Send + 'static,
+) {
+    let (done, signal) = futures::channel::oneshot::channel::<()>();
+    // A dropped loop also resolves the signal, so the file server never waits on a dead loop.
+    (EventsDone(done), signal.map(|_| ()))
+}
+
+pub struct EventsDone(futures::channel::oneshot::Sender<()>);
+
+impl EventsDone {
+    pub async fn after<F: Future>(self, events: F) -> F::Output {
+        let output = events.await;
+        let _ = self.0.send(());
+        output
     }
 }
 
@@ -156,6 +180,37 @@ mod tests {
             upstream.send(event()).await.is_err(),
             "upstream sends must fail once the event loop hits its deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn events_done_releases_the_checkpoint_only_after_the_loop_finishes() {
+        let (done, mut signal) = events_done();
+        let (finish, finished) = futures::channel::oneshot::channel::<()>();
+        let events = tokio::spawn(done.after(async move {
+            let _ = finished.await;
+            7
+        }));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut signal)
+                .await
+                .is_err(),
+            "the signal must not fire while the loop is still draining"
+        );
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), signal)
+            .await
+            .expect("the signal must fire once the loop finishes");
+        assert_eq!(events.await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn events_done_also_releases_the_checkpoint_when_the_loop_is_dropped() {
+        let (done, signal) = events_done();
+        drop(done);
+        tokio::time::timeout(Duration::from_secs(5), signal)
+            .await
+            .expect("a dropped loop must not block the final checkpoint write");
     }
 
     /// Mirrors the `kubernetes_logs` source during a config reload: a `drain_on_shutdown` file

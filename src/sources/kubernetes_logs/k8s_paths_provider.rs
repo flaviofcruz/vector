@@ -211,6 +211,7 @@ impl K8sPathsProvider {
                             container_name,
                             service_system: service_system_from_pod(&pod),
                             source_pod_id: source_pod_id_from_pod(&pod),
+                            admission_metadata: None,
                         }),
                         path,
                     )

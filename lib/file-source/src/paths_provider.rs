@@ -6,6 +6,8 @@ use file_source_common::internal_events::FileSourceInternalEvents;
 pub use glob::MatchOptions;
 use glob::Pattern;
 
+use crate::admission::AdmissionMetadata;
+
 /// Represents the ability to enumerate paths.
 ///
 /// For use in [`crate::file_server::FileServer`].
@@ -51,6 +53,8 @@ pub struct LogFileInfo {
     pub container_name: String,
     pub service_system: Option<String>,
     pub source_pod_id: Option<String>,
+    /// Immutable observation used by process-scoped file admission.
+    pub admission_metadata: Option<AdmissionMetadata>,
 }
 
 impl<E: FileSourceInternalEvents> Glob<E> {
