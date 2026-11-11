@@ -198,13 +198,13 @@ async fn send_agent_traces(urls: &Vec<String>, start: i64, duration: i64, span_i
         for url in urls {
             let res = client
                 .post(url)
-                .header(CONTENT_TYPE, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .json(&traces_payload)
                 .send()
                 .await
                 .unwrap();
 
-            if res.status() != hyper::StatusCode::OK {
+            if res.status() != reqwest::StatusCode::OK {
                 error!("Error sending traces to {}, res: {:?}.", url, res);
                 return false;
             }

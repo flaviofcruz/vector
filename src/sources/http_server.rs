@@ -540,7 +540,8 @@ mod tests {
     };
     use futures::Stream;
     use headers::{Authorization, authorization::Credentials};
-    use http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION};
+    use http::{Method, StatusCode, Uri};
+    use reqwest::header::{AUTHORIZATION, HeaderMap};
     use similar_asserts::assert_eq;
     use vector_lib::{
         codecs::{
@@ -681,7 +682,7 @@ mod tests {
     }
 
     async fn send_request(address: SocketAddr, method: &str, body: &str, path: &str) -> u16 {
-        let method = Method::from_bytes(method.to_owned().as_bytes()).unwrap();
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
         reqwest::Client::new()
             .request(method, format!("http://{address}{path}"))
             .body(body.to_owned())
@@ -1584,7 +1585,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            Authorization::basic("wrong", "test").0.encode(),
+            Authorization::basic("wrong", "test")
+                .0
+                .encode()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
         );
         assert_eq!(401, send_with_headers(addr, "", headers).await);
     }
@@ -1615,7 +1622,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            Authorization::basic("test", "test").0.encode(),
+            Authorization::basic("test", "test")
+                .0
+                .encode()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
         );
         assert_eq!(200, send_with_headers(addr, "", headers).await);
     }

@@ -12,8 +12,31 @@ clippy::cast_possible_truncation	lib/vector-core/src/event/event_log.rs	 count a
 clippy::cast_possible_truncation	lib/vector-core/src/event/event_log.rs	 count: path_count.count as usize,
 clippy::cast_possible_truncation	lib/vector-core/src/event/event_log.rs	 metric_count: path_count.count as usize,
 clippy::cast_possible_truncation	lib/vector-core/src/event/event_log.rs	 value.count = value.count.saturating_add(path_count.count as usize);
+clippy::collapsible_match	src/http.rs	 if start_reference.elapsed() >= max_connection_age { debug!( message = "Closing connection due to max connection age.", ?max_connection_age, connection_age = ?start_reference.elapsed(), ?peer_addr, ); // Tell the client to close this connection. // Hyper will automatically close the connection after the response is sent. response.headers_mut().insert( hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"), ); }
+clippy::collapsible_match	src/sinks/http/encoder.rs	 if !body.is_empty() { // Remove trailing newline for backwards-compatibility // with Vector `0.20.x`. body.truncate(body.len() - 1); }
+clippy::collapsible_match	src/sinks/websocket/sink.rs	 if format!("Bearer {}", token.inner()) != h.to_str().unwrap() { return Err( http::Response::<Option<String>>::new(None), ); }
+clippy::collapsible_match	src/sources/azure_blob/queue.rs	 if self.state.delete_message { delete_messages.push(message.clone()); }
+clippy::collapsible_match	src/sources/azure_blob/queue.rs	 if self.state.delete_message { delete_messages.push(message.clone()); }
+clippy::collapsible_match	src/sources/azure_blob/queue.rs	 if self.state.delete_message { delete_messages.push(message.clone()); }
+clippy::duration_suboptimal_units	lib/vector-buffers/src/variants/disk_v2/common.rs	pub(crate) const DEFAULT_READER_PROGRESS_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+clippy::duration_suboptimal_units	lib/vector-buffers/src/variants/disk_v2/tests/invariants.rs	 tokio::time::advance(Duration::from_secs(120)).await;
+clippy::duration_suboptimal_units	lib/vector-buffers/src/variants/disk_v2/tests/mod.rs	 Some(Duration::from_secs(60))
+clippy::duration_suboptimal_units	lib/vector-common/src/shutdown.rs	 let far_deadline = Instant::now() + Duration::from_secs(3600);
+clippy::duration_suboptimal_units	lib/vector-common/src/shutdown.rs	 let far_deadline = Instant::now() + Duration::from_secs(3600);
+clippy::duration_suboptimal_units	lib/vector-stream/src/batcher/mod.rs	 let timeout = Duration::from_secs(60);
+clippy::duration_suboptimal_units	lib/vector-stream/src/batcher/mod.rs	 let timeout = Duration::from_secs(60);
+clippy::iter_kv_map	src/topology/running.rs	 let conflicts = Resource::conflicts( remove_sink.map(|(key, value)| ((true, key), value)).chain( add_sink .chain(add_source) .map(|(key, value)| ((false, key), value)), ), ) .into_iter() .flat_map(|(_, components)| components)
 clippy::large_enum_variant	src/enrichment_tables/mod.rs	pub enum EnrichmentTables { /// Exposes data from a static file as an enrichment table. File(file::FileConfig), /// Exposes data fetched from an HTTP service as an enrichment table. #[cfg(feature = "enrichment-tables-http")] Http(http::HttpConfig), /// Exposes data from a memory cache as an enrichment table. The cache can be written to using /// a sink. #[cfg(feature = "enrichment-tables-memory")] Memory(memory::MemoryConfig), /// Exposes data from a [MaxMind][maxmind] [GeoIP2][geoip2] database as an enrichment table. /// /// [maxmind]: https://www.maxmind.com/ /// [geoip2]: https://www.maxmind.com/en/geoip2-databases #[cfg(feature = "enrichment-tables-geoip")] Geoip(geoip::GeoipConfig), /// Exposes data from a [MaxMind][maxmind] database as an enrichment table. /// /// [maxmind]: https://www.maxmind.com/ #[cfg(feature = "enrichment-tables-mmdb")] Mmdb(mmdb::MmdbConfig), }
 clippy::large_enum_variant	src/sources/azure_blob/queue.rs	enum QueueEvent { DirectIngest(DirectIngestMessage), EventGrid(EventGridEvent), }
+clippy::manual_is_variant_and	lib/vector-core/src/event/metric/mod.rs	 .filter(|t| t.get(name).filter(|v| *v == value).is_some())
+clippy::manual_is_variant_and	lib/vector-core/src/event/metric/mod.rs	 self.tags() .filter(|t| t.get(name).filter(|v| *v == value).is_some()) .is_some()
+clippy::map_unwrap_or	lib/vector-buffers/src/variants/disk_v2/ledger.rs	 unacked_reader_file_id_offset = result.map(|n| n - 1).unwrap_or(0),
+clippy::map_unwrap_or	lib/vector-common/src/internal_event/vector_event/delivery_event.rs	 env::var("EMIT_READ_EVENT_AFTER_MULTILINE_AGG") .map(|v| v == "true") .unwrap_or(false)
+clippy::map_unwrap_or	lib/vector-common/src/internal_event/vector_event/delivery_event.rs	 env::var("VECTOR_BATCH_DELIVERY_EVENT_LOGS") .map(|v| v.eq_ignore_ascii_case("true") || v == "1") .unwrap_or(false)
+clippy::map_unwrap_or	lib/vector-common/src/internal_event/vector_event/file_send_event.rs	 env::var("ENABLE_FILE_SEND_EVENTS") .map(|v| v == "true") .unwrap_or(false)
+clippy::map_unwrap_or	lib/vector-core/src/config/global_options.rs	 let readonly = std::fs::metadata(&data_dir) .map(|meta| meta.permissions().readonly()) .unwrap_or(true);
+clippy::result_large_err	src/sinks/aws_s3/config.rs	 .map_result(move |result: Result<S3Response, _>| { if let Ok(ref response) = result { response.event_log_metadata.emit_upload_event(); } // One SDK PutObject request is one upload attempt. The AWS SDK surfaces // non-2xx as `Err`, so `Ok`/`Err` is already the success/failure split. emit_blob_file_upload_attempt(result.is_ok(), &bucket); result })
+clippy::result_large_err	src/sources/aws_s3/sqs.rs	 .unwrap_or_else(|error| Err(SdkError::timeout_error(error)))
 clippy::too_many_arguments	lib/vector-common/src/internal_event/vector_event/delivery_event.rs	 pub fn accumulate_read( &'static self, path: String, bytes_read: usize, lines_read: usize, source_context: &Option<HashMap<String, String>>, service_system: Option<&str>, source_pod_id: Option<&str>, source_type: &'static str, time_parity: i64, emitted_after_multiline_agg: bool, delivery_paths: Option<&DeliveryPathAccounting>, workspace_id: Option<&str>, ) {
 clippy::too_many_arguments	lib/vector-common/src/internal_event/vector_event/delivery_event.rs	 pub fn emit_rejected( &self, path: &str, rejected_events: usize, source_context: &Option<HashMap<String, String>>, service_system: Option<&str>, source_pod_id: Option<&str>, source_type: &'static str, time_parity: i64, rejection_reason: &'static str, ) {
 clippy::too_many_arguments	src/app.rs	pub async fn load_configs( config_paths: &[ConfigPath], watcher_conf: Option<config::watcher::WatcherConfig>, require_healthy: Option<bool>, allow_empty_config: bool, interpolate_env: bool, graceful_shutdown_duration: Option<Duration>, graceful_data_source_shutdown_duration: Option<Duration>, graceful_data_sink_shutdown_duration: Option<Duration>, graceful_internal_source_shutdown_duration: Option<Duration>, signal_handler: &mut SignalHandler, ) -> Result<Config, ExitCode> {
@@ -32,3 +55,16 @@ clippy::too_many_lines	lib/vector-buffers/src/variants/disk_v2/writer.rs	 async 
 clippy::too_many_lines	lib/vector-buffers/src/variants/disk_v2/writer.rs	 pub(super) async fn validate_last_write(&mut self) -> Result<(), WriterError<T>> {
 clippy::too_many_lines	lib/vector-core/src/event/event_log.rs	 fn mixed_batches_keep_vel_totals_but_emit_each_event_in_only_one_counter_form() {
 clippy::too_many_lines	lib/vector-core/src/event/event_log.rs	pub fn generate_count_map( events: &[Event], for_delivery_events: bool, ) -> HashMap<String, MetadataValuesCount> {
+clippy::unnecessary_sort_by	lib/vector-core/src/metrics/ddsketch.rs	 counts.sort_unstable_by(|(k1, _), (k2, _)| k1.cmp(k2));
+clippy::unnecessary_trailing_comma	lib/vector-buffers/src/variants/disk_v2/common.rs	 reason: format!("must be greater than or equal to {MINIMUM_MAX_RECORD_SIZE} bytes",),
+clippy::unnecessary_trailing_comma	lib/vector-core/src/config/mod.rs	 Some(port) => write!(f, "port: \\"{port}\\",",),
+clippy::unnecessary_trailing_comma	vdev/src/commands/release/prepare.rs	 format!("https://raw.githubusercontent.com/vectordotdev/vrl/{latest_tag}/CHANGELOG.md",);
+clippy::useless_conversion	lib/codecs/tests/native.rs	 for (json_path, proto_path) in json_entries.into_iter().zip(proto_entries.into_iter()) {
+clippy::useless_conversion	lib/codecs/tests/native.rs	 for (json_path, proto_path) in json_entries.into_iter().zip(proto_entries.into_iter()) {
+clippy::useless_conversion	lib/vector-core/src/event/lua/metric.rs	 set.raw_set("values", lua.create_sequence_from(values.into_iter())?)?;
+clippy::useless_conversion	lib/vector-core/src/source_sender/output.rs	 self.send_batch(events.into_iter()).await?;
+clippy::useless_conversion	src/config/unit_test/mod.rs	 .for_each(|i| valid_components.extend(i.into_iter()));
+clippy::useless_conversion	src/sources/datadog_agent/tests.rs	 for (msg, event) in msgs.into_iter().zip(events.into_iter()) {
+clippy::useless_conversion	src/sources/util/framestream.rs	 let mut stream = stream::iter(frames.into_iter());
+clippy::useless_conversion	src/test_util/mod.rs	 let mut lines = stream::iter(lines.into_iter()).map(Ok);
+clippy::useless_conversion	src/topology/running.rs	 for (key, task) in self.tasks.into_iter().chain(self.source_tasks.into_iter()) {

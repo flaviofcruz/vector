@@ -61,7 +61,7 @@ runs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
       with:
-        toolchain: '1.92'
+        toolchain: '1.95'
         components: ${{ inputs.components }}
 
     - name: Configure Cargo cache

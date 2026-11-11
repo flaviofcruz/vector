@@ -176,19 +176,20 @@ impl DeltaTable {
         }
 
         // Try to open existing table or create new one
+        let table_url = deltalake::ensure_table_uri(&table_path)?;
         let (table, final_partition_columns) =
-            match deltalake::open_table_with_storage_options(&table_path, storage_options.clone())
+            match deltalake::open_table_with_storage_options(table_url, storage_options.clone())
                 .await
             {
                 Ok(table) => {
-                    let metadata = table.metadata()?.clone();
-                    let existing_partitions = metadata.partition_columns().clone();
+                    let metadata = table.snapshot()?.metadata().clone();
+                    let existing_partitions = metadata.partition_columns().to_vec();
 
                     info!(
                         message = "Existing partition columns loaded from Delta table",
                         existing_partitions = ?existing_partitions,
                     );
-                    let existing_schema = table.get_schema()?;
+                    let existing_schema = table.snapshot()?.schema();
 
                     // Use table's partition columns instead of config
                     let mut actual_partition_columns = Vec::new();
@@ -315,7 +316,7 @@ impl DeltaTable {
             // If this is a retry, update the table state first to get latest metadata (someone else might have written).
             if non_conflict_retries > 0 {
                 table_ref
-                    .update()
+                    .update_state()
                     .await
                     .map_err(|e| AzureDeltaError::DeltaTableError {
                         message: format!("Failed to update table state: {}", e),

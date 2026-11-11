@@ -186,6 +186,7 @@ pub fn make_test_pod_with_affinity<'a>(
                     label_selector: Some(selector),
                     namespaces: Some(vec![affinity_namespace.unwrap_or(namespace).to_string()]),
                     topology_key: "kubernetes.io/hostname".to_string(),
+                    ..Default::default()
                 }]),
             }),
             pod_anti_affinity: None,

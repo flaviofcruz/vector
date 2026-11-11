@@ -15,6 +15,7 @@ pub(super) fn ingestion_tls_settings(
     identity: Option<&ServiceTlsConfig>,
     domain_name: Option<&str>,
 ) -> Result<TlsSettings, ZerobusSinkError> {
+    crate::app::install_rustls_crypto_provider();
     let fail = |message: String| ZerobusSinkError::ConfigError {
         message: format!("Zerobus ingest tls: {message}"),
     };

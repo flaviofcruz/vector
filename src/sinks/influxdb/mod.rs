@@ -483,7 +483,11 @@ pub mod test_util {
         let status = query_v1(endpoint, &format!("create database {database}"))
             .await
             .status();
-        assert_eq!(status, http::StatusCode::OK, "UnexpectedStatus: {status}");
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "UnexpectedStatus: {status}"
+        );
         // Some times InfluxDB will return OK before it can actually
         // accept writes to the database, leading to test failures. Test
         // this with empty writes and loop if it reports the database
@@ -501,8 +505,8 @@ pub mod test_util {
                     .unwrap()
                     .status()
                 {
-                    http::StatusCode::NO_CONTENT => true,
-                    http::StatusCode::NOT_FOUND => false,
+                    reqwest::StatusCode::NO_CONTENT => true,
+                    reqwest::StatusCode::NOT_FOUND => false,
                     status => panic!("Unexpected status: {status}"),
                 }
             }
@@ -515,7 +519,11 @@ pub mod test_util {
         let status = query_v1(endpoint, &format!("drop database {database}"))
             .await
             .status();
-        assert_eq!(status, http::StatusCode::OK, "UnexpectedStatus: {status}");
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "UnexpectedStatus: {status}"
+        );
     }
 
     pub(crate) async fn onboarding_v2(endpoint: &str) {
@@ -542,7 +550,8 @@ pub mod test_util {
         let status = res.status();
 
         assert!(
-            status == StatusCode::CREATED || status == StatusCode::UNPROCESSABLE_ENTITY,
+            status == reqwest::StatusCode::CREATED
+                || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
             "UnexpectedStatus: {status}"
         );
     }

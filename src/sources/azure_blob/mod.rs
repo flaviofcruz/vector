@@ -557,7 +557,7 @@ fn no_decompression_transport() -> TransportOptions {
     // Mirror azure_core's own `new_reqwest_client`, which only sets `pool_max_idle_per_host(0)`
     // (a hyper idle-connection hang workaround, hyperium/hyper#2312) and default TLS. We add
     // `.no_gzip()`/`.no_deflate()` on top so responses are handed back untouched.
-    let client = reqwest_012::ClientBuilder::new()
+    let client = reqwest::ClientBuilder::new()
         .no_gzip()
         .no_deflate()
         .pool_max_idle_per_host(0)

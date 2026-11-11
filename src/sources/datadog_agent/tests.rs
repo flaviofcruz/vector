@@ -9,11 +9,11 @@ use std::{
 use bytes::Bytes;
 use chrono::{TimeZone, Utc};
 use futures::{Stream, StreamExt};
-use http::HeaderMap;
 use indoc::indoc;
 use ordered_float::NotNan;
 use prost::Message;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use reqwest::header::HeaderMap;
 use similar_asserts::assert_eq;
 use tokio::time::timeout;
 use vector_lib::{

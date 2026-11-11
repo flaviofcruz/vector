@@ -243,6 +243,11 @@ impl Application {
             opts.root.internal_log_rate_limit,
         );
         crate::openssl_provider::log_loaded_providers();
+        #[cfg(any(
+            feature = "sinks-azure-delta-table",
+            feature = "sinks-databricks-zerobus"
+        ))]
+        install_rustls_crypto_provider();
 
         // Set global color preference for downstream modules
         crate::set_global_color(color);
@@ -857,8 +862,28 @@ pub fn watcher_config(
     }
 }
 
+/// deltalake's reqwest enables rustls's aws-lc-rs provider alongside ring, and rustls only picks
+/// a provider on its own when exactly one is compiled in. Keep ring, which was the only one before.
+/// Code that builds rustls configs outside `prepare_from_opts` (e.g. tests) must call this too.
+#[cfg(any(
+    feature = "sinks-azure-delta-table",
+    feature = "sinks-databricks-zerobus"
+))]
+pub(crate) fn install_rustls_crypto_provider() {
+    // Err means a provider is already installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "sinks-azure-delta-table")]
+    #[test]
+    fn rustls_client_config_builder_has_a_crypto_provider() {
+        super::install_rustls_crypto_provider();
+        // Panics when rustls has more than one provider compiled in and none is installed.
+        let _ = rustls::ClientConfig::builder();
+    }
+
     use super::FinishedApplication;
     use super::staged_shutdown_secs;
     use crate::signal::SignalTo;

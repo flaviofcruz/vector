@@ -474,8 +474,10 @@ async fn credential_provider_config(
         .with_http_client(connector);
     // Credential providers build their own STS clients; configuring only the
     // service client leaves the initial IRSA exchange on the standard endpoint.
+    // Always set a value: when unset, the profile provider reads
+    // `use_fips_endpoint` from the component's credentials file instead.
     let use_fips = aws_config::default_provider::use_fips::use_fips_provider(&config).await;
-    config.with_use_fips(use_fips)
+    config.with_use_fips(Some(use_fips.unwrap_or(false)))
 }
 
 async fn default_credentials_provider(

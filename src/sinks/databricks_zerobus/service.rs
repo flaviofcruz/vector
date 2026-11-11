@@ -1372,6 +1372,7 @@ impl ZerobusService {
         mock: MockStream,
     ) -> Result<Self, ZerobusSinkError> {
         config.validate()?;
+        crate::app::install_rustls_crypto_provider();
 
         let sdk = ZerobusSdk::builder()
             .endpoint(&config.ingestion_endpoint)
