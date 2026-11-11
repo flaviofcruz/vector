@@ -5,7 +5,8 @@ use crate::databricks_auth::{LoginServiceHeadersProvider, TokenManager};
 use crate::event::Event;
 use crate::http::HttpClient;
 use crate::internal_events::{
-    SchemaReloadOutcome, ZerobusRetryableError, ZerobusSchemaRefetchFailed,
+    SchemaReloadOutcome, ZerobusAuthStreamBuildFailed, ZerobusAuthStreamDiscarded,
+    ZerobusAuthStreamRebuilt, ZerobusRetryableError, ZerobusSchemaRefetchFailed,
     ZerobusSchemaReloadOutcome,
 };
 use crate::sinks::util::retries::RetryLogic;
@@ -27,9 +28,9 @@ use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, Reques
 use vector_lib::stream::DriverResponse;
 
 use super::{
-    config::ZerobusSinkConfig, encoding::EncodingExecutor, error::ZerobusSinkError, freshness,
-    headers, ingest_tls::ingestion_tls_settings, uc_client::UnityCatalogClient,
-    unity_catalog_schema,
+    config::ZerobusSinkConfig, encoding::EncodingExecutor, error::ZerobusSinkError,
+    error::sdk_error_code, error::sdk_error_is_auth, freshness, headers,
+    ingest_tls::ingestion_tls_settings, uc_client::UnityCatalogClient, unity_catalog_schema,
 };
 
 /// Build a connector factory that routes Zerobus gRPC traffic through
@@ -423,6 +424,10 @@ pub struct ZerobusService {
     /// across the fetch await deliberately; the losers re-check the cache and
     /// reuse the winner's result.
     schema_resolve: Arc<Mutex<()>>,
+    /// Rebuild pacing after an auth/token-class stream failure. Shared across
+    /// clones so every request observes the same backoff. A plain
+    /// `std::sync::Mutex` suffices: guards are never held across an await.
+    rebuild_backoff: Arc<std::sync::Mutex<AuthRebuildBackoff>>,
     /// Optional token manager for Login service auth.
     token_manager: Option<Arc<TokenManager>>,
     unity_catalog_client: Option<Arc<UnityCatalogClient>>,
@@ -516,6 +521,7 @@ impl ZerobusService {
             stream: Arc::new(Mutex::new(None)),
             schema: Arc::new(RwLock::new(None)),
             schema_resolve: Arc::new(Mutex::new(())),
+            rebuild_backoff: Arc::new(std::sync::Mutex::new(AuthRebuildBackoff::default())),
             token_manager,
             unity_catalog_client,
             oauth_provider,
@@ -722,6 +728,55 @@ impl ZerobusService {
         self.get_or_create_stream(&schema).await.map(|_| ())
     }
 
+    /// Record an auth/token-class stream failure, arming or extending the
+    /// rebuild backoff.
+    fn note_auth_failure(&self) {
+        let mut backoff = self
+            .rebuild_backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        backoff.note_failure(tokio::time::Instant::now());
+    }
+
+    /// Record the outcome of a failed stream (re)build. Only auth/token-class
+    /// failures are paced and reported: other build failures (connection,
+    /// config) are surfaced by the ordinary error path, and the next request
+    /// retries them without delay.
+    fn note_build_failure(&self, error: &ZerobusSinkError) {
+        if !error.is_auth_error() {
+            return;
+        }
+        emit!(ZerobusAuthStreamBuildFailed {
+            error_code: error.error_code(),
+            error: error.to_string(),
+        });
+        self.note_auth_failure();
+    }
+
+    /// Record a successful stream build, clearing any armed backoff and
+    /// reporting the recovery when it followed auth failures.
+    fn note_rebuild_success(&self) {
+        let mut backoff = self
+            .rebuild_backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if backoff.consecutive_failures > 0 {
+            emit!(ZerobusAuthStreamRebuilt {
+                failures: backoff.consecutive_failures,
+            });
+        }
+        backoff.reset();
+    }
+
+    /// The wait still owed before a stream rebuild may be attempted, if any.
+    fn rebuild_wait_remaining(&self) -> Option<std::time::Duration> {
+        let backoff = self
+            .rebuild_backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        backoff.wait_remaining(tokio::time::Instant::now())
+    }
+
     /// Return an `Arc` handle to a stream pinned to `schema`, creating one if the
     /// slot is empty or holds a stream built for a different generation.
     ///
@@ -733,6 +788,9 @@ impl ZerobusService {
     /// `PinnedStream`), and letting it build a stale-shaped one would evict the
     /// healthy stream for everyone else. Its retry re-encodes against the current
     /// generation.
+    ///
+    /// While an auth-failure rebuild backoff is armed, an empty slot is refused
+    /// with a retryable `StreamRebuildBackoff` instead of attempting the build.
     async fn get_or_create_stream(
         &self,
         schema: &Arc<ResolvedSchema>,
@@ -771,14 +829,31 @@ impl ZerobusService {
 
         let result = match stream_guard.as_ref() {
             Some(pinned) => Ok(Arc::clone(&pinned.stream)),
-            None => self.build_stream(schema).await.map(|created| {
-                let stream = Arc::new(created);
-                *stream_guard = Some(PinnedStream {
-                    schema: Arc::clone(schema),
-                    stream: Arc::clone(&stream),
-                });
-                stream
-            }),
+            None => match self.rebuild_wait_remaining() {
+                // Backing off after an auth failure: refuse without attempting
+                // the build, so a burst of requests cannot hammer the token
+                // mint while it is failing. The batch is retried instead.
+                Some(wait) => Err(ZerobusSinkError::StreamRebuildBackoff {
+                    retry_after_ms: wait.as_millis() as u64,
+                }),
+                None => match self.build_stream(schema).await {
+                    Ok(created) => {
+                        self.note_rebuild_success();
+                        let stream = Arc::new(created);
+                        *stream_guard = Some(PinnedStream {
+                            schema: Arc::clone(schema),
+                            stream: Arc::clone(&stream),
+                        });
+                        Ok(stream)
+                    }
+                    // An auth failure during the build would fail again at the
+                    // same instant on the next request; pace the next attempt.
+                    Err(e) => {
+                        self.note_build_failure(&e);
+                        Err(e)
+                    }
+                },
+            },
         };
 
         // Close the evicted stream off the slot lock (as `close_stream` does, so
@@ -977,8 +1052,10 @@ impl ZerobusService {
     /// call so concurrent ingests can run in parallel; a concurrent `close()`
     /// will wait for the read guards to drain before flushing.
     ///
-    /// On retryable errors the active stream is removed from the slot so that
-    /// the next attempt (driven by Tower retry) creates a fresh one.
+    /// On retryable errors — and auth/token-class errors, which the SDK marks
+    /// non-retryable but which poison the stream — the active stream is removed
+    /// from the slot so that the next attempt (driven by Tower retry, paced by
+    /// the auth rebuild backoff) creates a fresh one.
     async fn ingest(
         &self,
         stream: Arc<ActiveStream>,
@@ -1049,9 +1126,26 @@ impl ZerobusService {
         };
 
         match result {
-            Ok(bytes_sent) => Ok(ZerobusResponse::delivered(events_byte_size, bytes_sent)),
+            Ok(bytes_sent) => {
+                self.note_rebuild_success();
+                Ok(ZerobusResponse::delivered(events_byte_size, bytes_sent))
+            }
             Err(e) => {
-                if e.is_retryable() {
+                // Classify once at the sink level: `is_retryable` already folds
+                // in the auth/token class, which the SDK marks non-retryable
+                // even though it poisons the stream (a mux retains the failure
+                // and replays it for every later ingest), so keeping it would
+                // reject every batch until restart. Discarding lets the retry
+                // rebuild once credentials recover, and the backoff paces that
+                // rebuild away from a failing token mint.
+                let error_code = sdk_error_code(&e);
+                let is_auth = sdk_error_is_auth(&e);
+                let error = ZerobusSinkError::IngestionError { source: e };
+                if error.is_retryable() {
+                    if is_auth {
+                        emit!(ZerobusAuthStreamDiscarded { error_code });
+                        self.note_auth_failure();
+                    }
                     // Drop the stream so the next attempt creates a fresh one.
                     // `close()` takes `&self`, so the graceful path always runs
                     // regardless of how many other `Arc` clones are in flight:
@@ -1059,7 +1153,7 @@ impl ZerobusService {
                     // guards to drain before flushing.
                     self.discard_stream(&stream).await;
                 }
-                Err(ZerobusSinkError::IngestionError { source: e })
+                Err(error)
             }
         }
     }
@@ -1093,12 +1187,74 @@ fn uncompressed_batch_bytes(batch: &arrow::record_batch::RecordBatch) -> usize {
 /// Whether a failed multiplexed ingest must drop the mux so the next attempt rebuilds it.
 ///
 /// A capacity or ack-wait timeout leaves the lanes usable; only a poisoned (closed) mux
-/// must be rebuilt, which recreates all lanes. Non-retryable errors never discard,
-/// matching the single-stream path. After an ack-wait timeout the batch stays queued on
-/// its lane and may still land, so the retry can duplicate it; delivery is at-least-once
-/// either way, since the single-stream close also keeps acking until its flush deadline.
+/// must be rebuilt, which recreates all lanes. Auth/token-class errors are included even
+/// though the SDK marks them non-retryable: they poison the mux (the SDK retains the
+/// original failure and replays it for every later ingest), so the only recovery is a
+/// rebuild. After an ack-wait timeout the batch stays queued on its lane and may still
+/// land, so the retry can duplicate it; delivery is at-least-once either way, since the
+/// single-stream close also keeps acking until its flush deadline.
 fn mux_should_discard(err: &ZerobusError, mux_closed: bool) -> bool {
-    err.is_retryable() && mux_closed
+    (err.is_retryable() || sdk_error_is_auth(err)) && mux_closed
+}
+
+/// First wait before a stream rebuild after an auth/token failure. Doubled per
+/// consecutive failure; see [`AuthRebuildBackoff`].
+const AUTH_REBUILD_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Ceiling on the auth-failure rebuild wait, so a long outage retries about
+/// once a minute instead of never.
+const AUTH_REBUILD_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Rebuild pacing after an auth/token-class stream failure.
+///
+/// The SDK poisons a stream (or mux) on such a failure and replays the retained
+/// error for every later ingest, and it classifies the error non-retryable — so
+/// without discarding, every batch until pod restart is rejected. Discarding is
+/// not enough on its own either: a rebuild mints a fresh token, and a burst of
+/// requests would each hammer the mint endpoint while it is failing. This state
+/// machine gates the rebuild: each auth failure arms (or extends) a wait —
+/// 1s doubled per consecutive failure, capped at 60s, ±50% jitter — and a
+/// successful rebuild resets it. Requests arriving during the wait get a
+/// retryable `StreamRebuildBackoff` instead of a rebuild attempt, so their
+/// batches are kept by the retry layer / disk buffer rather than acked or
+/// dropped.
+///
+/// Times are passed in by the caller so unit tests are deterministic.
+#[derive(Default)]
+struct AuthRebuildBackoff {
+    consecutive_failures: u32,
+    next_allowed: Option<tokio::time::Instant>,
+}
+
+impl AuthRebuildBackoff {
+    /// Wait still required before the next rebuild attempt; `None` when a
+    /// rebuild may proceed (including exactly at the deadline, where the raw
+    /// difference would be a zero `Some`).
+    fn wait_remaining(&self, now: tokio::time::Instant) -> Option<std::time::Duration> {
+        self.next_allowed
+            .and_then(|at| at.checked_duration_since(now))
+            .filter(|wait| !wait.is_zero())
+    }
+
+    /// Record an auth failure: arm or extend the backoff.
+    fn note_failure(&mut self, now: tokio::time::Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        // 1s, 2s, 4s, ... capped; the shift is bounded so this never overflows.
+        let shift = self.consecutive_failures.saturating_sub(1).min(6);
+        let base = AUTH_REBUILD_BACKOFF_BASE
+            .saturating_mul(1 << shift)
+            .min(AUTH_REBUILD_BACKOFF_MAX);
+        // ±50% jitter so concurrent failing sinks don't rebuild in lockstep.
+        let delay = base.mul_f64(0.5 + rand::random::<f64>());
+        self.next_allowed = Some(now + delay);
+    }
+
+    /// A successful rebuild returns the machine to healthy, so the next failure
+    /// starts over at the base delay instead of inheriting the old streak.
+    const fn reset(&mut self) {
+        self.consecutive_failures = 0;
+        self.next_allowed = None;
+    }
 }
 
 impl Service<ZerobusRequest> for ZerobusService {
@@ -1185,6 +1341,7 @@ impl Clone for ZerobusService {
             stream: Arc::clone(&self.stream),
             schema: Arc::clone(&self.schema),
             schema_resolve: Arc::clone(&self.schema_resolve),
+            rebuild_backoff: Arc::clone(&self.rebuild_backoff),
             token_manager: self.token_manager.clone(),
             unity_catalog_client: self.unity_catalog_client.clone(),
             oauth_provider: self.oauth_provider.clone(),
@@ -1246,6 +1403,7 @@ impl ZerobusService {
             stream: Arc::new(Mutex::new(Some(pinned))),
             schema: Arc::new(RwLock::new(None)),
             schema_resolve: Arc::new(Mutex::new(())),
+            rebuild_backoff: Arc::new(std::sync::Mutex::new(AuthRebuildBackoff::default())),
             token_manager: None,
             unity_catalog_client: None,
             oauth_provider,
@@ -1576,9 +1734,23 @@ mod tests {
     }
 
     #[test]
-    fn mux_discards_only_on_retryable_error_from_closed_mux() {
+    fn mux_discards_on_retryable_or_auth_error_from_closed_mux() {
+        use databricks_zerobus_ingest_sdk::GrpcStatus;
         let retryable = ZerobusError::ChannelCreationError("lane failed".to_string());
         let non_retryable = ZerobusError::InvalidArgument("bad field".to_string());
+        // The incident shape: a token-mint 401 poisons the mux (the SDK retains
+        // it and replays it for every later ingest), so it must discard.
+        let auth = ZerobusError::InvalidUCTokenError("mint 401".to_string());
+        let auth_grpc = ZerobusError::CreateStreamError(GrpcStatus::new(
+            databricks_zerobus_ingest_sdk::GrpcCode::Unauthenticated,
+            "expired",
+        ));
+        // In the auth class deliberately: grant/RAR propagation is eventual,
+        // so a denial can be transient and must discard + rebuild too.
+        let permission_denied = ZerobusError::CreateStreamError(GrpcStatus::new(
+            databricks_zerobus_ingest_sdk::GrpcCode::PermissionDenied,
+            "revoked grant",
+        ));
         assert!(retryable.is_retryable());
         assert!(!non_retryable.is_retryable());
 
@@ -1587,6 +1759,12 @@ mod tests {
             (&retryable, true, true),
             (&non_retryable, false, false),
             (&non_retryable, true, false),
+            (&auth, false, false),
+            (&auth, true, true),
+            (&auth_grpc, false, false),
+            (&auth_grpc, true, true),
+            (&permission_denied, false, false),
+            (&permission_denied, true, true),
         ] {
             assert_eq!(
                 mux_should_discard(err, closed),
@@ -2836,6 +3014,374 @@ mod tests {
         assert!(
             service.has_active_stream().await,
             "stream must not be discarded"
+        );
+    }
+
+    // --- Auth-failure rebuild backoff ---
+
+    #[test]
+    fn backoff_doubles_and_caps_with_jitter_bounds() {
+        let mut backoff = AuthRebuildBackoff::default();
+        let start = tokio::time::Instant::now();
+
+        // The jitter factor is uniform in [0.5, 1.5), so each delay lands in
+        // [0.5, 1.5) x base — i.e. [expected_min, expected_min * 3).
+        for expected_min in [500u64, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000] {
+            backoff.note_failure(start);
+            let wait = backoff
+                .wait_remaining(start)
+                .expect("a fresh failure must arm the backoff");
+            let ms = wait.as_millis() as u64;
+            assert!(
+                ms >= expected_min && ms < expected_min * 3,
+                "failure {}: {ms}ms not in [{expected_min}, {})",
+                backoff.consecutive_failures,
+                expected_min * 3
+            );
+        }
+
+        // Reset returns the machine to healthy and to the base delay.
+        backoff.reset();
+        assert_eq!(backoff.wait_remaining(start), None);
+        backoff.note_failure(start);
+        let ms = backoff.wait_remaining(start).unwrap().as_millis() as u64;
+        assert!((500..=1500).contains(&ms), "post-reset delay {ms}ms");
+    }
+
+    #[test]
+    fn backoff_wait_shrinks_as_time_passes() {
+        let mut backoff = AuthRebuildBackoff::default();
+        let start = tokio::time::Instant::now();
+        backoff.note_failure(start);
+        let total = backoff.wait_remaining(start).unwrap();
+        let halfway = backoff
+            .wait_remaining(start + total / 2)
+            .expect("still armed at halfway");
+        assert!(halfway <= total - total / 2);
+        assert_eq!(backoff.wait_remaining(start + total), None);
+    }
+
+    /// The incident: an auth error during ingest must discard the stream and
+    /// arm the backoff, so the next request is refused (retryably) instead of
+    /// rebuilding into a still-failing token mint — and the batch is kept for
+    /// retry rather than rejected.
+    #[tokio::test]
+    async fn auth_failure_discards_stream_and_arms_backoff() {
+        vector_lib::metrics::init_test();
+        clear_recorded_events();
+
+        let mock = MockStream::failing(ZerobusError::InvalidUCTokenError(
+            "User is not authorized to the requested authorizations".to_string(),
+        ));
+        let service = ZerobusService::new_with_mock(test_config(), mock)
+            .await
+            .unwrap();
+
+        let stream = current_stream(&service).await;
+        let err = service
+            .ingest(
+                stream,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
+            .await
+            .unwrap_err();
+
+        // The error is auth-class: retryable, so the batch is kept (Errored),
+        // not rejected.
+        assert!(err.is_auth_error(), "{err}");
+        assert!(ZerobusRetryLogic.is_retriable_error(&err));
+        assert_eq!(err.event_status(), vector_lib::event::EventStatus::Errored);
+        // The poisoned stream was discarded.
+        assert!(!service.has_active_stream().await);
+        // And the discard was countable.
+        assert!(
+            contains_name_once("ZerobusAuthStreamDiscarded").is_ok(),
+            "an auth discard must be reported"
+        );
+
+        // The next request is refused by the backoff, not sent into a rebuild.
+        service.seed_schema(narrow_schema()).await;
+        let schema = service.ensure_schema().await.unwrap();
+        let err = stream_error(&service, &schema).await;
+        assert!(
+            matches!(err, ZerobusSinkError::StreamRebuildBackoff { .. }),
+            "expected the rebuild to be gated by backoff, got: {err:?}"
+        );
+        assert!(
+            err.is_retryable(),
+            "the gated batch must be retried, not dropped"
+        );
+    }
+
+    /// Once the backoff elapses, the rebuild is attempted again (against the
+    /// unroutable test endpoint here, so the observable is a build failure —
+    /// not the backoff refusal).
+    #[tokio::test]
+    async fn backoff_expires_and_rebuild_is_attempted() {
+        let mock = MockStream::failing(ZerobusError::InvalidUCTokenError("mint 401".to_string()));
+        let service = ZerobusService::new_with_mock(test_config(), mock)
+            .await
+            .unwrap();
+        let stream = current_stream(&service).await;
+        assert!(
+            service
+                .ingest(
+                    stream,
+                    dummy_payload(),
+                    GroupedCountByteSize::new_untagged()
+                )
+                .await
+                .is_err()
+        );
+        assert!(!service.has_active_stream().await);
+
+        service.seed_schema(narrow_schema()).await;
+        let schema = service.ensure_schema().await.unwrap();
+
+        // Still gated immediately after the failure.
+        let err = stream_error(&service, &schema).await;
+        assert!(matches!(err, ZerobusSinkError::StreamRebuildBackoff { .. }));
+
+        // Past the maximum first delay (1s ±50% → ≤1.5s) the gate opens and a
+        // real build is attempted. It fails against the unroutable endpoint,
+        // which proves the gate no longer refuses.
+        tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+        let err = stream_error(&service, &schema).await;
+        assert!(
+            matches!(err, ZerobusSinkError::StreamInitError { .. }),
+            "expected a build attempt after the backoff, got: {err:?}"
+        );
+    }
+
+    /// A failed build must be observable and pace the next attempt only when it
+    /// is auth-class: when the very first build fails (e.g. a sustained
+    /// token-mint outage), no stream ever exists to discard, so without its own
+    /// event the outage leaves `zerobus_auth_stream_discard_total` at zero.
+    #[tokio::test]
+    async fn auth_build_failure_is_reported_and_arms_backoff() {
+        vector_lib::metrics::init_test();
+        clear_recorded_events();
+
+        let service = ZerobusService::new_with_mock(test_config(), MockStream::succeeding())
+            .await
+            .unwrap();
+
+        // A non-auth build failure is neither counted nor paced.
+        service.note_build_failure(&ZerobusSinkError::StreamInitError {
+            source: ZerobusError::ConnectionTimeout("dial tcp: i/o timeout".to_string()),
+        });
+        assert!(
+            contains_name_once("ZerobusAuthStreamBuildFailed").is_err(),
+            "a non-auth build failure must not be counted as an auth failure"
+        );
+        assert!(
+            service.rebuild_wait_remaining().is_none(),
+            "a non-auth build failure must not arm the backoff"
+        );
+
+        // An auth-class build failure emits its event and arms the backoff.
+        service.note_build_failure(&ZerobusSinkError::StreamInitError {
+            source: ZerobusError::InvalidUCTokenError("mint 401".to_string()),
+        });
+        assert!(
+            contains_name_once("ZerobusAuthStreamBuildFailed").is_ok(),
+            "an auth build failure must be reported"
+        );
+        assert!(
+            service.rebuild_wait_remaining().is_some(),
+            "an auth build failure must pace the next rebuild"
+        );
+    }
+
+    /// A successful ingest on a live stream clears the armed backoff, so a much
+    /// later auth failure starts over at the base delay.
+    #[tokio::test]
+    async fn successful_ingest_resets_backoff() {
+        let service = ZerobusService::new_with_mock(test_config(), MockStream::succeeding())
+            .await
+            .unwrap();
+        service.note_auth_failure();
+        assert!(service.rebuild_wait_remaining().is_some());
+
+        let stream = current_stream(&service).await;
+        assert!(
+            service
+                .ingest(
+                    stream,
+                    dummy_payload(),
+                    GroupedCountByteSize::new_untagged()
+                )
+                .await
+                .is_ok()
+        );
+        assert_eq!(service.rebuild_wait_remaining(), None);
+    }
+
+    /// A non-auth failure keeps the existing behavior: the stream stays, no
+    /// backoff is armed, and the same stream is handed out again.
+    #[tokio::test]
+    async fn non_auth_failure_keeps_stream_without_backoff() {
+        let mock = MockStream::failing(ZerobusError::InvalidArgument("bad field".to_string()));
+        let service = ZerobusService::new_with_mock(test_config(), mock)
+            .await
+            .unwrap();
+        let stream = current_stream(&service).await;
+        let err = service
+            .ingest(
+                stream,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
+            .await
+            .unwrap_err();
+        assert!(!err.is_retryable());
+        assert!(service.has_active_stream().await);
+        assert_eq!(service.rebuild_wait_remaining(), None);
+    }
+
+    /// A stream that is already pinned is handed out even while a backoff is
+    /// armed: a live stream is better than refusing, and a success resets.
+    #[tokio::test]
+    async fn armed_backoff_does_not_block_a_pinned_stream() {
+        let service = ZerobusService::new_with_mock(test_config(), MockStream::succeeding())
+            .await
+            .unwrap();
+        service.seed_schema(narrow_schema()).await;
+        service.pin_stream_to_cached_schema().await;
+        service.note_auth_failure();
+
+        let schema = service.ensure_schema().await.unwrap();
+        let pinned = current_stream(&service).await;
+        let stream = service.get_or_create_stream(&schema).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&stream, &pinned),
+            "the pinned stream must be reused despite the armed backoff"
+        );
+    }
+
+    /// A non-auth *build* failure must not arm the backoff: only auth-class
+    /// failures pace rebuilds, so an ordinary transport blip during stream
+    /// creation is retried at the request layer's normal pace.
+    #[tokio::test]
+    async fn non_auth_build_failure_leaves_backoff_unarmed() {
+        let service = ZerobusService::new_with_mock(test_config(), MockStream::succeeding())
+            .await
+            .unwrap();
+        service.seed_schema(narrow_schema()).await;
+        let schema = service.ensure_schema().await.unwrap();
+
+        // Building against the unroutable test endpoint fails with a
+        // transport error (ChannelCreationError → StreamInitError).
+        let err = stream_error(&service, &schema).await;
+        assert!(
+            matches!(err, ZerobusSinkError::StreamInitError { .. }),
+            "{err:?}"
+        );
+        assert!(
+            err.is_retryable() && !err.is_auth_error(),
+            "transport build failures stay plain-retryable: {err:?}"
+        );
+        assert_eq!(
+            service.rebuild_wait_remaining(),
+            None,
+            "a non-auth build failure must not arm the backoff"
+        );
+    }
+
+    /// A successful rebuild clears the armed backoff, so the next auth failure
+    /// starts over at the base delay. (A real build needs the network, so the
+    /// reset entry point is exercised directly; the call site on the build path
+    /// is the same method.)
+    #[tokio::test]
+    async fn rebuild_success_resets_armed_backoff() {
+        let service = ZerobusService::new_with_mock(test_config(), MockStream::succeeding())
+            .await
+            .unwrap();
+        service.note_auth_failure();
+        service.note_auth_failure();
+        assert!(service.rebuild_wait_remaining().is_some());
+
+        service.note_rebuild_success();
+        assert_eq!(service.rebuild_wait_remaining(), None);
+
+        // And the next failure starts from the base delay, not the old streak:
+        // the wait is at most 1.5x the 1s base.
+        service.note_auth_failure();
+        let wait = service.rebuild_wait_remaining().unwrap();
+        assert!(
+            wait <= std::time::Duration::from_millis(1500),
+            "post-reset wait {wait:?} must be near the base delay"
+        );
+    }
+
+    /// Two in-flight requests on the same poisoned stream both observe the auth
+    /// error (a real mux replays its retained failure to every holder). The
+    /// first failure discards the stream; after a rebuild, a *stale* error
+    /// arriving on the old stream handle must not discard the fresh stream —
+    /// the `Arc` identity guard in `discard_stream` protects it.
+    #[tokio::test]
+    async fn stale_auth_error_does_not_discard_the_rebuilt_stream() {
+        let mock = MockStream::failing(ZerobusError::InvalidUCTokenError("mint 401".to_string()));
+        let service = ZerobusService::new_with_mock(test_config(), mock)
+            .await
+            .unwrap();
+
+        // Both "requests" hold clones of the same stream handle, as concurrent
+        // in-flight ingests do.
+        let stream1 = current_stream(&service).await;
+        let stale_handle = Arc::clone(&stream1);
+
+        // First request fails with the auth error: discard + backoff armed.
+        let err = service
+            .ingest(
+                stream1,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is_auth_error());
+        assert!(!service.has_active_stream().await);
+        assert!(service.rebuild_wait_remaining().is_some());
+
+        // The rebuild (as `get_or_create_stream` would do once the backoff
+        // elapses) installs a fresh, healthy stream.
+        *service.stream.lock().await = Some(PinnedStream {
+            schema: ZerobusService::build_test_schema(
+                &service.config,
+                arrow::datatypes::Schema::empty(),
+            ),
+            stream: Arc::new(ActiveStream::Mock(MockStream::succeeding())),
+        });
+        let rebuilt = current_stream(&service).await;
+        assert!(!Arc::ptr_eq(&stale_handle, &rebuilt));
+
+        // The second (stale) request now fails with the same auth error on the
+        // old handle.
+        match stale_handle.as_ref() {
+            ActiveStream::Mock(m) => {
+                m.set_next_error(ZerobusError::InvalidUCTokenError("mint 401".to_string()))
+            }
+            _ => unreachable!("mock stream installed by new_with_mock"),
+        }
+        let err = service
+            .ingest(
+                stale_handle,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is_auth_error());
+
+        // The rebuilt stream survived: the stale error discarded only the old
+        // handle's stream.
+        assert!(service.has_active_stream().await);
+        let current = current_stream(&service).await;
+        assert!(
+            Arc::ptr_eq(&current, &rebuilt),
+            "the rebuilt stream must not be discarded by a stale error"
         );
     }
 }

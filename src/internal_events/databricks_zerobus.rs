@@ -99,6 +99,84 @@ impl InternalEvent for ZerobusRetryableError {
     }
 }
 
+/// An auth/token-class failure discarded the active stream; the rebuild backs
+/// off before retrying. Worth its own signal because the failure itself is
+/// non-retryable from the SDK's point of view: without this counter the
+/// affected batches' only trace is a spike of `invalid_config`-shaped errors.
+#[derive(Debug, NamedInternalEvent)]
+pub(crate) struct ZerobusAuthStreamDiscarded {
+    pub error_code: &'static str,
+}
+
+impl InternalEvent for ZerobusAuthStreamDiscarded {
+    fn emit(self) {
+        warn!(
+            message = "Zerobus stream failed with an auth/token error; discarding it so it can be rebuilt once credentials recover. Batches are retried, not dropped.",
+            error_code = self.error_code,
+            error_type = error_type::REQUEST_FAILED,
+            stage = error_stage::SENDING,
+            internal_log_rate_limit = true,
+        );
+        counter!(
+            "zerobus_auth_stream_discard_total",
+            "error_code" => self.error_code,
+        )
+        .increment(1);
+    }
+}
+
+/// A stream (re)build attempt itself failed with an auth/token-class error
+/// (e.g. the token mint is down, or a grant has not propagated yet). Distinct
+/// from [`ZerobusAuthStreamDiscarded`], which only fires on a failure of an
+/// already-established stream: when the very first build fails — a sustained
+/// token-mint outage — the discard counter stays at zero, so this is what makes
+/// the outage visible. Unlabeled by table, matching the discard event: a sink
+/// writes one table, `component_id` separates instances, and the log line has
+/// the name.
+#[derive(Debug, NamedInternalEvent)]
+pub(crate) struct ZerobusAuthStreamBuildFailed {
+    pub error_code: &'static str,
+    pub error: String,
+}
+
+impl InternalEvent for ZerobusAuthStreamBuildFailed {
+    fn emit(self) {
+        warn!(
+            message = "Zerobus stream creation failed with an auth/token error; the rebuild backs off until credentials recover. Batches are retried, not dropped.",
+            error = %self.error,
+            error_code = self.error_code,
+            error_type = error_type::REQUEST_FAILED,
+            stage = error_stage::SENDING,
+            internal_log_rate_limit = true,
+        );
+        counter!(
+            "zerobus_auth_stream_build_failure_total",
+            "error_code" => self.error_code,
+        )
+        .increment(1);
+    }
+}
+
+/// Ingestion recovered after one or more auth/token failures — the stream was
+/// rebuilt (or a still-live stream delivered again) without a restart.
+/// `failures` is the consecutive-failure count the backoff had reached, giving
+/// a sense of the outage length.
+#[derive(Debug, NamedInternalEvent)]
+pub(crate) struct ZerobusAuthStreamRebuilt {
+    pub failures: u32,
+}
+
+impl InternalEvent for ZerobusAuthStreamRebuilt {
+    fn emit(self) {
+        info!(
+            message = "Zerobus ingestion recovered after auth/token failures; resuming on a rebuilt stream.",
+            failures = self.failures,
+            internal_log_rate_limit = true,
+        );
+        counter!("zerobus_auth_stream_rebuild_total").increment(1);
+    }
+}
+
 /// Freshness counters for one acked batch, summed so they are bumped once per batch.
 ///
 /// A negative lag means the producer or LP clock runs ahead of this host. It is counted

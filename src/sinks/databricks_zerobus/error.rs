@@ -62,6 +62,44 @@ pub enum ZerobusSinkError {
     /// changed between attempts, so a retry is not a repeat of the same request.
     #[snafu(display("Zerobus schema reloaded after rejection ({}); retrying", message))]
     SchemaReloaded { message: String },
+
+    /// A previous auth/token-class failure discarded the stream, and its
+    /// rebuild is still backing off. Retryable: the batch must not be acked,
+    /// and once the backoff elapses the next attempt rebuilds the stream.
+    #[snafu(display(
+        "Zerobus stream rebuild backing off after an auth failure; retry in {retry_after_ms}ms"
+    ))]
+    StreamRebuildBackoff { retry_after_ms: u64 },
+}
+
+/// Whether an SDK error is auth/token-class: the credential itself was
+/// rejected or could not be minted, as opposed to a transport or data problem.
+///
+/// The SDK classifies these as non-retryable because its own recovery cannot
+/// fix them, but they are transient in practice — a token-mint 401
+/// (`InvalidUCTokenError`, e.g. `invalid_authorization_details` cold-miss) or a
+/// server `UNAUTHENTICATED`/`PERMISSION_DENIED` can clear on their own (grant
+/// and RAR propagation is eventual), so the sink must rebuild the stream and
+/// retry instead of rejecting every batch until restart. `PERMISSION_DENIED`
+/// is included deliberately, with a known trade-off: a *permanently* revoked
+/// grant would then retry indefinitely under LP's unbounded request retries and
+/// blocking buffers, stalling the pod — that state must be alerted on
+/// (`zerobus_auth_stream_discard_total`, or
+/// `zerobus_auth_stream_build_failure_total` when the very first build fails)
+/// rather than encoded away here.
+/// Genuinely permanent misconfigurations (bad table, bad schema, bad
+/// arguments) are excluded.
+pub(crate) fn sdk_error_is_auth(error: &ZerobusError) -> bool {
+    match error {
+        ZerobusError::InvalidUCTokenError(_) => true,
+        ZerobusError::CreateStreamError(status) | ZerobusError::StreamClosedError(status) => {
+            matches!(
+                status.code(),
+                GrpcCode::Unauthenticated | GrpcCode::PermissionDenied
+            )
+        }
+        _ => false,
+    }
 }
 
 impl ZerobusSinkError {
@@ -89,15 +127,32 @@ impl ZerobusSinkError {
     }
 
     /// Whether this error should be retried.
+    ///
+    /// Auth/token-class SDK errors (see [`sdk_error_is_auth`]) are retryable
+    /// here even though the SDK marks them non-retryable: its recovery cannot
+    /// fix a rejected credential, but the sink can discard the stream, back
+    /// off, and rebuild once the mint recovers. The LP deployment leaves the
+    /// request retry count unbounded and its buffers blocking, so the batches
+    /// are held (not acked, not dropped) until the stream recovers.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::ZerobusError { source }
             | Self::StreamInitError { source }
-            | Self::IngestionError { source } => source.is_retryable(),
+            | Self::IngestionError { source } => source.is_retryable() || sdk_error_is_auth(source),
             Self::StreamClosed | Self::EncodingTaskFailed { .. } => true,
             Self::SchemaError { retryable, .. } => *retryable,
-            Self::SchemaReloaded { .. } => true,
+            Self::SchemaReloaded { .. } | Self::StreamRebuildBackoff { .. } => true,
             Self::ConfigError { .. } | Self::EncodingError { .. } => false,
+        }
+    }
+
+    /// Whether this error is auth/token-class (see [`sdk_error_is_auth`]).
+    pub fn is_auth_error(&self) -> bool {
+        match self {
+            Self::ZerobusError { source }
+            | Self::StreamInitError { source }
+            | Self::IngestionError { source } => sdk_error_is_auth(source),
+            _ => false,
         }
     }
 
@@ -120,6 +175,7 @@ impl ZerobusSinkError {
             Self::StreamClosed => "stream_closed_concurrently",
             Self::SchemaError { status, .. } => unity_catalog_error_code(*status),
             Self::SchemaReloaded { .. } => "schema_reloaded",
+            Self::StreamRebuildBackoff { .. } => "stream_rebuild_backoff",
         }
     }
 
@@ -133,7 +189,7 @@ impl ZerobusSinkError {
     }
 }
 
-fn sdk_error_code(error: &ZerobusError) -> &'static str {
+pub(crate) fn sdk_error_code(error: &ZerobusError) -> &'static str {
     match error {
         ZerobusError::InvalidSchema { .. } => "schema_mismatch",
         ZerobusError::InvalidArgument(_) => "invalid_argument",
@@ -334,6 +390,114 @@ mod tests {
             schema_constraint: false,
         };
         assert!(!logic.is_retriable_error(&error));
+    }
+
+    fn auth_sdk_errors() -> Vec<ZerobusError> {
+        use databricks_zerobus_ingest_sdk::{GrpcCode, GrpcStatus};
+        vec![
+            // The incident shape: an OAuth token-mint 401 surfaces as this variant.
+            ZerobusError::InvalidUCTokenError(
+                "User is not authorized to the requested authorizations".to_string(),
+            ),
+            ZerobusError::CreateStreamError(GrpcStatus::new(
+                GrpcCode::Unauthenticated,
+                "bad credentials",
+            )),
+            // Grant/RAR propagation is eventual, so a denial can be transient;
+            // it is in the auth class deliberately (see `sdk_error_is_auth`).
+            ZerobusError::CreateStreamError(GrpcStatus::new(
+                GrpcCode::PermissionDenied,
+                "no grant",
+            )),
+            ZerobusError::StreamClosedError(GrpcStatus::new(
+                GrpcCode::Unauthenticated,
+                "expired token",
+            )),
+        ]
+    }
+
+    #[test]
+    fn auth_errors_are_retryable_and_errored() {
+        for source in auth_sdk_errors() {
+            let error = ZerobusSinkError::IngestionError { source };
+            assert!(error.is_auth_error(), "{error}");
+            // The whole point: the batch must be kept (Errored), not rejected.
+            assert!(
+                error.is_retryable() && ZerobusRetryLogic.is_retriable_error(&error),
+                "{error}"
+            );
+            assert_eq!(EventStatus::from(error), EventStatus::Errored);
+        }
+    }
+
+    #[test]
+    fn auth_errors_are_retryable_at_stream_init_too() {
+        // A token-mint 401 during stream creation must not reject the batch
+        // either: the retry rebuilds the stream once the mint recovers.
+        for source in auth_sdk_errors() {
+            let error = ZerobusSinkError::StreamInitError { source };
+            assert!(error.is_auth_error(), "{error}");
+            assert!(error.is_retryable(), "{error}");
+        }
+    }
+
+    #[test]
+    fn non_auth_errors_are_not_auth_errors() {
+        // TokenFetchError (mint 5xx/network) is already SDK-retryable; it is not
+        // in the auth class, so it keeps its existing recovery unchanged.
+        let fetch = ZerobusSinkError::IngestionError {
+            source: ZerobusError::TokenFetchError("mint 503".to_string()),
+        };
+        assert!(!fetch.is_auth_error());
+        assert!(fetch.is_retryable());
+
+        // Genuinely permanent config errors keep their rejection semantics.
+        let argument = ZerobusSinkError::IngestionError {
+            source: non_retryable_error(),
+        };
+        assert!(!argument.is_auth_error());
+        assert!(!argument.is_retryable());
+
+        let schema = ZerobusSinkError::SchemaError {
+            message: "UC 404".to_string(),
+            retryable: false,
+            status: Some(404),
+        };
+        assert!(!schema.is_auth_error());
+        assert!(!schema.is_retryable());
+    }
+
+    #[test]
+    fn stream_rebuild_backoff_is_retryable() {
+        let error = ZerobusSinkError::StreamRebuildBackoff { retry_after_ms: 1 };
+        assert!(error.is_retryable());
+        assert!(ZerobusRetryLogic.is_retriable_error(&error));
+        assert!(!error.is_auth_error());
+        assert_eq!(error.error_code(), "stream_rebuild_backoff");
+        assert_eq!(EventStatus::from(error), EventStatus::Errored);
+    }
+
+    #[test]
+    fn auth_error_codes_are_fixed() {
+        use databricks_zerobus_ingest_sdk::{GrpcCode, GrpcStatus};
+        assert_eq!(
+            sdk_error_code(&ZerobusError::InvalidUCTokenError("no".to_string())),
+            "invalid_config"
+        );
+        assert_eq!(
+            sdk_error_code(&ZerobusError::CreateStreamError(GrpcStatus::new(
+                GrpcCode::Unauthenticated,
+                "no"
+            ))),
+            "grpc_unauthenticated"
+        );
+        assert_eq!(
+            sdk_error_code(&ZerobusError::CreateStreamError(GrpcStatus::new(
+                GrpcCode::PermissionDenied,
+                "no"
+            ))),
+            "grpc_permission_denied"
+        );
     }
 
     // NOTE: no positive test for `is_schema_rejection` — `InvalidSchema` is
