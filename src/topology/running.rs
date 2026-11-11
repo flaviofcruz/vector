@@ -161,6 +161,42 @@ fn bounded_component_ids(mut ids: Vec<String>) -> (Vec<String>, usize) {
     (ids, total)
 }
 
+/// Sentinel id emitted on the `COMPONENTS_CLOSED` VEL event when a wave-1 deadline was
+/// missed but no straggler could be named. Guarantees a non-graceful close always names
+/// something, so the unattributed share stays a queryable split instead of silently
+/// collapsing into "empty list, count 0".
+const UNATTRIBUTED_COMPONENT: &str = "<unattributed>";
+
+/// Name the wave-1 components whose tasks are still running at a wave deadline, from that
+/// wave's abort handles: `AbortHandle::is_finished` reads tokio's task state directly, so
+/// it sees stragglers that the previous `Shared::peek` snapshot could miss — peek only
+/// observes completion recorded by a poll of the shared future, and on CPU-starved agents
+/// that left most non-graceful closes with empty lists and nothing named. Returns ids
+/// sorted for deterministic logging.
+fn unfinished_component_ids(
+    handles: &HashMap<ComponentKey, Vec<tokio::task::AbortHandle>>,
+) -> Vec<String> {
+    handles
+        .iter()
+        .filter(|(_, task_handles)| task_handles.iter().any(|handle| !handle.is_finished()))
+        .map(|(key, _)| key.to_string())
+        .sorted()
+        .collect()
+}
+
+/// Cap a wave's force-terminated ids for the `COMPONENTS_CLOSED` VEL event. A missed
+/// deadline with nothing nameable (every straggler task finished inside the
+/// timeout-to-snapshot window) emits a single `UNATTRIBUTED_COMPONENT` sentinel entry with
+/// count 1, so a non-graceful close never carries a silently-empty list. Named ids keep
+/// `bounded_component_ids` semantics: capped list, pre-cap count.
+fn bounded_force_terminated_ids(ids: Vec<String>) -> (Vec<String>, usize) {
+    if ids.is_empty() {
+        (vec![UNATTRIBUTED_COMPONENT.to_string()], 1)
+    } else {
+        bounded_component_ids(ids)
+    }
+}
+
 /// Set the flush signal on each `(key, signal)` pair, asking those (disk-buffered) sinks to drain
 /// their currently-open batches now that their upstream sources have stopped — rather than waiting
 /// for the batcher's own timeout. Best-effort and idempotent: the batcher clears the flag when it
@@ -491,21 +527,6 @@ impl RunningTopology {
         // The reporter closure below takes ownership of the original.
         let mut wave2_start_check_handles = check_handles.clone();
 
-        // Separate snapshot of check_handles used only if the wave 1 sink-drain deadline is
-        // exceeded, to name the still-active wave-1 transforms/sinks in a warn log. Must be
-        // cloned before `reporter` takes ownership of the original `check_handles`.
-        let wave1_sink_check_handles = check_handles.clone();
-
-        // Same snapshot restricted to wave-1 data sources: used only if the data-source drain
-        // deadline is exceeded, to name the force-aborted source tasks on the warn log and the
-        // COMPONENTS_CLOSED VEL event (peek-based, like the sink path below, so only tasks
-        // that were actually still running are named).
-        let wave1_source_check_handles: HashMap<ComponentKey, Vec<_>> = check_handles
-            .iter()
-            .filter(|(key, _)| wave1_source_abort_handles.contains_key(*key))
-            .map(|(key, handles)| (key.clone(), handles.clone()))
-            .collect();
-
         // Reports in intervals which components are still running.
         let mut interval = interval(Duration::from_secs(5));
         let reporter_component_roles = Arc::clone(&component_roles);
@@ -575,13 +596,6 @@ impl RunningTopology {
             Box::pin(success) as future::BoxFuture<'static, ()>,
         ])
         .map(|_| ());
-
-        // Wave-1 sink/transform keys (exclusively-non-deferred minus sources), used only to name
-        // stragglers if wave 1's sink-drain deadline is exceeded.
-        let wave1_sink_keys: HashSet<ComponentKey> = exclusively_non_deferred_keys
-            .difference(&source_keys)
-            .cloned()
-            .collect();
 
         // A second owner: the writer is moved into the orchestration future (below), while
         // `gracefully_closed_out` is moved into the returned future that reads it back.
@@ -658,7 +672,8 @@ impl RunningTopology {
                 // Force-terminated component ids from the wave-1 deadlines, carried on the
                 // COMPONENTS_CLOSED VEL event so "which component stalled at the deadline" is
                 // one central query instead of a regional service-log search. Empty unless the
-                // corresponding wave-1 deadline was missed.
+                // corresponding wave-1 deadline was missed; a missed deadline with nothing
+                // nameable carries the `UNATTRIBUTED_COMPONENT` sentinel instead.
                 let mut force_terminated_sources = Vec::<String>::new();
                 let mut force_terminated_source_count = 0usize;
                 let mut force_terminated_sinks = Vec::<String>::new();
@@ -672,21 +687,13 @@ impl RunningTopology {
                     .is_err()
                     {
                         wave1_sources_clean = false;
-                        // Name the stuck sources with the same peek-based filter the sink path
-                        // (phase B) uses, so only tasks that were actually still running are
-                        // listed.
-                        let mut stuck_source_handles = wave1_source_check_handles;
-                        stuck_source_handles.retain(|_key, handles| {
-                            retain(handles, |handle| handle.peek().is_none());
-                            !handles.is_empty()
-                        });
-                        let stuck_source_ids: Vec<String> = stuck_source_handles
-                            .into_keys()
-                            .sorted()
-                            .map(|key| key.to_string())
-                            .collect();
+                        // Name the stuck sources from their abort handles (see
+                        // `unfinished_component_ids`), checked before the abort is issued so
+                        // only tasks that were actually still running are listed.
+                        let stuck_source_ids =
+                            unfinished_component_ids(&wave1_source_abort_handles);
                         (force_terminated_sources, force_terminated_source_count) =
-                            bounded_component_ids(stuck_source_ids.clone());
+                            bounded_force_terminated_ids(stuck_source_ids.clone());
                         let (aborted_components, aborted_tasks) =
                             abort_active_tasks(&wave1_source_abort_handles);
                         warn!(
@@ -723,7 +730,6 @@ impl RunningTopology {
                 );
                 let mut wave1_sinks_clean = true;
                 if let Some(dk_deadline) = data_sink_deadline {
-                    let mut wave1_sink_check_handles = wave1_sink_check_handles;
                     if tokio::time::timeout_at(
                         dk_deadline,
                         futures::future::join_all(wave1_sink_wait_handles),
@@ -732,22 +738,12 @@ impl RunningTopology {
                     .is_err()
                     {
                         wave1_sinks_clean = false;
-                        // Same peek-based filter as the reporter, restricted to wave-1 sink
-                        // keys so the warn only names components that were still draining.
-                        wave1_sink_check_handles.retain(|key, handles| {
-                            if !wave1_sink_keys.contains(key) {
-                                return false;
-                            }
-                            retain(handles, |handle| handle.peek().is_none());
-                            !handles.is_empty()
-                        });
-                        let straggler_ids: Vec<String> = wave1_sink_check_handles
-                            .into_keys()
-                            .sorted()
-                            .map(|key| key.to_string())
-                            .collect();
+                        // Name the stragglers from their abort handles (see
+                        // `unfinished_component_ids`), checked before the abort is issued so
+                        // only components still draining at the deadline are listed.
+                        let straggler_ids = unfinished_component_ids(&wave1_sink_abort_handles);
                         (force_terminated_sinks, force_terminated_sink_count) =
-                            bounded_component_ids(straggler_ids.clone());
+                            bounded_force_terminated_ids(straggler_ids.clone());
                         let (aborted_components, aborted_tasks) =
                             abort_active_tasks(&wave1_sink_abort_handles);
                         warn!(
@@ -797,10 +793,12 @@ impl RunningTopology {
                 // fields). Empty lists on a clean shutdown; counts reflect the pre-cap totals so
                 // consumers can detect the MAX_FORCE_TERMINATED_COMPONENTS truncation. The sink
                 // list covers the wave-1 downstream that phase B force-terminates — transforms
-                // and sinks alike, named "sinks" for the dominant case. Names are snapshotted
-                // before the aborts, so a task finishing in that gap can be named even though
-                // the abort did nothing to it; only wave-1 force-terminations are named here
-                // (wave-2 and overall-deadline kills are not).
+                // and sinks alike, named "sinks" for the dominant case. Names come from the
+                // abort handles' task state checked before the aborts are issued, so a task
+                // finishing in that gap can be named even though the abort did nothing to it;
+                // a missed deadline with nothing nameable carries the `<unattributed>`
+                // sentinel (see `bounded_force_terminated_ids`). Only wave-1 force-terminations
+                // are named here (wave-2 and overall-deadline kills are not).
                 let force_terminated_sources_json =
                     serde_json::to_string(&force_terminated_sources)
                         .unwrap_or_else(|_| "[]".to_string());
@@ -2211,12 +2209,18 @@ fn sink_buffer_config(config: &Config, key: &ComponentKey) -> Option<BufferConfi
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, num::NonZeroU64};
+    use std::{
+        collections::{HashMap, HashSet},
+        num::NonZeroU64,
+    };
 
     use vector_common::flush_signal::FlushSignal;
     use vector_lib::buffers::{BufferConfig, BufferType, WhenFull};
 
-    use super::{bounded_component_ids, reusable_buffers, signal_sink_flush};
+    use super::{
+        UNATTRIBUTED_COMPONENT, bounded_component_ids, bounded_force_terminated_ids,
+        reusable_buffers, signal_sink_flush, unfinished_component_ids,
+    };
     use crate::{
         config::{ComponentKey, Config, ConfigDiff},
         test_util::mock::{basic_sink, basic_source},
@@ -2241,6 +2245,48 @@ mod tests {
         assert_eq!(ids.first().map(String::as_str), Some("sink_00"));
         assert_eq!(ids.last().map(String::as_str), Some("sink_19"));
         assert_eq!(total, 30);
+    }
+
+    #[test]
+    fn bounded_force_terminated_ids_substitutes_sentinel_when_nothing_nameable() {
+        // A missed deadline with nothing nameable must still name something, so a
+        // non-graceful close never carries a silently-empty list.
+        let (ids, total) = bounded_force_terminated_ids(Vec::new());
+        assert_eq!(ids, [UNATTRIBUTED_COMPONENT.to_string()]);
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn bounded_force_terminated_ids_caps_named_stragglers() {
+        // Named ids keep the cap and pre-cap count semantics of `bounded_component_ids`.
+        let many: Vec<String> = (0..30).map(|i| format!("sink_{i:02}")).collect();
+        let (ids, total) = bounded_force_terminated_ids(many);
+        assert_eq!(ids.len(), super::MAX_FORCE_TERMINATED_COMPONENTS);
+        assert_eq!(total, 30);
+    }
+
+    #[tokio::test]
+    async fn unfinished_component_ids_names_only_unfinished_tasks() {
+        use crate::config::ComponentKey;
+
+        let finished = tokio::spawn(async {});
+        let finished_abort = finished.abort_handle();
+        finished.await.unwrap();
+
+        let pending = tokio::spawn(futures::future::pending::<()>());
+
+        let mut handles = HashMap::new();
+        handles.insert(ComponentKey::from("done"), vec![finished_abort.clone()]);
+        handles.insert(ComponentKey::from("stuck"), vec![pending.abort_handle()]);
+        // The finished task's abort handle reports finished even though nothing polled the
+        // task again — this is the property the old `Shared::peek` snapshot lacked.
+        assert!(finished_abort.is_finished());
+
+        let ids = unfinished_component_ids(&handles);
+        assert_eq!(ids, ["stuck"]);
+
+        pending.abort();
+        pending.await.unwrap_err();
     }
 
     #[cfg(feature = "sources-prometheus-remote-write")]
