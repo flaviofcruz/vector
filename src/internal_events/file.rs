@@ -471,12 +471,14 @@ mod source {
 
     impl InternalEvent for FileAdded<'_> {
         fn emit(self) {
+            // Not a Vector event log (VEL) file event: LOGGING_AGENT_FILE_READ_STARTED
+            // follows within milliseconds for nearly every new file and carries the same
+            // fields plus the fingerprint and stat, so emitting both doubled VEL file-event
+            // volume.
             info!(
                 message = "Found new file to watch.",
                 file = %self.file.display(),
                 internal_log_rate_limit = false,
-                vector_event_type = "VECTOR_FILE_EVENT",
-                vector_file_event_type = "LOGGING_AGENT_FILE_DISCOVERED"
             );
             if self.include_file_metric_tag {
                 counter!(
@@ -793,7 +795,7 @@ mod tests {
         }
     }
 
-    fn capture(emit: impl FnOnce(&FileSourceInternalEventsEmitter)) -> Fields {
+    fn capture_all(emit: impl FnOnce(&FileSourceInternalEventsEmitter)) -> Vec<Fields> {
         let capture = FileEventCapture::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         tracing::subscriber::with_default(subscriber, || {
@@ -801,7 +803,11 @@ mod tests {
                 include_file_metric_tag: false,
             })
         });
-        let mut events = capture.0.lock().unwrap().clone();
+        capture.0.lock().unwrap().clone()
+    }
+
+    fn capture(emit: impl FnOnce(&FileSourceInternalEventsEmitter)) -> Fields {
+        let mut events = capture_all(emit);
         assert_eq!(events.len(), 1, "{events:?}");
         events.pop().unwrap()
     }
@@ -841,6 +847,12 @@ mod tests {
         assert_eq!(field(&fields, "num_bytes_read"), Some("21"));
         assert_eq!(field(&fields, "file_mtime_ms"), Some("1700000000000"));
         assert_eq!(field(&fields, "file_size_bytes"), Some("23"));
+    }
+
+    #[test]
+    fn added_is_not_a_vel_file_event() {
+        let events = capture_all(|e| e.emit_file_added(Path::new("/var/log/app.log")));
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]
