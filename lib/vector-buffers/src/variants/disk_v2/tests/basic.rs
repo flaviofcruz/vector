@@ -284,3 +284,35 @@ async fn initial_size_correct_with_multievents() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn disk_v2_buffer_reports_byte_limit() {
+    use std::num::NonZeroU64;
+
+    use crate::{
+        buffer_usage_data::BufferUsage, topology::builder::IntoBuffer,
+        variants::disk_v2::DiskV2Buffer,
+    };
+
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+        async move {
+            let handle = BufferUsage::from_span(tracing::Span::none()).add_stage(0);
+            let buffer: Box<dyn IntoBuffer<SizedRecord>> = Box::new(DiskV2Buffer::new(
+                "disk_limit".to_string(),
+                data_dir,
+                NonZeroU64::new(268_435_488).unwrap(),
+            ));
+            let parts = buffer
+                .into_buffer_parts(handle.clone())
+                .await
+                .expect("disk buffer should build");
+
+            let snapshot = handle.snapshot();
+            assert_eq!(snapshot.max_size_bytes, 268_435_488);
+            assert_eq!(snapshot.max_size_events, 0);
+            drop(parts);
+        }
+    })
+    .await;
+}

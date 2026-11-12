@@ -1,0 +1,2 @@
+Fixed byte-bounded sink memory buffers (`buffer.type = "memory"` with `max_size`) reporting their byte limit as an event limit: they now emit `vector_buffer_max_size_bytes` / `vector_buffer_max_byte_size` instead of `vector_buffer_max_size_events` / `vector_buffer_max_event_size`, so `vector_buffer_size_bytes / vector_buffer_max_size_bytes` gives the buffer fill ratio. Metrics only; `max_events` memory buffers and disk buffers are unchanged.
+https://github.com/databricks-eng/vector/pull/944
