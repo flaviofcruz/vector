@@ -23,7 +23,7 @@ use tower::{Layer, Service, timeout::error::Elapsed};
 use tracing::{info, warn};
 use vector_lib::codecs::encoding::{BatchEncoder, BatchOutput, BatchSerializerConfig};
 use vector_lib::finalization::{EventFinalizers, Finalizable};
-use vector_lib::internal_event::{CodedError, ComponentEventsDropped, UNINTENTIONAL};
+use vector_lib::internal_event::{CodedError, ComponentEventsDroppedWithCode, UNINTENTIONAL};
 use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
 use vector_lib::stream::DriverResponse;
 
@@ -1299,9 +1299,10 @@ impl Service<ZerobusRequest> for ZerobusService {
             // through would mark the events Rejected, and ack-enabled sources that keep failed
             // messages would redeliver the whole object, re-ingesting its valid rows each time.
             if record_batch.num_rows() == 0 {
-                emit!(ComponentEventsDropped::<UNINTENTIONAL> {
+                emit!(ComponentEventsDroppedWithCode::<UNINTENTIONAL> {
                     count: event_count,
                     reason: "wire_to_arrow dropped every row in the batch",
+                    error_code: "wire_to_arrow_dropped_rows",
                 });
                 return Ok(ZerobusResponse::delivered_nothing_sent());
             }
@@ -2927,6 +2928,7 @@ mod tests {
         use vector_lib::event::LogEvent;
         use vector_lib::json_size::JsonSize;
 
+        vector_lib::metrics::init_test();
         let uc_schema = UnityCatalogTableSchema {
             name: "test_table".into(),
             catalog_name: "test_cat".into(),
@@ -3015,6 +3017,24 @@ mod tests {
         assert!(
             service.has_active_stream().await,
             "stream must not be discarded"
+        );
+        // The drop must carry an error_code so coded-discard alerts can explain it.
+        let discarded: Vec<_> = vector_lib::metrics::Controller::get()
+            .unwrap()
+            .capture_metrics()
+            .into_iter()
+            .filter(|m| m.name() == "component_discarded_events_total")
+            .map(|m| {
+                let code = m.tags().and_then(|t| t.get("error_code")).map(String::from);
+                (code, m.value().clone())
+            })
+            .collect();
+        assert_eq!(
+            discarded,
+            vec![(
+                Some("wire_to_arrow_dropped_rows".to_string()),
+                vector_lib::event::MetricValue::Counter { value: 1.0 }
+            )]
         );
     }
 
