@@ -248,6 +248,8 @@ vector-vrl-metrics = { path = "lib/vector-vrl-metrics" }
 loki-logproto = { path = "lib/loki-logproto", optional = true }
 # TODO: switch back to a crates.io version once 3.2.0 (with binary `-bin` header support) is published.
 databricks-zerobus-ingest-sdk = { git = "https://github.com/databricks/zerobus-sdk", rev = "ea30d1368d0975aabf1d2af8e1937e4cd4a12775", optional = true, features = ["arrow-flight"] }
+# The SDK repo's vendored arrow-flight (already in the lockfile via the SDK); used by the databricks bench's fake Zerobus server.
+arrow-flight = { git = "https://github.com/databricks/zerobus-sdk", rev = "ea30d1368d0975aabf1d2af8e1937e4cd4a12775", optional = true }
 
 # Tokio / Futures
 async-stream.workspace = true
@@ -513,6 +515,7 @@ metrics-util = { workspace = true, features = ["debugging"] }
 proptest.workspace = true
 quickcheck = "1.0.3"
 reqwest.workspace = true
+rand_chacha = { version = "0.9", default-features = false }
 rstest = { version = "0.26.1" }
 serial_test.workspace = true
 similar-asserts = "1.7.0"
@@ -1156,6 +1159,7 @@ statistic-benches = []
 remap-benches = ["transforms-remap"]
 transform-benches = ["transforms-filter", "transforms-dedupe", "transforms-reduce", "transforms-route"]
 codecs-benches = []
+databricks-benches = ["vector-lib/prometheus", "dep:prost", "codecs-arrow", "dep:arrow-flight", "dep:tonic-014"]
 loki-benches = ["sinks-loki"]
 enrichment-tables-benches = ["enrichment-tables-geoip", "enrichment-tables-mmdb", "enrichment-tables-memory"]
 proptest = ["dep:proptest", "dep:proptest-derive", "vrl/proptest"]
@@ -1208,3 +1212,15 @@ name = "codecs"
 path = "benches/codecs/main.rs"
 harness = false
 required-features = ["codecs-benches"]
+
+[[bench]]
+name = "databricks"
+path = "benches/databricks/main.rs"
+harness = false
+test = false
+required-features = ["databricks-benches"]
+
+[[test]]
+name = "databricks_bench"
+path = "benches/databricks/unit_tests.rs"
+required-features = ["databricks-benches"]
