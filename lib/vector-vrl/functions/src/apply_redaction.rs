@@ -4,6 +4,11 @@
 //! and only the redaction walk runs per record. Fallible: a bad plan fails compilation, a malformed
 //! record fails at runtime.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use tracing::warn;
 use vector_redaction_executor as executor;
 
 use enrichment::{Case, Condition, IndexHandle, TableRegistry, TableSearch};
@@ -12,8 +17,18 @@ use vrl::prelude::*;
 use crate::redaction::resolver::{PlanKey, PlanResolver};
 
 const PUID_MAPPING_TABLE: &str = "puid_mapping";
+const FEDRAMP_ALLOWLIST_TABLE: &str = "fedramp_allowlist";
+const WORKSPACE_ID_FIELD: &str = "workspace_id";
+const ACCOUNT_ID_FIELD: &str = "account_id";
+const METASTORE_ID_FIELD: &str = "metastore_id";
+const DEFAULT_ALLOWLIST_REFRESH_SECS: i64 = 60;
+const ALLOWLIST_RETRY_AFTER: Duration = Duration::from_secs(5);
 const USER_ID_FIELD: &str = "user_id";
 const PUID_FIELD: &str = "puid";
+
+/// Set once a non-empty allowlist snapshot has been pushed. Process-wide like the executor's
+/// allowlist it mirrors, so an empty table only clears a snapshot that really existed.
+static ALLOWLIST_LOADED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug)]
 pub struct ApplyRedaction;
@@ -48,6 +63,25 @@ impl Function for ApplyRedaction {
             for LP pipeline plans; the LP splice sets this true, while Governator omits it (defaults
             false) to scope enforcement to the LP write path.
 
+            Opt-in extensions (every one defaults to the behavior above):
+
+            `shape_mode` is an optional literal string, mutually exclusive with `enforce_shapes`:
+            \"off\" and \"enforce_all\" equal `enforce_shapes: false` / `true`; \"match_attribution\"
+            resolves enforcement per record like classic Lumberjack: the record's in-proto
+            workspace/metastore/account id decides, falling back to the `workspace_id`,
+            `metastore_id` and `account_id` arguments (envelope ids; integers or strings, null or
+            absent = none). The allowlists are a snapshot of the `fedramp_allowlist` enrichment
+            table (`workspace_id` integer column; optional `account_id` / `metastore_id` string
+            columns), re-read at most every `allowlist_refresh_secs` (literal, default 60). Where
+            that table is not registered the mode is inert (no enforcement), like an empty classic
+            allowlist, and compiling logs a warning. Until a non-empty snapshot has loaded, a table
+            that cannot be read or has no rows leaves the executor enforcing (fail closed).
+
+            `keep_original` is an optional literal boolean (default false = wipe). True keeps the
+            non-centralizable fields, like classic Lumberjack outside prod.
+
+            `shard_name` is an optional per-record string passed to the executor for PUID derivation.
+
             The function is fallible (call it as `apply_redaction!(...)`): it fails if the plan
             cannot be read or registered at compile time, or if the record is not valid protobuf at
             runtime.
@@ -69,6 +103,41 @@ impl Function for ApplyRedaction {
             Parameter {
                 keyword: "enforce_shapes",
                 kind: kind::BOOLEAN,
+                required: false,
+            },
+            Parameter {
+                keyword: "shape_mode",
+                kind: kind::BYTES,
+                required: false,
+            },
+            Parameter {
+                keyword: "keep_original",
+                kind: kind::BOOLEAN,
+                required: false,
+            },
+            Parameter {
+                keyword: "allowlist_refresh_secs",
+                kind: kind::INTEGER,
+                required: false,
+            },
+            Parameter {
+                keyword: "workspace_id",
+                kind: kind::ANY,
+                required: false,
+            },
+            Parameter {
+                keyword: "account_id",
+                kind: kind::ANY,
+                required: false,
+            },
+            Parameter {
+                keyword: "metastore_id",
+                kind: kind::ANY,
+                required: false,
+            },
+            Parameter {
+                keyword: "shard_name",
+                kind: kind::ANY,
                 required: false,
             },
         ]
@@ -110,24 +179,105 @@ impl Function for ApplyRedaction {
             }) as Box<dyn DiagnosticMessage>
         })?;
 
-        // A literal (not a per-record expression) so the enforcement verdict is a static property
-        // of the VRL program: record content cannot flip the fail-closed gate off. Absent => Off.
-        let enforcement = match arguments.optional_literal("enforce_shapes", state)? {
+        // A literal (not a per-record expression) so the mode is a static property of the VRL
+        // program. Under match_attribution the record's attribution ids decide per record; without
+        // the allowlist table the mode is Off.
+        let compile_error = |message: &str| {
+            Box::new(ExpressionError::Error {
+                message: format!("apply_redaction: {message}"),
+                labels: vec![],
+                notes: vec![],
+            }) as Box<dyn DiagnosticMessage>
+        };
+        let enforce_shapes = match arguments.optional_literal("enforce_shapes", state)? {
+            Some(value) => Some(
+                value
+                    .try_boolean()
+                    .map_err(|_| compile_error("enforce_shapes must be a boolean"))?,
+            ),
+            None => None,
+        };
+        let shape_mode = match arguments.optional_literal("shape_mode", state)? {
+            Some(value) => Some(
+                value
+                    .try_bytes_utf8_lossy()
+                    .map_err(|_| compile_error("shape_mode must be a string"))?
+                    .into_owned(),
+            ),
+            None => None,
+        };
+        let enforcement = match (enforce_shapes, shape_mode.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err(compile_error(
+                    "enforce_shapes and shape_mode are mutually exclusive",
+                ));
+            }
+            (Some(true), None) | (None, Some("enforce_all")) => executor::ShapeEnforcement::On,
+            (Some(false), None) | (None, Some("off")) | (None, None) => {
+                executor::ShapeEnforcement::Off
+            }
+            (None, Some("match_attribution")) => executor::ShapeEnforcement::MatchAttribution,
+            (None, Some(other)) => {
+                return Err(compile_error(&format!(
+                    "shape_mode must be \"off\", \"enforce_all\" or \"match_attribution\", got \"{other}\""
+                )));
+            }
+        };
+        let keep_mode = match arguments.optional_literal("keep_original", state)? {
             Some(value) => {
-                let enforce = value.try_boolean().map_err(|_| {
-                    Box::new(ExpressionError::Error {
-                        message: "apply_redaction: enforce_shapes must be a boolean".to_owned(),
-                        labels: vec![],
-                        notes: vec![],
-                    }) as Box<dyn DiagnosticMessage>
-                })?;
-                if enforce {
-                    executor::ShapeEnforcement::On
+                let keep = value
+                    .try_boolean()
+                    .map_err(|_| compile_error("keep_original must be a boolean"))?;
+                if keep {
+                    executor::KeepMode::Keep
                 } else {
-                    executor::ShapeEnforcement::Off
+                    executor::KeepMode::Wipe
                 }
             }
-            None => executor::ShapeEnforcement::Off,
+            None => executor::KeepMode::Wipe,
+        };
+        let refresh_interval = match arguments.optional_literal("allowlist_refresh_secs", state)? {
+            Some(value) => {
+                let secs = value
+                    .try_integer()
+                    .map_err(|_| compile_error("allowlist_refresh_secs must be an integer"))?;
+                if secs < 1 {
+                    return Err(compile_error("allowlist_refresh_secs must be at least 1"));
+                }
+                secs
+            }
+            None => DEFAULT_ALLOWLIST_REFRESH_SECS,
+        };
+        let workspace_id = arguments.optional("workspace_id");
+        let account_id = arguments.optional("account_id");
+        let metastore_id = arguments.optional("metastore_id");
+        let shard_name = arguments.optional("shard_name");
+
+        // Only match_attribution consults the allowlist. Without the table the mode is inert.
+        let allowlist = if enforcement == executor::ShapeEnforcement::MatchAttribution {
+            match ctx.get_external_context_mut::<TableRegistry>() {
+                Some(registry)
+                    if registry
+                        .table_ids()
+                        .iter()
+                        .any(|table| table == FEDRAMP_ALLOWLIST_TABLE) =>
+                {
+                    Some(AllowlistRefresher::new(
+                        registry.as_readonly(),
+                        Duration::from_secs(refresh_interval.unsigned_abs()),
+                    ))
+                }
+                _ => {
+                    warn!(
+                        message = "apply_redaction: match_attribution has no fedramp_allowlist \
+                                   table, so shape enforcement is off for this program.",
+                        table = FEDRAMP_ALLOWLIST_TABLE,
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
 
         // Enrichment tables are optional for this function because a Vector instance can compile
@@ -169,6 +319,12 @@ impl Function for ApplyRedaction {
             message,
             resolver,
             enforcement,
+            keep_mode,
+            allowlist,
+            workspace_id,
+            account_id,
+            metastore_id,
+            shard_name,
             puid_lookup,
         }
         .as_expr())
@@ -210,13 +366,168 @@ impl PuidLookup {
     }
 }
 
+/// Keeps the executor's process-wide attribution allowlists current from the `fedramp_allowlist`
+/// enrichment table. Clones share one refresh deadline, so concurrent records trigger at most one
+/// scan per interval.
+#[derive(Clone, Debug)]
+struct AllowlistRefresher {
+    tables: TableSearch,
+    interval: Duration,
+    started: Instant,
+    next_refresh_ms: Arc<AtomicU64>,
+}
+
+impl AllowlistRefresher {
+    fn new(tables: TableSearch, interval: Duration) -> Self {
+        Self {
+            tables,
+            interval,
+            started: Instant::now(),
+            next_refresh_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn refresh_if_due(&self) {
+        let now = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let due = self.next_refresh_ms.load(Ordering::Acquire);
+        if now < due {
+            return;
+        }
+        // Exactly one caller wins the deadline and performs the scan.
+        let provisional = now.saturating_add(ALLOWLIST_RETRY_AFTER.as_millis() as u64);
+        if self
+            .next_refresh_ms
+            .compare_exchange(due, provisional, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        match self.push_snapshot() {
+            Ok(()) => {
+                let next = now.saturating_add(self.interval.as_millis() as u64);
+                self.next_refresh_ms.store(next, Ordering::Release);
+            }
+            Err(error) => {
+                // Keep the previous snapshot (or the executor's fail-closed default) and retry soon.
+                warn!(message = "apply_redaction: could not refresh the shape-enforcement allowlist.", %error);
+            }
+        }
+    }
+
+    /// Pushes the table as the executor's allowlist. Zero rows before a non-empty snapshot has
+    /// loaded are an unloaded table (an HTTP table whose first fetch failed starts empty), so they
+    /// fail the push and the executor keeps its fail-closed default. Rows with no usable id are
+    /// skipped and counted; if no row has one, the push fails for the same reason.
+    fn push_snapshot(&self) -> Result<(), String> {
+        let rows = self
+            .tables
+            .find_table_rows(
+                FEDRAMP_ALLOWLIST_TABLE,
+                Case::Sensitive,
+                &[],
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        let mut workspaces = Vec::with_capacity(rows.len());
+        let mut accounts = Vec::new();
+        let mut metastores = Vec::new();
+        let mut unusable = 0_usize;
+        for row in &rows {
+            let workspace = match row.get(WORKSPACE_ID_FIELD) {
+                Some(Value::Integer(id)) => Some(*id),
+                Some(Value::Bytes(text)) => String::from_utf8_lossy(text).parse::<i64>().ok(),
+                _ => None,
+            };
+            let account = row.get(ACCOUNT_ID_FIELD).and_then(text_id);
+            let metastore = row.get(METASTORE_ID_FIELD).and_then(text_id);
+            if workspace.is_none() && account.is_none() && metastore.is_none() {
+                unusable += 1;
+            }
+            // The executor keys workspaces by the two's-complement bit pattern.
+            workspaces.extend(workspace.map(|id| id as u64));
+            accounts.extend(account);
+            metastores.extend(metastore);
+        }
+        if unusable > 0 {
+            warn!(
+                message = "apply_redaction: skipped fedramp_allowlist rows with no usable id.",
+                skipped = unusable,
+                rows = rows.len(),
+            );
+        }
+        let usable = rows.len() - unusable;
+        if rows.is_empty() {
+            if !ALLOWLIST_LOADED.load(Ordering::Acquire) {
+                return Err(format!(
+                    "{FEDRAMP_ALLOWLIST_TABLE} has no rows yet; keeping the fail-closed default"
+                ));
+            }
+            warn!(
+                message = "apply_redaction: fedramp_allowlist is empty; match_attribution \
+                           enforces no workspace, account or metastore until it has rows.",
+                table = FEDRAMP_ALLOWLIST_TABLE,
+            );
+        } else if usable == 0 {
+            return Err(format!(
+                "{FEDRAMP_ALLOWLIST_TABLE} has {} rows but none has a usable id",
+                rows.len()
+            ));
+        }
+        executor::update_shape_enforcement_allowlists(&workspaces, &accounts, &metastores)
+            .map_err(|error| error.to_string())?;
+        if usable > 0 {
+            ALLOWLIST_LOADED.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+}
+
+/// An allowlist id column as text; empty text is no id.
+fn text_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Bytes(bytes) => {
+            let text = String::from_utf8_lossy(bytes).into_owned();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+/// Reads an optional per-record id expression as text: integers render in decimal, bytes as UTF-8,
+/// anything else (including null) is absent.
+fn optional_text(
+    expression: Option<&dyn Expression>,
+    ctx: &mut Context,
+) -> Result<Option<String>, ExpressionError> {
+    let Some(expression) = expression else {
+        return Ok(None);
+    };
+    Ok(match expression.resolve(ctx)? {
+        Value::Integer(id) => Some(id.to_string()),
+        Value::Bytes(text) => {
+            let text = String::from_utf8_lossy(&text).into_owned();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct ApplyRedactionFn {
     message: Box<dyn Expression>,
     resolver: PlanResolver,
-    // Resolved once at compile time from the literal `enforce_shapes` arg (see `compile`); a static
-    // property of the program, so record content cannot disable enforcement.
+    // Resolved once at compile time from the literal `enforce_shapes` / `shape_mode` args (see
+    // `compile`). Under match_attribution the record's attribution ids decide per record.
     enforcement: executor::ShapeEnforcement,
+    keep_mode: executor::KeepMode,
+    // Some only for match_attribution where the allowlist table is registered.
+    allowlist: Option<AllowlistRefresher>,
+    workspace_id: Option<Box<dyn Expression>>,
+    account_id: Option<Box<dyn Expression>>,
+    metastore_id: Option<Box<dyn Expression>>,
+    shard_name: Option<Box<dyn Expression>>,
     puid_lookup: Option<PuidLookup>,
 }
 
@@ -233,19 +544,41 @@ impl FunctionExpression for ApplyRedactionFn {
             .handle_for(&PlanKey::default())
             .ok_or("apply_redaction: no redaction plan registered")?;
 
+        // match_attribution without the allowlist table is inert, like an empty classic allowlist.
+        let enforcement = match (&self.allowlist, self.enforcement) {
+            (Some(allowlist), executor::ShapeEnforcement::MatchAttribution) => {
+                allowlist.refresh_if_due();
+                executor::ShapeEnforcement::MatchAttribution
+            }
+            (None, executor::ShapeEnforcement::MatchAttribution) => executor::ShapeEnforcement::Off,
+            (_, fixed) => fixed,
+        };
+
+        let workspace = optional_text(self.workspace_id.as_deref(), ctx)?;
+        let account = optional_text(self.account_id.as_deref(), ctx)?;
+        let metastore = optional_text(self.metastore_id.as_deref(), ctx)?;
+        let shard = optional_text(self.shard_name.as_deref(), ctx)?;
+        let context = executor::RedactContext {
+            shard_name: shard.as_deref(),
+            workspace_fallback: workspace.as_deref(),
+            account_fallback: account.as_deref(),
+            metastore_fallback: metastore.as_deref(),
+        };
+
         let redacted = if self.resolver.requires_puid_lookup() {
-            executor::redact_with_puid_lookup(
+            executor::redact_with_puid_lookup_and_context(
                 handle,
                 &bytes,
-                self.enforcement,
-                executor::KeepMode::Wipe,
+                enforcement,
+                self.keep_mode,
+                &context,
                 &|user_id| match &self.puid_lookup {
                     Some(lookup) => lookup.find(user_id),
                     None => executor::PuidLookupResult::Error,
                 },
             )
         } else {
-            executor::redact(handle, &bytes, self.enforcement)
+            executor::redact_with_context(handle, &bytes, enforcement, self.keep_mode, &context)
         }
         .map_err(|e| format!("apply_redaction: {e}"))?;
 
@@ -507,6 +840,11 @@ mod tests {
     }
 
     fn resolve_expression(expr: Box<dyn Expression>) -> Resolved {
+        resolve_ref(expr.as_ref())
+    }
+
+    /// Resolves without consuming the expression, so one compiled program can run several records.
+    fn resolve_ref(expr: &dyn Expression) -> Resolved {
         let mut runtime_state = state::RuntimeState::default();
         let mut object: Value = Value::Object(BTreeMap::new());
         let tz = TimeZone::default();
@@ -753,6 +1091,308 @@ mod tests {
             lookup_with_rows(vec![puid_row(Value::Bytes(Bytes::from_static(b"42")))]).find(7),
             executor::PuidLookupResult::Error
         );
+    }
+
+    #[derive(Clone)]
+    struct TestAllowlistTable {
+        rows: Arc<Mutex<Vec<ObjectMap>>>,
+    }
+
+    impl Table for TestAllowlistTable {
+        fn find_table_row<'a>(
+            &self,
+            _case: Case,
+            _condition: &'a [Condition<'a>],
+            _select: Option<&[String]>,
+            _wildcard: Option<&Value>,
+            _index: Option<IndexHandle>,
+        ) -> Result<ObjectMap, String> {
+            Err("single-row lookup is not used".to_owned())
+        }
+
+        fn find_table_rows<'a>(
+            &self,
+            _case: Case,
+            condition: &'a [Condition<'a>],
+            _select: Option<&[String]>,
+            _wildcard: Option<&Value>,
+            _index: Option<IndexHandle>,
+        ) -> Result<Vec<ObjectMap>, String> {
+            assert!(
+                condition.is_empty(),
+                "the snapshot scan must be unconditional"
+            );
+            Ok(self.rows.lock().expect("rows lock").clone())
+        }
+
+        fn add_index(&mut self, _case: Case, _fields: &[&str]) -> Result<IndexHandle, String> {
+            Ok(IndexHandle(0))
+        }
+
+        fn index_fields(&self) -> Vec<(Case, Vec<String>)> {
+            Vec::new()
+        }
+
+        fn needs_reload(&self) -> bool {
+            false
+        }
+    }
+
+    fn workspace_rows(workspaces: &[i64]) -> Vec<ObjectMap> {
+        workspaces
+            .iter()
+            .map(|id| BTreeMap::from([(WORKSPACE_ID_FIELD.into(), Value::Integer(*id))]))
+            .collect()
+    }
+
+    fn registry_with_rows(rows: Vec<ObjectMap>) -> TableRegistry {
+        shared_registry(Arc::new(Mutex::new(rows)))
+    }
+
+    /// Shares the rows so a test can change what the table returns between refreshes.
+    fn shared_registry(rows: Arc<Mutex<Vec<ObjectMap>>>) -> TableRegistry {
+        let registry = TableRegistry::default();
+        let mut tables: HashMap<String, Box<dyn Table + Send + Sync>> = HashMap::new();
+        tables.insert(
+            FEDRAMP_ALLOWLIST_TABLE.to_owned(),
+            Box::new(TestAllowlistTable { rows }),
+        );
+        registry.load(tables);
+        registry
+    }
+
+    /// Plan with one shape-gated `PassThroughString` (field 4, no allowed shapes: dropped when the
+    /// record is enforced, kept otherwise).
+    fn write_shape_gated_plan() -> String {
+        let plan = plan_proto::RedactionPlanSet {
+            plans: vec![plan_proto::MessageRedactionPlan {
+                actions: vec![plan_proto::FieldActionEntry {
+                    field_number: Some(4),
+                    action: Some(plan_proto::FieldAction {
+                        action: Some(plan_proto::field_action::Action::PassThroughString(
+                            plan_proto::PassThroughString::default(),
+                        )),
+                    }),
+                }],
+                ..Default::default()
+            }],
+        };
+        let path = plan_path("shape_gated");
+        std::fs::write(&path, plan.encode_to_vec()).expect("write plan");
+        path.to_str().expect("utf-8 temp path").to_owned()
+    }
+
+    fn shaped_record() -> Vec<u8> {
+        vec![(4u8 << 3) | 2, 4, b't', b'e', b'x', b't']
+    }
+
+    fn compile_with_registry(
+        registry: Option<&TableRegistry>,
+        args: ArgumentList,
+    ) -> Box<dyn Expression> {
+        let mut config = CompileConfig::default();
+        if let Some(registry) = registry {
+            config.set_custom(registry.clone());
+        }
+        let mut cctx = FunctionCompileContext::new(Span::new(0, 0), config);
+        let expr = ApplyRedaction
+            .compile(&TypeState::default(), &mut cctx, args)
+            .expect("compile should succeed");
+        if let Some(registry) = registry {
+            registry.finish_load();
+        }
+        expr
+    }
+
+    /// One test (not several) because the executor's allowlist is process-wide: parallel
+    /// match_attribution tests would overwrite each other's snapshot. Order matters: the executor
+    /// starts unset, so the first push must be an empty or unusable table, not a real snapshot.
+    #[test]
+    fn match_attribution_resolves_envelope_ids_against_the_table_snapshot() {
+        // A registry can be finished (loaded) only once, so each run gets a fresh one.
+        let run = |rows: Option<Vec<ObjectMap>>, workspace: Value| {
+            let registry = rows.map(registry_with_rows);
+            let args = func_args![
+                message: Bytes::from(shaped_record()),
+                plan_file: write_shape_gated_plan(),
+                shape_mode: "match_attribution",
+                workspace_id: workspace,
+            ];
+            resolve_expression(compile_with_registry(registry.as_ref(), args.into()))
+                .expect("redaction should resolve")
+        };
+        let enforced = Value::Bytes(Bytes::new());
+        let kept = Value::Bytes(Bytes::from(shaped_record()));
+        let unusable_row = || -> Vec<ObjectMap> {
+            vec![BTreeMap::from([(
+                WORKSPACE_ID_FIELD.into(),
+                Value::from("not-an-id"),
+            )])]
+        };
+
+        // Without the table the mode is inert.
+        assert_eq!(run(None, Value::Integer(4242)), kept);
+
+        // Until a non-empty snapshot loads, an empty table fails closed, as does a table
+        // whose rows have no usable id.
+        assert_eq!(run(Some(vec![]), Value::Integer(4242)), enforced);
+        assert_eq!(run(Some(unusable_row()), Value::Integer(4242)), enforced);
+
+        let listed = || workspace_rows(&[4242, -5]);
+        assert_eq!(run(Some(listed()), Value::Integer(4242)), enforced);
+        assert_eq!(run(Some(listed()), Value::from("4242")), enforced);
+        assert_eq!(run(Some(listed()), Value::Integer(-5)), enforced);
+        assert_eq!(run(Some(listed()), Value::Integer(7)), kept);
+        assert_eq!(run(Some(listed()), Value::Null), kept);
+
+        // Once a snapshot has loaded, a table with only unusable rows keeps it (the push fails).
+        assert_eq!(run(Some(unusable_row()), Value::Integer(4242)), enforced);
+
+        // Then an empty table clears it, like an empty classic allowlist.
+        assert_eq!(run(Some(vec![]), Value::Integer(4242)), kept);
+
+        // A non-positive refresh interval is rejected at compile time.
+        let zero_refresh = func_args![
+            message: Bytes::from(shaped_record()),
+            plan_file: write_shape_gated_plan(),
+            shape_mode: "match_attribution",
+            allowlist_refresh_secs: 0_i64,
+        ];
+        let mut cctx = FunctionCompileContext::new(Span::new(0, 0), CompileConfig::default());
+        let compiled =
+            ApplyRedaction.compile(&TypeState::default(), &mut cctx, zero_refresh.into());
+        assert!(
+            compiled.is_err(),
+            "allowlist_refresh_secs: 0 must not compile"
+        );
+
+        // Refresh is throttled to allowlist_refresh_secs: a table change is seen only after the
+        // interval elapses. Kept last in this test because it leaves a populated allowlist.
+        let rows = Arc::new(Mutex::new(workspace_rows(&[4242])));
+        let registry = shared_registry(rows.clone());
+        let args = func_args![
+            message: Bytes::from(shaped_record()),
+            plan_file: write_shape_gated_plan(),
+            shape_mode: "match_attribution",
+            workspace_id: Value::Integer(4242),
+            allowlist_refresh_secs: 1_i64,
+        ];
+        let expr = compile_with_registry(Some(&registry), args.into());
+        assert_eq!(resolve_ref(expr.as_ref()).expect("redact"), enforced);
+        *rows.lock().expect("rows lock") = workspace_rows(&[7]);
+        assert_eq!(resolve_ref(expr.as_ref()).expect("redact"), enforced);
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(resolve_ref(expr.as_ref()).expect("redact"), kept);
+    }
+
+    #[test]
+    fn shape_mode_is_exclusive_with_enforce_shapes_and_validated() {
+        let compile = |args: ArgumentList| {
+            let mut cctx = FunctionCompileContext::new(Span::new(0, 0), CompileConfig::default());
+            ApplyRedaction
+                .compile(&TypeState::default(), &mut cctx, args)
+                .map(|_| ())
+                .map_err(|e| e.message())
+        };
+        let both = func_args![
+            message: Bytes::from(record(7, 9)),
+            plan_file: write_pass1_drop2_plan(),
+            enforce_shapes: true,
+            shape_mode: "enforce_all",
+        ];
+        assert!(
+            compile(both.into())
+                .expect_err("both args")
+                .contains("mutually exclusive")
+        );
+        let bad = func_args![
+            message: Bytes::from(record(7, 9)),
+            plan_file: write_pass1_drop2_plan(),
+            shape_mode: "sometimes",
+        ];
+        assert!(
+            compile(bad.into())
+                .expect_err("bad mode")
+                .contains("shape_mode must be")
+        );
+        for mode in ["off", "enforce_all"] {
+            let ok = func_args![
+                message: Bytes::from(record(7, 9)),
+                plan_file: write_pass1_drop2_plan(),
+                shape_mode: mode,
+            ];
+            compile(ok.into()).expect("fixed modes compile");
+        }
+    }
+
+    #[test]
+    fn enforce_all_mode_matches_enforce_shapes_true() {
+        for args in [
+            func_args![
+                message: Bytes::from(shaped_record()),
+                plan_file: write_shape_gated_plan(),
+                enforce_shapes: true,
+            ],
+            func_args![
+                message: Bytes::from(shaped_record()),
+                plan_file: write_shape_gated_plan(),
+                shape_mode: "enforce_all",
+            ],
+        ] {
+            assert_eq!(
+                resolve_expression(compile_with_registry(None, args.into())).expect("resolve"),
+                Value::Bytes(Bytes::new())
+            );
+        }
+    }
+
+    /// Field 1 is `mode_switch { wipe: Remove, keep: PassThrough }`.
+    fn write_mode_switch_plan() -> String {
+        use plan_proto::field_action::Action;
+
+        let wipe = plan_proto::FieldAction {
+            action: Some(Action::Remove(plan_proto::Remove {})),
+        };
+        let keep = plan_proto::FieldAction {
+            action: Some(Action::PassThrough(plan_proto::PassThrough {})),
+        };
+        let mode_switch = plan_proto::ModeSwitch {
+            wipe: Some(Box::new(wipe)),
+            keep: Some(Box::new(keep)),
+        };
+        let plan = plan_proto::RedactionPlanSet {
+            plans: vec![plan_proto::MessageRedactionPlan {
+                actions: vec![plan_proto::FieldActionEntry {
+                    field_number: Some(1),
+                    action: Some(plan_proto::FieldAction {
+                        action: Some(Action::ModeSwitch(Box::new(mode_switch))),
+                    }),
+                }],
+                ..Default::default()
+            }],
+        };
+        let path = plan_path("mode_switch");
+        std::fs::write(&path, plan.encode_to_vec()).expect("write plan");
+        path.to_str().expect("utf-8 temp path").to_owned()
+    }
+
+    #[test]
+    fn keep_original_defaults_to_wipe_and_opts_in_to_keep() {
+        let resolve = |keep: Option<bool>| {
+            let mut args = func_args![
+                message: Bytes::from(record(7, 9)),
+                plan_file: write_mode_switch_plan(),
+            ];
+            if let Some(keep) = keep {
+                args.insert("keep_original", keep.into());
+            }
+            resolve_expression(compile_with_registry(None, args.into())).expect("resolve")
+        };
+        let wiped = Value::Bytes(Bytes::new());
+        let kept = Value::Bytes(Bytes::from(vec![(1u8 << 3), 7u8]));
+        assert_eq!(resolve(None), wiped);
+        assert_eq!(resolve(Some(false)), wiped);
+        assert_eq!(resolve(Some(true)), kept);
     }
 
     /// A missing plan file fails at compile time. Matched on a substring since the full message

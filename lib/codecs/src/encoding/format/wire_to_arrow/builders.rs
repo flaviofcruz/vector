@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
-    LargeBinaryBuilder, LargeStringBuilder, ListArray, MapArray, StructArray,
+    ArrayRef, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int32Builder,
+    Int64Builder, LargeBinaryBuilder, LargeStringBuilder, ListArray, MapArray, StructArray,
     TimestampMicrosecondBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -29,11 +29,16 @@ pub enum TypedBuilder {
     Boolean(BooleanBuilder),
     LargeUtf8(LargeStringBuilder),
     LargeBinary(LargeBinaryBuilder),
-    /// Builder for a proto int64 field whose Arrow column is declared as
-    /// `Timestamp(Microsecond, ...)`. The source int64 is epoch-milliseconds, so
-    /// `append` scales it ms->us (x1000) before writing (see append.rs). A raw,
-    /// unscaled ms value written as micros lands ~1970.
+    /// Builder for a proto int64 or string field whose Arrow column is declared as
+    /// `Timestamp(Microsecond, ...)`. An int64 is epoch-milliseconds, which `append`
+    /// scales ms->us (x1000) before writing. A string is parsed as ISO-8601 straight to
+    /// micros, with epoch 0 when unparseable (see append.rs). A raw, unscaled ms value
+    /// written as micros lands ~1970.
     TimestampMicros(TimestampMicrosecondBuilder),
+    /// Builder for a proto int64 field whose Arrow column is `Date32` (a UC DATE column). The
+    /// source int64 is epoch-milliseconds; `append` writes `floor(ms / 86_400_000)` days (see
+    /// append.rs), matching classic's `new java.sql.Date(ms)` in a UTC JVM.
+    Date32(Date32Builder),
 }
 
 /// Rough per-value byte-length hint used to pre-size the data buffer for
@@ -60,6 +65,7 @@ impl TypedBuilder {
                 | DataType::LargeUtf8
                 | DataType::LargeBinary
                 | DataType::Timestamp(TimeUnit::Microsecond, _)
+                | DataType::Date32
         )
     }
 
@@ -94,6 +100,7 @@ impl TypedBuilder {
                 }
                 TypedBuilder::TimestampMicros(builder)
             }
+            DataType::Date32 => TypedBuilder::Date32(Date32Builder::with_capacity(capacity)),
             other => panic!("unsupported leaf DataType {other:?} (PoC scope)"),
         }
     }
@@ -110,6 +117,7 @@ impl TypedBuilder {
             TypedBuilder::LargeUtf8(b) => b.append_null(),
             TypedBuilder::LargeBinary(b) => b.append_null(),
             TypedBuilder::TimestampMicros(b) => b.append_null(),
+            TypedBuilder::Date32(b) => b.append_null(),
         }
     }
 
@@ -125,6 +133,7 @@ impl TypedBuilder {
             TypedBuilder::LargeUtf8(b) => Arc::new(b.finish()),
             TypedBuilder::LargeBinary(b) => Arc::new(b.finish()),
             TypedBuilder::TimestampMicros(b) => Arc::new(b.finish()),
+            TypedBuilder::Date32(b) => Arc::new(b.finish()),
         }
     }
 }
@@ -861,7 +870,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unsupported leaf DataType")]
     fn unsupported_type_panics() {
-        // Date32 is not in our scope.
-        let _ = TypedBuilder::new(&DataType::Date32, 1);
+        // Date64 is not in our scope.
+        let _ = TypedBuilder::new(&DataType::Date64, 1);
     }
 }

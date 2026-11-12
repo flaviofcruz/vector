@@ -102,7 +102,7 @@ impl ScalarKind {
             ) => true,
             (
                 ScalarKind::Int64 | ScalarKind::SInt64 | ScalarKind::SFixed64,
-                DataType::Int64 | DataType::Timestamp(TimeUnit::Microsecond, _),
+                DataType::Int64 | DataType::Timestamp(TimeUnit::Microsecond, _) | DataType::Date32,
             ) => true,
             // `uint64`/`fixed64` → signed `Int64`, same no-unsigned-in-Delta reason.
             // Deliberately `Int64` only and NOT `Timestamp(Microsecond)`: span's
@@ -117,6 +117,9 @@ impl ScalarKind {
             (ScalarKind::Double, DataType::Float64) => true,
             (ScalarKind::Bool, DataType::Boolean) => true,
             (ScalarKind::String, DataType::LargeUtf8) => true,
+            // A string annotated `spark_data_type = TimestampType` holds an ISO-8601 instant;
+            // classic parses it into a timestamp (epoch 0 when unparseable). See append.rs.
+            (ScalarKind::String, DataType::Timestamp(TimeUnit::Microsecond, _)) => true,
             (ScalarKind::Bytes, DataType::LargeBinary) => true,
             _ => false,
         }
@@ -453,6 +456,12 @@ impl MessagePlan {
                     (Kind::Enum(enum_desc), DataType::LargeUtf8, false) => {
                         PlanSlot::EnumString(enum_desc.clone())
                     }
+                    // Message-typed field whose Arrow column is BINARY (not a struct): an opaque
+                    // binary column. The sub-message's LEN payload is copied verbatim, so it is
+                    // identical to the bytes `from_protobuf` decodes downstream.
+                    (Kind::Message(_), DataType::LargeBinary, false) => {
+                        PlanSlot::Scalar(ScalarKind::Bytes)
+                    }
                     // Singular scalar.
                     (_, dt, false) if !matches!(dt, DataType::Struct(_) | DataType::List(_)) => {
                         validate_arrow_leaf_types(arrow_field.name(), dt)?;
@@ -496,6 +505,12 @@ impl MessagePlan {
                         PlanSlot::RepeatedVariant(VariantSource::Message(Arc::new(
                             VariantMessagePlan::new(inner_desc),
                         )))
+                    }
+                    // Repeated opaque message -> List<LargeBinary> (see the singular arm above).
+                    (Kind::Message(_), DataType::List(item_field), true)
+                        if item_field.data_type() == &DataType::LargeBinary =>
+                    {
+                        PlanSlot::RepeatedScalar(ScalarKind::Bytes)
                     }
                     // Repeated nested message -> Arrow List<Struct>.
                     (Kind::Message(inner_desc), DataType::List(element_field), true) => {
@@ -673,7 +688,7 @@ impl MessagePlan {
 
 /// Recursively walk an Arrow `DataType` tree and verify every primitive
 /// leaf is supported by [`TypedBuilder`]. Plan-build calls this so an
-/// unsupported leaf (e.g. `Date32`) surfaces as a clean
+/// unsupported leaf (e.g. `Date64`) surfaces as a clean
 /// [`WireToArrowError::UnsupportedArrowLeafType`] at serializer init,
 /// instead of panicking in `TypedBuilder::new` on the first batch.
 ///

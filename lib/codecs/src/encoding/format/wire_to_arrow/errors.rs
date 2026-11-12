@@ -167,7 +167,7 @@ pub enum WireToArrowError {
     },
 
     /// The Arrow schema declares a primitive leaf type the encoder can't
-    /// build a column for (e.g. `Date32`, `Time64`, decimal). Caught at
+    /// build a column for (e.g. `Date64`, `Time64`, decimal). Caught at
     /// plan-build so the failure surfaces at serializer init rather than
     /// panicking inside `TypedBuilder::new` on the first batch.
     #[snafu(display("Arrow field '{name}' has unsupported leaf data type {arrow_type}"))]

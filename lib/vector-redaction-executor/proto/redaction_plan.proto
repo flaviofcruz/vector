@@ -97,7 +97,16 @@ message FieldAction {
     EmptyString empty_string = 10;
     // Drop the field (planner fail-safe for an unresolvable redaction).
     TodoRemove todo_remove = 11;
+    // Action chosen at redact time by the deployment mode (wipe in prod, keep otherwise). Mirrors
+    // universe's redaction_plan.proto; needed here so plan inspection sees nested arms.
+    ModeSwitch mode_switch = 12;
   }
+}
+
+// Mirrors universe's ModeSwitch: `keep` applies under keep-mode (non-prod), `wipe` otherwise.
+message ModeSwitch {
+  optional FieldAction wipe = 1;
+  optional FieldAction keep = 2;
 }
 
 // Copy the field's bytes verbatim (centralizable field).

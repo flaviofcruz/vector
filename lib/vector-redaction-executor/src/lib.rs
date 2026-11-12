@@ -154,6 +154,15 @@ unsafe extern "C" {
         out_record: *mut ForeignBuffer,
         out_error: *mut ForeignBuffer,
     ) -> i32;
+    fn db_redactor_update_shape_enforcement_allowlists(
+        workspaces: *const u64,
+        workspaces_len: usize,
+        accounts: *const ForeignStringView,
+        accounts_len: usize,
+        metastores: *const ForeignStringView,
+        metastores_len: usize,
+        out_error: *mut ForeignBuffer,
+    ) -> i32;
     fn db_redactor_field_value_conforms(
         shapes: *const i32,
         shapes_len: usize,
@@ -230,6 +239,40 @@ impl std::error::Error for RedactError {}
 pub enum ShapeEnforcement {
     Off,
     On,
+    /// Resolve enforcement per record from its workspace/metastore/account attribution against the
+    /// allowlists pushed by [`update_shape_enforcement_allowlists`] (classic `match_attribution`).
+    /// Fails closed (enforces) until the first allowlist push.
+    MatchAttribution,
+}
+
+#[cfg(feature = "static-executor")]
+impl ShapeEnforcement {
+    /// The `shape_enforcement_mode` byte of the C ABI.
+    fn abi_mode(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::On => 1,
+            Self::MatchAttribution => 2,
+        }
+    }
+}
+
+/// Per-record context passed to the executor alongside the record bytes. The default (all absent)
+/// is what the context-free entry points pass.
+#[cfg(feature = "static-executor")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RedactContext<'a> {
+    pub shard_name: Option<&'a str>,
+    /// Envelope attribution ids, used under [`ShapeEnforcement::MatchAttribution`] only when the
+    /// record carries no in-proto id of that kind.
+    pub workspace_fallback: Option<&'a str>,
+    pub account_fallback: Option<&'a str>,
+    pub metastore_fallback: Option<&'a str>,
+}
+
+#[cfg(feature = "static-executor")]
+fn optional_view(value: Option<&str>) -> ForeignStringView {
+    value.map_or(ForeignStringView::EMPTY, |v| string_view(v.as_bytes()))
 }
 
 #[cfg(feature = "static-executor")]
@@ -252,35 +295,48 @@ pub enum PuidLookupResult {
 /// target type determines whether the executor emits a native int64 or signed decimal text.
 #[cfg(feature = "static-executor")]
 pub fn plan_requires_puid_lookup(plan_bytes: &[u8]) -> Result<bool, RedactError> {
-    use plan_proto::field_action::Action;
-
     let plan = plan_proto::RedactionPlanSet::decode(plan_bytes)
         .map_err(|error| RedactError::InvalidPlan(error.to_string()))?;
     let mut requires_puid_lookup = false;
     for entry in plan.plans.iter().flat_map(|plan| &plan.actions) {
-        let Some(Action::RedactFrom(redact_from)) = entry
-            .action
-            .as_ref()
-            .and_then(|action| action.action.as_ref())
-        else {
-            continue;
-        };
-        if redact_from.transform != Some(plan_proto::RedactFromTransform::GeneratePuid as i32) {
-            continue;
+        if let Some(action) = entry.action.as_ref() {
+            requires_puid_lookup |= action_requires_puid_lookup(action)?;
         }
-        if !matches!(
-            redact_from
-                .puid_target_type
-                .and_then(|value| plan_proto::PuidTargetType::try_from(value).ok()),
-            Some(plan_proto::PuidTargetType::String | plan_proto::PuidTargetType::Int64)
-        ) {
-            return Err(RedactError::InvalidPlan(
-                "Vector GENERATE_PUID targets must be STRING or INT64".to_owned(),
-            ));
-        }
-        requires_puid_lookup = true;
     }
     Ok(requires_puid_lookup)
+}
+
+/// Whether `action` (or either arm of a nested `ModeSwitch`) is a `GENERATE_PUID` derivation.
+#[cfg(feature = "static-executor")]
+fn action_requires_puid_lookup(action: &plan_proto::FieldAction) -> Result<bool, RedactError> {
+    use plan_proto::field_action::Action;
+
+    match action.action.as_ref() {
+        Some(Action::RedactFrom(redact_from)) => {
+            if redact_from.transform != Some(plan_proto::RedactFromTransform::GeneratePuid as i32) {
+                return Ok(false);
+            }
+            if !matches!(
+                redact_from
+                    .puid_target_type
+                    .and_then(|value| plan_proto::PuidTargetType::try_from(value).ok()),
+                Some(plan_proto::PuidTargetType::String | plan_proto::PuidTargetType::Int64)
+            ) {
+                return Err(RedactError::InvalidPlan(
+                    "Vector GENERATE_PUID targets must be STRING or INT64".to_owned(),
+                ));
+            }
+            Ok(true)
+        }
+        Some(Action::ModeSwitch(switch)) => {
+            let mut requires = false;
+            for arm in [&switch.wipe, &switch.keep].into_iter().flatten() {
+                requires |= action_requires_puid_lookup(arm)?;
+            }
+            Ok(requires)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[cfg(feature = "static-executor")]
@@ -336,24 +392,40 @@ pub fn redact_with_mode(
     enforcement: ShapeEnforcement,
     keep_mode: KeepMode,
 ) -> Result<Bytes, RedactError> {
+    redact_with_context(
+        handle,
+        record,
+        enforcement,
+        keep_mode,
+        &RedactContext::default(),
+    )
+}
+
+/// [`redact_with_mode`] with the per-record shard name and envelope attribution fallbacks.
+#[cfg(feature = "static-executor")]
+pub fn redact_with_context(
+    handle: u64,
+    record: &[u8],
+    enforcement: ShapeEnforcement,
+    keep_mode: KeepMode,
+    context: &RedactContext<'_>,
+) -> Result<Bytes, RedactError> {
     ensure_abi_version()?;
     let mut output = ForeignBuffer::EMPTY;
     let mut error = ForeignBuffer::EMPTY;
-    // SAFETY: The record remains live for the call. The output pointers reference distinct,
-    // aligned, initialized locals and do not alias the input.
+    // SAFETY: The record and every context string remain live for the call. The output pointers
+    // reference distinct, aligned, initialized locals and do not alias the input.
     let status = unsafe {
         db_redactor_redact(
             handle,
             record.as_ptr(),
             record.len(),
-            u8::from(enforcement == ShapeEnforcement::On),
+            enforcement.abi_mode(),
             u8::from(keep_mode == KeepMode::Keep),
-            // TODO: Plumb shard_name, workspace_fallback, account_fallback, and
-            // metastore_fallback from the Vector event context.
-            ForeignStringView::EMPTY,
-            ForeignStringView::EMPTY,
-            ForeignStringView::EMPTY,
-            ForeignStringView::EMPTY,
+            optional_view(context.shard_name),
+            optional_view(context.workspace_fallback),
+            optional_view(context.account_fallback),
+            optional_view(context.metastore_fallback),
             &mut output,
             &mut error,
         )
@@ -374,23 +446,47 @@ pub fn redact_with_puid_lookup<F>(
 where
     F: Fn(i64) -> PuidLookupResult,
 {
+    redact_with_puid_lookup_and_context(
+        handle,
+        record,
+        enforcement,
+        keep_mode,
+        &RedactContext::default(),
+        lookup,
+    )
+}
+
+/// [`redact_with_puid_lookup`] with the per-record shard name and envelope attribution fallbacks.
+#[cfg(feature = "static-executor")]
+pub fn redact_with_puid_lookup_and_context<F>(
+    handle: u64,
+    record: &[u8],
+    enforcement: ShapeEnforcement,
+    keep_mode: KeepMode,
+    context: &RedactContext<'_>,
+    lookup: &F,
+) -> Result<Bytes, RedactError>
+where
+    F: Fn(i64) -> PuidLookupResult,
+{
     ensure_abi_version()?;
     let mut output = ForeignBuffer::EMPTY;
     let mut error = ForeignBuffer::EMPTY;
     let lookup_context = ptr::from_ref(lookup).cast_mut().cast::<c_void>();
-    // SAFETY: The record and lookup remain live for this synchronous call. The callback context
-    // points to `lookup`, and both output pointers reference distinct initialized locals.
+    // SAFETY: The record, context strings and lookup remain live for this synchronous call. The
+    // callback context points to `lookup`, and both output pointers reference distinct initialized
+    // locals.
     let status = unsafe {
         db_redactor_redact_with_puid_lookup(
             handle,
             record.as_ptr(),
             record.len(),
-            u8::from(enforcement == ShapeEnforcement::On),
+            enforcement.abi_mode(),
             u8::from(keep_mode == KeepMode::Keep),
-            ForeignStringView::EMPTY,
-            ForeignStringView::EMPTY,
-            ForeignStringView::EMPTY,
-            ForeignStringView::EMPTY,
+            optional_view(context.shard_name),
+            optional_view(context.workspace_fallback),
+            optional_view(context.account_fallback),
+            optional_view(context.metastore_fallback),
             Some(puid_lookup_callback::<F>),
             lookup_context,
             &mut output,
@@ -399,6 +495,39 @@ where
     };
     status_result(status, &error)?;
     Ok(output.into_bytes())
+}
+
+/// Atomically replaces the process-wide workspace/account/metastore allowlists consulted by
+/// [`ShapeEnforcement::MatchAttribution`]. Workspace ids are the two's-complement `u64` bit pattern
+/// of the signed id.
+#[cfg(feature = "static-executor")]
+pub fn update_shape_enforcement_allowlists(
+    workspaces: &[u64],
+    accounts: &[String],
+    metastores: &[String],
+) -> Result<(), RedactError> {
+    ensure_abi_version()?;
+    let account_views: Vec<ForeignStringView> =
+        accounts.iter().map(|v| string_view(v.as_bytes())).collect();
+    let metastore_views: Vec<ForeignStringView> = metastores
+        .iter()
+        .map(|v| string_view(v.as_bytes()))
+        .collect();
+    let mut error = ForeignBuffer::EMPTY;
+    // SAFETY: Every slice and the strings its views borrow remain live for the call; `error` is a
+    // distinct initialized local.
+    let status = unsafe {
+        db_redactor_update_shape_enforcement_allowlists(
+            workspaces.as_ptr(),
+            workspaces.len(),
+            account_views.as_ptr(),
+            account_views.len(),
+            metastore_views.as_ptr(),
+            metastore_views.len(),
+            &mut error,
+        )
+    };
+    status_result(status, &error)
 }
 
 #[cfg(feature = "static-executor")]
@@ -606,7 +735,7 @@ impl LpSplice {
                     _ => {
                         return Err(RedactError::InvalidArgument(format!(
                             "unknown splice input mode {mode:?}"
-                        )))
+                        )));
                     }
                 };
                 Ok((mode, path.to_owned()))
@@ -774,6 +903,155 @@ mod tests {
         output.push(value as u8);
     }
 
+    /// Root plan whose only action is a shape-gated `PassThroughString` on field 4 (dropped under
+    /// enforcement because it declares no allowed shapes), with in-proto workspace id on field 3.
+    fn attribution_plan() -> Vec<u8> {
+        use plan_proto::field_action::Action;
+
+        plan_proto::RedactionPlanSet {
+            plans: vec![plan_proto::MessageRedactionPlan {
+                actions: vec![plan_proto::FieldActionEntry {
+                    field_number: Some(4),
+                    action: Some(plan_proto::FieldAction {
+                        action: Some(Action::PassThroughString(
+                            plan_proto::PassThroughString::default(),
+                        )),
+                    }),
+                }],
+                workspace_id_field_number: Some(3),
+                account_id_field_number: Some(5),
+                metastore_id_field_number: Some(6),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn match_attribution_uses_envelope_fallback_and_pushed_allowlist() {
+        let handle = register_plan(&attribution_plan()).expect("plan should register");
+        let record = encode_string_field(4, "free text");
+
+        update_shape_enforcement_allowlists(&[4242], &["acct-1".to_owned()], &["ms-1".to_owned()])
+            .expect("allowlist should update");
+
+        let allowlisted = RedactContext {
+            workspace_fallback: Some("4242"),
+            ..Default::default()
+        };
+        let enforced = redact_with_context(
+            handle,
+            &record,
+            ShapeEnforcement::MatchAttribution,
+            KeepMode::Wipe,
+            &allowlisted,
+        )
+        .expect("redact");
+        assert!(
+            enforced.is_empty(),
+            "allowlisted workspace must be shape-enforced"
+        );
+
+        let other = RedactContext {
+            workspace_fallback: Some("7"),
+            ..Default::default()
+        };
+        let passed = redact_with_context(
+            handle,
+            &record,
+            ShapeEnforcement::MatchAttribution,
+            KeepMode::Wipe,
+            &other,
+        )
+        .expect("redact");
+        assert_eq!(passed.as_ref(), record.as_slice());
+
+        // Account and metastore fallbacks are checked against their own pushed lists.
+        let account_enforced = redact_with_context(
+            handle,
+            &record,
+            ShapeEnforcement::MatchAttribution,
+            KeepMode::Wipe,
+            &RedactContext {
+                account_fallback: Some("acct-1"),
+                ..Default::default()
+            },
+        )
+        .expect("redact");
+        assert!(
+            account_enforced.is_empty(),
+            "listed account must be enforced"
+        );
+
+        let account_passed = redact_with_context(
+            handle,
+            &record,
+            ShapeEnforcement::MatchAttribution,
+            KeepMode::Wipe,
+            &RedactContext {
+                account_fallback: Some("acct-2"),
+                ..Default::default()
+            },
+        )
+        .expect("redact");
+        assert_eq!(account_passed.as_ref(), record.as_slice());
+
+        let metastore_enforced = redact_with_context(
+            handle,
+            &record,
+            ShapeEnforcement::MatchAttribution,
+            KeepMode::Wipe,
+            &RedactContext {
+                metastore_fallback: Some("ms-1"),
+                ..Default::default()
+            },
+        )
+        .expect("redact");
+        assert!(
+            metastore_enforced.is_empty(),
+            "listed metastore must be enforced"
+        );
+
+        let metastore_passed = redact_with_context(
+            handle,
+            &record,
+            ShapeEnforcement::MatchAttribution,
+            KeepMode::Wipe,
+            &RedactContext {
+                metastore_fallback: Some("ms-2"),
+                ..Default::default()
+            },
+        )
+        .expect("redact");
+        assert_eq!(metastore_passed.as_ref(), record.as_slice());
+
+        // The in-proto id wins over the envelope fallback.
+        let mut in_proto = encode_varint_field(3, 4242);
+        in_proto.extend_from_slice(&record);
+        let in_proto_enforced = redact_with_context(
+            handle,
+            &in_proto,
+            ShapeEnforcement::MatchAttribution,
+            KeepMode::Wipe,
+            &other,
+        )
+        .expect("redact");
+        assert!(
+            !in_proto_enforced
+                .windows(record.len())
+                .any(|w| w == record.as_slice()),
+            "in-proto allowlisted workspace must drop the shaped string"
+        );
+        release_plan(handle);
+    }
+
+    fn encode_varint_field(field_number: u64, value: u64) -> Vec<u8> {
+        let mut output = Vec::new();
+        encode_varint(field_number << 3, &mut output);
+        encode_varint(value, &mut output);
+        output
+    }
+
     #[test]
     fn uses_current_abi_version() {
         assert_eq!(
@@ -882,6 +1160,40 @@ mod tests {
             assert!(plan_requires_puid_lookup(&puid_plan(target_type)).expect("plan should decode"));
         }
         assert!(!plan_requires_puid_lookup(&[0x0a, 0x00]).expect("minimal plan should decode"));
+    }
+
+    #[test]
+    fn detects_puid_inside_mode_switch_arms() {
+        use plan_proto::field_action::Action;
+
+        let puid = plan_proto::FieldAction {
+            action: Some(Action::RedactFrom(plan_proto::RedactFrom {
+                source_field_number: Some(1),
+                transform: Some(plan_proto::RedactFromTransform::GeneratePuid as i32),
+                puid_target_type: Some(plan_proto::PuidTargetType::Int64 as i32),
+                ..Default::default()
+            })),
+        };
+        let pass = plan_proto::FieldAction {
+            action: Some(Action::PassThrough(plan_proto::PassThrough {})),
+        };
+        for (wipe, keep) in [(puid.clone(), pass.clone()), (pass.clone(), puid.clone())] {
+            let plan = plan_proto::RedactionPlanSet {
+                plans: vec![plan_proto::MessageRedactionPlan {
+                    actions: vec![plan_proto::FieldActionEntry {
+                        field_number: Some(2),
+                        action: Some(plan_proto::FieldAction {
+                            action: Some(Action::ModeSwitch(Box::new(plan_proto::ModeSwitch {
+                                wipe: Some(Box::new(wipe)),
+                                keep: Some(Box::new(keep)),
+                            }))),
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+            };
+            assert!(plan_requires_puid_lookup(&plan.encode_to_vec()).expect("plan decodes"));
+        }
     }
 
     #[test]

@@ -19,6 +19,7 @@ vector-redaction-executor = { path = "../../vector-redaction-executor", optional
 dnstap-parser = { path = "../../dnstap-parser", optional = true }
 vector-vrl-metrics = { path = "../../vector-vrl-metrics", optional = true }
 serde_json = { workspace = true, optional = true }
+tracing.workspace = true
 
 [dev-dependencies]
 # The `apply_redaction` / resolver tests build a `RedactionPlanSet` to serialize as a plan file.

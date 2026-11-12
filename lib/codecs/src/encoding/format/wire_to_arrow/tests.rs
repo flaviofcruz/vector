@@ -1637,16 +1637,16 @@ fn plan_build_rejects_non_nullable_absent_column() {
 
 #[test]
 fn plan_build_rejects_unsupported_arrow_leaf_in_scalar_slot() {
-    // proto says `id: int32`, Arrow says `id: Date32`. Date32 isn't in
+    // proto says `id: int32`, Arrow says `id: Date64`. Date64 isn't in
     // `TypedBuilder::supports`, so plan-build must reject up front
     // rather than letting the first batch panic inside `TypedBuilder::new`.
     let desc = scalar_descriptor();
     let schema = Schema::new(vec![
         Field::new("name", DataType::LargeUtf8, true),
-        Field::new("id", DataType::Date32, true),
+        Field::new("id", DataType::Date64, true),
         Field::new("email", DataType::LargeUtf8, true),
     ]);
-    let err = WireToArrowEncoder::new(&desc, schema).expect_err("should reject Date32");
+    let err = WireToArrowEncoder::new(&desc, schema).expect_err("should reject Date64");
     assert!(
         matches!(
             &err,
@@ -1665,10 +1665,10 @@ fn plan_build_rejects_unsupported_arrow_leaf_in_absent_slot() {
     let desc = scalar_descriptor();
     let schema = Schema::new(vec![
         Field::new("name", DataType::LargeUtf8, true),
-        Field::new("created_at", DataType::Date32, true),
+        Field::new("created_at", DataType::Date64, true),
     ]);
     let err =
-        WireToArrowEncoder::new(&desc, schema).expect_err("should reject Date32 on absent slot");
+        WireToArrowEncoder::new(&desc, schema).expect_err("should reject Date64 on absent slot");
     assert!(
         matches!(
             &err,
@@ -3196,4 +3196,346 @@ proptest! {
         let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
         let _ = enc.encode_batch(&[Bytes::from(bytes)]);
     }
+}
+
+// -------------------------------------------------------------------------
+// Message-typed fields stored as opaque binary columns.
+// -------------------------------------------------------------------------
+
+/// `Row { Inner opaque = 1; repeated Inner opaques = 2; string name = 3; }`,
+/// `Inner { int32 a = 1; string b = 2; }`.
+fn opaque_message_descriptor() -> MessageDescriptor {
+    let field = |name: &str, number: i32, ty: ProtoType, label: Label, type_name: Option<&str>| {
+        FieldDescriptorProto {
+            name: Some(name.into()),
+            number: Some(number),
+            label: Some(label as i32),
+            r#type: Some(ty as i32),
+            type_name: type_name.map(str::to_owned),
+            ..Default::default()
+        }
+    };
+    let fd = FileDescriptorProto {
+        name: Some("opaque_test.proto".into()),
+        package: Some("opaque_test".into()),
+        message_type: vec![
+            DescriptorProto {
+                name: Some("Inner".into()),
+                field: vec![
+                    field("a", 1, ProtoType::Int32, Label::Optional, None),
+                    field("b", 2, ProtoType::String, Label::Optional, None),
+                ],
+                ..Default::default()
+            },
+            DescriptorProto {
+                name: Some("Row".into()),
+                field: vec![
+                    field(
+                        "opaque",
+                        1,
+                        ProtoType::Message,
+                        Label::Optional,
+                        Some(".opaque_test.Inner"),
+                    ),
+                    field(
+                        "opaques",
+                        2,
+                        ProtoType::Message,
+                        Label::Repeated,
+                        Some(".opaque_test.Inner"),
+                    ),
+                    field("name", 3, ProtoType::String, Label::Optional, None),
+                ],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let mut bytes = Vec::new();
+    FileDescriptorSet { file: vec![fd] }
+        .encode(&mut bytes)
+        .unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("opaque_test.Row")
+        .unwrap()
+}
+
+#[test]
+fn opaque_message_fields_become_binary_columns() {
+    let desc = opaque_message_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("opaque", DataType::LargeBinary, true),
+        Field::new(
+            "opaques",
+            DataType::List(Arc::new(Field::new("item", DataType::LargeBinary, true))),
+            true,
+        ),
+        Field::new("name", DataType::LargeUtf8, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // Inner { a: 7, b: "x" } = 08 07 12 01 78; Inner { a: 9 } = 08 09.
+    let inner_one = [0x08u8, 0x07, 0x12, 0x01, b'x'];
+    let inner_two = [0x08u8, 0x09];
+    let mut row = vec![0x0a, inner_one.len() as u8];
+    row.extend_from_slice(&inner_one);
+    row.extend_from_slice(&[0x12, inner_two.len() as u8]);
+    row.extend_from_slice(&inner_two);
+    row.extend_from_slice(&[0x12, inner_one.len() as u8]);
+    row.extend_from_slice(&inner_one);
+    row.extend_from_slice(&[0x1a, 0x02, b'o', b'k']);
+
+    let batch = enc.encode_batch(&[Bytes::from(row), Bytes::new()]).unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    let opaque = batch.column(0).as_binary::<i64>();
+    assert_eq!(opaque.value(0), inner_one);
+    assert!(opaque.is_null(1));
+    let list = batch.column(1).as_list::<i32>();
+    let items = list.value(0);
+    let items = items.as_binary::<i64>();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items.value(0), inner_two);
+    assert_eq!(items.value(1), inner_one);
+    assert_eq!(batch.column(2).as_string::<i64>().value(0), "ok");
+    // A message-typed field against a struct column keeps its struct handling.
+    let struct_schema = Schema::new(vec![Field::new(
+        "opaque",
+        DataType::Struct(ArrowFields::from(vec![Field::new(
+            "a",
+            DataType::Int32,
+            true,
+        )])),
+        true,
+    )]);
+    WireToArrowEncoder::new(&desc, struct_schema).unwrap();
+}
+
+#[test]
+fn opaque_message_field_against_other_scalar_columns_still_errors() {
+    let desc = opaque_message_descriptor();
+    let schema = Schema::new(vec![Field::new("opaque", DataType::Int64, true)]);
+    assert!(matches!(
+        WireToArrowEncoder::new(&desc, schema),
+        Err(WireToArrowError::UnsupportedKind { .. })
+    ));
+}
+
+// -------------------------------------------------------------------------
+// Classic-compatible date handling: int64 ms -> Date32, ISO-8601 string -> Timestamp.
+// -------------------------------------------------------------------------
+
+fn int64_row(value: i64) -> Bytes {
+    let mut row = vec![1u8 << 3];
+    encode_varint_into(&mut row, value as u64);
+    Bytes::from(row)
+}
+
+fn date32_encoder() -> WireToArrowEncoder {
+    let schema = Schema::new(vec![Field::new("event_time", DataType::Date32, true)]);
+    WireToArrowEncoder::new(&timestamp_descriptor(), schema).unwrap()
+}
+
+#[test]
+fn int64_ms_to_date32_matches_classic_utc_day() {
+    let enc = date32_encoder();
+    let ms_per_day = 86_400_000i64;
+    let cases: Vec<(i64, i32)> = vec![
+        (0, 0),                      // 1970-01-01, a real date and not null
+        (ms_per_day - 1, 0),         // last millisecond of the first day
+        (ms_per_day, 1),             // first millisecond of 1970-01-02
+        (1_700_000_000_000, 19_675), // 2023-11-14
+        (-1, -1),                    // 1969-12-31
+        (-ms_per_day, -1),           // exactly one day before the epoch
+        (-ms_per_day - 1, -2),       // floors, not truncates toward zero
+        (i64::MAX, i32::MAX),        // beyond the i32 day range saturates, never wraps
+        (i64::MIN, i32::MIN),
+    ];
+    let mut rows: Vec<Bytes> = cases.iter().map(|(ms, _)| int64_row(*ms)).collect();
+    rows.push(Bytes::new()); // absent field -> null
+    let batch = enc.encode_batch(&rows).unwrap();
+    assert_eq!(batch.num_rows(), cases.len() + 1);
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Date32Array>()
+        .expect("Date32Array");
+    for (i, (ms, days)) in cases.iter().enumerate() {
+        assert_eq!(col.value(i), *days, "ms={ms}");
+    }
+    assert!(col.is_null(cases.len()));
+}
+
+#[test]
+fn zigzag_int64_to_date32_uses_the_decoded_value() {
+    // sint64 field paired with a Date32 column: -1 ms is zigzag 1 and must land on 1969-12-31.
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_sint_date.proto".into()),
+        package: Some("wire_to_arrow_poc_test".into()),
+        message_type: vec![DescriptorProto {
+            name: Some("SintDate".into()),
+            field: vec![FieldDescriptorProto {
+                name: Some("d".into()),
+                number: Some(1),
+                label: Some(Label::Optional as i32),
+                r#type: Some(ProtoType::Sint64 as i32),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut bytes = Vec::new();
+    FileDescriptorSet { file: vec![fd] }
+        .encode(&mut bytes)
+        .unwrap();
+    let desc = DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_poc_test.SintDate")
+        .unwrap();
+    let enc = WireToArrowEncoder::new(
+        &desc,
+        Schema::new(vec![Field::new("d", DataType::Date32, true)]),
+    )
+    .unwrap();
+    let batch = enc.encode_batch(&[Bytes::from(vec![0x08, 0x01])]).unwrap();
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Date32Array>()
+        .unwrap();
+    assert_eq!(col.value(0), -1);
+}
+
+fn string_timestamp_descriptor() -> MessageDescriptor {
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_str_ts.proto".into()),
+        package: Some("wire_to_arrow_poc_test".into()),
+        message_type: vec![DescriptorProto {
+            name: Some("StrTs".into()),
+            field: vec![FieldDescriptorProto {
+                name: Some("ts".into()),
+                number: Some(1),
+                label: Some(Label::Optional as i32),
+                r#type: Some(ProtoType::String as i32),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut bytes = Vec::new();
+    FileDescriptorSet { file: vec![fd] }
+        .encode(&mut bytes)
+        .unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_poc_test.StrTs")
+        .unwrap()
+}
+
+fn string_row(text: &str) -> Bytes {
+    let mut row = vec![(1u8 << 3) | 2, text.len() as u8];
+    row.extend_from_slice(text.as_bytes());
+    Bytes::from(row)
+}
+
+#[test]
+fn iso_string_to_timestamp_matches_classic_instant_parse() {
+    let ts_type = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()));
+    let enc = WireToArrowEncoder::new(
+        &string_timestamp_descriptor(),
+        Schema::new(vec![Field::new("ts", ts_type, true)]),
+    )
+    .unwrap();
+    let seconds = 1_700_000_000i64 * 1_000_000;
+    let cases: Vec<(&str, i64)> = vec![
+        ("2023-11-14T22:13:20Z", seconds),
+        ("2023-11-14T23:13:20+01:00", seconds), // offset is applied
+        ("2023-11-14T22:13:20.123456789Z", seconds + 123_456), // sub-microsecond truncated
+        ("2023-11-14T22:13:20.5Z", seconds + 500_000),
+        ("1969-12-31T23:59:59.999999999Z", -1), // floors for pre-epoch instants
+        ("1970-01-01T00:00:00Z", 0),
+        ("not a date", 0),                      // unparseable -> epoch 0, row kept
+        ("", 0),                                // present but empty -> epoch 0
+        ("2023-11-14", 0),                      // date only is not an instant
+        ("2023-11-14 22:13:20Z", 0),            // no 'T'
+        ("2023-11-14T22:13:20.1234567890Z", 0), // >9 fraction digits fail like Instant.parse
+    ];
+    let mut rows: Vec<Bytes> = cases.iter().map(|(text, _)| string_row(text)).collect();
+    rows.push(Bytes::new()); // absent -> null
+    let batch = enc.encode_batch(&rows).unwrap();
+    assert_eq!(batch.num_rows(), cases.len() + 1, "no row may be dropped");
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+        .expect("TimestampMicrosecondArray");
+    for (i, (text, micros)) in cases.iter().enumerate() {
+        assert_eq!(col.value(i), *micros, "input {text:?}");
+    }
+    assert!(col.is_null(cases.len()));
+}
+
+#[test]
+fn existing_date_and_timestamp_pairings_are_unchanged() {
+    // int64 -> Int64 and int64 -> Timestamp keep their behavior.
+    let ts_type = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()));
+    let ts = WireToArrowEncoder::new(
+        &timestamp_descriptor(),
+        Schema::new(vec![Field::new("event_time", ts_type, true)]),
+    )
+    .unwrap();
+    let batch = ts.encode_batch(&[int64_row(1_700_000_000_000)]).unwrap();
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+        .unwrap();
+    assert_eq!(col.value(0), 1_700_000_000_000 * 1000);
+    let plain = WireToArrowEncoder::new(
+        &timestamp_descriptor(),
+        Schema::new(vec![Field::new("event_time", DataType::Int64, true)]),
+    )
+    .unwrap();
+    let batch = plain.encode_batch(&[int64_row(7)]).unwrap();
+    assert_eq!(
+        batch
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int64Type>()
+            .value(0),
+        7
+    );
+
+    // string -> LargeUtf8 stays text (not parsed).
+    let text = WireToArrowEncoder::new(
+        &string_timestamp_descriptor(),
+        Schema::new(vec![Field::new("ts", DataType::LargeUtf8, true)]),
+    )
+    .unwrap();
+    let batch = text
+        .encode_batch(&[string_row("2023-11-14T22:13:20Z")])
+        .unwrap();
+    assert_eq!(
+        batch.column(0).as_string::<i64>().value(0),
+        "2023-11-14T22:13:20Z"
+    );
+}
+
+#[test]
+fn unsupported_date_pairings_still_fail_plan_build() {
+    // string -> Date32, int32 -> Date32 and int64 -> Date64 were and remain plan-build errors.
+    let string_to_date = WireToArrowEncoder::new(
+        &string_timestamp_descriptor(),
+        Schema::new(vec![Field::new("ts", DataType::Date32, true)]),
+    );
+    assert!(matches!(
+        string_to_date,
+        Err(WireToArrowError::UnsupportedCombination { .. })
+    ));
+    let int64_to_date64 = WireToArrowEncoder::new(
+        &timestamp_descriptor(),
+        Schema::new(vec![Field::new("event_time", DataType::Date64, true)]),
+    );
+    assert!(int64_to_date64.is_err());
 }

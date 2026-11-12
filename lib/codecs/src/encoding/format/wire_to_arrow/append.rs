@@ -98,6 +98,38 @@ pub(super) fn wire_type_byte(wv: &WireValue) -> u8 {
     }
 }
 
+/// Milliseconds per day, for the int64 -> `Date32` coercion.
+const MS_PER_DAY: i64 = 86_400_000;
+
+/// Classic Lumberjack reads an int64 annotated `spark_data_type = DateType` as epoch milliseconds
+/// (`new java.sql.Date(ms)`); the DATE column holds the UTC day. `div_euclid` floors, so negative
+/// milliseconds land on the correct pre-1970 day. Days outside the `i32` range (far beyond any
+/// real date; Delta rejects them too) saturate instead of wrapping.
+fn epoch_ms_to_date32(ms: i64) -> i32 {
+    let days = ms.div_euclid(MS_PER_DAY);
+    i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX })
+}
+
+/// Classic parses an ISO-8601 instant string with `Instant.parse` and stores epoch 0 when that
+/// fails (neither null nor a dropped row). Accepts `Z` or a `+hh:mm` offset and 0-9 fractional
+/// digits (a longer fraction fails like `Instant.parse`); the result is truncated to microseconds.
+fn parse_iso_instant_micros(s: &str) -> i64 {
+    let fraction_digits = s
+        .split_once('.')
+        .map(|(_, rest)| rest.bytes().take_while(u8::is_ascii_digit).count())
+        .unwrap_or(0);
+    if fraction_digits > 9 {
+        return 0;
+    }
+    // `Instant.parse` requires the 'T' separator; chrono also accepts a space.
+    if !matches!(s.as_bytes().get(10), Some(b'T' | b't')) {
+        return 0;
+    }
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.timestamp_micros())
+        .unwrap_or(0)
+}
+
 /// Append one scalar `WireValue` into the matching typed Arrow builder.
 /// The only runtime error is a wire-type disagreement; (kind, builder)
 /// pairing is enforced when the plan is built.
@@ -127,6 +159,10 @@ pub(super) fn append_scalar_from_wire(
                     // microseconds, so scale ms->us. Without this the raw ms value written as
                     // micros lands ~1970. saturating_mul avoids an overflow panic.
                     b.append_value((v as i64).saturating_mul(1000));
+                    return Ok(());
+                }
+                TypedBuilder::Date32(b) => {
+                    b.append_value(epoch_ms_to_date32(v as i64));
                     return Ok(());
                 }
                 _ => {}
@@ -180,6 +216,10 @@ pub(super) fn append_scalar_from_wire(
                 TypedBuilder::TimestampMicros(b) => {
                     // ms -> micros (see the TimestampMicros scaling note above).
                     b.append_value(decode_zigzag64(v).saturating_mul(1000));
+                    return Ok(());
+                }
+                TypedBuilder::Date32(b) => {
+                    b.append_value(epoch_ms_to_date32(decode_zigzag64(v)));
                     return Ok(());
                 }
                 _ => {}
@@ -244,6 +284,10 @@ pub(super) fn append_scalar_from_wire(
                     b.append_value((v as i64).saturating_mul(1000));
                     return Ok(());
                 }
+                TypedBuilder::Date32(b) => {
+                    b.append_value(epoch_ms_to_date32(v as i64));
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -263,10 +307,20 @@ pub(super) fn append_scalar_from_wire(
         }
         ScalarKind::String => {
             let bytes = expect_len(wv)?;
-            if let TypedBuilder::LargeUtf8(b) = tb {
-                let s = std::str::from_utf8(bytes).map_err(|_| WireToArrowError::InvalidUtf8)?;
-                b.append_value(s);
-                return Ok(());
+            match tb {
+                TypedBuilder::LargeUtf8(b) => {
+                    let s =
+                        std::str::from_utf8(bytes).map_err(|_| WireToArrowError::InvalidUtf8)?;
+                    b.append_value(s);
+                    return Ok(());
+                }
+                TypedBuilder::TimestampMicros(b) => {
+                    let s =
+                        std::str::from_utf8(bytes).map_err(|_| WireToArrowError::InvalidUtf8)?;
+                    b.append_value(parse_iso_instant_micros(s));
+                    return Ok(());
+                }
+                _ => {}
             }
         }
         ScalarKind::Bytes => {
@@ -349,6 +403,10 @@ pub(super) fn append_proto3_default(kind: ScalarKind, tb: &mut TypedBuilder) {
                 b.append_value(0);
                 return;
             }
+            TypedBuilder::Date32(b) => {
+                b.append_value(0);
+                return;
+            }
             _ => {}
         },
         ScalarKind::UInt32 | ScalarKind::Fixed32 => match tb {
@@ -391,12 +449,18 @@ pub(super) fn append_proto3_default(kind: ScalarKind, tb: &mut TypedBuilder) {
                 return;
             }
         }
-        ScalarKind::String => {
-            if let TypedBuilder::LargeUtf8(b) = tb {
+        ScalarKind::String => match tb {
+            TypedBuilder::LargeUtf8(b) => {
                 b.append_value("");
                 return;
             }
-        }
+            // "" does not parse as an instant, so classic stores epoch 0.
+            TypedBuilder::TimestampMicros(b) => {
+                b.append_value(0);
+                return;
+            }
+            _ => {}
+        },
         ScalarKind::Bytes => {
             if let TypedBuilder::LargeBinary(b) = tb {
                 b.append_value(b"" as &[u8]);

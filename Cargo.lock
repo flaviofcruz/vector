@@ -14768,6 +14768,7 @@ dependencies = [
  "prost 0.12.6",
  "prost-reflect",
  "serde_json",
+ "tracing 0.1.44",
  "vector-redaction-executor",
  "vector-vrl-metrics",
  "vrl",
