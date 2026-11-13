@@ -176,9 +176,10 @@ unsafe extern "C" {
         value: ForeignStringView,
         out_conforms: *mut u8,
     ) -> i32;
-    fn db_redactor_lp_splice_register(
+    fn db_redactor_lp_splice_register_with_kind(
         descriptor_file: ForeignStringView,
         message_type: ForeignStringView,
+        subtable_kind: ForeignStringView,
         out_handle: *mut u64,
         out_inputs: *mut ForeignBuffer,
         out_error: *mut ForeignBuffer,
@@ -696,18 +697,30 @@ pub struct LpSplice {
 
 #[cfg(feature = "static-executor")]
 impl LpSplice {
-    /// Resolves the splice mapping against `message_type` in the descriptor-set file.
+    /// Resolves the splice mapping against `message_type` in the descriptor-set file, with no
+    /// subtable kind (the `subtable_kind` column is empty).
     pub fn register(descriptor_file: &str, message_type: &str) -> Result<Self, RedactError> {
+        Self::register_with_subtable_kind(descriptor_file, message_type, "")
+    }
+
+    /// [`LpSplice::register`] for a union table: `subtable_kind` is the constant written to the
+    /// `subtable_kind` column. Empty means none.
+    pub fn register_with_subtable_kind(
+        descriptor_file: &str,
+        message_type: &str,
+        subtable_kind: &str,
+    ) -> Result<Self, RedactError> {
         ensure_abi_version()?;
         let mut handle = 0;
         let mut inputs = ForeignBuffer::EMPTY;
         let mut error = ForeignBuffer::EMPTY;
-        // SAFETY: Both views borrow strings that stay live for the call. The output pointers
-        // reference distinct, aligned, initialized locals and do not alias either input.
+        // SAFETY: Each view borrows a string that stays live for the call. The output pointers
+        // reference distinct, aligned, initialized locals and do not alias any input.
         let status = unsafe {
-            db_redactor_lp_splice_register(
+            db_redactor_lp_splice_register_with_kind(
                 string_view(descriptor_file.as_bytes()),
                 string_view(message_type.as_bytes()),
+                string_view(subtable_kind.as_bytes()),
                 &mut handle,
                 &mut inputs,
                 &mut error,

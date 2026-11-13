@@ -90,7 +90,7 @@ run_step() {
 }
 
 verify_redaction_fixture() {
-  echo "05ec8a74d9b2b6621323ce294665b3c8b3a461cf612228800ba8bf601b1e6359  lib/vector-redaction-executor/tests/fixtures/linux-x86_64/libvector_redactor.a" | sha256sum --check -
+  echo "2913e3b4e7253b7fd8fc13330927fd33441e15c928d8e99a85b2a6ad8f09219e  lib/vector-redaction-executor/tests/fixtures/linux-x86_64/libvector_redactor.a" | sha256sum --check -
 }
 
 verify_clippy_exceptions_unchanged() {

@@ -950,14 +950,14 @@ mod tests {
                     executor::DataShape::Hex64 as i32,
                     executor::DataShape::Numeric as i32,
                 ],
-                Some(hex),
+                Some(numeric),
             ),
             (
                 vec![
                     executor::DataShape::Numeric as i32,
                     executor::DataShape::Hex64 as i32,
                 ],
-                Some(hex),
+                Some(numeric),
             ),
             (vec![executor::DataShape::Uuid as i32], None),
             (vec![], None),

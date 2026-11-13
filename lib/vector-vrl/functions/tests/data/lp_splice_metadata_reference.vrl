@@ -99,6 +99,9 @@ meta._log_metadata.vector_metadata.timestamp_ms = to_unix_timestamp(now(), unit:
 # _log_metadata.etl_metadata: the LP path never runs the classic ETL that stamps
 # ingestion_timestamp_ms, so this VA VRL stage is the equivalent ingestion moment.
 meta._log_metadata.etl_metadata.ingestion_timestamp_ms = to_unix_timestamp(now(), unit: "milliseconds")
+# The splice VRL stamps the target proto's byte length (classic's message_size_in_bytes) on
+# ._lp_message_size_in_bytes; the native mapping reads it with to_int.
+meta._log_metadata.etl_metadata.message_size_in_bytes = to_int(._lp_message_size_in_bytes) ?? 0
 meta._log_metadata.vector_metadata.location_metadata.cloud_provider = get_env_var("CLOUD_PROVIDER") ?? ""
 meta._log_metadata.vector_metadata.location_metadata.cloud_provider_region = get_env_var("CLOUD_REGION") ?? ""
 meta._log_metadata.vector_metadata.location_metadata.kubernetes_cluster_type = get_env_var("K8S_CLUSTER_TYPE") ?? ""

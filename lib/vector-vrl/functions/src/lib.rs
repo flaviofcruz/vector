@@ -17,11 +17,15 @@ pub mod apply_redaction;
 #[cfg(feature = "databricks-redaction")]
 pub mod enforce_metadata_shape;
 pub mod get_secret;
+pub mod lp_oneof_payload;
 #[cfg(feature = "databricks-redaction")]
 pub mod lp_splice_metadata;
+pub mod lp_subtable_name;
 pub mod lp_unwrap;
+mod lp_wire;
 #[cfg(feature = "databricks-redaction")]
 pub mod redaction;
+pub mod registry_variant;
 pub mod remove_secret;
 pub mod set_secret;
 pub mod set_semantic_meaning;
@@ -47,7 +51,12 @@ pub fn secret_functions() -> Vec<Box<dyn Function>> {
 
 /// Returns the Lumberjack Prime pipeline functions that need no redaction executor.
 pub fn lumberjack_prime_functions() -> Vec<Box<dyn Function>> {
-    vec![Box::new(lp_unwrap::LpUnwrap) as _]
+    vec![
+        Box::new(lp_unwrap::LpUnwrap) as _,
+        Box::new(registry_variant::LpRegistryVariant) as _,
+        Box::new(lp_subtable_name::LpSubtableName) as _,
+        Box::new(lp_oneof_payload::LpOneofPayload) as _,
+    ]
 }
 
 /// Returns Vector-specific redaction functions.

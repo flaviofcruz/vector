@@ -1,0 +1,2 @@
+Add `lp_subtable_name`, a VRL function that returns a Lumberjack Prime union row's sub-table route from the populated oneof member, read off the record's wire bytes by field number, with `generic_*` Any members routed by their type URL. It mirrors the classic sub-table extractor. Add an optional `subtable_kind` argument to `lp_splice_metadata` (the table's constant kind, empty when absent). Neither is called by default.
+https://github.com/databricks-eng/vector/pull/936

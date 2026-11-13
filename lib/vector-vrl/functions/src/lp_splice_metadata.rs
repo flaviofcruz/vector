@@ -40,7 +40,9 @@ impl Function for LpSpliceMetadata {
             with the redacted target-proto bytes by the splice. `enforce_shape` applies the
             `enforce_metadata_shape` policy to the encoded `_log_metadata` strings when it is
             `true`; any other value, including null, leaves it off, so a per-table marker that is
-            absent on most events can be passed as-is.
+            absent on most events can be passed as-is. `subtable_kind` (a string literal, optional)
+            is the constant written to the union table's `subtable_kind` column; when it is absent
+            the column is empty, as before the argument existed.
 
             Fallible (call as `lp_splice_metadata!(...)`): errors if `log_time` is present and its
             `seconds` / `nanos` do not coerce like `to_int`, or if the executor rejects the record.
@@ -62,6 +64,11 @@ impl Function for LpSpliceMetadata {
             Parameter {
                 keyword: "enforce_shape",
                 kind: kind::ANY,
+                required: false,
+            },
+            Parameter {
+                keyword: "subtable_kind",
+                kind: kind::BYTES,
                 required: false,
             },
         ]
@@ -98,8 +105,13 @@ impl Function for LpSpliceMetadata {
             "message_type",
             arguments.required_literal("message_type", state)?,
         )?;
-        let splice = LpSplice::register(&descriptor_file, &message_type)
-            .map_err(|error| compile_error(error.to_string()))?;
+        let subtable_kind = match arguments.optional_literal("subtable_kind", state)? {
+            Some(value) => literal_string("subtable_kind", value)?,
+            None => String::new(),
+        };
+        let splice =
+            LpSplice::register_with_subtable_kind(&descriptor_file, &message_type, &subtable_kind)
+                .map_err(|error| compile_error(error.to_string()))?;
         let mut parents: Vec<OwnedTargetPath> = Vec::new();
         let inputs = splice
             .inputs()
