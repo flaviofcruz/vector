@@ -323,6 +323,13 @@ Flags, as for `check` unless noted:
 
 - `--corpus`, `--sink` (repeatable), `--schema`, `--iterations`, `--items-per-sec`,
   `--max-concurrency`, `--work-dir` (missing or empty, never overwritten).
+- `--sink-latency-ms KIND=MS` (repeatable, once per selected `--sink` kind), e.g.
+  `--sink-latency-ms s3=100 --sink-latency-ms zerobus=50`. Omitted kinds use zero. One fake
+  endpoint per kind gets that delay, identical for every candidate and round, not per table or
+  pod. S3 delays each PUT before storage/response (`fake-s3 --latency-ms`); Zerobus delays each
+  batch acknowledgement (`fake-zerobus --ack-delay-ms`). This does not simulate bandwidth, TLS
+  or network behaviour. Malformed, negative/non-integer, unknown, duplicate and unselected kinds
+  are refused before anything starts. `check` stays zero-delay and has no such flag.
 - `--candidate NAME=BIN:CONFIG` (repeatable, at least one; names as for `check`).
 - `--repeat N` (default 1, at least 1): rounds of every candidate, alternating their order. Use
   at least 3 to compare candidates.
@@ -332,7 +339,8 @@ Flags, as for `check` unless noted:
 
 What lands under `--work-dir`:
 
-- `results.json`: the settings, the harness and candidate CPU sets, each run's candidate, round
+- `results.json`: the settings (including `sink_latencies_ms` for every selected kind, even zero),
+  the harness and candidate CPU sets, each run's candidate, round
   (from 1) and numbers (with the rows each sink recorded and gen's retried attempts), binary,
   config, `--version` line and failures, and each candidate's summary over its runs.
 - `<name>/<round>/vector.log`: the candidate's stdout and stderr in that round. Start here when a

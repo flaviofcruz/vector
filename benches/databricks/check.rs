@@ -286,7 +286,8 @@ pub(super) fn start_fake_uc(
 /// them.
 pub(super) fn start_sink_fakes(
     run_dir: &Path,
-    sinks: &[&'static dyn SinkKind],
+    sinks: &[&dyn SinkKind],
+    latencies_ms: &std::collections::BTreeMap<String, u64>,
     schema_endpoint: Option<SocketAddr>,
     fakes: &mut Vec<RunningFake>,
 ) -> Result<Vec<(String, String)>, BoxError> {
@@ -296,6 +297,7 @@ pub(super) fn start_sink_fakes(
             out: sink_out_dir(run_dir, *sink),
             tls_dir: run_dir.join("tls"),
             schema_endpoint,
+            latency_ms: latencies_ms.get(sink.name()).copied().unwrap_or(0),
         };
         let fake = sink.start_fake(&setup)?;
         let fake_addr = fake.addr;
@@ -355,6 +357,7 @@ async fn execute(plan: &Plan, corpus: &Corpus, session: &mut Session) -> CmdResu
         env.extend(start_sink_fakes(
             &dir,
             &plan.sinks,
+            &Default::default(),
             schema_endpoint,
             &mut session.fakes,
         )?);
@@ -731,6 +734,90 @@ mod tests {
         env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
     }
 
+    #[tokio::test]
+    async fn fake_delays_are_per_kind_and_identical_across_candidates_and_rounds() {
+        use super::super::sink::ReadBack;
+        use std::sync::Mutex;
+
+        struct RecordingSink(&'static str, Mutex<Vec<(PathBuf, u64)>>);
+        impl SinkKind for RecordingSink {
+            fn name(&self) -> &'static str {
+                self.0
+            }
+            fn read_back(
+                &self,
+                _: &Path,
+                _: &mut dyn FnMut(&str, u64, &[u8]),
+            ) -> Result<ReadBack, BoxError> {
+                unreachable!()
+            }
+            fn start_fake(&self, setup: &FakeSetup) -> Result<RunningFake, BoxError> {
+                self.1
+                    .lock()
+                    .unwrap()
+                    .push((setup.out.clone(), setup.latency_ms));
+                super::super::fake_s3::start(super::super::fake_s3::FakeS3Args {
+                    listen: EPHEMERAL_LOOPBACK,
+                    out: setup.out.clone(),
+                    discard: false,
+                    latency_ms: setup.latency_ms,
+                    fail_every: 0,
+                })
+            }
+            fn candidate_env(
+                &self,
+                _: &FakeSetup,
+                _: SocketAddr,
+            ) -> Result<Vec<(&'static str, String)>, BoxError> {
+                Ok(vec![])
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s3 = RecordingSink("s3", Mutex::new(vec![]));
+        let zerobus = RecordingSink("zerobus", Mutex::new(vec![]));
+        let delays = [("s3".into(), 100), ("zerobus".into(), 50)]
+            .into_iter()
+            .collect();
+        for round in 1..=2 {
+            for candidate in ["a", "b"] {
+                let run_dir = dir.path().join(candidate).join(round.to_string());
+                let mut fakes = vec![];
+                start_sink_fakes(&run_dir, &[&s3, &zerobus], &delays, None, &mut fakes).unwrap();
+                for fake in fakes {
+                    fake.stop().await.unwrap();
+                }
+            }
+        }
+        // The correctness path passes an empty map and stays zero-delay.
+        let check_dir = dir.path().join("check");
+        let mut fakes = vec![];
+        start_sink_fakes(
+            &check_dir,
+            &[&s3, &zerobus],
+            &Default::default(),
+            None,
+            &mut fakes,
+        )
+        .unwrap();
+        for fake in fakes {
+            fake.stop().await.unwrap();
+        }
+        for (sink, ms) in [(&s3, 100), (&zerobus, 50)] {
+            let seen = sink.1.lock().unwrap();
+            let mut expected = vec![];
+            for round in 1..=2 {
+                for candidate in ["a", "b"] {
+                    expected.push((
+                        sink_out_dir(&dir.path().join(candidate).join(round.to_string()), sink),
+                        ms,
+                    ));
+                }
+            }
+            expected.push((sink_out_dir(&check_dir, sink), 0));
+            assert_eq!(*seen, expected);
+        }
+    }
+
     #[test]
     fn s3_sets_its_endpoint_and_dummy_credentials_only() {
         let addr: SocketAddr = "127.0.0.1:17002".parse().unwrap();
@@ -738,6 +825,7 @@ mod tests {
             out: PathBuf::from("/w/a/s3-out"),
             tls_dir: PathBuf::from("/w/a/tls"),
             schema_endpoint: None,
+            latency_ms: 0,
         };
         let env: Vec<(String, String)> = sink_named("s3")
             .unwrap()
@@ -765,6 +853,7 @@ mod tests {
             out: PathBuf::from("/w/a/zerobus-out"),
             tls_dir: PathBuf::from("/w/a/tls"),
             schema_endpoint: None,
+            latency_ms: 0,
         };
         let zerobus = sink_named("zerobus").unwrap();
         assert!(

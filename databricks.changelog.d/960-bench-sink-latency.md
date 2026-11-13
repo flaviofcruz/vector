@@ -1,0 +1,1 @@
+Add bench --sink-latency-ms KIND=MS to configure existing fake S3 PUT latency and Zerobus acknowledgement delay identically for every candidate and repeat, with zero defaults and effective settings recorded in results.json. https://github.com/databricks-eng/vector/pull/960

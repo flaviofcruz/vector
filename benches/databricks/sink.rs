@@ -29,6 +29,8 @@ pub struct FakeSetup {
     pub tls_dir: PathBuf,
     /// The shared fake-uc, when a requested sink `needs_schema`; `None` otherwise.
     pub schema_endpoint: Option<SocketAddr>,
+    /// This kind's fake delay: PUT latency for S3, batch ack delay for Zerobus. `check` uses zero.
+    pub latency_ms: u64,
 }
 
 /// What reading back one output found besides its rows.

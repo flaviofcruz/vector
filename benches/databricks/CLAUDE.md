@@ -157,6 +157,12 @@ needs are:
     --items-per-sec 30000 --iterations 10 --repeat 3 --work-dir /tmp/bench-$(date +%s)
   ```
 
+- **Fake delays.** `--sink-latency-ms s3=100 --sink-latency-ms zerobus=50` sets per-kind delays
+  identically for every candidate and round; omitted kinds use zero. S3 delays PUT storage/responses,
+  Zerobus delays batch acknowledgements, using the existing fakes, not network simulation.
+  `results.json` records every selected kind's effective value in `settings.sink_latencies_ms`.
+  `check` remains zero-delay. For a latency smoke, inspect each fake's `index.ndjson`:
+  `ack_ms - recv_ms` includes the injected delay (plus storage/scheduling); wall times can overlap.
 - **Rate.** Pass `--items-per-sec`. A staging AWS us-west-2 pod received about 30k items/s on
   2026-11-13 (README, "Which rate"), so 30000 is the default choice. Unset, a candidate accepts
   faster than its sinks drain, its memory climbs to `--candidate-memory`, and it may be OOM-killed.

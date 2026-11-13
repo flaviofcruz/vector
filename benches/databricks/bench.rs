@@ -33,6 +33,7 @@
 //! - `<candidate>/<round>/sent.ndjson`: the sent log `gen` wrote for that run.
 //! - `<candidate>/<round>/data/`, `tls/`, `<sink>-out/`: as for `check`, per run.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
@@ -59,7 +60,7 @@ use super::process::{
     Stopped, free_loopback_addr, log_tail, logged_failure, open_gate, spawn_gated_candidate,
     terminate, wait_for_listener,
 };
-use super::sink::SinkKind;
+use super::sink::{SinkKind, sink_named};
 use super::source_codec::codec_named;
 use super::{CmdResult, err};
 
@@ -81,6 +82,11 @@ pub struct BenchArgs {
     /// A sink kind to run, by its kind name. Repeatable. The config must use exactly these sinks.
     #[arg(long = "sink", required = true, value_name = "KIND")]
     sinks: Vec<String>,
+    /// Fake delay per selected sink kind, as KIND=MS. Repeatable, once per kind; omitted kinds
+    /// use zero. Identical for every candidate and round. S3 delays PUT storage/responses;
+    /// Zerobus delays batch acknowledgements. No bandwidth or network simulation.
+    #[arg(long = "sink-latency-ms", value_name = "KIND=MS", value_parser = parse_sink_latency)]
+    sink_latencies: Vec<(String, u64)>,
     /// A candidate, as NAME=VECTOR_BIN:CONFIG. Repeatable. Candidates run one at a time, in the
     /// order given, reversed every other round. Use a release build (`cargo build --release`)
     /// copied out of `target/`: `cargo bench` replaces `target/release/vector`, which is refused.
@@ -122,11 +128,48 @@ pub struct BenchArgs {
     work_dir: PathBuf,
 }
 
+/// Parses one fake delay using the sink registry's kind names.
+fn parse_sink_latency(spec: &str) -> Result<(String, u64), String> {
+    let invalid =
+        || format!("--sink-latency-ms `{spec}`: expected KIND=MS with non-negative integer MS");
+    let (kind, ms) = spec.split_once('=').ok_or_else(invalid)?;
+    sink_named(kind).map_err(|e| format!("--sink-latency-ms: {e}"))?;
+    if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    Ok((kind.to_owned(), ms.parse().map_err(|_| invalid())?))
+}
+
+/// Effective delays for every selected kind, including zero defaults. One map is shared by all
+/// candidates and rounds and saved with the results.
+fn sink_latencies(
+    sinks: &[&dyn SinkKind],
+    specs: &[(String, u64)],
+) -> Result<BTreeMap<String, u64>, BoxError> {
+    let mut delays: BTreeMap<String, u64> = sinks
+        .iter()
+        .map(|sink| (sink.name().to_owned(), 0))
+        .collect();
+    for (i, (kind, ms)) in specs.iter().enumerate() {
+        if specs[..i].iter().any(|(seen, _)| seen == kind) {
+            return Err(err(format!(
+                "--sink-latency-ms `{kind}` is given more than once"
+            )));
+        }
+        let delay = delays
+            .get_mut(kind)
+            .ok_or_else(|| err(format!("--sink-latency-ms `{kind}` requires --sink {kind}")))?;
+        *delay = *ms;
+    }
+    Ok(delays)
+}
+
 /// The run as the command line describes it. Building one reads the binaries, configs, schema and
 /// CPU topology it names, and starts and writes nothing.
 struct Plan {
     corpus: PathBuf,
     sinks: Vec<&'static dyn SinkKind>,
+    sink_latencies_ms: BTreeMap<String, u64>,
     candidates: Vec<Candidate>,
     /// Empty when no `--sink` reads a table schema.
     schemas: Vec<TableSchema>,
@@ -143,6 +186,7 @@ struct Plan {
 impl Plan {
     fn from_args(args: &BenchArgs) -> Result<Self, BoxError> {
         let sinks = parse_sinks(&args.sinks)?;
+        let sink_latencies_ms = sink_latencies(&sinks, &args.sink_latencies)?;
         let candidates = args
             .candidates
             .iter()
@@ -170,6 +214,7 @@ impl Plan {
         Ok(Self {
             corpus: args.corpus.clone(),
             sinks,
+            sink_latencies_ms,
             candidates,
             schemas,
             iterations: args.iterations,
@@ -325,7 +370,13 @@ async fn measure(
     let version = vector_version(&bin)?;
 
     let schema_endpoint = start_fake_uc(&plan.schemas, &mut session.fakes)?;
-    let fakes_env = start_sink_fakes(&dir, &plan.sinks, schema_endpoint, &mut session.fakes)?;
+    let fakes_env = start_sink_fakes(
+        &dir,
+        &plan.sinks,
+        &plan.sink_latencies_ms,
+        schema_endpoint,
+        &mut session.fakes,
+    )?;
 
     let source = free_loopback_addr()?;
     let mut env = common_env(&data_dir, source);
@@ -712,6 +763,7 @@ struct LoadgenNumbers {
 struct Settings<'a> {
     corpus: &'a Path,
     sinks: Vec<&'static str>,
+    sink_latencies_ms: &'a BTreeMap<String, u64>,
     iterations: u64,
     repeat: u64,
     items_per_sec: Option<f64>,
@@ -741,6 +793,7 @@ fn write_results(plan: &Plan, runs: &[Run], summary: &[CandidateSummary]) -> Res
         settings: Settings {
             corpus: &plan.corpus,
             sinks: plan.sinks.iter().map(|sink| sink.name()).collect(),
+            sink_latencies_ms: &plan.sink_latencies_ms,
             iterations: plan.iterations,
             repeat: plan.repeat,
             items_per_sec: plan.items_per_sec,
@@ -937,6 +990,80 @@ fn mib(bytes: u64) -> String {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: BenchArgs,
+    }
+
+    fn latency_args(specs: &[&str]) -> Result<BenchArgs, clap::Error> {
+        use clap::Parser;
+        let mut argv = vec![
+            "bench",
+            "--corpus",
+            "unused",
+            "--sink",
+            "s3",
+            "--sink",
+            "zerobus",
+            "--candidate",
+            "a=unused:unused",
+            "--work-dir",
+            "unused",
+        ];
+        for spec in specs {
+            argv.extend(["--sink-latency-ms", spec]);
+        }
+        TestCli::try_parse_from(argv).map(|cli| cli.args)
+    }
+
+    #[test]
+    fn sink_latency_cli_defaults_and_overrides() {
+        let sinks = parse_sinks(&["s3".into(), "zerobus".into()]).unwrap();
+        for (specs, s3, zerobus) in [
+            (vec![], 0, 0),
+            (vec!["s3=100"], 100, 0),
+            (vec!["zerobus=50"], 0, 50),
+            (vec!["zerobus=50", "s3=100"], 100, 50),
+            (vec!["s3=0", "zerobus=0"], 0, 0),
+        ] {
+            let args = latency_args(&specs).unwrap();
+            let effective = sink_latencies(&sinks, &args.sink_latencies).unwrap();
+            assert_eq!(
+                effective,
+                BTreeMap::from([("s3".into(), s3), ("zerobus".into(), zerobus)])
+            );
+        }
+    }
+
+    #[test]
+    fn sink_latency_cli_refuses_bad_specs() {
+        for spec in [
+            "s3",
+            "s3=",
+            "=10",
+            "s3=-1",
+            "s3=1.5",
+            "s3=NaN",
+            "s3=+1",
+            "s3=1=2",
+            "s3= 1",
+            "gcs=10",
+            "s3=18446744073709551616",
+        ] {
+            let error = latency_args(&[spec]).err().unwrap().to_string();
+            assert!(error.contains("--sink-latency-ms"), "{error}");
+        }
+        // Validation precedes candidate file checks and any runtime or output creation.
+        let args = latency_args(&["s3=0", "s3=1"]).unwrap();
+        let error = Plan::from_args(&args).err().unwrap().to_string();
+        assert!(error.contains("given more than once"), "{error}");
+        let mut args = latency_args(&["zerobus=0"]).unwrap();
+        args.sinks = vec!["s3".into()];
+        let error = Plan::from_args(&args).err().unwrap().to_string();
+        assert!(error.contains("requires --sink zerobus"), "{error}");
+    }
 
     fn exit(code: i32) -> ExitStatus {
         // A wait status: the exit code sits in the high byte.

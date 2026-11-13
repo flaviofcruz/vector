@@ -54,7 +54,7 @@ impl SinkKind for ZerobusFlight {
             tls_dir: setup.tls_dir.clone(),
             listen: EPHEMERAL_LOOPBACK,
             discard: false,
-            ack_delay_ms: 0,
+            ack_delay_ms: setup.latency_ms,
         })
     }
 

@@ -40,7 +40,7 @@ impl SinkKind for S3Ndjson {
             listen: EPHEMERAL_LOOPBACK,
             out: setup.out.clone(),
             discard: false,
-            latency_ms: 0,
+            latency_ms: setup.latency_ms,
             fail_every: 0,
         })
     }
