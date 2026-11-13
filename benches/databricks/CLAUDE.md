@@ -201,8 +201,11 @@ needs are:
   The `--sent-log` header records the corpus path and header, and the request count, so verify
   needs only the sent log.
 - **`verify`** compares each candidate's sink output with its sink's baseline (the first output of
-  that sink), as a multiset of rows, each compared by its destination and exact bytes. Nothing is
-  parsed, so rows serialized differently are different rows. Run it once the sinks have flushed (the S3 batch
+  that sink), as a multiset of (destination, metadata fingerprint, exact row bytes). Metadata is
+  the Zerobus Arrow schema as sent, or the S3 object's name (UUID and digits masked) and codec,
+  fingerprinted once per schema/object and reused for its rows. Empty objects/streams have no
+  metadata comparison. Differences show original rows and metadata hashes (README, "verify").
+  Run it once the sinks have flushed (the S3 batch
   timeout, then a few seconds). A sent log that is truncated or has a gap is refused (exit 2). Each `--output <target>=<s3|zerobus>:<dir>` names the sent-log target, the sink
   kind and that fake's `--out`; each sink needs at least two outputs. Any retried or not-accepted
   request on a compared target makes the verdict INCONCLUSIVE. It proves only that outputs agree

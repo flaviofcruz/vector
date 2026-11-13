@@ -3,6 +3,11 @@
 //! Each object is stored as `<bucket>/<key>` under the fake's `--out`, with the sink's compression
 //! kept. A row is one line of an object, and its destination is the object's `<bucket>/<key
 //! prefix>`, without the file name.
+//!
+//! Each row includes a fingerprint of its object metadata: its file name with the parts
+//! that differ per run masked (see [`object_name_shape`]), and the compression its content is in.
+//! So a candidate whose key prefix differs only in the part that lands in the file name, or that
+//! names or compresses its objects differently, is a difference even when its rows match.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -12,7 +17,7 @@ use std::path::Path;
 use super::fake_s3::{self, FakeS3Args};
 use super::fakes::{EPHEMERAL_LOOPBACK, INDEX_FILE, RunningFake};
 use super::io_at;
-use super::sink::{FakeSetup, ReadBack, SinkKind, destination_of, emit, files_under};
+use super::sink::{FakeSetup, ReadBack, SinkKind, destination_of, emit, files_under, fingerprint};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -58,7 +63,7 @@ impl SinkKind for S3Ndjson {
     fn read_back(
         &self,
         out: &Path,
-        row: &mut dyn FnMut(&str, &[u8]),
+        row: &mut dyn FnMut(&str, u64, &[u8]),
     ) -> Result<ReadBack, BoxError> {
         let mut found = ReadBack::default();
         for relative in files_under(out)? {
@@ -68,34 +73,89 @@ impl SinkKind for S3Ndjson {
             }
             let destination = destination_of(&relative);
             found.files += 1;
-            found.damaged +=
-                decode_object(&out.join(&relative), &mut |line| row(&destination, line))?;
+            let name = relative.file_name().unwrap_or_default().to_string_lossy();
+            found.damaged += decode_object(&out.join(&relative), &name, &mut |metadata, line| {
+                row(&destination, metadata, line)
+            })?;
         }
         Ok(found)
     }
 }
 
+/// An object's file name with the parts that differ per run masked, so names that differ only
+/// there are equal. `aws_s3` names an object `<key prefix tail><time>-<uuid>.<extension>`, where
+/// the time is `filename_time_format` rendered at upload. A UUID (8-4-4-4-12 hex digits) becomes
+/// `<uuid>`, then every other ASCII digit becomes `#`. Everything else is kept: the key prefix's
+/// tail, the time format's separators and letters, and the extension.
+///
+/// Digits are masked one for one, so a time rendered either side of a second, or of midnight, has
+/// the same shape with a zero-padded format such as `%F-%s` (`####-##-##-##########`); one that is
+/// not padded, such as `%-d`, changes shape on the day its width does. Month or weekday names
+/// (`%b`, `%a`) are letters and so are kept, which makes a run that spans the change differ, as
+/// does a `date=%F` key prefix (`check` warns about a run that crosses midnight). The cost of
+/// masking every digit: a key prefix tail that differs only in its digits, with as many of them,
+/// is not seen. A `filename_prepend_crypto_nonce` (8 hex digits) is not masked, so it differs.
+pub fn object_name_shape(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let mut shape = String::with_capacity(name.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_uuid(&bytes[i..]) {
+            shape.push_str("<uuid>");
+            i += UUID_LEN;
+            continue;
+        }
+        // Copy one whole character, so a non-ASCII name stays intact.
+        let c = name[i..].chars().next().expect("i is on a char boundary");
+        shape.push(if c.is_ascii_digit() { '#' } else { c });
+        i += c.len_utf8();
+    }
+    shape
+}
+
+/// The length of a hyphenated UUID, `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+const UUID_LEN: usize = 36;
+
+/// Whether `bytes` starts with a hyphenated UUID of hex digits, in either case.
+fn is_uuid(bytes: &[u8]) -> bool {
+    bytes.len() >= UUID_LEN
+        && bytes[..UUID_LEN].iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
 /// Calls `row` with each line of one object, without its line break. The object is decompressed by
 /// its content, so `.json.zst` and plain `.json` objects both work. Returns 1 if the object was cut
-/// short, after its complete lines.
-fn decode_object(file: &Path, row: &mut dyn FnMut(&[u8])) -> Result<u64, BoxError> {
+/// short, after its complete lines. The metadata fingerprint is computed once per object.
+fn decode_object(
+    file: &Path,
+    name: &str,
+    row: &mut dyn FnMut(u64, &[u8]),
+) -> Result<u64, BoxError> {
     let mut raw = BufReader::new(io_at(File::open(file), "opening", file)?);
     let head = io_at(raw.fill_buf(), "reading", file)?;
-    let mut lines: Box<dyn BufRead> = if head.starts_with(&ZSTD_MAGIC) {
+    let (compression, mut lines): (_, Box<dyn BufRead>) = if head.starts_with(&ZSTD_MAGIC) {
         let decoder = io_at(zstd::Decoder::new(raw), "decoding", file)?;
-        Box::new(BufReader::new(decoder))
+        ("zstd", Box::new(BufReader::new(decoder)))
     } else if head.starts_with(&GZIP_MAGIC) {
-        Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(raw)))
+        (
+            "gzip",
+            Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(raw))),
+        )
     } else {
-        Box::new(raw)
+        ("none", Box::new(raw))
     };
+    let metadata = fingerprint((object_name_shape(name), compression));
     let mut damaged = 0;
     let mut line = Vec::new();
     loop {
         line.clear();
         match lines.read_until(b'\n', &mut line) {
             Ok(0) => break,
-            Ok(_) => emit(line.strip_suffix(b"\n").unwrap_or(&line), row),
+            Ok(_) => emit(line.strip_suffix(b"\n").unwrap_or(&line), &mut |bytes| {
+                row(metadata, bytes)
+            }),
             Err(e) => {
                 // A truncated zstd or gzip stream ends in an error; the rows before it count.
                 eprintln!("verify: {}: {e}", file.display());
@@ -115,12 +175,12 @@ mod tests {
 
     const ROW: &str = "{\"name\":\"up\",\"labels\":{},\"values\":[{\"ts\":1,\"v\":1.0}]}\n";
 
-    /// Reads back `root` and collects `(destination, row)` pairs, in read order.
-    fn read(root: &Path) -> (ReadBack, Vec<(String, Vec<u8>)>) {
+    /// Reads back `root` as `(destination, metadata hash, original row)` triples, in read order.
+    fn read(root: &Path) -> (ReadBack, Vec<(String, u64, Vec<u8>)>) {
         let mut rows = Vec::new();
         let found = S3Ndjson
-            .read_back(root, &mut |destination, bytes| {
-                rows.push((destination.to_owned(), bytes.to_vec()))
+            .read_back(root, &mut |destination, metadata, bytes| {
+                rows.push((destination.to_owned(), metadata, bytes.to_vec()))
             })
             .unwrap();
         (found, rows)
@@ -142,20 +202,20 @@ mod tests {
 
         let (found, rows) = read(root);
         assert_eq!(
-            found,
-            ReadBack {
-                files: 3,
-                damaged: 0
-            },
+            (found.files, found.damaged),
+            (3, 0),
             "the index is not an object"
         );
         assert_eq!(rows.len(), 6);
-        let in_date = rows.iter().filter(|(d, _)| d == "bucket/date=1").count();
+        let in_date = rows.iter().filter(|(d, _, _)| d == "bucket/date=1").count();
         assert_eq!(in_date, 5, "the two plain and three zstd rows");
-        assert_eq!(rows.iter().filter(|(d, _)| d == "bucket").count(), 1);
+        assert_eq!(rows.iter().filter(|(d, _, _)| d == "bucket").count(), 1);
         // Bytes are the line as written, without its line break.
-        assert!(rows.iter().all(|(_, bytes)| bytes.last() != Some(&b'\n')));
-        assert_eq!(rows[0].1, ROW.trim_end().as_bytes());
+        assert!(
+            rows.iter()
+                .all(|(_, _, bytes)| bytes.last() != Some(&b'\n'))
+        );
+        assert_eq!(rows[0].2, ROW.trim_end().as_bytes());
     }
 
     #[test]
@@ -169,5 +229,57 @@ mod tests {
         let (found, rows) = read(root);
         assert_eq!(found.damaged, 1);
         assert!(rows.len() > 1, "rows before the cut are kept");
+    }
+
+    #[test]
+    fn object_names_mask_the_time_and_uuid_and_keep_the_rest() {
+        let shape = object_name_shape(
+            "vector-aggregator-lumberjack-2026-11-13-1794551152-0b8f6c3e-5d1a-4e2b-9c7d-1a2b3c4d5e6f.json.zst",
+        );
+        assert_eq!(
+            shape,
+            "vector-aggregator-lumberjack-####-##-##-##########-<uuid>.json.zst"
+        );
+        // Another second, another day, another UUID (upper case too): the same shape.
+        for other in [
+            "vector-aggregator-lumberjack-2026-11-13-1794551153-ffffffff-ffff-ffff-ffff-ffffffffffff.json.zst",
+            "vector-aggregator-lumberjack-2026-11-14-1794585600-ABCDEF01-2345-6789-ABCD-EF0123456789.json.zst",
+        ] {
+            assert_eq!(object_name_shape(other), shape, "{other}");
+        }
+        // The fixed parts are kept: the key prefix's tail, the time format's shape, the extension.
+        for differs in [
+            "vector-aggregator-WRONG-2026-11-13-1794551152-0b8f6c3e-5d1a-4e2b-9c7d-1a2b3c4d5e6f.json.zst",
+            "vector-aggregator-lumberjack-1794551152-0b8f6c3e-5d1a-4e2b-9c7d-1a2b3c4d5e6f.json.zst",
+            "vector-aggregator-lumberjack-2026-11-13-1794551152-0b8f6c3e-5d1a-4e2b-9c7d-1a2b3c4d5e6f.json.gz",
+            "vector-aggregator-lumberjack-2026-11-13-1794551152.json.zst",
+        ] {
+            assert_ne!(object_name_shape(differs), shape, "{differs}");
+        }
+        // Not a UUID: one hex digit short, or a separator moved.
+        assert_eq!(
+            object_name_shape("0b8f6c3e-5d1a-4e2b-9c7d-1a2b3c4d5e6"),
+            "#b#f#c#e-#d#a-#e#b-#c#d-#a#b#c#d#e#"
+        );
+        assert_eq!(object_name_shape("é1.json"), "é#.json");
+    }
+
+    #[test]
+    fn metadata_is_reused_per_object_and_includes_the_codec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("b/p")).unwrap();
+        let zst = zstd::encode_all(ROW.as_bytes(), 0).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(ROW.as_bytes()).unwrap();
+        let gz = gz.finish().unwrap();
+        // Two zstd objects a second apart match; gzip with the same extension does not.
+        std::fs::write(root.join("b/p/x-1794551152.json.zst"), &zst).unwrap();
+        std::fs::write(root.join("b/p/x-1794551153.json.zst"), &zst).unwrap();
+        std::fs::write(root.join("b/p/x-1794551154.json.zst"), &gz).unwrap();
+        let (_, rows) = read(root);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1, rows[1].1);
+        assert_ne!(rows[0].1, rows[2].1);
     }
 }

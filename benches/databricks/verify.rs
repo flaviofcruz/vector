@@ -3,10 +3,11 @@
 //! Each `--output <target>=<sink>:<dir>` names a `gen --target`, a sink (see `sink.rs`) and a
 //! fake's `--out`. The sink reads its output back as rows, each with the destination it was written
 //! under (`SinkKind::read_back`). The first output of each sink is the baseline, and every other
-//! output of that sink is a candidate, compared with it as a multiset of `(destination, bytes)`.
+//! output of that sink is a candidate, compared with it as a multiset of
+//! `(destination, metadata fingerprint, original bytes)`.
 //!
 //! Rows are compared byte for byte, so no JSON is parsed and nothing is canonicalized: a row equals
-//! another only when both its destination and its bytes are equal. Rows that hold the same data but
+//! another only when its destination, metadata and bytes are equal. Rows that hold the same data but
 //! are serialized differently (key order, whitespace, number spelling) are different rows. A
 //! pipeline that needs semantic equality normalizes its rows in its sink's `read_back`.
 //!
@@ -25,13 +26,11 @@
 //! Refusals are errors (exit 2), not verdicts: a sent log that does not hold every request of its
 //! run, an output with no rows, and a sink with fewer than two outputs.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
-use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 
 use super::generator::{SentLogHeader, SentRequest};
-use super::sink::{SinkKind, sink_named};
+use super::sink::{SinkKind, fingerprint, sink_named};
 use super::source_codec::{Outcome, SourceCodec, codec_named};
 use super::{CmdResult, err, io_at};
 
@@ -215,7 +214,9 @@ pub fn verify(sent_log: &Path, outputs: &[String]) -> CmdResult {
             eprintln!("verify: IDENTICAL: every output of each sink holds the same rows")
         }
         Verdict::Different => {
-            eprintln!("verify: DIFFERENT: a candidate's rows differ from its sink's baseline")
+            eprintln!(
+                "verify: DIFFERENT: a candidate's rows or metadata differ from its sink's baseline"
+            )
         }
         Verdict::Inconclusive => eprintln!(
             "verify: INCONCLUSIVE: {}; retried duplicates can legitimately differ across candidates",
@@ -347,8 +348,8 @@ fn scan(output: &Output) -> Result<Scan<'_>, BoxError> {
     let mut keys = Vec::new();
     let found = output
         .sink
-        .read_back(&output.dir, &mut |destination, bytes| {
-            keys.push(row_key(destination, bytes));
+        .read_back(&output.dir, &mut |destination, metadata, bytes| {
+            keys.push(row_key(destination, metadata, bytes));
         })?;
     Ok(Scan {
         output,
@@ -358,16 +359,11 @@ fn scan(output: &Output) -> Result<Scan<'_>, BoxError> {
     })
 }
 
-/// A fingerprint of a row's destination and bytes, so outputs are compared without holding their
-/// rows in memory. Two different rows share one only on a 64-bit hash collision: for n rows the
-/// chance is about n² / 2⁶⁵, around 10⁻⁸ for a million rows. The destination's length is hashed
-/// first, so no two (destination, bytes) pairs feed the hash the same input.
-fn row_key(destination: &str, bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write_usize(destination.len());
-    hasher.write(destination.as_bytes());
-    hasher.write(bytes);
-    hasher.finish()
+/// A row's identity without buffering its bytes. Hash's tuple/string/slice framing delimits
+/// fields unambiguously. Both this key and the metadata fingerprint have a 64-bit collision risk;
+/// for a million distinct rows, the row-key collision probability is around 10⁻⁸.
+fn row_key(destination: &str, metadata: u64, bytes: &[u8]) -> u64 {
+    fingerprint((destination, metadata, bytes))
 }
 
 /// The comparison of one candidate with its sink's baseline.
@@ -377,9 +373,9 @@ struct Diff {
     /// Rows the baseline holds more often than the candidate, and the reverse.
     only_baseline: u64,
     only_candidate: u64,
-    /// The first rows of each side that are not in the other, as (destination, bytes).
-    examples_baseline: Vec<(String, Vec<u8>)>,
-    examples_candidate: Vec<(String, Vec<u8>)>,
+    /// The first rows of each side that are not in the other, as (destination, metadata hash, bytes).
+    examples_baseline: Vec<(String, u64, Vec<u8>)>,
+    examples_candidate: Vec<(String, u64, Vec<u8>)>,
 }
 
 impl Diff {
@@ -445,21 +441,24 @@ fn multiset_diff(baseline: &[u64], candidate: &[u64]) -> (u64, u64, Surplus, Sur
     )
 }
 
-/// The first rows of `output` that `wanted` still counts, as (destination, bytes), at most
+/// The first rows of `output` that `wanted` still counts, as (destination, metadata hash, bytes), at most
 /// `EXAMPLES` of them. Each one found uses up one count.
-fn examples(output: &Output, wanted: &mut Surplus) -> Result<Vec<(String, Vec<u8>)>, BoxError> {
+fn examples(
+    output: &Output,
+    wanted: &mut Surplus,
+) -> Result<Vec<(String, u64, Vec<u8>)>, BoxError> {
     let mut found = Vec::new();
     output
         .sink
-        .read_back(&output.dir, &mut |destination, bytes| {
+        .read_back(&output.dir, &mut |destination, metadata, bytes| {
             if found.len() >= EXAMPLES {
                 return;
             }
-            if let Some(n) = wanted.get_mut(&row_key(destination, bytes))
+            if let Some(n) = wanted.get_mut(&row_key(destination, metadata, bytes))
                 && *n > 0
             {
                 *n -= 1;
-                found.push((destination.to_owned(), bytes.to_vec()));
+                found.push((destination.to_owned(), metadata, bytes.to_vec()));
             }
         })?;
     Ok(found)
@@ -485,24 +484,27 @@ fn print_diff(d: &Diff) {
         "diff[{label}]: {} rows only in baseline, {} only in candidate -> DIFFERENT",
         d.only_baseline, d.only_candidate
     );
-    let show = |destination: &str, bytes: &[u8]| {
+    let show = |destination: &str, metadata: u64, bytes: &[u8]| {
         let destination = if destination.is_empty() {
             "<root>"
         } else {
             destination
         };
-        format!("at {destination}: {}", text(bytes))
+        format!(
+            "at {destination} (metadata {metadata:016x}): {}",
+            text(bytes)
+        )
     };
-    for (destination, bytes) in &d.examples_baseline {
+    for (destination, metadata, bytes) in &d.examples_baseline {
         eprintln!(
             "diff[{label}]:   only in baseline, {}",
-            show(destination, bytes)
+            show(destination, *metadata, bytes)
         );
     }
-    for (destination, bytes) in &d.examples_candidate {
+    for (destination, metadata, bytes) in &d.examples_candidate {
         eprintln!(
             "diff[{label}]:   only in candidate, {}",
-            show(destination, bytes)
+            show(destination, *metadata, bytes)
         );
     }
 }
@@ -656,11 +658,19 @@ mod tests {
         assert_eq!((d.only_baseline, d.only_candidate), (1, 1));
         assert_eq!(
             d.examples_baseline,
-            [("bucket/date=1".into(), b"{\"v\":1}".to_vec())]
+            [(
+                "bucket/date=1".into(),
+                fingerprint(("x.json".to_owned(), "none")),
+                b"{\"v\":1}".to_vec()
+            )]
         );
         assert_eq!(
             d.examples_candidate,
-            [("bucket/date=2".into(), b"{\"v\":1}".to_vec())]
+            [(
+                "bucket/date=2".into(),
+                fingerprint(("x.json".to_owned(), "none")),
+                b"{\"v\":1}".to_vec()
+            )]
         );
     }
 
@@ -692,9 +702,9 @@ mod tests {
         // At most EXAMPLES rows per side, each once.
         assert_eq!(d.examples_baseline.len(), EXAMPLES);
         assert_eq!(d.examples_candidate.len(), EXAMPLES);
-        assert!(d.examples_baseline.iter().all(|(dest, _)| dest == "b"));
-        assert_eq!(d.examples_baseline[0].1, b"{\"v\":2}");
-        assert_eq!(d.examples_candidate[0].1, b"{\"v\":7}");
+        assert!(d.examples_baseline.iter().all(|(dest, _, _)| dest == "b"));
+        assert_eq!(d.examples_baseline[0].2, b"{\"v\":2}");
+        assert_eq!(d.examples_candidate[0].2, b"{\"v\":7}");
     }
 
     #[test]
@@ -795,5 +805,48 @@ mod tests {
         let scan = scan(&s3).unwrap();
         assert_eq!(scan.damaged, 1);
         assert!(!scan.keys.is_empty());
+    }
+
+    #[test]
+    fn row_identity_delimits_fields_and_associates_metadata_with_rows() {
+        assert_ne!(row_key("ab", 1, b"c"), row_key("a", 1, b"bc"));
+        let base = [row_key("t", 1, b"a"), row_key("t", 2, b"b")];
+        let swapped = [row_key("t", 2, b"a"), row_key("t", 1, b"b")];
+        let (only_a, only_b, _, _) = multiset_diff(&base, &swapped);
+        assert_eq!((only_a, only_b), (2, 2));
+    }
+
+    #[test]
+    fn object_boundaries_do_not_count_but_stem_extension_and_codec_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = write_output(dir.path(), "base", &[("b/x-1.json", "a\nb\n")]);
+        let same = write_output(
+            dir.path(),
+            "same",
+            &[("b/x-2.json", "b\n"), ("b/x-3.json", "a\n")],
+        );
+        let base_out = output("s3", &base);
+        let base = scan(&base_out).unwrap();
+        assert!(
+            diff(&base, &scan(&output("s3", &same)).unwrap())
+                .unwrap()
+                .identical()
+        );
+        for (i, name) in ["b/wrong-1.json", "b/x-1.txt", "b/x-1.json"]
+            .iter()
+            .enumerate()
+        {
+            let wrong = write_output(dir.path(), &format!("wrong-{i}"), &[(name, "a\nb\n")]);
+            if i == 2 {
+                let mut gz =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                gz.write_all(b"a\nb\n").unwrap();
+                std::fs::write(wrong.join(name), gz.finish().unwrap()).unwrap();
+            }
+            let d = diff(&base, &scan(&output("s3", &wrong)).unwrap()).unwrap();
+            assert_eq!((d.only_baseline, d.only_candidate), (2, 2));
+            assert_eq!(d.examples_baseline[0].2, b"a");
+            assert_ne!(d.examples_baseline[0].1, d.examples_candidate[0].1);
+        }
     }
 }

@@ -567,22 +567,33 @@ hb verify --sent-log sent.ndjson \
   names the codec, so verify needs no corpus file. Each sink that appears needs at least two
   outputs, one baseline and one candidate, or verify refuses and names the sink.
 - **Rows.** A row is its destination (the directory it was written under, without its file name:
-  `<bucket>/<key prefix>` for S3, the table's last name segment for Zerobus) and its exact bytes.
-  Each candidate
-  is compared with its baseline as a multiset of these, and a row equals another only when both parts
-  are equal. Nothing is parsed or canonicalized: key order, whitespace and number spelling are part of
-  the row. So rows that hold the same data but are serialized differently are different rows. A
-  pipeline that needs semantic equality normalizes its rows in its sink's `read_back`, which then
+  `<bucket>/<key prefix>` for S3, the table's last name segment for Zerobus), a metadata fingerprint,
+  and its original bytes. Each candidate is compared with its baseline as a multiset of these
+  triples; all three parts must match. Nothing is parsed or canonicalized: key order, whitespace
+  and number spelling are part of the row. So rows that hold the same data but are serialized
+  differently are different rows. A pipeline that needs semantic equality normalizes its rows in
+  its sink's `read_back`, which then
   applies the same normalization to every output.
-- **Schema.** verify compares the rendered rows, not the Zerobus Arrow schema. A column whose Arrow
-  type changes can change its rendering (for example `Int64` `1` to `Float64` `1.0`), and so counts as
-  a difference.
+- **Metadata.** Fingerprinted once per S3 object or decoded Zerobus schema, then reused for
+  each associated row. Object, batch and connection boundaries do not count, but changing which
+  rows use which metadata does, even when the row set and schema set stay the same.
+  - Zerobus: Arrow's native schema hash includes column order, names, nested types/nullability,
+    and field/schema metadata (sorted by key). It is computed before timezone retagging, so
+    `LargeUtf8` versus `Utf8`, timestamp units, and `UTC` versus `+00:00` remain distinct even
+    when the rendered rows match. Column order matters because Zerobus validates it.
+  - S3: the existing normalized filename (UUID masked as `<uuid>`, other ASCII digits as `#`)
+    and the codec detected from content (`zstd`, `gzip`, `none`). This retains the prefix tail,
+    time format shape and extension. A zero-padded format keeps its shape across seconds/days;
+    an unpadded field can change width. A `date=%F` directory still changes destination at
+    midnight. Prefix tails differing only in same-width digits remain indistinguishable;
+    crypto nonces and month/weekday names are not masked.
+  Empty objects/streams have no rows with which to compare metadata. Fingerprints are 64-bit
+  hashes, so collisions are possible; they are not persistent identifiers.
 - **Damaged records.** A cut-off object or frame keeps its complete rows and counts as a damaged
   record. Any damaged output makes the verdict DIFFERENT, even when its rows match.
-- **Report.** Per candidate: how many rows are only in the baseline and only in the candidate. For a
-  difference, the first two rows of each side are shown in full, with their destinations. verify
-  reads the outputs again to fetch them. It does not say which part of a row
-  differs, since rows are compared as bytes.
+- **Report.** Per candidate: counts of rows only in the baseline/candidate, then the first two
+  differing rows on each side, in full with their destinations and metadata hashes. verify
+  re-reads the outputs to fetch examples; it does not describe individual metadata fields.
 - **Retries.** A compared target whose requests were retried, or whose last attempt was not
   accepted, can legitimately deliver duplicates that differ across candidates. The verdict is then
   INCONCLUSIVE, though the differences are still printed.
@@ -599,7 +610,8 @@ with a known-good baseline, or read the differing rows, before concluding which 
 
 A sink kind implements `SinkKind` (`sink.rs`), and is listed in `SINKS`. It names the output kind,
 and `read_back` reads what that kind's fake recorded under `--out` as rows, each with its
-destination. Rows are flattened across objects, batches and connections, since batching depends on
+destination and metadata fingerprint (see "verify").
+Rows are flattened across objects, batches and connections, since batching depends on
 timing. It has no knowledge of what the rows should hold. For `check` the same entry also says
 whether the sink reads a table schema (`needs_schema`), starts its fake for a candidate
 (`start_fake`), and names the environment variables that point the candidate at the fake
@@ -607,12 +619,13 @@ whether the sink reads a table schema (`needs_schema`), starts its fake for a ca
 
 | Kind | Fake | Captured files | Read back as |
 | --- | --- | --- | --- |
-| `s3` (`s3_ndjson.rs`) | `fake-s3` | every object except the fake's top-level `index.ndjson` | NDJSON, one row per line; zstd or gzip detected by content. A stream cut short keeps the rows before the cut and counts one damaged record. |
-| `zerobus` (`zerobus_flight.rs`) | `fake-zerobus` | every `.flight` file | Arrow Flight frames in order: a schema, then record batches, rendered with arrow's JSON writer and explicit nulls. A cut-off frame keeps the complete frames before it and counts one damaged record. |
+| `s3` (`s3_ndjson.rs`) | `fake-s3` | every object except the fake's top-level `index.ndjson` | NDJSON, one row per line; zstd or gzip detected by content. A stream cut short keeps the rows before the cut and counts one damaged record. Metadata: normalized object name and detected codec. |
+| `zerobus` (`zerobus_flight.rs`) | `fake-zerobus` | every `.flight` file | Arrow Flight frames in order: a schema, then record batches, rendered with arrow's JSON writer and explicit nulls. A schema frame later in the stream applies to the batches after it. A cut-off frame keeps the complete frames before it and counts one damaged record. Metadata: decoded schema as sent, applied to subsequent rows. |
 
 The Zerobus reader retags `UTC` timestamps as `+00:00` before rendering, since arrow's JSON
 reader needs the `chrono-tz` feature for a named zone, which the bench does not enable. The
-instants are unchanged, and every output is rendered the same way.
+instants are unchanged, and every output is rendered the same way. The schema fingerprints are computed
+before the retag, so a candidate that sends `+00:00` where the baseline sends `UTC` differs.
 
 ## Source codecs
 

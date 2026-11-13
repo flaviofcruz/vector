@@ -8,6 +8,8 @@
 //! A new sink plugs in by implementing [`SinkKind`] and listing it in [`SINKS`]. Nothing else in
 //! the harness names a kind.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -39,16 +41,26 @@ pub struct ReadBack {
     pub damaged: u64,
 }
 
+/// A comparison fingerprint, not a persistent identifier. `Hash` delimits compound values.
+pub fn fingerprint(value: impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub trait SinkKind: Sync {
     /// The kind in `--output <target>=<kind>:<dir>`.
     fn name(&self) -> &'static str;
 
-    /// Calls `row` with the destination and the bytes of every row the fake recorded under `out`,
-    /// in no particular order. The destination is the path the object or frames were written
-    /// under, without the final file name: that name carries a timestamp and a UUID, which differ
-    /// per run. The bytes are the row as the sink wrote it, without its line break.
-    fn read_back(&self, out: &Path, row: &mut dyn FnMut(&str, &[u8]))
-    -> Result<ReadBack, BoxError>;
+    /// Calls `row` with each row's destination, metadata fingerprint and original bytes, in no
+    /// particular order. The destination is the capture's directory. Metadata is fingerprinted
+    /// once per object or schema and reused for its rows: the normalized file name and codec for
+    /// S3, or the decoded schema as sent for Zerobus. Bytes exclude the line break.
+    fn read_back(
+        &self,
+        out: &Path,
+        row: &mut dyn FnMut(&str, u64, &[u8]),
+    ) -> Result<ReadBack, BoxError>;
 
     /// Whether the sink reads its table schema from the shared fake-uc, which `check` starts once
     /// (from `--schema`) when any requested sink says so.

@@ -411,7 +411,7 @@ async fn measure(
         .iter()
         .map(|sink| {
             let mut rows = 0;
-            sink.read_back(&sink_out_dir(&dir, *sink), &mut |_, _| rows += 1)?;
+            sink.read_back(&sink_out_dir(&dir, *sink), &mut |_, _, _| rows += 1)?;
             Ok(Delivered {
                 sink: sink.name(),
                 rows,
