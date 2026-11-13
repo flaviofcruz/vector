@@ -130,6 +130,54 @@ SIGTERM, and verifies. Everything in `README.md` ("check") applies; the points a
 - **Changing the candidate.** The config must use exactly the `--sink` values it is run with; the
   variables it reads are listed in `README.md` ("check").
 
+## Running a performance run (`bench`)
+
+`bench` is the one command for performance, beside `check`. It runs each candidate alone on half
+of the box's cores, fenced off from every other process by a cgroup cpuset partition with a memory
+limit; the fakes, the load generator and the rest of the box run on the other half. Everything in `README.md` ("bench") applies. The points an agent
+needs are:
+
+- **Builds.** The bench refuses a debug build, so run it with plain `cargo bench` (no
+  `--profile dev`), and build each candidate with `cargo build --release`, then copy it out of
+  `target/` (`cp target/release/vector /tmp/vector-a`) and pass the copy. Every `cargo bench`
+  re-links `target/release/vector` to the bench profile's build, so bench refuses that path. A
+  release build's `--version` names no commit and has no `debug=`; one with debug info (bench or
+  dev profile) says `-custom-<sha>` and `debug=full`. The version line is recorded in
+  `results.json`.
+- **Command.** The same sinks, schema and corpus as `check`, with `--candidate NAME=BIN:CONFIG`
+  (one or more, run in order) and optional `--items-per-sec`, `--iterations`, `--repeat`,
+  `--candidate-memory`, `--gen-threads`. Use `--repeat 3` or more to compare candidates, and
+  compare the summary's medians:
+
+  ```bash
+  cargo bench --bench databricks --no-default-features --features $FEATURES -- \
+    bench --corpus ~/scratch/hb/pr-capture.v4.ndjson --sink s3 --sink zerobus \
+    --schema main.databricks_bench.output=$HOME/scratch/hb/fetched/pod_prime_raw.json \
+    --candidate a=/tmp/vector-a:$CFG --candidate b=/tmp/vector-a:$CFG \
+    --items-per-sec 30000 --iterations 10 --repeat 3 --work-dir /tmp/bench-$(date +%s)
+  ```
+
+- **Rate.** Pass `--items-per-sec`. A staging AWS us-west-2 pod received about 30k items/s on
+  2026-11-13 (README, "Which rate"), so 30000 is the default choice. Unset, a candidate accepts
+  faster than its sinks drain, its memory climbs to `--candidate-memory`, and it may be OOM-killed.
+
+- **Exit codes.** 0 when every run passed; 1 when a run failed (a request not accepted, the
+  candidate exited non-zero after SIGTERM or logged lost data: a failed shutdown or dropped
+  events, the fence was no longer a valid partition at the end, a paced run missed its rate, or a
+  sink recorded no rows or a different count from the first run's); 2 on error. Nothing here
+  verifies outputs: use `check` for that.
+- **Equivalence.** bench assumes its candidates are semantically equivalent, so every run's sinks
+  record the same number of rows. Run `check` on the candidates first.
+- **Sudo.** The fence (`/sys/fs/cgroup/databricks-bench`) is made and removed with `sudo -n`, so
+  bench needs passwordless sudo. It changes which CPUs the rest of the box may use while a
+  candidate runs; ask the user before running bench.
+- **Duration.** Set `--iterations` to about `seconds × items/s ÷ items per pass` (283,544 for v4):
+  10 at 30k items/s replays for about 95 s.
+- **Leftovers.** A bench run stops its candidates and fakes and removes the fence, and leaves none
+  behind. After an interrupted run, check `ps` for `vector --config` lines naming the work dir and
+  stop any by PID, and if `/sys/fs/cgroup/databricks-bench` still exists, run the two commands
+  bench printed (README, "bench").
+
 ## Running against real systems
 
 - **`capture`** runs `vector tap` inside a live pod via `kubectl exec`, and scrapes the pod's

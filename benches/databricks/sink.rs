@@ -20,9 +20,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// What a sink's fake is given for one candidate. Every path is under the run's `--work-dir`.
 pub struct FakeSetup {
-    /// `<work-dir>/<candidate>/<sink>-out`: where the fake records what arrives. Not yet created.
+    /// `<run dir>/<sink>-out`: where the fake records what arrives. Not yet created. The run dir
+    /// is `<work-dir>/<candidate>` for `check` and `<work-dir>/<candidate>/<round>` for `bench`.
     pub out: PathBuf,
-    /// `<work-dir>/<candidate>/tls`: throwaway TLS files for an HTTPS fake, created on demand.
+    /// `<run dir>/tls`: throwaway TLS files for an HTTPS fake, created on demand.
     pub tls_dir: PathBuf,
     /// The shared fake-uc, when a requested sink `needs_schema`; `None` otherwise.
     pub schema_endpoint: Option<SocketAddr>,

@@ -1,4 +1,5 @@
-//! Child processes for `check`: candidate Vector processes, their logs, readiness and shutdown.
+//! Child processes for `check` and `bench`: candidate Vector processes, their logs, readiness and
+//! shutdown.
 //!
 //! Fakes are not here: they run as tasks in the harness's own process (see `fakes`). Candidates
 //! run as children so that each one is a real Vector process, with its own signals and exit.
@@ -36,15 +37,15 @@ const LOGGED_FAILURES: &[&str] = &[
     "An error occurred that Vector couldn't handle",
 ];
 
-/// Starts `bin --config <config> --graceful-shutdown-limit-secs <n>` with `env` added to the
-/// environment. Stdout and stderr both go to `log`, which must not exist yet. The child is killed
-/// if this process drops it, so no candidate outlives the harness.
-pub fn spawn_candidate(
-    bin: &Path,
-    config: &Path,
+/// Starts `program args` with `env` added to the environment, its stdin `stdin`, and its stdout
+/// and stderr both in `log`, which must not exist yet. The child is killed if this process drops
+/// it, so no child outlives the harness.
+fn spawn_logged(
+    program: &Path,
+    args: &[String],
     env: &[(String, String)],
     log: &Path,
-    graceful_shutdown_secs: u64,
+    stdin: Stdio,
 ) -> Result<Child, BoxError> {
     let file = OpenOptions::new()
         .write(true)
@@ -52,18 +53,70 @@ pub fn spawn_candidate(
         .open(log)
         .map_err(|e| err(format!("creating {}: {e}", log.display())))?;
     let stderr = file.try_clone()?;
-    Command::new(bin)
-        .arg("--config")
-        .arg(config)
-        .arg("--graceful-shutdown-limit-secs")
-        .arg(graceful_shutdown_secs.to_string())
+    Command::new(program)
+        .args(args)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(file)
         .stderr(stderr)
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| err(format!("starting {}: {e}", bin.display())))
+        .map_err(|e| err(format!("starting {}: {e}", program.display())))
+}
+
+/// The arguments every candidate gets.
+fn candidate_args(config: &Path, graceful_shutdown_secs: u64) -> Vec<String> {
+    vec![
+        "--config".to_owned(),
+        config.display().to_string(),
+        "--graceful-shutdown-limit-secs".to_owned(),
+        graceful_shutdown_secs.to_string(),
+    ]
+}
+
+/// Starts `bin --config <config> --graceful-shutdown-limit-secs <n>` with `env`, logging to `log`.
+pub fn spawn_candidate(
+    bin: &Path,
+    config: &Path,
+    env: &[(String, String)],
+    log: &Path,
+    graceful_shutdown_secs: u64,
+) -> Result<Child, BoxError> {
+    let args = candidate_args(config, graceful_shutdown_secs);
+    spawn_logged(bin, &args, env, log, Stdio::null())
+}
+
+/// Like `spawn_candidate`, but held at a gate: the child is a shell waiting on its stdin, and
+/// Vector starts only when `open_gate` is called. The shell execs Vector, so the child's pid is
+/// Vector's. This lets the caller move the child into a cgroup before Vector allocates anything,
+/// so that every byte it uses is charged there.
+pub fn spawn_gated_candidate(
+    bin: &Path,
+    config: &Path,
+    env: &[(String, String)],
+    log: &Path,
+    graceful_shutdown_secs: u64,
+) -> Result<Child, BoxError> {
+    let mut args = vec![
+        "-c".to_owned(),
+        // The gate closing without a line means the harness is gone: do not start.
+        r#"read -r _ || exit 1; exec "$@""#.to_owned(),
+        "sh".to_owned(),
+        bin.display().to_string(),
+    ];
+    args.extend(candidate_args(config, graceful_shutdown_secs));
+    spawn_logged(Path::new("/bin/sh"), &args, env, log, Stdio::piped())
+}
+
+/// Lets a child from `spawn_gated_candidate` exec Vector. Its stdin is closed after.
+pub async fn open_gate(child: &mut Child) -> Result<(), BoxError> {
+    use tokio::io::AsyncWriteExt;
+    let mut gate = child
+        .stdin
+        .take()
+        .expect("a gated candidate has a piped stdin");
+    gate.write_all(b"\n").await?;
+    Ok(())
 }
 
 /// A free loopback port: bound, read and released. Another process may take it before the

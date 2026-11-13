@@ -530,6 +530,10 @@ vrl.workspace = true
 wiremock = "0.6.4"
 zstd = { version = "0.13.0", default-features = false }
 
+# The Databricks bench reads its own CPU time.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.26.2", default-features = false, features = ["resource"] }
+
 [patch.crates-io]
 aws-sigv4 = { path = "vendor/aws-sigv4-1.4.5" }
 azure_storage = { path = "vendor/azure_storage-0.21.0" }

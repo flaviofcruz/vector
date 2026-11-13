@@ -164,6 +164,186 @@ hb check --corpus ~/scratch/hb/pr-capture.v4.ndjson --sink s3 --sink zerobus \
   --work-dir /tmp/check-$(date +%s)
 ```
 
+## bench: the performance run
+
+**`bench` is THE way to run a performance comparison**, beside `check` for correctness. It runs its
+candidates one at a time, so no two of them compete for the box, and it measures each candidate's
+CPU and memory over the replay. With `--repeat N` it runs N rounds of every candidate, alternating
+their order, and summarizes each candidate over its runs. Use `--repeat 3` or more to compare
+candidates: a single run per candidate cannot tell a difference from noise.
+
+```bash
+hb_perf() { cargo bench --bench databricks --no-default-features --features $FEATURES -- "$@"; }
+hb_perf bench --corpus ~/scratch/hb/pr-capture.v4.ndjson --sink s3 --sink zerobus \
+  --schema main.databricks_bench.output=$HOME/scratch/hb/fetched/pod_prime_raw.json \
+  --candidate a=/tmp/vector-a:benches/databricks/configs/hydra_dual_write.yaml \
+  --candidate b=/tmp/vector-a:benches/databricks/configs/hydra_dual_write.yaml \
+  --repeat 3 --work-dir /tmp/bench-$(date +%s)
+```
+
+**Builds.** `bench` refuses to run from a debug build, so run it with plain `cargo bench` (no
+`--profile dev`). Build each candidate with `cargo build --release`, then copy it out of `target/`
+(`cp target/release/vector /tmp/vector-a`) and pass the copy. The bench profile shares
+`target/release/`, and every `cargo bench` re-links `target/release/vector` to its own build of
+Vector (optimized, with debug info), so a candidate at that path is never your release build;
+`bench` refuses it. The version line is recorded with each run. A release build's names no commit
+(`vector 0.53.0-databricks (x86_64-unknown-linux-gnu)`), while a build with debug info, such as
+the bench or dev profile, says `-custom-<sha>` and `debug=full`
+(`vector 0.53.0-databricks-custom-8447822b1 (x86_64-unknown-linux-gnu debug=full)`). A debug
+Vector tops out around 17k items/s, so a debug candidate's numbers say nothing about production.
+
+**Isolation.** The box's physical cores are split in two, derived from its topology (sysfs
+`thread_siblings_list`), never typed in: the first half of the cores, rounded down, serve the
+harness, and the rest serve the candidate. Each core stays whole on one side, so the two never share
+a core. A box with fewer than two cores is refused. The chosen sets are printed at startup and
+recorded in `results.json`.
+
+- The **harness** runs the load generator (`gen`) and the fakes, both in the `bench` process, as
+  for `check`. Nothing is pinned: while the fence holds the candidate CPUs, the kernel keeps the
+  `bench` process, like every process outside the fence, on the harness CPUs. `--gen-threads` sets
+  the threads of the runtime gen and the fakes share, and defaults to the harness CPU count.
+- The **candidate** runs alone on its CPUs, behind a **fence**: a cgroup-v2 cpuset partition,
+  `/sys/fs/cgroup/databricks-bench`, of type `root` on the candidate CPUs. The kernel takes a
+  partition's CPUs away from every other cgroup, so system services, your session and the harness
+  all run on the harness CPUs while a candidate runs, and a process moved into it runs on the
+  candidate CPUs only. Type `root`, not `isolated`, keeps the
+  scheduler balancing the candidate's threads across its CPUs. The fence also sets `memory.max`
+  from `--candidate-memory` (default `8G`) and `memory.swap.max` to 0. There is no CPU quota: the
+  fence fixes the candidate's share, and quota throttling would distort latency.
+- Before each candidate, `bench` checks that the fence took: it reads exactly `root` (an invalid
+  partition reads `root invalid (...)`), owns exactly the candidate CPUs, and no other top-level
+  cgroup can still run on them. It refuses to run otherwise. After the candidate exits, it reads
+  the partition again, and a fence that is no longer exactly `root` fails the run.
+- The candidate starts held at a gate (a shell waiting on its stdin) and is moved into the fence
+  before the shell execs Vector, so every byte Vector uses is charged to the fence.
+- **Passwordless sudo is required.** A partition must sit under the root cgroup, so making it,
+  moving the candidate into it and removing it are root writes, done with `sudo -n`. The fence is
+  made fresh for each candidate (which also gives each its own `memory.peak`) and removed after it,
+  on errors and Ctrl-C too. It lives in the kernel only, so a reboot removes it as well. If a run
+  could not remove it, `bench` prints the commands, and refuses to start while it exists:
+  `echo member | sudo tee /sys/fs/cgroup/databricks-bench/cpuset.cpus.partition`, then
+  `sudo rmdir /sys/fs/cgroup/databricks-bench`.
+- Per-CPU kernel threads and interrupts still run on the candidate CPUs (only boot options such as
+  `isolcpus` move them), and on a VM the host's other tenants share the physical cores.
+
+**Rounds.** `--repeat N` (default 1) runs N rounds, and each round runs every candidate once: in
+the order given in odd rounds and reversed in even ones (a, b, then b, a, then a, b ...), so over
+each pair of rounds a drift that grows linearly with time, such as the box warming up, weighs on
+every candidate alike. Every run gets fresh fakes and a fresh fence. After the per-run table,
+`bench` prints each candidate's median and min-max of `ms/1k-item`, `cand-cpu`, `mem-peak` and
+`anon-max` over its runs (failed runs included), and `results.json` holds the same summary.
+Compare medians, and treat a difference smaller than the ranges as noise.
+
+For each run, `bench`:
+
+1. makes `<work-dir>/<name>/<round>/` (data dir, TLS dir, sink out dirs, logs), and reads the
+   candidate's `--version` line;
+2. starts the fakes, makes the fence, starts the candidate in it, and waits until the candidate
+   listens (60 s, as `check`);
+3. replays the corpus with `gen` to the candidate, sampling the fence about once a second for the
+   candidate's anonymous memory;
+4. stops the candidate with SIGTERM and times its flush, reads the fence's counters once it has
+   exited (the cgroup outlives its process), checks the fence is still valid, removes it, and
+   stops the fakes;
+5. counts the rows each sink's fake recorded, read back as `verify` reads them, once the fakes
+   have stopped, so the outputs are complete and the count is outside every timing.
+
+**How many iterations.** One pass of the v4 corpus is 283,544 items, about 3 s uncapped, which is
+too short to compare candidates. Pick the length of the replay and set `--iterations` to about
+`seconds × items/s ÷ items per pass`: for 60 s, about 20 uncapped (near 90k items/s) or 2 at
+`--items-per-sec 10000`.
+
+**Which rate.** Compare candidates at a fixed `--items-per-sec`, ideally production's. On
+2026-11-13 a staging AWS us-west-2 pod (`vector-aggregator-metrics`, context
+`staging-aws-us-west-2-0`) received about 30k items/s on its `prom_remote_write` source, measured
+from the growth of `vector_component_received_events_total` over 75 s. At `--items-per-sec 30000`
+one v4 pass is about 9.5 s, so `--iterations 10` replays for about 95 s. Unset, gen sends as fast
+as the candidate accepts, and a candidate can accept faster than its sinks drain: the backlog grows
+in memory until the fence's `memory.max`, and the candidate may be OOM-killed (in our uncapped
+20-iteration runs, peak memory reached the 8G limit and one run was killed). Use an unset rate only
+to probe capacity, with a short run.
+
+**What is measured.** The candidate from the start of the replay until it exits, so the flush of
+what it accepted but had not yet written counts: with acknowledgements off and deep buffers, a
+candidate can accept quickly and do the work after the last request, and stopping at the end of
+the replay would favour the one that buffers more. The harness (gen and the fakes) is measured over
+the replay only, where it works.
+
+| Column | Meaning |
+| --- | --- |
+| `cand-cpu` | `cpu-s` per wall second of replay and flush: the candidate's busy CPUs, out of its CPU set. |
+| `cpu-s` | CPU seconds the fence used from replay start until the candidate exited. |
+| `ms/1k-item` | `cpu-s` per 1,000 items sent, in milliseconds. The number to compare between candidates: it does not depend on how a candidate splits its work between the replay and the flush. |
+| `mem-peak` | The fence's `memory.peak` after the candidate exited: the most it used since it started. |
+| `anon-max` | The highest anonymous memory sampled, about every second, until the candidate exited. |
+| `oom` | `oom_kill` events in the fence from replay start until the candidate exited. |
+| `items/s` | Items gen sent per second. |
+| `target` | `--items-per-sec`, or `-` when unset. |
+| `lag-ms` | The largest time a request was sent after its due time. It counts waiting for a free slot of `--max-concurrency`, so with a target set, large lag usually means the candidate was slow to answer. |
+| `harness-cpu` | Busy CPUs of the `bench` process (gen and the fakes) over the replay, from its `getrusage`, out of the harness CPU set. |
+| `accepted` | Whether every request was accepted (2xx) on the candidate. |
+| `rows` | Rows every sink's fake recorded, summed; `results.json` and the lines under the table give each sink's. |
+| `flush-s` | Time from SIGTERM to the candidate's exit. |
+
+Also recorded: the fence (its cgroup, partition type, CPUs, `memory.max` and `memory.swap.max` as
+read back), the `--version` line, and the binary and config paths (canonical).
+
+**Pass rule.** A run fails when a request was not accepted, when the candidate exits non-zero after
+SIGTERM or is killed, when its log reports lost data, a failed shutdown or dropped events (the
+same lines `check` reads), or when the fence is no longer a valid `root` partition once the
+candidate has exited (its CPUs stopped being exclusive, so the numbers cannot be trusted). With
+`--items-per-sec`, it also fails when gen achieved more than 1% below the target or dispatched a
+request more than 3 s after its due time: the candidate then set the rate, so its numbers are not
+at the target. It also fails when a sink recorded no rows, or a different number of rows from the
+first run of the invocation. A run that fails still gets its numbers. Exit `0` when every run
+passed, `1` when any failed, `2` on error.
+
+**Equivalent candidates.** `bench` assumes the candidates it compares are semantically equivalent:
+given the same corpus, each sink writes the same rows for every one of them. Run `check` on them
+first; that is what proves it. The row count is a cheap guard against a run that lost or
+duplicated rows, not a comparison of the rows. Retried requests can legitimately deliver a row
+twice, so when either run retried, the failure says so.
+A candidate that never listens, a fake that cannot start or stop cleanly, or a fence that does not
+take or cannot be removed is an error, not a failed run. Nothing here verifies outputs: that is `check`.
+
+Limits:
+
+- Linux only: cgroup v2 with the cpuset controller, plus passwordless sudo.
+- The box may be too small near production rates (a staging pod receives about 30k items/s, see
+  "Which rate"). The harness and the candidate each get half of this box's cores, which is not a
+  pod's CPU allotment.
+- The load is what `--items-per-sec` sets, so a higher rate tests the candidate at that rate. Unset,
+  the run measures how fast the candidate accepts, and may end in an OOM kill (see "Which rate").
+- Timing is for comparing candidates on the same box, in the same run conditions. It is not an
+  absolute production number.
+- Compare candidates in one invocation: the fence keeps other processes off the candidate's CPUs,
+  but not the VM's neighbours off the host.
+
+Flags, as for `check` unless noted:
+
+- `--corpus`, `--sink` (repeatable), `--schema`, `--iterations`, `--items-per-sec`,
+  `--max-concurrency`, `--work-dir` (missing or empty, never overwritten).
+- `--candidate NAME=BIN:CONFIG` (repeatable, at least one; names as for `check`).
+- `--repeat N` (default 1, at least 1): rounds of every candidate, alternating their order. Use
+  at least 3 to compare candidates.
+- `--candidate-memory LIMIT` (default `8G`): the fence's `memory.max`, in bytes or with a K, M or G
+  suffix.
+- `--gen-threads N` (default: the harness CPU count, at least 1).
+
+What lands under `--work-dir`:
+
+- `results.json`: the settings, the harness and candidate CPU sets, each run's candidate, round
+  (from 1) and numbers (with the rows each sink recorded and gen's retried attempts), binary,
+  config, `--version` line and failures, and each candidate's summary over its runs.
+- `<name>/<round>/vector.log`: the candidate's stdout and stderr in that round. Start here when a
+  run fails.
+- `<name>/<round>/sent.ndjson`: the sent log `gen` wrote for that run.
+- `<name>/<round>/data/`, `<name>/<round>/tls/`, `<name>/<round>/<sink>-out/`: as for `check`,
+  for that run.
+
+Ctrl-C (SIGINT) and any error stop the candidate with SIGTERM, remove the fence, stop the fakes,
+and keep the work dir.
+
 ## fetch-schema: save a table's schema for the fakes (step 0)
 
 `fake-uc` answers the sink's Unity Catalog lookups with a table schema. Rather than keep a copy in

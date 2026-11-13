@@ -6,13 +6,17 @@
 //! `source_codec` and `benches/databricks/README.md`.
 #![allow(deprecated)] // hyper 0.14 server/client APIs, matching the rest of the crate.
 
+mod bench;
 mod capture;
+mod cgroup;
 mod check;
 mod corpus;
+mod cpus;
 mod fake_s3;
 mod fake_uc;
 mod fake_zerobus;
 mod fakes;
+mod fence;
 mod fetch_schema;
 mod generator;
 mod out_dir;
@@ -69,6 +73,28 @@ enum Command {
     Gen(generator::GenArgs),
     /// Compare what candidates' sinks wrote, each with its sink's baseline.
     Verify(verify::VerifyArgs),
+    /// Runs the candidates one at a time for performance: the one command for perf, beside `check`.
+    ///
+    /// It runs in --repeat rounds, each of which runs every candidate once, in the order given and
+    /// then reversed, alternately. For each run it starts the fakes in this process, fences the
+    /// candidate CPUs off from every other process (a cpuset partition with a memory limit, made
+    /// with passwordless sudo), starts the candidate inside the fence, replays the corpus with the
+    /// load generator, stops the candidate with SIGTERM (timing its flush), removes the fence, then
+    /// stops the fakes. The CPUs are split from the box's cores: the first half serves the harness
+    /// (the load generator and the fakes) and the rest the candidate.
+    ///
+    /// Real runs need optimized builds: the bench (plain `cargo bench`, without `--profile dev`,
+    /// which is refused) and each candidate (`cargo build --release`, copied out of `target/`, since
+    /// `cargo bench` replaces `target/release/vector` with its own build, which is refused too).
+    /// The candidate's `--version` line is recorded with its binary and config.
+    ///
+    /// A run fails when a request was not accepted, the candidate exits non-zero after SIGTERM or
+    /// logs a failed shutdown, its fence is no longer valid at the end, a paced run missed its
+    /// rate, or a sink recorded no rows or a different count from the first run's. Outputs are not
+    /// verified: that is `check`. Exits 0 when every run passed, 1 when any failed, and 2 on error.
+    /// Everything written goes under --work-dir, which must be missing or empty; `results.json`
+    /// holds every run and each candidate's median and range over its runs.
+    Bench(bench::BenchArgs),
 }
 
 fn main() {
@@ -88,6 +114,7 @@ fn main() {
         Command::FakeZerobus(args) => runtime().block_on(fake_zerobus::serve(args)),
         Command::Gen(args) => runtime().block_on(generator::run_cli(args)),
         Command::Verify(args) => verify::run_cli(args),
+        Command::Bench(args) => bench::run_cli(args),
     };
     match result {
         Ok(true) => {}

@@ -55,14 +55,14 @@ pub const SOURCE_ADDR_VAR: &str = "DATABRICKS_BENCH_SOURCE_ADDR";
 /// Set in every candidate's environment: its fresh data dir.
 pub const DATA_DIR_VAR: &str = "DATABRICKS_BENCH_DATA_DIR";
 /// How long a candidate may take to listen on its source after it starts.
-const READY_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a candidate may take to flush and exit after SIGTERM, before it is killed.
-const FLUSH_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const FLUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Vector's own graceful-shutdown budget. It is below `FLUSH_TIMEOUT`, so a slow flush is ended
 /// by Vector, which logs why, before the harness kills the process.
-const GRACEFUL_SHUTDOWN_SECS: u64 = 50;
+pub(super) const GRACEFUL_SHUTDOWN_SECS: u64 = 50;
 /// Per-attempt timeout for `gen`, as its default.
-const REQUEST_TIMEOUT_SECS: u64 = 30;
+pub(super) const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 #[derive(clap::Args)]
 pub struct CheckArgs {
@@ -107,16 +107,16 @@ pub struct CheckArgs {
 
 /// One candidate: a name, a Vector binary and its config.
 #[derive(Debug, PartialEq)]
-struct Candidate {
+pub(super) struct Candidate {
     /// The flag it came from, for error messages.
-    flag: &'static str,
-    name: String,
-    bin: PathBuf,
-    config: PathBuf,
+    pub(super) flag: &'static str,
+    pub(super) name: String,
+    pub(super) bin: PathBuf,
+    pub(super) config: PathBuf,
 }
 
 /// Parses `NAME=BIN:CONFIG`. The config is taken after the last colon.
-fn parse_candidate(flag: &'static str, spec: &str) -> Result<Candidate, BoxError> {
+pub(super) fn parse_candidate(flag: &'static str, spec: &str) -> Result<Candidate, BoxError> {
     let usage = || err(format!("{flag} `{spec}`: expected NAME=VECTOR_BIN:CONFIG"));
     let (name, rest) = spec.split_once('=').ok_or_else(usage)?;
     let (bin, config) = rest.rsplit_once(':').ok_or_else(usage)?;
@@ -137,7 +137,7 @@ fn parse_candidate(flag: &'static str, spec: &str) -> Result<Candidate, BoxError
     })
 }
 
-fn parse_sinks(kinds: &[String]) -> Result<Vec<&'static dyn SinkKind>, BoxError> {
+pub(super) fn parse_sinks(kinds: &[String]) -> Result<Vec<&'static dyn SinkKind>, BoxError> {
     let mut sinks: Vec<&'static dyn SinkKind> = Vec::new();
     for kind in kinds {
         let sink = sink_named(kind).map_err(|e| err(format!("--sink: {e}")))?;
@@ -147,6 +147,58 @@ fn parse_sinks(kinds: &[String]) -> Result<Vec<&'static dyn SinkKind>, BoxError>
         sinks.push(sink);
     }
     Ok(sinks)
+}
+
+/// Refuses candidate names that repeat, and binaries or configs that are not files. Names are
+/// checked against the candidates before them, so the first repeat is the one reported.
+pub(super) fn check_candidates(candidates: &[Candidate]) -> Result<(), BoxError> {
+    for (i, candidate) in candidates.iter().enumerate() {
+        if candidates[..i].iter().any(|c| c.name == candidate.name) {
+            return Err(err(format!(
+                "{} `{}`: the name `{}` is already used; candidate names must differ",
+                candidate.flag, candidate.name, candidate.name
+            )));
+        }
+        if !candidate.bin.is_file() {
+            return Err(err(format!(
+                "{}: no vector binary at {}",
+                candidate.flag,
+                candidate.bin.display()
+            )));
+        }
+        if !candidate.config.is_file() {
+            return Err(err(format!(
+                "{}: no config at {}",
+                candidate.flag,
+                candidate.config.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The table schemas for fake-uc: required when a sink reads one, refused when none does, and one
+/// per table.
+pub(super) fn schema_for(
+    sinks: &[&'static dyn SinkKind],
+    schemas: &[TableSchema],
+) -> Result<Vec<TableSchema>, BoxError> {
+    let needing_schema: Vec<&str> = sinks
+        .iter()
+        .filter(|sink| sink.needs_schema())
+        .map(|sink| sink.name())
+        .collect();
+    fake_uc::check_unique(schemas).map_err(err)?;
+    match (schemas.is_empty(), needing_schema.is_empty()) {
+        (false, true) => Err(err(
+            "--schema is given, but no --sink reads a table schema; drop it",
+        )),
+        (true, false) => Err(err(format!(
+            "--schema is required: sink(s) {} read a table schema from fake-uc",
+            needing_schema.join(", ")
+        ))),
+        _ => Ok(schemas.to_vec()),
+    }
 }
 
 /// The run as the command line describes it. Building one reads nothing but the binaries, configs
@@ -171,49 +223,8 @@ impl Plan {
         for spec in &args.candidates {
             candidates.push(parse_candidate("--candidate", spec)?);
         }
-        for (i, candidate) in candidates.iter().enumerate() {
-            if candidates[..i].iter().any(|c| c.name == candidate.name) {
-                return Err(err(format!(
-                    "{} `{}`: the name `{}` is already used; candidate names must differ",
-                    candidate.flag, candidate.name, candidate.name
-                )));
-            }
-            if !candidate.bin.is_file() {
-                return Err(err(format!(
-                    "{}: no vector binary at {}",
-                    candidate.flag,
-                    candidate.bin.display()
-                )));
-            }
-            if !candidate.config.is_file() {
-                return Err(err(format!(
-                    "{}: no config at {}",
-                    candidate.flag,
-                    candidate.config.display()
-                )));
-            }
-        }
-
-        let needing_schema: Vec<&str> = sinks
-            .iter()
-            .filter(|sink| sink.needs_schema())
-            .map(|sink| sink.name())
-            .collect();
-        fake_uc::check_unique(&args.schemas).map_err(err)?;
-        match (args.schemas.is_empty(), needing_schema.is_empty()) {
-            (false, true) => {
-                return Err(err(
-                    "--schema is given, but no --sink reads a table schema; drop it",
-                ));
-            }
-            (true, false) => {
-                return Err(err(format!(
-                    "--schema is required: sink(s) {} read a table schema from fake-uc",
-                    needing_schema.join(", ")
-                )));
-            }
-            _ => {}
-        }
+        check_candidates(&candidates)?;
+        let schemas = schema_for(&sinks, &args.schemas)?;
 
         check_run_args(
             args.iterations,
@@ -225,7 +236,7 @@ impl Plan {
             corpus: args.corpus.clone(),
             sinks,
             candidates,
-            schemas: args.schemas.clone(),
+            schemas,
             iterations: args.iterations,
             items_per_sec: args.items_per_sec,
             max_concurrency: args.max_concurrency,
@@ -235,18 +246,67 @@ impl Plan {
 }
 
 /// Where a sink's fake for a candidate records its output.
-fn out_dir(work_dir: &Path, candidate: &str, sink: &dyn SinkKind) -> PathBuf {
-    work_dir
-        .join(candidate)
-        .join(format!("{}-out", sink.name()))
+pub(super) fn out_dir(work_dir: &Path, candidate: &str, sink: &dyn SinkKind) -> PathBuf {
+    sink_out_dir(&work_dir.join(candidate), sink)
+}
+
+/// Where a sink's fake records its output, under the directory of the run it serves.
+pub(super) fn sink_out_dir(run_dir: &Path, sink: &dyn SinkKind) -> PathBuf {
+    run_dir.join(format!("{}-out", sink.name()))
 }
 
 /// The environment every candidate gets, whatever its sinks. Each sink adds its own.
-fn common_env(data_dir: &Path, source: SocketAddr) -> Vec<(String, String)> {
+pub(super) fn common_env(data_dir: &Path, source: SocketAddr) -> Vec<(String, String)> {
     vec![
         (DATA_DIR_VAR.to_owned(), data_dir.display().to_string()),
         (SOURCE_ADDR_VAR.to_owned(), source.to_string()),
     ]
+}
+
+/// Starts the shared fake-uc when there are `schemas`, adding it to `fakes`, and returns its
+/// address for the sinks that read a table schema.
+pub(super) fn start_fake_uc(
+    schemas: &[TableSchema],
+    fakes: &mut Vec<RunningFake>,
+) -> Result<Option<SocketAddr>, BoxError> {
+    if schemas.is_empty() {
+        return Ok(None);
+    }
+    let uc = fake_uc::start(FakeUcArgs {
+        listen: EPHEMERAL_LOOPBACK,
+        schemas: schemas.to_vec(),
+    })?;
+    let addr = uc.addr;
+    fakes.push(uc);
+    Ok(Some(addr))
+}
+
+/// Starts one candidate's fake for each of `sinks`, recording under `run_dir`, adding each to
+/// `fakes` as soon as it runs, and returns the environment that points the candidate's config at
+/// them.
+pub(super) fn start_sink_fakes(
+    run_dir: &Path,
+    sinks: &[&'static dyn SinkKind],
+    schema_endpoint: Option<SocketAddr>,
+    fakes: &mut Vec<RunningFake>,
+) -> Result<Vec<(String, String)>, BoxError> {
+    let mut env = Vec::new();
+    for sink in sinks {
+        let setup = FakeSetup {
+            out: sink_out_dir(run_dir, *sink),
+            tls_dir: run_dir.join("tls"),
+            schema_endpoint,
+        };
+        let fake = sink.start_fake(&setup)?;
+        let fake_addr = fake.addr;
+        fakes.push(fake);
+        env.extend(
+            sink.candidate_env(&setup, fake_addr)?
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v)),
+        );
+    }
+    Ok(env)
 }
 
 /// A candidate process this run started.
@@ -283,17 +343,7 @@ pub async fn run(args: CheckArgs) -> CmdResult {
 
 async fn execute(plan: &Plan, corpus: &Corpus, session: &mut Session) -> CmdResult {
     let codec = codec_named(&corpus.header.source_type)?;
-    let schema_endpoint = if plan.schemas.is_empty() {
-        None
-    } else {
-        let uc = fake_uc::start(FakeUcArgs {
-            listen: EPHEMERAL_LOOPBACK,
-            schemas: plan.schemas.clone(),
-        })?;
-        let addr = uc.addr;
-        session.fakes.push(uc);
-        Some(addr)
-    };
+    let schema_endpoint = start_fake_uc(&plan.schemas, &mut session.fakes)?;
 
     for candidate in &plan.candidates {
         let dir = plan.work_dir.join(&candidate.name);
@@ -302,21 +352,12 @@ async fn execute(plan: &Plan, corpus: &Corpus, session: &mut Session) -> CmdResu
             .map_err(|e| err(format!("creating {}: {e}", data_dir.display())))?;
         let source = free_loopback_addr()?;
         let mut env = common_env(&data_dir, source);
-        for sink in &plan.sinks {
-            let setup = FakeSetup {
-                out: out_dir(&plan.work_dir, &candidate.name, *sink),
-                tls_dir: dir.join("tls"),
-                schema_endpoint,
-            };
-            let fake = sink.start_fake(&setup)?;
-            let fake_addr = fake.addr;
-            session.fakes.push(fake);
-            env.extend(
-                sink.candidate_env(&setup, fake_addr)?
-                    .into_iter()
-                    .map(|(k, v)| (k.to_owned(), v)),
-            );
-        }
+        env.extend(start_sink_fakes(
+            &dir,
+            &plan.sinks,
+            schema_endpoint,
+            &mut session.fakes,
+        )?);
 
         let log = dir.join("vector.log");
         let mut child = spawn_candidate(

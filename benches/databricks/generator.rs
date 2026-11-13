@@ -502,6 +502,69 @@ mod tests {
     }
 
     #[test]
+    fn every_iteration_stamps_the_request_with_its_own_send_time() {
+        // Two passes of two one-item requests at 20 items/s, so sends are 50 ms apart: each
+        // request is encoded when it is sent, so its second pass carries a later timestamp.
+        let make = hyper::service::make_service_fn(|_| async {
+            Ok::<_, std::convert::Infallible>(hyper::service::service_fn(
+                |_req: hyper::Request<hyper::Body>| async {
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(hyper::Body::empty()))
+                },
+            ))
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let server = hyper::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(make);
+            let addr = server.local_addr();
+            tokio::spawn(server);
+            let targets = [Target {
+                name: "a".into(),
+                uri: format!("http://{addr}/").parse().unwrap(),
+            }];
+            let corpus = Corpus {
+                header: header(),
+                requests: vec![vec![item("up")], vec![item("down")]],
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let sent_log = dir.path().join("sent.ndjson");
+            let settings = RunSettings {
+                iterations: 2,
+                items_per_sec: Some(20.0),
+                max_concurrency: 1,
+                request_timeout: Duration::from_secs(30),
+            };
+            generate(&corpus, identity(), &targets, &sent_log, settings)
+                .await
+                .unwrap();
+            let sent: Vec<SentRequest> = std::fs::read_to_string(&sent_log)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(sent.len(), 4);
+            for request in [0, 1] {
+                let stamp = |iteration| {
+                    sent.iter()
+                        .find(|r| r.request == request && r.iteration == iteration)
+                        .map(|r| r.ts)
+                        .unwrap()
+                };
+                assert!(
+                    stamp(1) > stamp(0),
+                    "request {request} was stamped {} then {}",
+                    stamp(0),
+                    stamp(1)
+                );
+            }
+        });
+    }
+
+    #[test]
     fn no_more_than_max_concurrency_requests_are_in_flight() {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
