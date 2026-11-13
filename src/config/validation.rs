@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{LazyLock, Mutex},
+};
 
 use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, stream};
 use heim::{disk::Partition, units::information::byte};
@@ -18,6 +22,11 @@ const EWMA_ALPHA_MIN: f64 = 0.0;
 /// Maximum value (exclusive) for `utilization_ewma_alpha`.
 /// The alpha value must be strictly less than this value.
 const EWMA_ALPHA_MAX: f64 = 1.0;
+
+/// Buffers already reported as having no matching mountpoint. The buffer check runs on every config
+/// reload, so without this the same warning is repeated for the life of the process.
+static REPORTED_UNMATCHED_BUFFERS: LazyLock<Mutex<HashSet<(String, PathBuf)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Check that provide + topology config aren't present in the same builder, which is an error.
 pub fn check_provider(config: &ConfigBuilder) -> Result<(), Vec<String>> {
@@ -280,12 +289,21 @@ pub async fn check_buffer_preconditions(config: &Config) -> Result<(), Vec<Strin
                 .find(|mountpoint| canonicalized_data_dir.starts_with(mountpoint));
 
             match mountpoint {
-                None => warn!(
-                    buffer_id = usage.id().id(),
-                    data_dir = usage.data_dir().to_string_lossy().as_ref(),
-                    canonicalized_data_dir = canonicalized_data_dir.to_string_lossy().as_ref(),
-                    message = "Found no matching mountpoint for buffer data directory.",
-                ),
+                None => {
+                    let first_report = REPORTED_UNMATCHED_BUFFERS
+                        .lock()
+                        .expect("reported unmatched buffers lock poisoned")
+                        .insert((usage.id().id().to_string(), canonicalized_data_dir.clone()));
+                    if first_report {
+                        warn!(
+                            buffer_id = usage.id().id(),
+                            data_dir = usage.data_dir().to_string_lossy().as_ref(),
+                            canonicalized_data_dir =
+                                canonicalized_data_dir.to_string_lossy().as_ref(),
+                            message = "Found no matching mountpoint for buffer data directory.",
+                        );
+                    }
+                }
                 Some(mountpoint) => {
                     mappings.entry(mountpoint.clone()).or_default().push(usage);
                 }
