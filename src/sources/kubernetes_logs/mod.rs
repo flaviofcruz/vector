@@ -1430,7 +1430,8 @@ impl Source {
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
 
-        let checkpoints = checkpointer.view();
+        let checkpoints = util::DeliveryCheckpoints::new(checkpointer.view());
+        let read_checkpoints = checkpoints.clone();
         let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
         let mut encoding_decoder = encoding_charset.map(Decoder::new);
         let events = file_source_rx
@@ -1560,7 +1561,7 @@ impl Source {
                 );
             }
 
-            checkpoints.update(line.file_id, line.end_offset);
+            read_checkpoints.read(line.file_id, line.end_offset);
             event
         });
 
@@ -1621,6 +1622,7 @@ impl Source {
             let fut = util::send_stream_with_deadline_on_signal(
                 out,
                 stream,
+                checkpoints,
                 shutdown,
                 Duration::from_secs(30), // more than enough time to propagate
             )
