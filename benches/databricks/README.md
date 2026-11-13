@@ -46,7 +46,8 @@ resolve against it. Drop `--profile dev` (the bench profile is release) for perf
 you rarely run them by hand.
 
 ```bash
-hb check --corpus corpus.ndjson --sink s3 --sink zerobus --schema table.json \
+hb check --corpus corpus.ndjson --sink s3 --sink zerobus \
+  --schema <catalog.schema.table>=table.json \
   --baseline a=<vector-bin>:<config> --candidate b=<vector-bin>:<config> \
   --work-dir /tmp/check-run
 ```
@@ -69,17 +70,21 @@ What it does, in order:
 5. Stops each candidate with SIGTERM. Vector stops its sources and drains its sinks, which write
    their open batches, so no batch timeout has to elapse. A candidate that has not exited within
    60 s is killed and reported as an error, since its outputs may be incomplete. A candidate that
-   exits 0 is still checked: its log must not hold a failed shutdown. Vector exits 0 after it gives up
-   on components, or after a component fails, so the log is the only evidence. The lines checked for,
-   in `process.rs`, are `Failed to gracefully shut down in time`, `Overall shutdown deadline
-   exceeded` and `An error occurred that Vector couldn't handle`. `gracefully_closed = false` is not
-   one of them: on this build's shutdown path Vector logs it on every run.
+   exits 0 is still checked: its log must not report lost data. Vector exits 0 after it gives up
+   on components, after a component fails, and after a component drops events by mistake, so the
+   log is the only evidence. A drop is caught here because it would not show in verify when the
+   baseline and a candidate drop the same rows (a table with no `--schema`, for example, or a batch
+   every candidate's sink rejects). The lines checked for, in `process.rs`, are `Events dropped
+   intentional=false`, `Failed to gracefully shut down in time`, `Overall shutdown deadline
+   exceeded` and `An error occurred that Vector couldn't handle`. A filter's deliberate drops log
+   `intentional=true` and are not checked. `gracefully_closed = false` is not one of them either: on
+   this build's shutdown path Vector logs it on every run.
 6. Stops the fakes and verifies each sink's outputs against that sink's baseline (the baseline is
    the first candidate, always).
 
 Exit codes: `0` IDENTICAL; `1` DIFFERENT, INCONCLUSIVE, or a request that was not accepted on every
 candidate; `2` an error, including a refused sent log, a candidate that had to be killed, and a
-candidate whose log reports a failed shutdown. Ctrl-C
+candidate whose log reports lost data (a failed shutdown or dropped events). Ctrl-C
 (SIGINT) and any other error stop the candidates with SIGTERM and the fakes with the process; the
 work dir is kept.
 
@@ -95,10 +100,30 @@ Flags:
 - `--baseline NAME=BIN:CONFIG` and `--candidate NAME=BIN:CONFIG` (at least one candidate). The
   config is taken after the last colon, so it may not contain one. Names are letters, digits and
   underscores, and must differ.
-- `--schema FILE`: the table schema (see `fetch-schema`) that fake-uc serves. Required when a sink
-  reads a table schema (`zerobus`), and refused otherwise.
+- `--schema TABLE=PATH` (repeatable, once per table): TABLE is the full `<catalog>.<schema>.<table>`
+  the config writes, and PATH the table schema saved by `fetch-schema`. The shared fake-uc serves
+  each table its own file, and answers 404 for a table no `--schema` names, so the sink fails and
+  `check` reports it. Required when a sink reads a table schema (`zerobus`), and refused otherwise.
+  A repeated TABLE, a spec that is not `TABLE=PATH`, and a missing file are refused when the
+  arguments are parsed, before anything starts.
 - `--iterations`, `--items-per-sec`, `--max-concurrency`: as for `gen`.
 - `--work-dir DIR`: everything the run writes goes under it.
+
+### Fan-out: several tables and S3 prefixes
+
+A candidate's config may write several Zerobus tables and several S3 key prefixes. The harness sets
+one `DATABRICKS_BENCH_ZEROBUS_TABLE` for all of them, so a fan-out config writes each Zerobus sink's
+`table_name` itself, and gives every table its own `--schema TABLE=PATH`. Each `--sink` kind gets
+one fake per candidate, which every sink of that kind in the config writes to:
+
+- `fake-zerobus` writes each table's frames to `<zerobus-out>/<last segment of the table>/`. Two
+  tables whose names differ only by catalog or schema have the same last segment, so their rows land
+  in one directory and `verify` cannot tell them apart. Give fan-out tables distinct last segments.
+- `fake-s3` writes each object to `<s3-out>/<bucket>/<key>`, so sinks with different key
+  prefixes land in different directories, and a sink with the same prefix as another would merge.
+
+A table or prefix the candidate writes and the baseline does not shows as a destination `verify`
+reports as extra, so the verdict is DIFFERENT.
 
 What lands under `--work-dir`, and why:
 
@@ -134,7 +159,7 @@ Example, with the committed config for both sides and the Hydra corpus (for a re
 ```bash
 CFG=benches/databricks/configs/hydra_dual_write.yaml
 hb check --corpus ~/scratch/hb/pr-capture.v4.ndjson --sink s3 --sink zerobus \
-  --schema ~/scratch/hb/fetched/pod_prime_raw.json \
+  --schema main.databricks_bench.output=$HOME/scratch/hb/fetched/pod_prime_raw.json \
   --baseline a=target/release/vector:$CFG --candidate b=target/release/vector:$CFG \
   --work-dir /tmp/check-$(date +%s)
 ```
@@ -151,8 +176,8 @@ hb fetch-schema --profile <profile> --table <catalog.schema.table> --out table.j
 It runs `databricks tables get <table> -p <profile> -o json`, checks that the response has a
 non-empty `columns` array, and writes the response to `--out`. The CLI's stderr is shown but kept
 out of the file. If the CLI is missing or auth fails, it stops and prints the CLI's error with the
-`databricks auth login --profile <profile>` hint. Then start `fake-uc --schema <file>`, which serves
-it.
+`databricks auth login --profile <profile>` hint. Then start `fake-uc --schema TABLE=<file>`, once per
+table, which serves each table its own file.
 
 ## capture: record a corpus from a live pod
 
@@ -248,9 +273,9 @@ unity_catalog_endpoint: "http://127.0.0.1:9080"  # fake-uc --listen
 ingestion_endpoint: "https://127.0.0.1:9443"     # fake-zerobus --listen
 ```
 
-`fake-uc` serves the token and the table schema. The sink fetches them the first time it needs a
-stream, and again after Zerobus rejects its schema, when `recover_from_schema_rejection` is set. It
-has no `--out` and records nothing. Start order: `fetch-schema`, then `fake-uc`, then
+`fake-uc` serves the token and each `--schema` table's schema, and 404s any other table. The sink
+fetches them the first time it needs a stream, and again after Zerobus rejects its schema, when
+`recover_from_schema_rejection` is set. It has no `--out` and records nothing. Start order: `fetch-schema`, then `fake-uc`, then
 `fake-zerobus`, then the sink.
 
 Both write `index.ndjson`, one line per accepted PUT or batch, in arrival order:

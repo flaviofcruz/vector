@@ -17,7 +17,7 @@ pub struct FetchSchemaArgs {
     /// Full table name, `catalog.schema.table`.
     #[arg(long)]
     pub table: String,
-    /// File to write the GET-table response to, for `fake-uc --schema`.
+    /// File to write the GET-table response to, for `--schema TABLE=PATH` (`check` or `fake-uc`).
     #[arg(long)]
     pub out: PathBuf,
 }

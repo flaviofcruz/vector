@@ -110,7 +110,7 @@ SIGTERM, and verifies. Everything in `README.md` ("check") applies; the points a
   ```bash
   cargo bench --profile dev --bench databricks --no-default-features --features $FEATURES -- \
     check --corpus ~/scratch/hb/pr-capture.v4.ndjson --sink s3 --sink zerobus \
-    --schema ~/scratch/hb/fetched/pod_prime_raw.json \
+    --schema main.databricks_bench.output=$HOME/scratch/hb/fetched/pod_prime_raw.json \
     --baseline a=target/debug/vector:benches/databricks/configs/hydra_dual_write.yaml \
     --candidate b=target/debug/vector:benches/databricks/configs/hydra_dual_write.yaml \
     --work-dir /tmp/check-e2e/<run>
@@ -119,7 +119,8 @@ SIGTERM, and verifies. Everything in `README.md` ("check") applies; the points a
   `--work-dir` must not exist or must be empty; use a fresh path per run. The run takes minutes
   (about 3.5 min for the 270,608-row corpus in the dev profile, most of it verify).
 - **Exit codes.** 0 IDENTICAL; 1 DIFFERENT or INCONCLUSIVE, or a request not accepted; 2 error,
-  including a candidate whose log reports a failed shutdown. For 1 or 2, read the report on stderr,
+  including a candidate whose log reports lost data (a failed shutdown, or events dropped by
+  mistake, which verify cannot see when every candidate drops the same rows). For 1 or 2, read the report on stderr,
   then `<work-dir>/<name>/vector.log` for the candidate in question. For a DIFFERENT verdict, the
   report shows the rows that differ, with their destinations.
 - **Ports.** `check` binds only OS-assigned `127.0.0.1` ports, so it does not clash with the user's
@@ -169,8 +170,8 @@ SIGTERM, and verifies. Everything in `README.md` ("check") applies; the points a
 ### Manual flow (debugging only)
 
 `check` does all of this. Use the manual flow only to debug one part, such as a fake or a sink
-config, that `check` does not expose. Start fake-uc (`--schema`), fake-s3 and fake-zerobus on fresh
-`--out` dirs, export the candidate's `DATABRICKS_BENCH_*` variables (the table in `README.md`,
+config, that `check` does not expose. Start fake-uc (`--schema TABLE=PATH` per table), fake-s3 and
+fake-zerobus on fresh `--out` dirs, export the candidate's `DATABRICKS_BENCH_*` variables (the table in `README.md`,
 "check") pointing at them, and start the candidate. Then:
 
 1. `hb gen --corpus c.ndjson --target a=http://127.0.0.1:<port>/ --sent-log sent.ndjson`

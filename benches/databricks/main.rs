@@ -60,7 +60,8 @@ enum Command {
     FetchSchema(fetch_schema::FetchSchemaArgs),
     /// Serve a minimal S3 PutObject endpoint that records every object it receives.
     FakeS3(fake_s3::FakeS3Args),
-    /// Serve the Unity Catalog and OAuth endpoints the sink calls to get its table schema.
+    /// Serve the Unity Catalog and OAuth endpoints the sink calls to get its table schemas, one
+    /// `--schema TABLE=PATH` per table.
     FakeUc(fake_uc::FakeUcArgs),
     /// Serve a fake Zerobus ingestion endpoint (Arrow Flight over TLS) that records batches.
     FakeZerobus(fake_zerobus::FakeZerobusArgs),

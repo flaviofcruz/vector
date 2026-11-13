@@ -1,0 +1,1 @@
+The Databricks bench's `check` and `fake-uc` take `--schema TABLE=PATH` once per table, so a config that writes several Zerobus tables can be checked. fake-uc serves each table its own saved schema and answers 404 for a table that no `--schema` names. https://github.com/databricks-eng/vector/pull/951

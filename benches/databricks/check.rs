@@ -35,14 +35,14 @@ use std::time::Duration;
 use tokio::process::Child;
 
 use super::corpus::Corpus;
-use super::fake_uc::{self, FakeUcArgs};
+use super::fake_uc::{self, FakeUcArgs, TableSchema};
 use super::fakes::{BoxError, EPHEMERAL_LOOPBACK, RunningFake};
 use super::generator::{
     CorpusIdentity, RunSettings, Target, check_run_args, generate, parse_targets,
 };
 use super::out_dir::claim_empty_dir;
 use super::process::{
-    Stopped, free_loopback_addr, log_tail, shutdown_failure, spawn_candidate, terminate,
+    Stopped, free_loopback_addr, log_tail, logged_failure, spawn_candidate, terminate,
     wait_for_listener,
 };
 use super::sink::{FakeSetup, SinkKind, sink_named};
@@ -80,10 +80,16 @@ pub struct CheckArgs {
     /// letters, digits and underscores, and must differ.
     #[arg(long = "candidate", required = true, value_name = "NAME=BIN:CONFIG")]
     candidates: Vec<String>,
-    /// Table schema (as `fetch-schema` saves it) that the shared fake-uc serves. Required when a
+    /// Table schema the shared fake-uc serves, as `TABLE=PATH`: TABLE is the full
+    /// `<catalog>.<schema>.<table>` the config writes, and PATH the file `fetch-schema` saved for
+    /// it. Repeatable, once per table; a table not given gets 404 from fake-uc. Required when a
     /// `--sink` reads a table schema, and refused otherwise.
-    #[arg(long)]
-    schema: Option<PathBuf>,
+    #[arg(
+        long = "schema",
+        value_name = "TABLE=PATH",
+        value_parser = fake_uc::parse_table_schema
+    )]
+    schemas: Vec<TableSchema>,
     /// Passes over the corpus, as for `gen`.
     #[arg(long, default_value_t = 1)]
     iterations: u64,
@@ -150,7 +156,8 @@ struct Plan {
     sinks: Vec<&'static dyn SinkKind>,
     /// The baseline first, then the candidates in the order given.
     candidates: Vec<Candidate>,
-    schema: Option<PathBuf>,
+    /// Empty when no `--sink` reads a table schema.
+    schemas: Vec<TableSchema>,
     iterations: u64,
     items_per_sec: Option<f64>,
     max_concurrency: usize,
@@ -192,26 +199,21 @@ impl Plan {
             .filter(|sink| sink.needs_schema())
             .map(|sink| sink.name())
             .collect();
-        let schema = match (&args.schema, needing_schema.is_empty()) {
-            (Some(path), false) => {
-                if !path.is_file() {
-                    return Err(err(format!("--schema: no file at {}", path.display())));
-                }
-                Some(path.clone())
-            }
-            (Some(_), true) => {
+        fake_uc::check_unique(&args.schemas).map_err(err)?;
+        match (args.schemas.is_empty(), needing_schema.is_empty()) {
+            (false, true) => {
                 return Err(err(
                     "--schema is given, but no --sink reads a table schema; drop it",
                 ));
             }
-            (None, false) => {
+            (true, false) => {
                 return Err(err(format!(
                     "--schema is required: sink(s) {} read a table schema from fake-uc",
                     needing_schema.join(", ")
                 )));
             }
-            (None, true) => None,
-        };
+            _ => {}
+        }
 
         check_run_args(
             args.iterations,
@@ -223,7 +225,7 @@ impl Plan {
             corpus: args.corpus.clone(),
             sinks,
             candidates,
-            schema,
+            schemas: args.schemas.clone(),
             iterations: args.iterations,
             items_per_sec: args.items_per_sec,
             max_concurrency: args.max_concurrency,
@@ -281,17 +283,16 @@ pub async fn run(args: CheckArgs) -> CmdResult {
 
 async fn execute(plan: &Plan, corpus: &Corpus, session: &mut Session) -> CmdResult {
     let codec = codec_named(&corpus.header.source_type)?;
-    let schema_endpoint = match &plan.schema {
-        Some(schema) => {
-            let uc = fake_uc::start(FakeUcArgs {
-                listen: EPHEMERAL_LOOPBACK,
-                schema: schema.clone(),
-            })?;
-            let addr = uc.addr;
-            session.fakes.push(uc);
-            Some(addr)
-        }
-        None => None,
+    let schema_endpoint = if plan.schemas.is_empty() {
+        None
+    } else {
+        let uc = fake_uc::start(FakeUcArgs {
+            listen: EPHEMERAL_LOOPBACK,
+            schemas: plan.schemas.clone(),
+        })?;
+        let addr = uc.addr;
+        session.fakes.push(uc);
+        Some(addr)
     };
 
     for candidate in &plan.candidates {
@@ -387,11 +388,13 @@ async fn execute(plan: &Plan, corpus: &Corpus, session: &mut Session) -> CmdResu
                 running.log.display()
             )),
         }
-        // Vector exits 0 even when its shutdown gave up on components, so the log is the evidence.
-        match shutdown_failure(&running.log) {
+        // Vector exits 0 even when its shutdown gave up on components or a component dropped
+        // events, so the log is the evidence. A drop shared by every candidate would not show
+        // in verify.
+        match logged_failure(&running.log) {
             Ok(Some(line)) => problems.push(format!(
-                "candidate `{}` logged a failed shutdown, so its sinks may not have flushed: \
-                 `{line}`; log {}",
+                "candidate `{}` logged lost data, so its outputs may be incomplete: `{line}`; \
+                 log {}",
                 running.name,
                 running.log.display()
             )),
@@ -572,9 +575,9 @@ mod tests {
     #[test]
     fn zerobus_needs_a_schema_and_only_zerobus_takes_one() {
         let dir = tempfile::tempdir().unwrap();
-        let schema = dir.path().join("table.json");
-        std::fs::write(&schema, b"{}").unwrap();
-        let schema = schema.display().to_string();
+        let file = dir.path().join("table.json");
+        std::fs::write(&file, b"{}").unwrap();
+        let schema = format!("main.databricks_bench.output={}", file.display());
 
         let error = plan_error(&argv(dir.path(), &["--sink", "zerobus"]));
         assert!(error.contains("--schema is required"), "{error}");
@@ -587,6 +590,40 @@ mod tests {
 
         let error = plan_error(&argv(dir.path(), &["--sink", "s3", "--schema", &schema]));
         assert!(error.contains("--schema is given"), "{error}");
+    }
+
+    #[test]
+    fn each_schema_names_one_table_and_a_repeated_table_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("table.json");
+        std::fs::write(&file, b"{}").unwrap();
+        let first = format!("main.databricks_bench.output={}", file.display());
+        let second = format!("main.databricks_bench.output2={}", file.display());
+        plan_ok(&argv(
+            dir.path(),
+            &["--sink", "zerobus", "--schema", &first, "--schema", &second],
+        ));
+
+        let error = plan_error(&argv(
+            dir.path(),
+            &["--sink", "zerobus", "--schema", &first, "--schema", &first],
+        ));
+        assert!(
+            error.contains("--schema main.databricks_bench.output="),
+            "{error}"
+        );
+        assert!(error.contains("given more than once"), "{error}");
+    }
+
+    #[test]
+    fn a_schema_file_that_is_missing_is_refused_at_parse_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such.json");
+        let spec = format!("main.databricks_bench.output={}", missing.display());
+        let args = argv(dir.path(), &["--sink", "zerobus", "--schema", &spec]);
+        let error = TestCli::try_parse_from(&args).err().unwrap().to_string();
+        assert!(error.contains("--schema"), "{error}");
+        assert!(error.contains(&missing.display().to_string()), "{error}");
     }
 
     #[test]

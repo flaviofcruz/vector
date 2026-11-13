@@ -18,10 +18,16 @@ use super::source_codec::SourceCodec;
 /// Lines of a candidate's log shown in an error.
 const TAIL_LINES: usize = 25;
 
-/// Messages Vector logs when its shutdown did not finish cleanly. It exits 0 after each of them, so
-/// the exit status cannot show that data may have been dropped. `gracefully_closed = false` is not
-/// one: on this build's shutdown path it is always false, and a clean run logs it.
-const SHUTDOWN_FAILURES: &[&str] = &[
+/// Messages Vector logs when it lost data: a shutdown that did not finish cleanly, or events a
+/// component dropped by mistake. It exits 0 after each of them, so the exit status cannot show
+/// that data was dropped, and a drop that hits the baseline and a candidate alike leaves their
+/// outputs equal. `gracefully_closed = false` is not one: on this build's shutdown path it is
+/// always false, and a clean run logs it.
+const LOGGED_FAILURES: &[&str] = &[
+    // internal_event/component_events_dropped.rs: a component dropped events it did not mean to
+    // (a filter's drops log `intentional=true`). The first is always logged before any are
+    // rate-limited.
+    "Events dropped intentional=false",
     // topology/running.rs: the wave-1 deadline passed, and the remaining components were killed.
     "Failed to gracefully shut down in time",
     // topology/running.rs: the overall shutdown deadline aborted the components still running.
@@ -131,13 +137,13 @@ pub fn log_tail(log: &Path) -> String {
     }
 }
 
-/// The first line of a candidate's log that reports a failed shutdown (see `SHUTDOWN_FAILURES`).
-pub fn shutdown_failure(log: &Path) -> Result<Option<String>, BoxError> {
+/// The first line of a candidate's log that reports lost data (see `LOGGED_FAILURES`).
+pub fn logged_failure(log: &Path) -> Result<Option<String>, BoxError> {
     let bytes = std::fs::read(log).map_err(|e| err(format!("reading {}: {e}", log.display())))?;
     let text = String::from_utf8_lossy(&bytes);
     Ok(text
         .lines()
-        .find(|line| SHUTDOWN_FAILURES.iter().any(|marker| line.contains(marker)))
+        .find(|line| LOGGED_FAILURES.iter().any(|marker| line.contains(marker)))
         .map(|line| line.trim().to_owned()))
 }
 
@@ -147,20 +153,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_failed_shutdown_in_the_log_is_found_and_a_clean_one_is_not() {
+    fn a_logged_failure_is_found_and_a_clean_log_is_not() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("vector.log");
         // A clean run logs `gracefully_closed = false` on this build's shutdown path.
         let clean =
             "INFO vector: Vector has stopped.\nINFO vector::topology: gracefully_closed = false\n";
         std::fs::write(&log, clean).unwrap();
-        assert_eq!(shutdown_failure(&log).unwrap(), None);
+        assert_eq!(logged_failure(&log).unwrap(), None);
 
-        for marker in SHUTDOWN_FAILURES {
+        for marker in LOGGED_FAILURES {
             let line = format!("ERROR vector::topology::running: {marker}. Killing components.");
             std::fs::write(&log, format!("{clean}{line}\n")).unwrap();
             assert_eq!(
-                shutdown_failure(&log).unwrap().as_deref(),
+                logged_failure(&log).unwrap().as_deref(),
                 Some(line.as_str())
             );
         }
@@ -170,7 +176,7 @@ mod tests {
     fn a_missing_log_is_an_error_naming_it() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("absent.log");
-        let error = shutdown_failure(&log).unwrap_err().to_string();
+        let error = logged_failure(&log).unwrap_err().to_string();
         assert!(error.contains("absent.log"), "{error}");
     }
 }
