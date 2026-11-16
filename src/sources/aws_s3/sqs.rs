@@ -3,7 +3,10 @@ use std::{
     future::ready,
     num::{NonZeroU64, NonZeroUsize},
     panic,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -30,6 +33,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 use smallvec::SmallVec;
 use snafu::{ResultExt, Snafu};
+use tokio::io::AsyncRead;
 use tokio::{pin, select};
 use tokio_util::codec::FramedRead;
 use tracing::Instrument;
@@ -58,13 +62,13 @@ use crate::{
     config::{SourceAcknowledgementsConfig, SourceContext},
     event::{BatchNotifier, BatchStatus, EstimatedJsonEncodedSizeOf},
     internal_events::{
-        EventsReceived, QueueMessageCount, QueueNotificationProcessLag, S3ObjectProcessingFailed,
-        S3ObjectProcessingSucceeded, SqsMessageDeleteBatchError, SqsMessageDeletePartialError,
-        SqsMessageDeleteSucceeded, SqsMessageProcessingError, SqsMessageProcessingSucceeded,
-        SqsMessageReceiveError, SqsMessageReceiveSucceeded, SqsMessageSendBatchError,
-        SqsMessageSentPartialError, SqsMessageSentSucceeded, SqsMessageVisibilityReleased,
-        SqsS3EventRecordInvalidEventIgnored, StreamClosedError, emit_object_storage_ack_metrics,
-        emit_object_storage_non_ack_metrics,
+        EventsReceived, ObjectStorageBlobTruncated, QueueMessageCount, QueueNotificationProcessLag,
+        S3ObjectProcessingFailed, S3ObjectProcessingSucceeded, SqsMessageDeleteBatchError,
+        SqsMessageDeletePartialError, SqsMessageDeleteSucceeded, SqsMessageProcessingError,
+        SqsMessageProcessingSucceeded, SqsMessageReceiveError, SqsMessageReceiveSucceeded,
+        SqsMessageSendBatchError, SqsMessageSentPartialError, SqsMessageSentSucceeded,
+        SqsMessageVisibilityReleased, SqsS3EventRecordInvalidEventIgnored, StreamClosedError,
+        emit_object_storage_ack_metrics, emit_object_storage_non_ack_metrics,
     },
     line_agg::{self, LineAgg},
     shutdown::ShutdownSignal,
@@ -72,6 +76,7 @@ use crate::{
     sources::ingestion_callback::IngestionCallbackClient,
     sources::util::object_storage_drain_gate::{GateDecision, ObjectStorageGate},
     sources::util::object_storage_rate_limit::{ByteCounter, ObjectStorageRateLimiter},
+    sources::util::{TolerateTrailingEof, TruncatedArchiveFramer},
     tls::TlsConfig,
 };
 
@@ -245,6 +250,23 @@ pub(super) struct Config {
     #[serde(default)]
     #[derivative(Default)]
     pub(super) process_custom_message: bool,
+
+    /// Whether to ingest the decodable prefix of a truncated compressed object and ack it, instead
+    /// of failing the read and redelivering the message forever.
+    ///
+    /// A gzip/zstd archive whose committed bytes end mid-member (a torn upload) decodes fine up to
+    /// the tear, then errors with `UnexpectedEof`. The object is immutable, so leaving the read to
+    /// error redelivers the same un-decodable object indefinitely, re-ingesting the decodable
+    /// prefix as duplicates each cycle. When enabled, the source ingests the records that did
+    /// decode, acks the message, and emits `ObjectStorageBlobTruncated` for the dropped tail.
+    ///
+    /// Defaults to `false`: tolerating truncation drops the torn tail (data loss), so it is
+    /// opt-in per source. It only ever applies to a fully-downloaded but truncated archive — a
+    /// short *transfer* (fewer bytes than `Content-Length`) still redelivers regardless of this
+    /// setting.
+    #[serde(default)]
+    #[derivative(Default)]
+    pub(super) tolerate_truncated_archives: bool,
 }
 
 const fn default_poll_secs() -> u32 {
@@ -403,6 +425,7 @@ pub struct State {
 
     deferred: Option<DeferredConfig>,
     process_custom_message: bool,
+    tolerate_truncated_archives: bool,
     callback_client: Option<IngestionCallbackClient>,
     rate_limiter: ObjectStorageRateLimiter,
     adaptive: Option<AdaptiveObjectStorageConcurrency>,
@@ -468,6 +491,7 @@ impl Ingestor {
 
             deferred: config.deferred,
             process_custom_message: config.process_custom_message,
+            tolerate_truncated_archives: config.tolerate_truncated_archives,
             callback_client,
             rate_limiter,
             adaptive,
@@ -1283,6 +1307,14 @@ impl IngestorProcess {
                 .expect("invalid timestamp")
         });
 
+        // Advertised size of the object; used to distinguish a truncated object (compressed bytes
+        // pulled == content_length) from a short download (fewer bytes) below.
+        let content_length = object
+            .content_length
+            .and_then(|len| u64::try_from(len).ok())
+            .unwrap_or(0);
+        let compressed_bytes = Arc::new(AtomicU64::new(0));
+
         let (batch, receiver) = BatchNotifier::maybe_new_with_receiver(self.acknowledgements);
         let object_reader = super::s3_object_decoder(
             self.state.compression,
@@ -1290,8 +1322,24 @@ impl IngestorProcess {
             object.content_encoding.as_deref(),
             object.content_type.as_deref(),
             object.body,
+            Arc::clone(&compressed_bytes),
         )
         .await;
+
+        // Optionally tolerate a truncated trailing gzip/zstd member: ingest the decodable prefix
+        // and ack rather than redelivering an immutable, un-fully-decodable object forever. Gated
+        // by `tolerate_truncated_archives` (default off) because the dropped tail is data loss.
+        // See TolerateTrailingEof.
+        let truncated_tail = Arc::new(AtomicBool::new(false));
+        let object_reader: Box<dyn AsyncRead + Send + Unpin> =
+            if self.state.tolerate_truncated_archives {
+                Box::new(TolerateTrailingEof::new(
+                    object_reader,
+                    Arc::clone(&truncated_tail),
+                ))
+            } else {
+                object_reader
+            };
 
         // Record the read error seen to propagate up later so we avoid ack'ing the SQS
         // message
@@ -1313,19 +1361,25 @@ impl IngestorProcess {
         let obj_start_bytes = byte_counter.get();
 
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = Box::new(
-            FramedRead::new(object_reader, self.state.decoder.framer.clone())
-                .map(|res| {
-                    res.inspect(|bytes| {
-                        bytes_received.emit(ByteSize(bytes.len()));
-                        byte_counter.add(bytes.len());
-                    })
-                    .map_err(|err| {
-                        read_error = Some(err);
-                    })
-                    .ok()
+            FramedRead::new(
+                object_reader,
+                TruncatedArchiveFramer::new(
+                    self.state.decoder.framer.clone(),
+                    Arc::clone(&truncated_tail),
+                ),
+            )
+            .map(|res| {
+                res.inspect(|bytes| {
+                    bytes_received.emit(ByteSize(bytes.len()));
+                    byte_counter.add(bytes.len());
                 })
-                .take_while(|res| ready(res.is_some()))
-                .map(|r| r.expect("validated by take_while")),
+                .map_err(|err| {
+                    read_error = Some(err);
+                })
+                .ok()
+            })
+            .take_while(|res| ready(res.is_some()))
+            .map(|r| r.expect("validated by take_while")),
         );
 
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = match &self.state.multiline {
@@ -1412,7 +1466,8 @@ impl IngestorProcess {
         // reference must be dropped before the status of the batch is sent to the channel.
         drop(batch);
 
-        if let Some(error) = read_error {
+        let mut delivered = false;
+        let processing_result = if let Some(error) = read_error {
             Err(ProcessingError::ReadObject {
                 source: error,
                 bucket: bucket.clone(),
@@ -1426,7 +1481,11 @@ impl IngestorProcess {
             })
         } else {
             match receiver {
-                None => Ok(()),
+                // Acknowledgements disabled: best-effort send, treat as delivered.
+                None => {
+                    delivered = true;
+                    Ok(())
+                }
                 Some(receiver) => {
                     let result = receiver.await;
                     if result != BatchStatus::Delivered
@@ -1443,6 +1502,7 @@ impl IngestorProcess {
                                 bucket = %bucket,
                                 key = %key,
                             );
+                            delivered = true;
                             Ok(())
                         }
                         BatchStatus::Errored => Err(ProcessingError::ErrorAcknowledgement {
@@ -1470,7 +1530,38 @@ impl IngestorProcess {
                     }
                 }
             }
+        };
+
+        // Reconcile a successful result with how much of the advertised object we actually read.
+        let mut processing_result = processing_result;
+        let pulled = compressed_bytes.load(Ordering::Relaxed);
+        if processing_result.is_ok() && content_length > 0 && pulled < content_length {
+            warn!(
+                message = "Incomplete S3 object download (short transfer); will redeliver.",
+                bucket = %bucket,
+                key = %key,
+                bytes_read = %pulled,
+                content_length = %content_length,
+            );
+            processing_result = Err(ProcessingError::ReadObject {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("incomplete object download: read {pulled} of {content_length} bytes"),
+                )),
+                bucket: bucket.clone(),
+                key: key.clone(),
+            });
+        } else if truncated_tail.load(Ordering::Relaxed) && delivered {
+            // Whole object read but its trailing member was truncated: we ingested the
+            // decodable prefix and the batch was delivered. Record the tolerated data-drop.
+            emit!(ObjectStorageBlobTruncated {
+                cloud: CLOUD_PROVIDER,
+                container: &bucket,
+                blob: &key,
+            });
         }
+
+        processing_result
     }
 
     async fn receive_messages(
@@ -2442,6 +2533,85 @@ fn only_get_object_failures_release_early() {
     for err in &kept {
         assert_eq!(err.release_reason(), None, "{err:?}");
     }
+}
+
+#[test]
+fn test_tolerate_truncated_archives_config_parsing() {
+    // Default: off — tolerating truncation drops the torn tail, so it must be opt-in.
+    let config: Config = toml::from_str(
+        r#"
+            queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+        "#,
+    )
+    .unwrap();
+    assert!(!config.tolerate_truncated_archives);
+
+    let config: Config = toml::from_str(
+        r#"
+            queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue"
+            tolerate_truncated_archives = true
+        "#,
+    )
+    .unwrap();
+    assert!(config.tolerate_truncated_archives);
+}
+
+/// Through the real `s3_object_decoder` gzip path: a two-member gzip whose second member is
+/// truncated yields the first member and is tolerated, and the compressed byte counter sees the
+/// whole object so the reconcile step treats it as a truncated archive, not a short transfer.
+/// Guards the assumption that async-compression reports mid-member truncation as `UnexpectedEof`.
+#[tokio::test]
+async fn real_truncated_gzip_yields_prefix_and_is_tolerated() {
+    use std::io::Write as _;
+    use tokio::io::AsyncReadExt as _;
+
+    fn gz(bytes: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(bytes).unwrap();
+        e.finish().unwrap()
+    }
+
+    async fn decode(bytes: Vec<u8>) -> (String, bool, u64) {
+        let tolerated = Arc::new(AtomicBool::new(false));
+        let pulled = Arc::new(AtomicU64::new(0));
+        let inner = super::s3_object_decoder(
+            super::Compression::Gzip,
+            "spans.log.gz",
+            None,
+            None,
+            aws_smithy_types::byte_stream::ByteStream::from(bytes),
+            Arc::clone(&pulled),
+        )
+        .await;
+        let mut reader = TolerateTrailingEof::new(inner, Arc::clone(&tolerated));
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        (
+            String::from_utf8(out).unwrap(),
+            tolerated.load(Ordering::Relaxed),
+            pulled.load(Ordering::Relaxed),
+        )
+    }
+
+    let m1 = gz(b"span1\nspan2\n");
+    let m2 = gz(b"span3\nspan4\nspan5\n");
+
+    let mut full = m1.clone();
+    full.extend_from_slice(&m2);
+    let full_len = full.len() as u64;
+    let (out, tolerated, pulled) = decode(full).await;
+    assert_eq!(out, "span1\nspan2\nspan3\nspan4\nspan5\n");
+    assert!(!tolerated);
+    assert_eq!(pulled, full_len);
+
+    let mut truncated = m1.clone();
+    truncated.extend_from_slice(&m2[..12]);
+    let truncated_len = truncated.len() as u64;
+    let (out, tolerated, pulled) = decode(truncated).await;
+    assert!(out.starts_with("span1\nspan2\n"), "got: {out:?}");
+    assert!(out.len() < "span1\nspan2\nspan3\nspan4\nspan5\n".len());
+    assert!(tolerated);
+    assert_eq!(pulled, truncated_len);
 }
 
 #[test]

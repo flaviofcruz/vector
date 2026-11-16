@@ -1,64 +1,20 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-
-use bytes::{Bytes, BytesMut};
-use tokio_util::codec::Decoder;
-use vector_lib::codecs::decoding::{BoxedFramingError, Framer};
-
-/// A synthetic EOF from a truncated archive does not establish a final record boundary.
-pub(super) struct TruncatedArchiveFramer {
-    inner: Framer,
-    truncated_tail: Arc<AtomicBool>,
-}
-
-impl TruncatedArchiveFramer {
-    pub(super) const fn new(inner: Framer, truncated_tail: Arc<AtomicBool>) -> Self {
-        Self {
-            inner,
-            truncated_tail,
-        }
-    }
-}
-
-impl Decoder for TruncatedArchiveFramer {
-    type Item = Bytes;
-    type Error = BoxedFramingError;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        self.inner.decode(src)
-    }
-
-    fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if self.truncated_tail.load(Ordering::Relaxed)
-            && matches!(
-                self.inner,
-                Framer::NewlineDelimited(_) | Framer::CharacterDelimited(_)
-            )
-        {
-            // Drain terminated frames before discarding the unconfirmed tail. Its bytes may
-            // still parse successfully as a shorter base64/protobuf record.
-            let frame = self.inner.decode(src)?;
-            if frame.is_none() {
-                src.clear();
-            }
-            Ok(frame)
-        } else {
-            self.inner.decode_eof(src)
-        }
-    }
-}
+pub(super) use crate::sources::util::TruncatedArchiveFramer;
 
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use async_compression::tokio::bufread::GzipDecoder;
+    use bytes::{Bytes, BytesMut};
     use flate2::{Compression, write::GzEncoder};
     use futures::StreamExt;
     use tokio::io::{AsyncRead, BufReader};
-    use tokio_util::codec::FramedRead;
+    use tokio_util::codec::{Decoder, FramedRead};
+    use vector_lib::codecs::decoding::{BoxedFramingError, Framer};
     use vector_lib::codecs::{
         BytesDecoder, CharacterDelimitedDecoder, LengthDelimitedDecoder, NewlineDelimitedDecoder,
     };

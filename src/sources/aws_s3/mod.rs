@@ -1,4 +1,8 @@
 use std::convert::TryInto;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use aws_smithy_types::byte_stream::ByteStream;
 use aws_types::region::Region;
@@ -374,10 +378,16 @@ async fn s3_object_decoder(
     content_encoding: Option<&str>,
     content_type: Option<&str>,
     mut body: ByteStream,
+    compressed_bytes: Arc<AtomicU64>,
 ) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {
     // async_stream::stream! is not Unpin, so Box::pin to satisfy build_decoder's bounds.
+    // Counts the compressed bytes actually pulled so callers can confirm the whole object was
+    // read before tolerating a trailing EOF (see `TolerateTrailingEof`).
     let body_stream = Box::pin(async_stream::stream! {
         while let Some(chunk) = body.next().await {
+            if let Ok(chunk) = &chunk {
+                compressed_bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            }
             yield chunk.map_err(std::io::Error::other);
         }
     });
