@@ -393,6 +393,125 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn regional_s3_and_sqs_endpoints_cover_government_partitions() {
+        use crate::aws::{ClientBuilder, test_util::CaptureClient};
+
+        struct Case {
+            name: &'static str,
+            region: &'static str,
+            dns_suffix: &'static str,
+            use_fips: Option<bool>,
+            sqs_endpoint: Option<&'static str>,
+            expected_s3_url: &'static str,
+        }
+
+        for case in [
+            Case {
+                name: "public",
+                region: "us-east-1",
+                dns_suffix: "amazonaws.com",
+                use_fips: None,
+                sqs_endpoint: None,
+                expected_s3_url: "https://s3.us-east-1.amazonaws.com/test-bucket/",
+            },
+            Case {
+                name: "GovCloud",
+                region: "us-gov-west-1",
+                dns_suffix: "amazonaws.com",
+                use_fips: None,
+                sqs_endpoint: None,
+                expected_s3_url: "https://s3.us-gov-west-1.amazonaws.com/test-bucket/",
+            },
+            Case {
+                name: "DoD with FIPS and configured SQS endpoint",
+                region: "us-gov-west-1",
+                dns_suffix: "amazonaws.com",
+                use_fips: Some(true),
+                sqs_endpoint: Some("https://sqs.us-gov-west-1.amazonaws.com"),
+                expected_s3_url: "https://test-bucket.s3-fips.us-gov-west-1.amazonaws.com/",
+            },
+            Case {
+                name: "ISO",
+                region: "us-iso-east-1",
+                dns_suffix: "c2s.ic.gov",
+                use_fips: None,
+                sqs_endpoint: None,
+                expected_s3_url: "https://s3.us-iso-east-1.c2s.ic.gov/test-bucket/",
+            },
+            Case {
+                name: "ISO-B",
+                region: "us-isob-east-1",
+                dns_suffix: "sc2s.sgov.gov",
+                use_fips: None,
+                sqs_endpoint: None,
+                expected_s3_url: "https://s3.us-isob-east-1.sc2s.sgov.gov/test-bucket/",
+            },
+        ] {
+            let regional_sqs_endpoint = format!("https://sqs.{}.{}", case.region, case.dns_suffix);
+            let config: AwsS3Config = serde_json::from_value(serde_json::json!({
+                "region": case.region,
+                "sqs": {
+                    "queue_url": format!("{regional_sqs_endpoint}/123456789012/test"),
+                    "endpoint": case.sqs_endpoint,
+                }
+            }))
+            .unwrap();
+            let s3_http = CaptureClient::new("");
+            S3ClientBuilder {
+                force_path_style: Some(true),
+            }
+            .build(&s3_http.config(config.s3_client_region().unwrap().as_ref(), case.use_fips))
+            .head_bucket()
+            .bucket("test-bucket")
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(
+                s3_http.requests.lock().unwrap()[0].uri(),
+                case.expected_s3_url,
+                "{}",
+                case.name
+            );
+            assert!(
+                s3_http.requests.lock().unwrap()[0]
+                    .headers()
+                    .get("authorization")
+                    .unwrap()
+                    .contains(&format!("/{}/s3/aws4_request", case.region)),
+                "{}",
+                case.name
+            );
+
+            let sqs_http = CaptureClient::new("{}");
+            assert_eq!(config.sqs_client_endpoint().as_deref(), case.sqs_endpoint);
+            let mut sqs_config = sqs_http.config(case.region, case.use_fips).into_builder();
+            sqs_config.set_endpoint_url(config.sqs_client_endpoint());
+            SqsClientBuilder
+                .build(&sqs_config.build())
+                .receive_message()
+                .queue_url(config.sqs.as_ref().unwrap().queue_url.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                sqs_http.requests.lock().unwrap()[0].uri(),
+                format!("{}/", case.sqs_endpoint.unwrap_or(&regional_sqs_endpoint)),
+                "{}",
+                case.name
+            );
+            assert!(
+                sqs_http.requests.lock().unwrap()[0]
+                    .headers()
+                    .get("authorization")
+                    .unwrap()
+                    .contains(&format!("/{}/sqs/aws4_request", case.region)),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn sqs_override_preserves_s3_endpoint_and_region() {
         use crate::aws::{ClientBuilder, test_util::CaptureClient};
 
