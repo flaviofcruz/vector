@@ -672,6 +672,23 @@ pub(super) struct Ingestor {
     state: Arc<State>,
 }
 
+pub(super) fn cloud_for_cross_account(blob_client: &BlobServiceClient) -> super::AzureCloud {
+    // Cross-account credentials are only present for certificate auth, whose primary
+    // blob client already uses the configured cloud. Reuse its endpoint for extra accounts.
+    let gov_blob_suffix = format!(
+        ".blob.{}",
+        super::AzureCloud::UsGovernment.storage_endpoint_suffix()
+    );
+    if blob_client.url().ok().is_some_and(|url| {
+        url.host_str()
+            .is_some_and(|host| host.ends_with(&gov_blob_suffix))
+    }) {
+        super::AzureCloud::UsGovernment
+    } else {
+        super::AzureCloud::Public
+    }
+}
+
 impl Ingestor {
     /// Creates a new ingestor instance with the provided configuration
     pub(super) async fn new(
@@ -708,14 +725,18 @@ impl Ingestor {
         // setup failure surfaces here rather than on the first cross-account message. Cross-account
         // reads reuse the account-agnostic token, so this is empty under connection-string auth.
         // The configured account is served by `blob_client`.
+        let cloud = cloud_for_cross_account(&blob_client);
         let extra_blob_clients: HashMap<String, BlobServiceClient> = match cross_account_credentials
         {
             Some(credentials) => allowed_storage_accounts
                 .into_iter()
                 .filter(|account| !account.is_empty() && account != &storage_account_name)
                 .map(|account| {
-                    let client =
-                        super::build_blob_service_client(account.clone(), credentials.clone());
+                    let client = super::build_blob_service_client(
+                        account.clone(),
+                        credentials.clone(),
+                        cloud,
+                    );
                     (account, client)
                 })
                 .collect(),

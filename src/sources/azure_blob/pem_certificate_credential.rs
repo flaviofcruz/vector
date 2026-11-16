@@ -60,6 +60,27 @@ const fn default_send_certificate_chain() -> bool {
     true
 }
 
+/// Azure cloud hosting the storage account and service principal.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureCloud {
+    /// Public Azure endpoints.
+    #[default]
+    Public,
+    /// Azure US Government endpoints.
+    UsGovernment,
+}
+
+impl AzureCloud {
+    pub(super) const fn storage_endpoint_suffix(self) -> &'static str {
+        match self {
+            Self::Public => "core.windows.net",
+            Self::UsGovernment => "core.usgovcloudapi.net",
+        }
+    }
+}
+
 /// Configuration that must be provided by the client if they want to
 /// use service principal based SNI authentication.
 ///
@@ -93,6 +114,10 @@ pub struct PemCertificateCredential {
     /// Defaults to true.
     #[serde(default = "default_send_certificate_chain")]
     pub send_certificate_chain: bool,
+
+    /// Azure cloud to authenticate against. Defaults to public Azure.
+    #[serde(default)]
+    pub cloud: AzureCloud,
 }
 
 impl PemCertificateCredential {
@@ -110,12 +135,17 @@ impl PemCertificateCredential {
             storage_account,
             client_certificate_path,
             send_certificate_chain: send_certificate_chain.unwrap_or(true),
+            cloud: AzureCloud::Public,
         }
     }
 
     /// Loads the PEM key and certificate for signing Azure client assertions.
     pub fn create_client_certificate_credential(&self) -> Result<PemTokenCredential> {
-        self.create_credential_with_options(TokenCredentialOptions::default())
+        let mut options = TokenCredentialOptions::default();
+        if self.cloud == AzureCloud::UsGovernment {
+            options.set_authority_host("https://login.microsoftonline.us".to_owned());
+        }
+        self.create_credential_with_options(options)
     }
 
     fn create_credential_with_options(
@@ -412,6 +442,23 @@ FLgLKNR10xCWvrfoLa2uhwFmt1pjfBCV+GRkscoq3DxIpTxzESL5jIX5VRUSug==
         );
 
         assert!(cred.send_certificate_chain); // Default should be true
+    }
+
+    #[test]
+    fn certificate_cloud_selects_token_authority() {
+        let file = create_temp_pem_file(&format!("{PEM_PRIVATE_KEY_ONLY}{PEM_CERTIFICATE_ONLY}"));
+        for (cloud, authority) in [
+            (AzureCloud::Public, "https://login.microsoftonline.com"),
+            (AzureCloud::UsGovernment, "https://login.microsoftonline.us"),
+        ] {
+            let mut config = test_config(&file, true);
+            config.cloud = cloud;
+            let credential = config.create_client_certificate_credential().unwrap();
+            assert_eq!(
+                credential.audience.as_str(),
+                format!("{authority}/tenant-123/oauth2/v2.0/token")
+            );
+        }
     }
 
     #[test]

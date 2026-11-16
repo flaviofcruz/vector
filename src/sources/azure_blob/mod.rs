@@ -49,7 +49,7 @@ mod framing;
 pub mod pem_certificate_credential;
 pub mod queue;
 
-use pem_certificate_credential::PemCertificateCredential;
+use pem_certificate_credential::{AzureCloud, PemCertificateCredential};
 
 /// Configuration for the Azure Blob Storage source.
 ///
@@ -524,8 +524,16 @@ impl AzureBlobConfig {
         // Disable transport-level gzip decompression so `Content-Length` survives: see
         // `no_decompression_transport`. The queue client is left as-is (queue responses are
         // never gzip-encoded).
-        let blob_client = build_blob_service_client(account.clone(), storage_credentials.clone());
-        let queue_client = QueueServiceClient::new(account, storage_credentials.clone());
+        let blob_client = build_blob_service_client(
+            account.clone(),
+            storage_credentials.clone(),
+            client_cert_config.cloud,
+        );
+        let queue_client = build_queue_service_client(
+            account,
+            storage_credentials.clone(),
+            client_cert_config.cloud,
+        );
 
         // The token credential authenticates to any account this identity can read, so
         // surface it to enable cross-account direct-ingest reads for allowlisted accounts.
@@ -538,10 +546,42 @@ impl AzureBlobConfig {
 fn build_blob_service_client(
     account: String,
     credentials: StorageCredentials,
+    cloud: AzureCloud,
 ) -> BlobServiceClient {
-    ClientBuilder::new(account, credentials)
+    let builder = match cloud {
+        AzureCloud::Public => ClientBuilder::new(account, credentials),
+        AzureCloud::UsGovernment => ClientBuilder::with_location(
+            CloudLocation::Custom {
+                uri: format!("https://{account}.blob.{}", cloud.storage_endpoint_suffix()),
+                account,
+            },
+            credentials,
+        ),
+    };
+    builder
         .transport(no_decompression_transport())
         .blob_service_client()
+}
+
+fn build_queue_service_client(
+    account: String,
+    credentials: StorageCredentials,
+    cloud: AzureCloud,
+) -> QueueServiceClient {
+    match cloud {
+        AzureCloud::Public => QueueServiceClient::new(account, credentials),
+        AzureCloud::UsGovernment => QueueServiceClientBuilder::with_location(
+            CloudLocation::Custom {
+                uri: format!(
+                    "https://{account}.queue.{}",
+                    cloud.storage_endpoint_suffix()
+                ),
+                account,
+            },
+            credentials,
+        )
+        .build(),
+    }
 }
 
 /// Builds the Azure Storage HTTP transport with response decompression disabled.
@@ -859,12 +899,31 @@ mod test {
             "87654321-4321-4321-4321-210987654321"
         );
         assert_eq!(client_cert.storage_account, "mystorageaccount");
+        assert_eq!(client_cert.cloud, AzureCloud::Public);
         assert_eq!(
             client_cert.client_certificate_path,
             "/path/to/certificate.pem"
         );
         assert!(client_cert.send_certificate_chain);
         assert_eq!(config.queue.queue_name, "my-queue");
+
+        let gov_config: AzureBlobConfig = toml::from_str(
+            r#"
+            [client_certificate]
+            tenant_id = "tenant"
+            client_id = "client"
+            storage_account = "account"
+            client_certificate_path = "/path/to/cert.pem"
+            cloud = "us_government"
+            [queue]
+            queue_name = "messages"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            gov_config.client_certificate.unwrap().cloud,
+            AzureCloud::UsGovernment
+        );
 
         // Test 3: Test full config with connection string and all options
         let config: Result<AzureBlobConfig, _> = toml::from_str(
@@ -1125,6 +1184,50 @@ mod test {
                 case.expected_queue_url,
                 "queue URL mismatch: {}",
                 case.name
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_cloud_selects_blob_and_queue_hosts() {
+        for (cloud, blob_url, queue_url, cross_account_host) in [
+            (
+                AzureCloud::Public,
+                "https://account.blob.core.windows.net/c/b",
+                "https://account.queue.core.windows.net/",
+                "other.blob.core.windows.net",
+            ),
+            (
+                AzureCloud::UsGovernment,
+                "https://account.blob.core.usgovcloudapi.net/c/b",
+                "https://account.queue.core.usgovcloudapi.net/",
+                "other.blob.core.usgovcloudapi.net",
+            ),
+        ] {
+            let credentials = StorageCredentials::access_key("account", "Zm9vYmFyYmF6");
+            let blob = build_blob_service_client("account".to_owned(), credentials.clone(), cloud);
+            let queue =
+                build_queue_service_client("account".to_owned(), credentials.clone(), cloud);
+            assert_eq!(queue::cloud_for_cross_account(&blob), cloud);
+            assert_eq!(
+                blob.container_client("c")
+                    .blob_client("b")
+                    .url()
+                    .unwrap()
+                    .as_str(),
+                blob_url
+            );
+            assert_eq!(queue.url().unwrap().as_str(), queue_url);
+
+            let cross_account = build_blob_service_client("other".to_owned(), credentials, cloud);
+            assert_eq!(
+                cross_account
+                    .container_client("c")
+                    .blob_client("b")
+                    .url()
+                    .unwrap()
+                    .host_str(),
+                Some(cross_account_host),
             );
         }
     }
