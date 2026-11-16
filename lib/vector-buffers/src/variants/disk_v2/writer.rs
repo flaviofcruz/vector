@@ -205,12 +205,13 @@ where
 }
 
 #[derive(Debug)]
-pub(super) struct WriteToken {
+pub(super) struct WriteToken<T> {
+    record: T,
     event_count: usize,
     serialized_len: usize,
 }
 
-impl WriteToken {
+impl<T> WriteToken<T> {
     pub fn event_count(&self) -> usize {
         self.event_count
     }
@@ -447,7 +448,7 @@ where
     /// Errors can occur during the encoding or serialization stage.  If an error occurs
     /// during any of these stages, an appropriate error variant will be returned describing the error.
     #[instrument(skip(self, record), level = "trace")]
-    pub fn archive_record(&mut self, id: u64, record: T) -> Result<WriteToken, WriterError<T>> {
+    pub fn archive_record(&mut self, id: u64, record: T) -> Result<WriteToken<T>, WriterError<T>> {
         let event_count = record.event_count();
 
         self.encode_buf.clear();
@@ -467,12 +468,11 @@ where
         // the actual encoded size and then check it against the limit.
         //
         // C'est la vie.
-        // Clone record here because encode will consume it and ack it to source.
-        // We have not yet archived the record, so we should avoid acknowledging the event.
-        let old_record = record.clone();
+        // Encoding consumes its input. Retain the original and its source finalizers
+        // until the buffer accepts the write or returns the record for retry.
         let encode_result = {
             let mut encode_buf = (&mut self.encode_buf).limit(self.max_record_size);
-            record.encode(&mut encode_buf)
+            record.clone().encode(&mut encode_buf)
         };
         let encoded_len = encode_result
             .map(|()| self.encode_buf.len())
@@ -535,8 +535,6 @@ where
                 "Archived record is too large to fit in remaining free space of current data file."
             );
 
-            // assign old record rather that decoding again
-            let record = old_record;
             return Err(WriterError::DataFileFull {
                 record,
                 serialized_len,
@@ -554,6 +552,7 @@ where
         length_delimiter_dst.copy_from_slice(&archive_len_buf[..]);
 
         Ok(WriteToken {
+            record,
             event_count,
             serialized_len,
         })
@@ -601,10 +600,10 @@ where
     /// when a record has actually been written to the data file, we return any information of
     /// implicit flushes so that the writer can be aware of when data has actually made it to the
     /// data file or not.
-    #[instrument(skip(self), level = "trace")]
+    #[instrument(skip(self, token), level = "trace")]
     pub async fn flush_record(
         &mut self,
-        token: WriteToken,
+        token: WriteToken<T>,
     ) -> Result<(usize, Option<FlushResult>), WriterError<T>> {
         // Make sure the write token we've been given matches whatever the last call to `archive_record` generated.
         let event_count = token.event_count();
@@ -626,54 +625,6 @@ where
             .expect("Serialized length of record should never exceed 2^64 bytes.");
 
         Ok((serialized_len, flush_result))
-    }
-
-    /// Recovers an archived record that has not yet been flushed.
-    ///
-    /// In some cases, we must archive a record to see how large the resulting archived record is, and potentially
-    /// recover the original record if it's too large, and so on.
-    ///
-    /// This method allows decoding an archived record that is still sitting in the internal buffers waiting to be
-    /// flushed. Technically, this decodes the original record back from its archived/encoded form, and so this isn't a
-    /// clone but it does mean incurring the cost of decoding directly.
-    ///
-    /// # Errors
-    ///
-    /// If the archived record cannot be deserialized from its archival form, or can't be decoded back to its original
-    /// form `T`, an error variant will be returned describing the error. Notably, the only error we return is
-    /// `InconsistentState`, as being unable to immediately deserialize and decode a record we just serialized and
-    /// encoded implies a fatal, and unrecoverable, error with the buffer implementation as a whole.
-    #[instrument(skip(self), level = "trace")]
-    pub fn recover_archived_record(&mut self, token: &WriteToken) -> Result<T, WriterError<T>> {
-        // Make sure the write token we've been given matches whatever the last call to `archive_record` generated.
-        let serialized_len = token.serialized_len();
-        debug_assert_eq!(
-            serialized_len,
-            self.ser_buf.len(),
-            "using write token from non-contiguous archival call"
-        );
-
-        // First, decode the archival wrapper. This means skipping the length delimiter.
-        let wrapped_record = try_as_record_archive(&self.ser_buf[8..]).map_err(|_| {
-            WriterError::InconsistentState {
-                reason: "failed to decode archived record immediately after archiving it"
-                    .to_string(),
-            }
-        })?;
-
-        // Now we can actually decode it as `T`.
-        let record_metadata = T::Metadata::from_u32(wrapped_record.metadata()).ok_or(
-            WriterError::InconsistentState {
-                reason: "failed to decode record metadata immediately after encoding it"
-                    .to_string(),
-            },
-        )?;
-
-        T::decode(record_metadata, wrapped_record.payload()).map_err(|_| {
-            WriterError::InconsistentState {
-                reason: "failed to decode record immediately after encoding it".to_string(),
-            }
-        })
     }
 
     /// Flushes the writer.
@@ -1315,11 +1266,8 @@ where
             }
         };
 
-        // Now that we know the record was archived successfully -- record wasn't too large, etc -- we actually need
-        // to check if it will fit based on our current buffer size. If not, we recover the record from the writer's
-        // internal buffers, as we haven't yet flushed it, and we return it to the caller.
-        //
-        // Otherwise, we proceed with flushing like we normally would.
+        // The archived size must also fit the entire buffer. Keep the original record
+        // until this admission check succeeds; decoding the archive loses source finalizers.
         let can_write_record = self.can_write_record(token.serialized_len());
         let writer = self
             .writer
@@ -1331,11 +1279,7 @@ where
             // `DataFileFull`, as that gets checked during archiving.
             writer.flush_record(token).await?
         } else {
-            // The record would not fit given the current size of the buffer, so we need to recover it from the
-            // writer and hand it back. This looks a little weird because we want to surface deserialize/decoding
-            // errors if we encounter them, but if we recover the record successfully, we're returning
-            // `Ok(Err(record))` to signal that our attempt failed but the record is able to be retried again later.
-            return Ok(Err(writer.recover_archived_record(&token)?));
+            return Ok(Err(token.record));
         };
 
         // Track our write since things appear to have succeeded. This only updates our internal

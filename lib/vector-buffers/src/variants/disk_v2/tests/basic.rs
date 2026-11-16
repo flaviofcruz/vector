@@ -4,8 +4,7 @@ use futures::{StreamExt, stream};
 use tokio::{select, time::sleep};
 use tokio_test::{assert_pending, task::spawn};
 use tracing::Instrument;
-use vector_common::finalization::BatchNotifier;
-use vector_common::finalization::{AddBatchNotifier, BatchStatus, Finalizable};
+use vector_common::finalization::{AddBatchNotifier, BatchNotifier, BatchStatus, Finalizable};
 
 use super::{create_default_buffer_v2, read_next, read_next_some};
 use crate::variants::disk_v2::WriterError;
@@ -40,22 +39,56 @@ async fn archive_record_not_acknowledge_when_data_file_full() {
     );
 }
 
-// Test to validate that the record is acknowledged written to disk/archived.
+// Archiving alone must not acknowledge a record before buffer admission.
 #[tokio::test]
-async fn archive_record_acknowledge_when_archived() {
+async fn archive_record_acknowledge_when_written() {
     let mut record_writer = RecordWriter::new(Cursor::new(Vec::new()), 0, 16_384, 105, 55);
     let mut record = SizedRecord::new(1);
     let (batch, mut receiver) = BatchNotifier::new_with_receiver();
     record.add_batch_notifier(batch);
 
-    let record = record_writer.archive_record(1, record);
-    assert!(record.is_ok(), "Was expecting archive record to succeed");
+    let token = record_writer.archive_record(1, record).unwrap();
+    assert!(receiver.try_recv().is_err());
+    record_writer.flush_record(token).await.unwrap();
 
     let result = receiver.try_recv();
     assert!(
         matches!(result, Ok(BatchStatus::Delivered)),
         "Was expecting receiver's try_recv to complete"
     );
+}
+
+#[tokio::test]
+async fn buffer_capacity_rejection_preserves_source_acknowledgement() {
+    with_temp_dir(|dir| {
+        let data_dir = dir.to_path_buf();
+        async move {
+            let (mut writer, _reader, _ledger) =
+                super::create_buffer_v2_with_data_file_count_limit(data_dir, 1024, 2).await;
+
+            for _ in 0..8 {
+                let mut record = SizedRecord::new(256);
+                let (batch, mut receiver) = BatchNotifier::new_with_receiver();
+                record.add_batch_notifier(batch);
+
+                if let Some(returned) = writer.try_write_record(record).await.unwrap() {
+                    assert!(
+                        receiver.try_recv().is_err(),
+                        "A record rejected by the disk capacity check must not advance its source checkpoint"
+                    );
+                    let returned = writer.try_write_record(returned).await.unwrap().unwrap();
+                    assert!(receiver.try_recv().is_err(), "Retry must retain the source acknowledgement");
+                    acknowledge(returned).await;
+                    assert_eq!(receiver.await, BatchStatus::Delivered);
+                    return;
+                }
+                writer.flush().await.unwrap();
+                assert_eq!(receiver.await, BatchStatus::Delivered);
+            }
+            panic!("Expected the bounded disk buffer to reject a record");
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
