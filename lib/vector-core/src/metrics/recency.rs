@@ -225,35 +225,6 @@ pub(super) trait KeyMatcher<K> {
     fn matches(&self, key: &K) -> bool;
 }
 
-struct PerSetTimeout<K, M: KeyMatcher<K>> {
-    configuration: Vec<(M, Duration)>,
-    per_key_timeouts: HashMap<K, Option<Duration>>,
-}
-
-impl<K, M> PerSetTimeout<K, M>
-where
-    K: Clone + Eq + Hashable,
-    M: KeyMatcher<K>,
-{
-    fn new(configuration: Vec<(M, Duration)>) -> Self {
-        Self {
-            configuration,
-            per_key_timeouts: HashMap::new(),
-        }
-    }
-
-    fn get_timeout_for_key(&mut self, key: &K, default: Option<Duration>) -> Option<Duration> {
-        *self.per_key_timeouts.entry(key.clone()).or_insert_with(|| {
-            for (matcher, duration) in &self.configuration {
-                if matcher.matches(key) {
-                    return Some(*duration);
-                }
-            }
-            default
-        })
-    }
-}
-
 /// Tracks recency of metric updates by their registry generation and time.
 ///
 /// In many cases, a user may have a long-running process where metrics are stored over time using
@@ -269,9 +240,10 @@ where
 /// tracking recency does not matter, despite their otherwise tight coupling.
 pub(super) struct Recency<K, M: KeyMatcher<K>> {
     mask: MetricKindMask,
-    inner: Mutex<(Clock, HashMap<K, (Generation, Instant)>)>,
+    // Cache timeouts with recency entries so expiry also releases their keys.
+    inner: Mutex<(Clock, HashMap<K, (Generation, Instant, Duration)>)>,
     global_idle_timeout: Option<Duration>,
-    per_set_timeouts: Mutex<PerSetTimeout<K, M>>,
+    per_set_timeouts: Vec<(M, Duration)>,
 }
 
 impl<K, M> Recency<K, M>
@@ -281,9 +253,9 @@ where
 {
     /// Creates a new [`Recency`].
     ///
-    /// If `global_idle_timeout` is `None`, no recency checking will occur.  Otherwise, any metric that has
-    /// not been updated for longer than `global_idle_timeout` will be subject for deletion the next time
-    /// the metric is checked.
+    /// The first matching per-set timeout overrides `global_idle_timeout`. If neither specifies a
+    /// timeout, the metric is not tracked for recency. Otherwise, a metric that has not been updated
+    /// for longer than its timeout is subject to deletion the next time it is checked.
     ///
     /// The provided `clock` is used for tracking time, while `mask` controls which metrics
     /// are covered by the recency logic.  For example, if `mask` only contains counters and
@@ -301,7 +273,7 @@ where
             mask,
             inner: Mutex::new((clock, HashMap::new())),
             global_idle_timeout,
-            per_set_timeouts: Mutex::new(PerSetTimeout::new(per_set_timeouts)),
+            per_set_timeouts,
         }
     }
 
@@ -389,20 +361,13 @@ where
         F: Fn(&Registry<K, S>, &K) -> bool,
         S: Storage<K>,
     {
-        let key_timeout = self
-            .per_set_timeouts
-            .lock()
-            .get_timeout_for_key(key, self.global_idle_timeout);
-
         let generation = value.get_generation();
-        if let Some(timeout) = key_timeout
-            && self.mask.matches(kind)
-        {
+        if self.mask.matches(kind) {
             let mut guard = self.inner.lock();
             let (clock, entries) = &mut *guard;
 
             let now = clock.now();
-            let deleted = if let Some((last_gen, last_update)) = entries.get_mut(key) {
+            let deleted = if let Some((last_gen, last_update, timeout)) = entries.get_mut(key) {
                 // If the value is the same as the latest value we have internally, and
                 // we're over the idle timeout period, then remove it and continue.
                 if *last_gen == generation {
@@ -418,7 +383,7 @@ where
                     // If the delete returns false, that means that our generation counter is
                     // out-of-date, and that the metric has been updated since, so we don't
                     // actually want to delete it yet.
-                    !referenced && (now - *last_update) > timeout && delete_op(registry, key)
+                    !referenced && (now - *last_update) > *timeout && delete_op(registry, key)
                 } else {
                     // Value has changed, so mark it such.
                     *last_update = now;
@@ -426,7 +391,14 @@ where
                     false
                 }
             } else {
-                entries.insert(key.clone(), (generation, now));
+                let timeout = self
+                    .per_set_timeouts
+                    .iter()
+                    .find_map(|(matcher, timeout)| matcher.matches(key).then_some(*timeout))
+                    .or(self.global_idle_timeout);
+                if let Some(timeout) = timeout {
+                    entries.insert(key.clone(), (generation, now, timeout));
+                }
                 false
             };
 
@@ -437,5 +409,298 @@ where
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Weak, thread};
+
+    use metrics::{Key, Label};
+
+    use super::*;
+    use crate::metrics::storage::VectorStorage;
+
+    type TestRegistry = Registry<Key, GenerationalStorage<VectorStorage>>;
+
+    struct Matcher {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl KeyMatcher<Key> for Matcher {
+        fn matches(&self, key: &Key) -> bool {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            key.name() == self.name
+        }
+    }
+
+    fn matcher(name: &'static str) -> Matcher {
+        Matcher {
+            name,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn registry() -> TestRegistry {
+        Registry::new(GenerationalStorage::new(VectorStorage))
+    }
+
+    // Observe ownership of real metric names and labels, including copies in caches
+    // other than the registry and recency map.
+    fn tracked_key(name: &str, id: usize) -> (Key, [Weak<str>; 2]) {
+        let name: Arc<str> = Arc::from(name);
+        let label: Arc<str> = Arc::from(id.to_string());
+        let refs = [Arc::downgrade(&name), Arc::downgrade(&label)];
+        (Key::from_parts(name, vec![Label::new("id", label)]), refs)
+    }
+
+    // Use separate handle snapshots, as the production recorder does. Visiting
+    // under registry locks would deadlock when recency deletes an expired metric.
+    fn collect(recency: &Recency<Key, Matcher>, registry: &TestRegistry) -> [usize; 3] {
+        let mut retained = [0; 3];
+        for (key, value) in registry.get_counter_handles() {
+            retained[0] += usize::from(recency.should_store_counter(&key, &value, registry));
+        }
+        for (key, value) in registry.get_gauge_handles() {
+            retained[1] += usize::from(recency.should_store_gauge(&key, &value, registry));
+        }
+        for (key, value) in registry.get_histogram_handles() {
+            retained[2] += usize::from(recency.should_store_histogram(&key, &value, registry));
+        }
+        retained
+    }
+
+    fn assert_released(refs: &[[Weak<str>; 2]]) {
+        assert!(
+            refs.iter().flatten().all(|value| value.upgrade().is_none()),
+            "expired metric names or labels are still retained"
+        );
+    }
+
+    #[test]
+    fn expired_keys_release_names_and_labels() {
+        let (clock, time) = Clock::mock();
+        let recency = Recency::<_, Matcher>::new(
+            clock,
+            MetricKindMask::ALL,
+            Some(Duration::from_secs(10)),
+            vec![],
+        );
+        let registry = registry();
+
+        // Keep Recency alive across batches: memory must follow live cardinality,
+        // not every label value observed over the process lifetime.
+        for batch in 0..8 {
+            let mut refs = Vec::new();
+            for id in batch * 32..(batch + 1) * 32 {
+                let (key, weak) = tracked_key("counter", id);
+                registry.get_or_create_counter(&key, |value| CounterFn::increment(value, 1));
+                refs.push(weak);
+                let (key, weak) = tracked_key("gauge", id);
+                registry.get_or_create_gauge(&key, |value| value.set(1.0));
+                refs.push(weak);
+                let (key, weak) = tracked_key("histogram", id);
+                registry.get_or_create_histogram(&key, |value| value.record(1.0));
+                refs.push(weak);
+            }
+            assert_eq!(collect(&recency, &registry), [32; 3]);
+            assert_eq!(recency.inner.lock().1.len(), 96);
+            time.increment(Duration::from_secs(11));
+            assert_eq!(collect(&recency, &registry), [0; 3]);
+            assert!(registry.get_counter_handles().is_empty());
+            assert!(registry.get_gauge_handles().is_empty());
+            assert!(registry.get_histogram_handles().is_empty());
+            assert!(recency.inner.lock().1.is_empty());
+            assert_released(&refs);
+        }
+    }
+
+    #[test]
+    fn registered_handles_protect_all_metric_kinds_until_dropped() {
+        let (clock, time) = Clock::mock();
+        let recency = Recency::<_, Matcher>::new(
+            clock,
+            MetricKindMask::ALL,
+            Some(Duration::from_secs(10)),
+            vec![],
+        );
+        let registry = registry();
+        let (key, counter_refs) = tracked_key("counter", 0);
+        let counter: Counter = registry.get_or_create_counter(&key, |value| value.clone().into());
+        drop(key);
+        let (key, gauge_refs) = tracked_key("gauge", 0);
+        let gauge: Gauge = registry.get_or_create_gauge(&key, |value| value.clone().into());
+        drop(key);
+        let (key, histogram_refs) = tracked_key("histogram", 0);
+        let histogram: metrics::Histogram =
+            registry.get_or_create_histogram(&key, |value| value.clone().into());
+        drop(key);
+
+        assert_eq!(collect(&recency, &registry), [1; 3]);
+        time.increment(Duration::from_secs(11));
+        assert_eq!(collect(&recency, &registry), [1; 3]);
+        counter.increment(1);
+        gauge.set(1.0);
+        histogram.record(1.0);
+        drop((counter, gauge, histogram));
+        // An update starts a fresh idle period even when the handle is dropped.
+        assert_eq!(collect(&recency, &registry), [1; 3]);
+        time.increment(Duration::from_secs(10));
+        assert_eq!(collect(&recency, &registry), [1; 3]);
+        time.increment(Duration::from_nanos(1));
+        assert_eq!(collect(&recency, &registry), [0; 3]);
+        assert!(recency.inner.lock().1.is_empty());
+        assert_released(&[counter_refs, gauge_refs, histogram_refs]);
+    }
+
+    #[test]
+    fn recreated_keys_get_a_fresh_timeout_and_cached_match() {
+        let (clock, time) = Clock::mock();
+        let matcher = matcher("counter");
+        let calls = Arc::clone(&matcher.calls);
+        let recency = Recency::new(
+            clock,
+            MetricKindMask::ALL,
+            None,
+            vec![(matcher, Duration::from_secs(10))],
+        );
+        let registry = registry();
+
+        for incarnation in 1..=3 {
+            let (key, refs) = tracked_key("counter", 0);
+            registry.get_or_create_counter(&key, |value| CounterFn::increment(value, 1));
+            drop(key);
+            assert_eq!(collect(&recency, &registry), [1, 0, 0]);
+            time.increment(Duration::from_secs(10));
+            assert_eq!(collect(&recency, &registry), [1, 0, 0]);
+            assert_eq!(calls.load(Ordering::Relaxed), incarnation);
+            time.increment(Duration::from_nanos(1));
+            assert_eq!(collect(&recency, &registry), [0; 3]);
+            assert_eq!(calls.load(Ordering::Relaxed), incarnation);
+            assert!(recency.inner.lock().1.is_empty());
+            assert_released(&[refs]);
+        }
+    }
+
+    #[test]
+    fn first_matching_override_wins_with_or_without_a_default() {
+        for default in [Some(Duration::from_secs(10)), None] {
+            let (clock, time) = Clock::mock();
+            let recency = Recency::new(
+                clock,
+                MetricKindMask::ALL,
+                default,
+                vec![
+                    (matcher("short"), Duration::from_secs(3)),
+                    (matcher("short"), Duration::from_secs(30)),
+                    (matcher("long"), Duration::from_secs(20)),
+                ],
+            );
+            let registry = registry();
+            let mut refs = Vec::new();
+            for name in ["short", "long", "unmatched"] {
+                let (key, weak) = tracked_key(name, 0);
+                registry.get_or_create_counter(&key, |value| CounterFn::increment(value, 1));
+                refs.push(weak);
+            }
+            assert_eq!(collect(&recency, &registry), [3, 0, 0]);
+            time.increment(Duration::from_secs(4));
+            assert_eq!(collect(&recency, &registry), [2, 0, 0]);
+            assert!(
+                registry
+                    .get_counter(&Key::from_parts("short", &[("id", "0")]))
+                    .is_none()
+            );
+            time.increment(Duration::from_secs(7));
+            assert_eq!(
+                collect(&recency, &registry),
+                [if default.is_some() { 1 } else { 2 }, 0, 0]
+            );
+            time.increment(Duration::from_secs(10));
+            assert_eq!(
+                collect(&recency, &registry),
+                [usize::from(default.is_none()), 0, 0]
+            );
+            assert!(recency.inner.lock().1.is_empty());
+            // Unmatched, non-expiring keys belong only to the registry; recency
+            // must not accumulate an extra retained-key cache for them.
+            registry.clear();
+            assert_released(&refs);
+        }
+    }
+
+    #[test]
+    fn disabled_expiry_and_excluded_kinds_do_not_retain_keys() {
+        for (mask, timeout) in [
+            (MetricKindMask::ALL, None),
+            (MetricKindMask::GAUGE, Some(Duration::from_secs(10))),
+        ] {
+            let (clock, time) = Clock::mock();
+            let recency = Recency::<_, Matcher>::new(clock, mask, timeout, vec![]);
+            let registry = registry();
+            let (key, refs) = tracked_key("counter", 0);
+            registry.get_or_create_counter(&key, |value| CounterFn::increment(value, 1));
+            drop(key);
+            assert_eq!(collect(&recency, &registry), [1, 0, 0]);
+            time.increment(Duration::from_secs(100));
+            assert_eq!(collect(&recency, &registry), [1, 0, 0]);
+            assert!(recency.inner.lock().1.is_empty());
+            registry.clear();
+            assert_released(&[refs]);
+        }
+    }
+
+    #[test]
+    fn concurrent_collection_preserves_handles_and_reclaims_dropped_keys() {
+        let (clock, time) = Clock::mock();
+        let recency = Recency::<_, Matcher>::new(
+            clock,
+            MetricKindMask::ALL,
+            Some(Duration::from_secs(10)),
+            vec![],
+        );
+        let registry = registry();
+        let mut refs = Vec::new();
+        let mut handles = Vec::new();
+        for id in 0..32 {
+            let (key, weak) = tracked_key("counter", id);
+            let counter: Counter =
+                registry.get_or_create_counter(&key, |value| value.clone().into());
+            handles.push(counter);
+            refs.push(weak);
+        }
+        assert_eq!(collect(&recency, &registry), [32, 0, 0]);
+        time.increment(Duration::from_secs(11));
+        thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..32 {
+                        assert_eq!(collect(&recency, &registry), [32, 0, 0]);
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for _ in 0..32 {
+                    for handle in &handles {
+                        handle.increment(1);
+                    }
+                }
+            });
+        });
+        drop(handles);
+        // Observe the final generation before starting the idle interval.
+        collect(&recency, &registry);
+        time.increment(Duration::from_secs(11));
+        thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| collect(&recency, &registry));
+            }
+        });
+        // Concurrent snapshots may temporarily protect each other's handles.
+        assert_eq!(collect(&recency, &registry), [0; 3]);
+        assert!(registry.get_counter_handles().is_empty());
+        assert!(recency.inner.lock().1.is_empty());
+        assert_released(&refs);
     }
 }
