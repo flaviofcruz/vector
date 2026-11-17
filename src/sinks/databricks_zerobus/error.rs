@@ -32,9 +32,19 @@ pub enum ZerobusSinkError {
     #[snafu(display("Stream initialization failed: {}", source))]
     StreamInitError { source: ZerobusError },
 
-    /// Record ingestion failed.
+    /// Record ingestion failed, and the stream is still open.
     #[snafu(display("Record ingestion failed: {}", source))]
     IngestionError { source: ZerobusError },
+
+    /// Record ingestion failed, and the failure closed the stream (or poisoned
+    /// the multiplexed stream).
+    ///
+    /// The SDK hands the error that closed a stream to every batch still in
+    /// flight on it, and a poisoned mux replays it for every later ingest, so
+    /// it says nothing about this batch's data. It is never
+    /// [`ErrorCategory::BadData`], whatever its code.
+    #[snafu(display("Record ingestion failed and the stream closed: {}", source))]
+    TerminalIngestionError { source: ZerobusError },
 
     /// The shared stream was closed concurrently (by shutdown or retry-driven
     /// replacement) before this ingest could run. Retryable: the next attempt
@@ -71,6 +81,47 @@ pub enum ZerobusSinkError {
     ))]
     StreamRebuildBackoff { retry_after_ms: u64 },
 }
+
+/// How the sink treats a failed batch, from the error that failed it.
+///
+/// With end-to-end acknowledgements the sink's verdict decides whether the source
+/// deletes the queue message (Delivered/Rejected) or keeps it for redelivery
+/// (Errored). Only errors known to describe the data itself may drop a batch;
+/// a failure of a dependency, of configuration, or of anything unrecognised must
+/// not delete good data.
+///
+/// On disk-buffered sinks `Errored` is not replayed: the `disk_v2` ledger
+/// finalizer ignores the status (`lib/vector-buffers/src/variants/disk_v2/ledger.rs`),
+/// so the batch is dropped there either way. The difference is only in what is
+/// counted: `zerobus_errored_batches_total` rather than
+/// `component_discarded_events_total`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorCategory {
+    /// Known bad data: retrying cannot help. The batch is `Rejected` (dropped).
+    BadData,
+    /// Transient: retried in the sink with a bounded budget, then `Errored`.
+    Retryable,
+    /// Everything else that is not retryable (configuration, permanent
+    /// dependency failures, unknown codes): `Errored` at once, no in-sink retry.
+    Dependency,
+}
+
+/// `error_code`s that are known to describe bad data, and so may drop a batch.
+///
+/// Any code not listed here (including codes added later) is [`ErrorCategory::Dependency`],
+/// so a new failure mode requeues instead of silently deleting data. A listed code is bad
+/// data only on an error about one batch (see `ZerobusSinkError::can_be_bad_data`): the
+/// same code from a stream setup failure, or from the error that closed a stream, is
+/// `Dependency`.
+///
+/// `invalid_argument` is also what the SDK returns for an empty batch, but the
+/// service never sends one: a batch whose rows were all dropped by encoding is
+/// acknowledged as delivered-nothing before it reaches the SDK.
+pub const BAD_DATA_ERROR_CODES: &[&str] = &[
+    "encoding_failed",
+    "invalid_argument",
+    "grpc_invalid_argument",
+];
 
 /// Whether an SDK error is auth/token-class: the credential itself was
 /// rejected or could not be minted, as opposed to a transport or data problem.
@@ -119,11 +170,23 @@ impl ZerobusSinkError {
     pub const fn is_schema_rejection(&self) -> bool {
         let (Self::ZerobusError { source }
         | Self::StreamInitError { source }
-        | Self::IngestionError { source }) = self
+        | Self::IngestionError { source }
+        | Self::TerminalIngestionError { source }) = self
         else {
             return false;
         };
         matches!(source, ZerobusError::InvalidSchema { .. })
+    }
+
+    /// Whether the batch is sent again on a fresh stream before this error is
+    /// answered: a failure that closed the stream under the batch and that the
+    /// request retry layer would not retry. Such an error reaches every batch in
+    /// flight on the stream, so it most likely says nothing about this one. A
+    /// schema rejection is excluded; `recover_from_schema_rejection` handles it.
+    pub fn retries_on_fresh_stream(&self) -> bool {
+        matches!(self, Self::TerminalIngestionError { .. })
+            && !self.is_retryable()
+            && !self.is_schema_rejection()
     }
 
     /// Whether this error should be retried.
@@ -138,7 +201,10 @@ impl ZerobusSinkError {
         match self {
             Self::ZerobusError { source }
             | Self::StreamInitError { source }
-            | Self::IngestionError { source } => source.is_retryable() || sdk_error_is_auth(source),
+            | Self::IngestionError { source }
+            | Self::TerminalIngestionError { source } => {
+                source.is_retryable() || sdk_error_is_auth(source)
+            }
             Self::StreamClosed | Self::EncodingTaskFailed { .. } => true,
             Self::SchemaError { retryable, .. } => *retryable,
             Self::SchemaReloaded { .. } | Self::StreamRebuildBackoff { .. } => true,
@@ -151,7 +217,8 @@ impl ZerobusSinkError {
         match self {
             Self::ZerobusError { source }
             | Self::StreamInitError { source }
-            | Self::IngestionError { source } => sdk_error_is_auth(source),
+            | Self::IngestionError { source }
+            | Self::TerminalIngestionError { source } => sdk_error_is_auth(source),
             _ => false,
         }
     }
@@ -171,7 +238,8 @@ impl ZerobusSinkError {
             Self::EncodingError { .. } => "encoding_failed",
             Self::ZerobusError { source }
             | Self::StreamInitError { source }
-            | Self::IngestionError { source } => sdk_error_code(source),
+            | Self::IngestionError { source }
+            | Self::TerminalIngestionError { source } => sdk_error_code(source),
             Self::StreamClosed => "stream_closed_concurrently",
             Self::SchemaError { status, .. } => unity_catalog_error_code(*status),
             Self::SchemaReloaded { .. } => "schema_reloaded",
@@ -179,12 +247,38 @@ impl ZerobusSinkError {
         }
     }
 
-    /// Event status to apply to a batch's finalizers when this error occurs.
-    pub fn event_status(&self) -> EventStatus {
+    /// Whether this error is about one batch, so its code may classify it as bad data.
+    ///
+    /// Only two places judge a single batch: the encoder, and the SDK rejecting
+    /// a batch on a stream that stays open. Every other error carrying a
+    /// bad-data code says nothing about the batch and would recur for every one:
+    /// a stream setup failure (a CreateStream `INVALID_ARGUMENT` from a bad
+    /// option, table name or header, or an SDK builder `InvalidArgument`), an
+    /// SDK error outside ingestion, and the error that closed a stream.
+    const fn can_be_bad_data(&self) -> bool {
+        matches!(
+            self,
+            Self::IngestionError { .. } | Self::EncodingError { .. }
+        )
+    }
+
+    /// Which of the three outcomes applies to a batch that failed with this error.
+    pub fn category(&self) -> ErrorCategory {
         if self.is_retryable() {
-            EventStatus::Errored
+            ErrorCategory::Retryable
+        } else if self.can_be_bad_data() && BAD_DATA_ERROR_CODES.contains(&self.error_code()) {
+            ErrorCategory::BadData
         } else {
-            EventStatus::Rejected
+            ErrorCategory::Dependency
+        }
+    }
+
+    /// Event status to apply to a batch's finalizers when this error occurs.
+    /// Only known bad data is `Rejected`; every other failure is `Errored`.
+    pub fn event_status(&self) -> EventStatus {
+        match self.category() {
+            ErrorCategory::BadData => EventStatus::Rejected,
+            ErrorCategory::Retryable | ErrorCategory::Dependency => EventStatus::Errored,
         }
     }
 }
@@ -326,20 +420,22 @@ mod tests {
         assert_eq!(EventStatus::from(error), EventStatus::Errored);
     }
 
+    /// A stream that cannot be set up fails every batch the same way, so its
+    /// `InvalidArgument` (a bad option, table name or header) must not delete them.
     #[test]
-    fn non_retryable_stream_init_error_maps_to_rejected() {
+    fn non_retryable_stream_init_error_maps_to_errored() {
         let error = ZerobusSinkError::StreamInitError {
             source: non_retryable_error(),
         };
-        assert_eq!(EventStatus::from(error), EventStatus::Rejected);
+        assert_eq!(EventStatus::from(error), EventStatus::Errored);
     }
 
     #[test]
-    fn config_error_maps_to_rejected() {
+    fn config_error_maps_to_errored() {
         let error = ZerobusSinkError::ConfigError {
             message: "bad config".to_string(),
         };
-        assert_eq!(EventStatus::from(error), EventStatus::Rejected);
+        assert_eq!(EventStatus::from(error), EventStatus::Errored);
     }
 
     #[test]
@@ -557,14 +653,15 @@ mod tests {
     }
 
     #[test]
-    fn non_retryable_schema_error_maps_to_rejected() {
+    fn non_retryable_schema_error_maps_to_errored() {
+        // A Unity Catalog failure says nothing about the data: requeue, do not delete.
         let error = ZerobusSinkError::SchemaError {
             message: "UC 404".to_string(),
             retryable: false,
             status: Some(404),
         };
         assert!(!ZerobusRetryLogic.is_retriable_error(&error));
-        assert_eq!(EventStatus::from(error), EventStatus::Rejected);
+        assert_eq!(EventStatus::from(error), EventStatus::Errored);
     }
 
     #[test]
@@ -648,5 +745,301 @@ mod tests {
         assert_eq!(code(Some(429)), "uc_rate_limited");
         assert_eq!(code(Some(503)), "uc_server_error");
         assert_eq!(code(Some(400)), "uc_http_error");
+    }
+
+    use ErrorCategory::{BadData, Dependency, Retryable};
+
+    fn grpc(code: GrpcCode) -> ZerobusError {
+        ZerobusError::CreateStreamError(databricks_zerobus_ingest_sdk::GrpcStatus::new(code, "x"))
+    }
+
+    fn ingestion(source: ZerobusError) -> ZerobusSinkError {
+        ZerobusSinkError::IngestionError { source }
+    }
+
+    fn init(source: ZerobusError) -> ZerobusSinkError {
+        ZerobusSinkError::StreamInitError { source }
+    }
+
+    fn terminal(source: ZerobusError) -> ZerobusSinkError {
+        ZerobusSinkError::TerminalIngestionError { source }
+    }
+
+    fn uc(retryable: bool, status: Option<u16>) -> ZerobusSinkError {
+        ZerobusSinkError::SchemaError {
+            message: "uc".to_string(),
+            retryable,
+            status,
+        }
+    }
+
+    /// One representative of every way the sink can fail, with its expected category.
+    /// New `ZerobusSinkError` variants must be added here (the exhaustive `match` in
+    /// `error_code` forces them to have a code; this list forces a decision).
+    fn all_errors() -> Vec<(ZerobusSinkError, ErrorCategory)> {
+        let mut cases = vec![
+            // Category 1: known bad data.
+            (
+                ZerobusSinkError::EncodingError {
+                    message: "x".into(),
+                    schema_constraint: false,
+                },
+                BadData,
+            ),
+            (
+                ingestion(ZerobusError::InvalidArgument("x".into())),
+                BadData,
+            ),
+            (ingestion(grpc(GrpcCode::InvalidArgument)), BadData),
+            // Category 2: retryable.
+            (
+                ZerobusSinkError::EncodingTaskFailed {
+                    message: "x".into(),
+                },
+                Retryable,
+            ),
+            (ZerobusSinkError::StreamClosed, Retryable),
+            (
+                ZerobusSinkError::SchemaReloaded {
+                    message: "x".into(),
+                },
+                Retryable,
+            ),
+            (
+                ZerobusSinkError::StreamRebuildBackoff { retry_after_ms: 1 },
+                Retryable,
+            ),
+            (uc(true, Some(503)), Retryable),
+            (uc(true, Some(408)), Retryable),
+            (uc(true, Some(429)), Retryable),
+            (uc(true, None), Retryable),
+            (
+                ingestion(ZerobusError::ChannelCreationError("x".into())),
+                Retryable,
+            ),
+            (
+                ingestion(ZerobusError::FailedToEstablishTlsConnectionError),
+                Retryable,
+            ),
+            (
+                ingestion(ZerobusError::TokenFetchError("x".into())),
+                Retryable,
+            ),
+            (
+                ingestion(ZerobusError::UnexpectedStreamResponseError("x".into())),
+                Retryable,
+            ),
+            // The auth class is retryable here even though the SDK says otherwise.
+            (
+                ingestion(ZerobusError::InvalidUCTokenError("x".into())),
+                Retryable,
+            ),
+            (ingestion(grpc(GrpcCode::Unauthenticated)), Retryable),
+            (ingestion(grpc(GrpcCode::PermissionDenied)), Retryable),
+            // Category 3: everything else.
+            (
+                ZerobusSinkError::ConfigError {
+                    message: "x".into(),
+                },
+                Dependency,
+            ),
+            (
+                ZerobusSinkError::EncodingError {
+                    message: "x".into(),
+                    schema_constraint: true,
+                },
+                Dependency,
+            ),
+            (uc(false, Some(404)), Dependency),
+            (uc(false, Some(401)), Dependency),
+            (uc(false, Some(403)), Dependency),
+            (uc(false, Some(400)), Dependency),
+            (uc(false, None), Dependency),
+            (
+                ingestion(ZerobusError::InvalidTableName("x".into())),
+                Dependency,
+            ),
+            (
+                ingestion(ZerobusError::InvalidStateError("x".into())),
+                Dependency,
+            ),
+            (
+                ingestion(ZerobusError::InvalidZerobusEndpointError("x".into())),
+                Dependency,
+            ),
+            (
+                ingestion(ZerobusError::InvalidUCEndpointError("x".into())),
+                Dependency,
+            ),
+            (ingestion(grpc(GrpcCode::NotFound)), Dependency),
+            (ingestion(grpc(GrpcCode::OutOfRange)), Dependency),
+            (ingestion(grpc(GrpcCode::Unimplemented)), Dependency),
+            // A bad-data code outside a single-batch error: the same failure recurs
+            // for every batch, so it must not delete them.
+            (init(ZerobusError::InvalidArgument("x".into())), Dependency),
+            (init(grpc(GrpcCode::InvalidArgument)), Dependency),
+            (
+                ZerobusSinkError::ZerobusError {
+                    source: ZerobusError::InvalidArgument("x".into()),
+                },
+                Dependency,
+            ),
+            (
+                terminal(ZerobusError::InvalidArgument("x".into())),
+                Dependency,
+            ),
+            (terminal(grpc(GrpcCode::InvalidArgument)), Dependency),
+            (terminal(grpc(GrpcCode::NotFound)), Dependency),
+            // A closed stream keeps the retryable and auth classes of its error.
+            (terminal(grpc(GrpcCode::Unavailable)), Retryable),
+            (terminal(grpc(GrpcCode::Unauthenticated)), Retryable),
+        ];
+        // Every gRPC code lands in exactly one category, and only InvalidArgument is bad data.
+        for code in [
+            GrpcCode::Cancelled,
+            GrpcCode::Unknown,
+            GrpcCode::DeadlineExceeded,
+            GrpcCode::AlreadyExists,
+            GrpcCode::ResourceExhausted,
+            GrpcCode::FailedPrecondition,
+            GrpcCode::Aborted,
+            GrpcCode::Internal,
+            GrpcCode::Unavailable,
+            GrpcCode::DataLoss,
+        ] {
+            cases.push((ingestion(grpc(code)), Retryable));
+        }
+        cases
+    }
+
+    #[test]
+    fn every_error_is_in_exactly_one_category() {
+        for (error, expected) in all_errors() {
+            assert_eq!(
+                error.category(),
+                expected,
+                "{error} ({})",
+                error.error_code()
+            );
+            let status = match expected {
+                BadData => EventStatus::Rejected,
+                Retryable | Dependency => EventStatus::Errored,
+            };
+            assert_eq!(error.event_status(), status, "{error}");
+            // In-sink retry happens for the retryable category and nothing else.
+            assert_eq!(
+                ZerobusRetryLogic.is_retriable_error(&error),
+                expected == Retryable,
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_data_codes_are_only_produced_by_non_retryable_errors() {
+        let cases = all_errors();
+        for code in BAD_DATA_ERROR_CODES {
+            let producers: Vec<_> = cases
+                .iter()
+                .filter(|(error, _)| error.error_code() == *code)
+                .collect();
+            assert!(
+                !producers.is_empty(),
+                "no error produces bad-data code {code}"
+            );
+            assert!(
+                producers.iter().all(|(error, _)| !error.is_retryable()),
+                "bad-data code {code} is produced by a retryable error"
+            );
+        }
+        // And nothing outside the list, or outside a single-batch error, is ever
+        // classified as bad data.
+        for (error, category) in &cases {
+            assert_eq!(
+                *category == BadData,
+                BAD_DATA_ERROR_CODES.contains(&error.error_code())
+                    && !error.is_retryable()
+                    && error.can_be_bad_data(),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_codes_outside_the_known_list_are_dependency_errors() {
+        // `other` is what an SDK error this build does not know about reports.
+        assert_eq!(
+            sdk_error_code(&ZerobusError::TokenFetchError("x".into())),
+            "token_fetch_failed"
+        );
+        for error in [
+            ZerobusSinkError::ConfigError {
+                message: "x".into(),
+            },
+            uc(false, Some(404)),
+            ingestion(ZerobusError::InvalidStateError("x".into())),
+        ] {
+            assert!(!BAD_DATA_ERROR_CODES.contains(&error.error_code()));
+            assert_eq!(error.category(), Dependency, "{error}");
+        }
+    }
+
+    /// Moving a failure out of the bad-data category keeps its `error_code`, so the
+    /// metric series stays the same and only the verdict changes.
+    #[test]
+    fn stream_wide_bad_data_codes_keep_their_code_but_are_errored() {
+        for (error, code) in [
+            (
+                init(ZerobusError::InvalidArgument("x".into())),
+                "invalid_argument",
+            ),
+            (
+                init(grpc(GrpcCode::InvalidArgument)),
+                "grpc_invalid_argument",
+            ),
+            (
+                terminal(ZerobusError::InvalidArgument("x".into())),
+                "invalid_argument",
+            ),
+            (
+                terminal(grpc(GrpcCode::InvalidArgument)),
+                "grpc_invalid_argument",
+            ),
+        ] {
+            assert_eq!(error.error_code(), code, "{error}");
+            assert!(!error.is_retryable(), "{error}");
+            assert_eq!(error.category(), Dependency, "{error}");
+            assert_eq!(error.event_status(), EventStatus::Errored, "{error}");
+        }
+    }
+
+    /// Only a non-retryable failure that closed the stream, and is not a schema
+    /// rejection, is sent again on a fresh stream.
+    #[test]
+    fn only_non_retryable_terminal_failures_retry_on_a_fresh_stream() {
+        for (error, expected) in [
+            (terminal(grpc(GrpcCode::InvalidArgument)), true),
+            (terminal(grpc(GrpcCode::NotFound)), true),
+            (terminal(ZerobusError::InvalidStateError("x".into())), true),
+            // Retried by the request retry layer already.
+            (terminal(grpc(GrpcCode::Unavailable)), false),
+            (terminal(grpc(GrpcCode::Unauthenticated)), false),
+            // The stream stayed open, or never existed.
+            (ingestion(ZerobusError::InvalidArgument("x".into())), false),
+            (ingestion(grpc(GrpcCode::NotFound)), false),
+            (init(grpc(GrpcCode::InvalidArgument)), false),
+        ] {
+            assert_eq!(error.retries_on_fresh_stream(), expected, "{error}");
+        }
+    }
+
+    /// The SDK rejects an empty batch with `InvalidArgument` (code `invalid_argument`, bad
+    /// data). The service never reaches it: an all-rows-dropped batch is acknowledged as
+    /// delivered-nothing first (see `all_rows_dropped_by_codec_is_delivered_without_ingest`).
+    #[test]
+    fn empty_batch_error_code_is_known_bad_data() {
+        let error = ingestion(ZerobusError::InvalidArgument("empty batch".into()));
+        assert_eq!(error.error_code(), "invalid_argument");
+        assert_eq!(error.category(), BadData);
     }
 }

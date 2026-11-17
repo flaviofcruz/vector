@@ -99,6 +99,29 @@ impl InternalEvent for ZerobusRetryableError {
     }
 }
 
+/// A batch ended with an `Errored` verdict: either the in-sink retry budget ran out on a
+/// retryable error, or the error was not retryable but not known to be bad data either
+/// (configuration, a permanent dependency failure, an unknown code).
+///
+/// Counts batches, once per batch regardless of how many attempts it took. On sinks whose
+/// source acknowledges end to end, `Errored` means the batch was requeued for redelivery.
+/// On disk-buffered sinks nothing replays it: the batch was dropped (and is counted here
+/// rather than in `component_discarded_events_total`).
+#[derive(Debug, NamedInternalEvent)]
+pub(crate) struct ZerobusErroredBatch {
+    pub error_code: &'static str,
+}
+
+impl InternalEvent for ZerobusErroredBatch {
+    fn emit(self) {
+        counter!(
+            "zerobus_errored_batches_total",
+            "error_code" => self.error_code,
+        )
+        .increment(1);
+    }
+}
+
 /// An auth/token-class failure discarded the active stream; the rebuild backs
 /// off before retrying. Worth its own signal because the failure itself is
 /// non-retryable from the SDK's point of view: without this counter the

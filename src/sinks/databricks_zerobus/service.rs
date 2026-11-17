@@ -6,14 +6,14 @@ use crate::event::Event;
 use crate::http::HttpClient;
 use crate::internal_events::{
     SchemaReloadOutcome, ZerobusAuthStreamBuildFailed, ZerobusAuthStreamDiscarded,
-    ZerobusAuthStreamRebuilt, ZerobusRetryableError, ZerobusSchemaRefetchFailed,
-    ZerobusSchemaReloadOutcome,
+    ZerobusAuthStreamRebuilt, ZerobusErroredBatch, ZerobusRetryableError,
+    ZerobusSchemaRefetchFailed, ZerobusSchemaReloadOutcome,
 };
 use crate::sinks::util::retries::RetryLogic;
 use crate::tls::TlsSettings;
 use databricks_zerobus_ingest_sdk::{
     BatchStats, ConnectorFactory, HeadersProvider, MultiplexedArrowStream, OffsetId,
-    ProxyConnector, StatsExporter, StreamStat, ZerobusArrowStream, ZerobusError, ZerobusSdk,
+    ProxyConnector, StatsExporter, StreamStat, ZerobusArrowStream, ZerobusSdk,
 };
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -28,8 +28,8 @@ use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, Reques
 use vector_lib::stream::DriverResponse;
 
 use super::{
-    config::ZerobusSinkConfig, encoding::EncodingExecutor, error::ZerobusSinkError,
-    error::sdk_error_code, error::sdk_error_is_auth, freshness, headers,
+    config::ZerobusSinkConfig, encoding::EncodingExecutor, error::ErrorCategory,
+    error::ZerobusSinkError, error::sdk_error_code, error::sdk_error_is_auth, freshness, headers,
     ingest_tls::ingestion_tls_settings, uc_client::UnityCatalogClient, unity_catalog_schema,
 };
 
@@ -248,6 +248,17 @@ impl ActiveStream {
         ActiveStream::ArrowMux(RwLock::new(Some(Box::new(stream))))
     }
 
+    /// Whether this is a multiplexed stream, which [`should_discard_stream`]
+    /// keeps through lane-level failures.
+    const fn is_multiplexed(&self) -> bool {
+        match self {
+            ActiveStream::Arrow(..) => false,
+            ActiveStream::ArrowMux(_) => true,
+            #[cfg(test)]
+            ActiveStream::Mock(mock) => mock.multiplexed,
+        }
+    }
+
     /// Gracefully flush and close the underlying SDK stream.
     ///
     /// Waits for any in-flight ingests (read-lock holders) to complete, then
@@ -297,6 +308,16 @@ pub struct MockStream {
     /// deterministically force two ingests to overlap (each holding an `Arc`
     /// clone of the `ActiveStream`) before they fail.
     gate: Option<MockGate>,
+    /// Stands in for a multiplexed stream: the service applies the mux rule for
+    /// keeping it after a failure.
+    multiplexed: bool,
+    /// When set, a failed ingest closes the stream the way a server-side
+    /// failure does: [`Self::is_closed`] reports `true` from then on. A
+    /// multiplexed mock also replays that failure for every later ingest, as the
+    /// SDK's poisoned mux does.
+    server_closes_on_error: bool,
+    /// The failure that closed the stream, once `server_closes_on_error` fired.
+    terminal_error: std::sync::Mutex<Option<databricks_zerobus_ingest_sdk::ZerobusError>>,
 }
 
 #[cfg(test)]
@@ -333,15 +354,35 @@ impl MockStream {
             next_error: std::sync::Mutex::new(None),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gate: None,
+            multiplexed: false,
+            server_closes_on_error: false,
+            terminal_error: std::sync::Mutex::new(None),
         }
     }
 
     pub fn failing(error: databricks_zerobus_ingest_sdk::ZerobusError) -> Self {
         Self {
             next_error: std::sync::Mutex::new(Some(error)),
-            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            gate: None,
+            ..Self::succeeding()
         }
+    }
+
+    /// Behave as a multiplexed stream (see `multiplexed`).
+    pub fn multiplexed(mut self) -> Self {
+        self.multiplexed = true;
+        self
+    }
+
+    /// Close the stream on a failed ingest (see `server_closes_on_error`).
+    pub fn server_closes_on_error(mut self) -> Self {
+        self.server_closes_on_error = true;
+        self
+    }
+
+    /// Whether the stream is closed, by the service or by a failure.
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Relaxed)
+            || self.terminal_error.lock().unwrap().is_some()
     }
 
     /// Install a gate so ingests block until the test releases them.
@@ -373,8 +414,18 @@ impl MockStream {
             // permit on drop, the test's `release()` call hands them out.
             gate.release.acquire().await.unwrap().forget();
         }
+        if self.multiplexed
+            && let Some(retained) = self.terminal_error.lock().unwrap().as_ref()
+        {
+            return Err(retained.clone());
+        }
         match self.next_error.lock().unwrap().take() {
-            Some(e) => Err(e),
+            Some(e) => {
+                if self.server_closes_on_error {
+                    *self.terminal_error.lock().unwrap() = Some(e.clone());
+                }
+                Err(e)
+            }
             None => Ok(()),
         }
     }
@@ -446,6 +497,11 @@ pub struct ZerobusService {
     #[cfg(test)]
     schema_fetch_results:
         Arc<std::sync::Mutex<std::collections::VecDeque<arrow::datatypes::Schema>>>,
+    /// Test-only stand-in for stream creation, which unit tests cannot perform.
+    /// When non-empty, `build_stream` hands out the next mock instead of
+    /// connecting, so a test can script what a rebuilt stream does.
+    #[cfg(test)]
+    scripted_streams: Arc<std::sync::Mutex<std::collections::VecDeque<MockStream>>>,
 }
 
 impl ZerobusService {
@@ -528,6 +584,8 @@ impl ZerobusService {
             custom_headers,
             #[cfg(test)]
             schema_fetch_results: Arc::new(std::sync::Mutex::new(Default::default())),
+            #[cfg(test)]
+            scripted_streams: Arc::new(std::sync::Mutex::new(Default::default())),
         })
     }
 
@@ -886,6 +944,13 @@ impl ZerobusService {
         &self,
         schema: &ResolvedSchema,
     ) -> Result<ActiveStream, ZerobusSinkError> {
+        #[cfg(test)]
+        {
+            let scripted = self.scripted_streams.lock().unwrap().pop_front();
+            if let Some(mock) = scripted {
+                return Ok(ActiveStream::Mock(mock));
+            }
+        }
         let options = &self.config.stream_options;
         let builder = self
             .sdk
@@ -1052,10 +1117,11 @@ impl ZerobusService {
     /// call so concurrent ingests can run in parallel; a concurrent `close()`
     /// will wait for the read guards to drain before flushing.
     ///
-    /// On retryable errors — and auth/token-class errors, which the SDK marks
-    /// non-retryable but which poison the stream — the active stream is removed
-    /// from the slot so that the next attempt (driven by Tower retry, paced by
-    /// the auth rebuild backoff) creates a fresh one.
+    /// On a failure, [`should_discard_stream`] decides whether the active stream
+    /// is removed from the slot so that the next attempt (driven by Tower retry,
+    /// paced by the auth rebuild backoff) creates a fresh one. A failure that
+    /// closed the stream is reported as `TerminalIngestionError`, which is never
+    /// bad data.
     async fn ingest(
         &self,
         stream: Arc<ActiveStream>,
@@ -1064,13 +1130,16 @@ impl ZerobusService {
     ) -> Result<ZerobusResponse, ZerobusSinkError> {
         let ZerobusPayload(record_batch) = payload;
         let ack_times = freshness::AckTimes::from_batch(&record_batch);
-        let result = match stream.as_ref() {
+        // Each arm reports, with a failure, whether that failure left the stream
+        // closed. It is read before the read guard drops: the SDK marks a
+        // stream closed before it hands the closing error to the waiters.
+        let (result, stream_closed) = match stream.as_ref() {
             ActiveStream::Arrow(lock, stats) => {
                 let guard = lock.read().await;
                 let Some(s) = guard.as_ref() else {
                     return Err(ZerobusSinkError::StreamClosed);
                 };
-                match s.ingest_batch(record_batch).await {
+                let result = match s.ingest_batch(record_batch).await {
                     Ok(offset) => {
                         let acked = s.wait_for_offset(offset).await;
                         if acked.is_ok() {
@@ -1086,7 +1155,9 @@ impl ZerobusService {
                         })
                     }
                     Err(e) => Err(e),
-                }
+                };
+                let closed = result.is_err() && s.is_closed();
+                (result, closed)
             }
             ActiveStream::ArrowMux(lock) => {
                 let guard = lock.read().await;
@@ -1105,15 +1176,12 @@ impl ZerobusService {
                 if acked.is_ok() {
                     ack_times.record_acked(&self.config.table_name);
                 }
-                if let Err(e) = &acked
-                    && !mux_should_discard(e, s.is_closed())
-                {
-                    return Err(ZerobusSinkError::IngestionError { source: e.clone() });
-                }
-                acked.map(|_| {
+                let closed = acked.is_err() && s.is_closed();
+                let result = acked.map(|_| {
                     record_uncompressed_bytes(uncompressed);
                     None
-                })
+                });
+                (result, closed)
             }
             #[cfg(test)]
             ActiveStream::Mock(mock) => {
@@ -1121,7 +1189,8 @@ impl ZerobusService {
                 if acked.is_ok() {
                     ack_times.record_acked(&self.config.table_name);
                 }
-                acked.map(|_| None)
+                let closed = acked.is_err() && mock.is_closed();
+                (acked.map(|_| None), closed)
             }
         };
 
@@ -1131,17 +1200,21 @@ impl ZerobusService {
                 Ok(ZerobusResponse::delivered(events_byte_size, bytes_sent))
             }
             Err(e) => {
-                // Classify once at the sink level: `is_retryable` already folds
-                // in the auth/token class, which the SDK marks non-retryable
-                // even though it poisons the stream (a mux retains the failure
-                // and replays it for every later ingest), so keeping it would
-                // reject every batch until restart. Discarding lets the retry
-                // rebuild once credentials recover, and the backoff paces that
-                // rebuild away from a failing token mint.
                 let error_code = sdk_error_code(&e);
                 let is_auth = sdk_error_is_auth(&e);
-                let error = ZerobusSinkError::IngestionError { source: e };
-                if error.is_retryable() {
+                // The error that closed a stream reaches every batch in flight on
+                // it (and, on a mux, every later one), so it cannot be blamed on
+                // this batch: never let it reject the batch as bad data.
+                let error = if stream_closed {
+                    ZerobusSinkError::TerminalIngestionError { source: e }
+                } else {
+                    ZerobusSinkError::IngestionError { source: e }
+                };
+                if should_discard_stream(stream.is_multiplexed(), &error, stream_closed) {
+                    // Auth/token-class errors are retryable here although the SDK
+                    // marks them non-retryable; dropping the stream lets the retry
+                    // rebuild once credentials recover, and the backoff paces that
+                    // rebuild away from a failing token mint.
                     if is_auth {
                         emit!(ZerobusAuthStreamDiscarded { error_code });
                         self.note_auth_failure();
@@ -1155,6 +1228,70 @@ impl ZerobusService {
                 }
                 Err(error)
             }
+        }
+    }
+}
+
+/// How many times a batch is sent again, on a freshly built stream, after a
+/// failure that closed the stream under it and is not otherwise retried (see
+/// [`ZerobusService::ingest_with_fresh_stream_retry`]).
+const FRESH_STREAM_RETRIES: usize = 1;
+
+impl ZerobusService {
+    /// Ingest `payload`, sending it again on a fresh stream if a failure closed
+    /// the stream under it and is not otherwise retried.
+    ///
+    /// The SDK hands the error that closed a stream to every batch in flight on
+    /// it, so most batches that get it did nothing wrong. `ingest` has already
+    /// dropped that stream, so the retry goes to a new one: an innocent batch
+    /// lands, and a batch that closes the new stream too comes back with the
+    /// same error and is answered as before (`Errored`). Retryable failures are
+    /// left to the request retry layer, and schema rejections to
+    /// `recover_from_schema_rejection`, as before. Bounded by
+    /// [`FRESH_STREAM_RETRIES`] whatever the sink's `retry_attempts`, which LP
+    /// leaves unlimited on disk-buffered sinks: each retry of a batch that
+    /// really is bad closes another stream for everything in flight on it.
+    async fn ingest_with_fresh_stream_retry(
+        &self,
+        schema: &Arc<ResolvedSchema>,
+        mut stream: Arc<ActiveStream>,
+        payload: ZerobusPayload,
+        events_byte_size: GroupedCountByteSize,
+    ) -> Result<ZerobusResponse, ZerobusSinkError> {
+        let mut retries_left = FRESH_STREAM_RETRIES;
+        loop {
+            let error = match self
+                .ingest(
+                    Arc::clone(&stream),
+                    payload.clone(),
+                    events_byte_size.clone(),
+                )
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+            if retries_left == 0 || !error.retries_on_fresh_stream() {
+                return Err(self
+                    .recover_from_schema_rejection(error, schema, Some(&stream))
+                    .await);
+            }
+            retries_left -= 1;
+            debug!(
+                message = "Zerobus stream closed under the batch; sending it again on a fresh stream.",
+                error = %error,
+            );
+            emit!(ZerobusRetryableError {
+                error_code: error.error_code(),
+            });
+            stream = match self.get_or_create_stream(schema).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return Err(self
+                        .recover_from_schema_rejection(error, schema, None)
+                        .await);
+                }
+            };
         }
     }
 }
@@ -1184,17 +1321,30 @@ fn uncompressed_batch_bytes(batch: &arrow::record_batch::RecordBatch) -> usize {
         .sum()
 }
 
-/// Whether a failed multiplexed ingest must drop the mux so the next attempt rebuilds it.
+/// Whether a failed ingest must drop the cached stream so the next attempt builds a
+/// fresh one.
 ///
-/// A capacity or ack-wait timeout leaves the lanes usable; only a poisoned (closed) mux
-/// must be rebuilt, which recreates all lanes. Auth/token-class errors are included even
-/// though the SDK marks them non-retryable: they poison the mux (the SDK retains the
-/// original failure and replays it for every later ingest), so the only recovery is a
-/// rebuild. After an ack-wait timeout the batch stays queued on its lane and may still
-/// land, so the retry can duplicate it; delivery is at-least-once either way, since the
-/// single-stream close also keeps acking until its flush deadline.
-fn mux_should_discard(err: &ZerobusError, mux_closed: bool) -> bool {
-    (err.is_retryable() || sdk_error_is_auth(err)) && mux_closed
+/// A stream the failure closed is dropped whatever the error. It cannot take another
+/// batch: a closed single stream refuses every later ingest, and a poisoned mux replays
+/// the failure that closed it for every later one, so keeping it would fail every batch
+/// with that error until the pod restarts, even after the dependency recovers.
+///
+/// While the stream is still open:
+/// - A mux is kept. A lane-level failure (a capacity or ack-wait timeout, a batch the SDK
+///   refused before sending it) leaves the lanes usable, and a rebuild recreates all of
+///   them. After an ack-wait timeout the batch stays queued on its lane and may still
+///   land, so the retry can duplicate it; delivery is at-least-once either way, since the
+///   single-stream close also keeps acking until its flush deadline.
+/// - A single stream is kept for bad data, which is a property of the batch, and for a
+///   schema rejection, which `recover_from_schema_rejection` decides about. Every other
+///   failure (retryable, auth, or a dependency problem such as a permanent permission or
+///   not-found error) drops it, so the next batch gets fresh credentials and a fresh
+///   setup.
+fn should_discard_stream(multiplexed: bool, error: &ZerobusSinkError, stream_closed: bool) -> bool {
+    if stream_closed {
+        return true;
+    }
+    !multiplexed && error.category() != ErrorCategory::BadData && !error.is_schema_rejection()
 }
 
 /// First wait before a stream rebuild after an auth/token failure. Doubled per
@@ -1319,15 +1469,9 @@ impl Service<ZerobusRequest> for ZerobusService {
                         .await);
                 }
             };
-            match service
-                .ingest(Arc::clone(&stream), payload, events_byte_size)
+            service
+                .ingest_with_fresh_stream_retry(&schema, stream, payload, events_byte_size)
                 .await
-            {
-                Ok(response) => Ok(response),
-                Err(e) => Err(service
-                    .recover_from_schema_rejection(e, &schema, Some(&stream))
-                    .await),
-            }
         })
     }
 }
@@ -1349,6 +1493,8 @@ impl Clone for ZerobusService {
             custom_headers: self.custom_headers,
             #[cfg(test)]
             schema_fetch_results: Arc::clone(&self.schema_fetch_results),
+            #[cfg(test)]
+            scripted_streams: Arc::clone(&self.scripted_streams),
         }
     }
 }
@@ -1411,6 +1557,7 @@ impl ZerobusService {
             oauth_provider,
             custom_headers,
             schema_fetch_results: Arc::new(std::sync::Mutex::new(Default::default())),
+            scripted_streams: Arc::new(std::sync::Mutex::new(Default::default())),
         })
     }
 
@@ -1484,6 +1631,16 @@ impl ZerobusService {
     pub(super) fn scripted_fetch_count(&self) -> usize {
         self.schema_fetch_results.lock().unwrap().len()
     }
+
+    /// Script the streams the next `build_stream` calls will "create".
+    pub(super) fn script_streams(&self, streams: impl IntoIterator<Item = MockStream>) {
+        *self.scripted_streams.lock().unwrap() = streams.into_iter().collect();
+    }
+
+    /// How many scripted streams have not been built yet.
+    pub(super) fn scripted_stream_count(&self) -> usize {
+        self.scripted_streams.lock().unwrap().len()
+    }
 }
 
 impl RetryLogic for ZerobusRetryLogic {
@@ -1511,20 +1668,32 @@ impl RetryLogic for ZerobusRetryLogic {
 /// `error_code` for an attempt cut off by the Tower request timeout (`Elapsed`).
 const REQUEST_TIMEOUT_ERROR_CODE: &str = "request_timeout";
 
-/// Tower layer that converts retry-budget-exhausted retryable errors into a
-/// successful `ZerobusResponse` carrying `EventStatus::Errored`.
+/// Tower layer that decides the final verdict for a failed batch.
 ///
 /// Wraps the retry layer from the outside. When the retry layer returns:
 /// - `Ok(resp)` — pass through unchanged.
-/// - `Err(e)` where `e.is_retryable()` — convert to `Ok(ZerobusResponse::errored())`
-///   so the driver marks finalizers `Errored` (transient — source / disk
-///   buffer may replay) rather than `Rejected` (permanent drop).
-/// - `Err(e)` permanent — propagate so the driver maps to `Rejected`, wrapped in a
-///   `CodedError` so the driver's error and discard metrics carry its `error_code`.
+/// - `Err(e)` of [`ErrorCategory::Retryable`] — the in-sink retry budget ran out;
+///   convert to `Ok(ZerobusResponse::errored())` so the driver marks finalizers
+///   `Errored` (the source requeues the message) rather than `Rejected`.
+/// - `Err(e)` of [`ErrorCategory::Dependency`] (configuration, permanent
+///   dependency failures, any code not known to be bad data) — also
+///   `Ok(errored())`, at once: the retry layer does not retry these, because a
+///   retry cannot succeed until someone fixes the dependency, and the batch must
+///   not be deleted meanwhile. The stream is discarded where the error is raised
+///   (`ZerobusService::ingest`), so the next batch gets fresh credentials.
+/// - `Err(e)` of [`ErrorCategory::BadData`] — propagate so the driver maps to
+///   `Rejected`, wrapped in a `CodedError` so the driver's error and discard
+///   metrics carry its `error_code`.
+///
+/// Each `Errored` verdict is counted once per batch in `zerobus_errored_batches_total`.
+/// On disk-buffered sinks the `disk_v2` ledger finalizer ignores the status
+/// (`lib/vector-buffers/src/variants/disk_v2/ledger.rs`), so `Errored` is not
+/// replayed there: those batches are dropped as before, but counted by that metric
+/// instead of `component_discarded_events_total`.
 ///
 /// Without this layer the driver maps every `Err` from `Service::call` to
-/// `EventStatus::Rejected`, which would drop transient-but-exhausted failures
-/// as if they were permanent.
+/// `EventStatus::Rejected`, which would drop transient and dependency failures
+/// as if they were bad data.
 #[derive(Clone, Debug, Default)]
 pub struct RetryableErrorAsErroredLayer;
 
@@ -1567,24 +1736,37 @@ where
                     // adaptive-concurrency). Downcast to inspect retryability;
                     // anything that isn't a `ZerobusSinkError` (e.g. a timeout
                     // `Elapsed`) is conservatively treated as transient.
-                    let (retryable, error_code) = match e.downcast_ref::<ZerobusSinkError>() {
-                        Some(zb) => (zb.is_retryable(), zb.error_code()),
-                        None if e.is::<Elapsed>() => (true, REQUEST_TIMEOUT_ERROR_CODE),
-                        None => (true, "other"),
+                    let (category, error_code) = match e.downcast_ref::<ZerobusSinkError>() {
+                        Some(zb) => (zb.category(), zb.error_code()),
+                        None if e.is::<Elapsed>() => {
+                            (ErrorCategory::Retryable, REQUEST_TIMEOUT_ERROR_CODE)
+                        }
+                        None => (ErrorCategory::Retryable, "other"),
                     };
-                    if retryable {
-                        warn!(
-                            message = "Zerobus retry budget exhausted on transient error; signaling Errored so source or buffer may replay.",
-                            error = %e,
-                            error_code,
-                        );
-                        Ok(ZerobusResponse::errored())
-                    } else {
-                        Err(CodedError {
+                    match category {
+                        ErrorCategory::Retryable => {
+                            warn!(
+                                message = "Zerobus retry budget exhausted on transient error; signaling Errored so source or buffer may replay.",
+                                error = %e,
+                                error_code,
+                            );
+                            emit!(ZerobusErroredBatch { error_code });
+                            Ok(ZerobusResponse::errored())
+                        }
+                        ErrorCategory::Dependency => {
+                            warn!(
+                                message = "Zerobus batch failed with a non-retryable error that is not known to be bad data; signaling Errored so it is not deleted.",
+                                error = %e,
+                                error_code,
+                            );
+                            emit!(ZerobusErroredBatch { error_code });
+                            Ok(ZerobusResponse::errored())
+                        }
+                        ErrorCategory::BadData => Err(CodedError {
                             code: error_code,
                             error: e,
                         }
-                        .into())
+                        .into()),
                     }
                 }
             }
@@ -1736,43 +1918,294 @@ mod tests {
     }
 
     #[test]
-    fn mux_discards_on_retryable_or_auth_error_from_closed_mux() {
-        use databricks_zerobus_ingest_sdk::GrpcStatus;
-        let retryable = ZerobusError::ChannelCreationError("lane failed".to_string());
-        let non_retryable = ZerobusError::InvalidArgument("bad field".to_string());
-        // The incident shape: a token-mint 401 poisons the mux (the SDK retains
-        // it and replays it for every later ingest), so it must discard.
-        let auth = ZerobusError::InvalidUCTokenError("mint 401".to_string());
-        let auth_grpc = ZerobusError::CreateStreamError(GrpcStatus::new(
-            databricks_zerobus_ingest_sdk::GrpcCode::Unauthenticated,
-            "expired",
-        ));
-        // In the auth class deliberately: grant/RAR propagation is eventual,
-        // so a denial can be transient and must discard + rebuild too.
-        let permission_denied = ZerobusError::CreateStreamError(GrpcStatus::new(
-            databricks_zerobus_ingest_sdk::GrpcCode::PermissionDenied,
-            "revoked grant",
-        ));
-        assert!(retryable.is_retryable());
-        assert!(!non_retryable.is_retryable());
-
-        for (err, closed, expected) in [
-            (&retryable, false, false),
-            (&retryable, true, true),
-            (&non_retryable, false, false),
-            (&non_retryable, true, false),
-            (&auth, false, false),
-            (&auth, true, true),
-            (&auth_grpc, false, false),
-            (&auth_grpc, true, true),
-            (&permission_denied, false, false),
-            (&permission_denied, true, true),
-        ] {
+    fn closed_streams_are_always_discarded_open_muxes_kept() {
+        use databricks_zerobus_ingest_sdk::{GrpcCode, GrpcStatus};
+        let grpc = |code| ZerobusError::StreamClosedError(GrpcStatus::new(code, "x"));
+        let sources = [
+            ZerobusError::ChannelCreationError("lane failed".to_string()),
+            ZerobusError::InvalidArgument("bad field".to_string()),
+            grpc(GrpcCode::InvalidArgument),
+            // The incident shape: a token-mint 401 poisons the mux.
+            ZerobusError::InvalidUCTokenError("mint 401".to_string()),
+            ZerobusError::CreateStreamError(GrpcStatus::new(GrpcCode::Unauthenticated, "x")),
+            // A permanent dependency failure, which the old mux rule kept.
+            grpc(GrpcCode::NotFound),
+            ZerobusError::InvalidStateError("x".to_string()),
+        ];
+        for source in sources {
+            let closed = ZerobusSinkError::TerminalIngestionError {
+                source: source.clone(),
+            };
+            let open = ZerobusSinkError::IngestionError { source };
+            for multiplexed in [false, true] {
+                // Whatever the error, a stream the failure closed is dropped.
+                assert!(
+                    should_discard_stream(multiplexed, &closed, true),
+                    "{closed}, multiplexed = {multiplexed}"
+                );
+            }
+            // An open mux survives lane-level failures.
+            assert!(!should_discard_stream(true, &open, false), "{open}");
+            // An open single stream is kept only for bad data.
             assert_eq!(
-                mux_should_discard(err, closed),
-                expected,
-                "{err:?}, closed = {closed}"
+                should_discard_stream(false, &open, false),
+                open.category() != ErrorCategory::BadData,
+                "{open}"
             );
+        }
+    }
+
+    /// A mux the server closed with a permanent dependency error replays that error for
+    /// every later ingest. It must be dropped, or every batch fails until restart.
+    #[tokio::test]
+    async fn poisoned_mux_is_discarded_on_dependency_error() {
+        use databricks_zerobus_ingest_sdk::{GrpcCode, GrpcStatus};
+        let mock = MockStream::failing(ZerobusError::StreamClosedError(GrpcStatus::new(
+            GrpcCode::NotFound,
+            "table not found",
+        )))
+        .multiplexed()
+        .server_closes_on_error();
+        let closed_flag = mock.closed_flag();
+        let service = ZerobusService::new_with_mock(test_config(), mock)
+            .await
+            .unwrap();
+
+        let stream = current_stream(&service).await;
+        let err = service
+            .ingest(
+                Arc::clone(&stream),
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ZerobusSinkError::TerminalIngestionError { .. }
+        ));
+        assert_eq!(err.error_code(), "grpc_not_found");
+        assert_eq!(err.category(), ErrorCategory::Dependency);
+        assert!(!service.has_active_stream().await);
+        assert!(closed_flag.load(std::sync::atomic::Ordering::Relaxed));
+
+        // The old handle would have failed every later batch the same way.
+        let replayed = service
+            .ingest(
+                stream,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(replayed.error_code(), "grpc_not_found");
+    }
+
+    /// A stream the server closed with `INVALID_ARGUMENT` hands that error to every
+    /// batch in flight on it (and a mux to every later batch), so it must not reject
+    /// them as bad data: they are Errored, and the stream is dropped.
+    #[tokio::test]
+    async fn bad_data_code_that_closed_the_stream_is_not_bad_data() {
+        use databricks_zerobus_ingest_sdk::{GrpcCode, GrpcStatus};
+        for multiplexed in [false, true] {
+            let mock = MockStream::failing(ZerobusError::StreamClosedError(GrpcStatus::new(
+                GrpcCode::InvalidArgument,
+                "rejected",
+            )))
+            .server_closes_on_error();
+            let mock = if multiplexed {
+                mock.multiplexed()
+            } else {
+                mock
+            };
+            let service = ZerobusService::new_with_mock(test_config(), mock)
+                .await
+                .unwrap();
+
+            let stream = current_stream(&service).await;
+            let err = service
+                .ingest(
+                    stream,
+                    dummy_payload(),
+                    GroupedCountByteSize::new_untagged(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ZerobusSinkError::TerminalIngestionError { .. }),
+                "multiplexed = {multiplexed}"
+            );
+            assert_eq!(err.error_code(), "grpc_invalid_argument");
+            assert_eq!(err.category(), ErrorCategory::Dependency);
+            assert_eq!(err.event_status(), vector_lib::event::EventStatus::Errored);
+            assert!(
+                !service.has_active_stream().await,
+                "multiplexed = {multiplexed}"
+            );
+        }
+    }
+
+    /// A service whose installed `first` stream is pinned to a seeded schema, so the
+    /// fresh-stream retry can rebuild through `get_or_create_stream`, which hands out the
+    /// `rebuilt` mocks in order.
+    async fn service_for_fresh_stream_retry(
+        first: MockStream,
+        rebuilt: Vec<MockStream>,
+    ) -> (ZerobusService, Arc<ResolvedSchema>) {
+        let service = ZerobusService::new_with_mock(test_config(), first)
+            .await
+            .unwrap();
+        service.seed_schema(narrow_schema()).await;
+        service.pin_stream_to_cached_schema().await;
+        service.script_streams(rebuilt);
+        let schema = service.cached_schema().await.unwrap();
+        (service, schema)
+    }
+
+    fn server_closed(code: databricks_zerobus_ingest_sdk::GrpcCode) -> ZerobusError {
+        ZerobusError::StreamClosedError(databricks_zerobus_ingest_sdk::GrpcStatus::new(
+            code, "closed",
+        ))
+    }
+
+    /// A batch that was only in flight when a stream closed under it lands on the fresh
+    /// stream the retry builds, single stream or mux.
+    #[tokio::test]
+    async fn batch_on_a_closed_stream_lands_on_a_fresh_stream() {
+        use databricks_zerobus_ingest_sdk::GrpcCode;
+        for (first, label) in [
+            (
+                MockStream::failing(server_closed(GrpcCode::InvalidArgument))
+                    .server_closes_on_error(),
+                "single stream, bad-data code",
+            ),
+            (
+                MockStream::failing(server_closed(GrpcCode::NotFound))
+                    .multiplexed()
+                    .server_closes_on_error(),
+                "mux, dependency code",
+            ),
+        ] {
+            let closed = first.closed_flag();
+            let (service, schema) =
+                service_for_fresh_stream_retry(first, vec![MockStream::succeeding()]).await;
+            let stream = current_stream(&service).await;
+            let response = service
+                .ingest_with_fresh_stream_retry(
+                    &schema,
+                    stream,
+                    dummy_payload(),
+                    GroupedCountByteSize::new_untagged(),
+                )
+                .await;
+            assert!(response.is_ok(), "{label}: {response:?}");
+            assert_eq!(service.scripted_stream_count(), 0, "{label}: one rebuild");
+            assert!(service.has_active_stream().await, "{label}");
+            assert!(
+                closed.load(std::sync::atomic::Ordering::Relaxed),
+                "{label}: the closed stream was dropped"
+            );
+        }
+    }
+
+    /// A batch that closes the fresh stream too is answered as before, after one retry.
+    #[tokio::test]
+    async fn batch_that_closes_the_fresh_stream_too_is_errored_after_one_retry() {
+        use databricks_zerobus_ingest_sdk::GrpcCode;
+        let bad = || {
+            MockStream::failing(server_closed(GrpcCode::InvalidArgument)).server_closes_on_error()
+        };
+        let (service, schema) =
+            service_for_fresh_stream_retry(bad(), vec![bad(), MockStream::succeeding()]).await;
+        let stream = current_stream(&service).await;
+        let err = service
+            .ingest_with_fresh_stream_retry(
+                &schema,
+                stream,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ZerobusSinkError::TerminalIngestionError { .. }
+        ));
+        assert_eq!(err.error_code(), "grpc_invalid_argument");
+        assert_eq!(err.category(), ErrorCategory::Dependency);
+        assert_eq!(
+            service.scripted_stream_count(),
+            1,
+            "bounded: only one fresh stream is built"
+        );
+    }
+
+    /// Failures the retry layer already retries, and bad data on a stream that stays
+    /// open, are not sent again on a fresh stream.
+    #[tokio::test]
+    async fn fresh_stream_retry_skips_retryable_and_open_stream_failures() {
+        use databricks_zerobus_ingest_sdk::GrpcCode;
+        for (first, label) in [
+            (
+                MockStream::failing(server_closed(GrpcCode::Unavailable)).server_closes_on_error(),
+                "retryable failure that closed the stream",
+            ),
+            (
+                MockStream::failing(ZerobusError::InvalidArgument("bad batch".to_string())),
+                "bad data on an open stream",
+            ),
+        ] {
+            let (service, schema) =
+                service_for_fresh_stream_retry(first, vec![MockStream::succeeding()]).await;
+            let stream = current_stream(&service).await;
+            let err = service
+                .ingest_with_fresh_stream_retry(
+                    &schema,
+                    stream,
+                    dummy_payload(),
+                    GroupedCountByteSize::new_untagged(),
+                )
+                .await
+                .unwrap_err();
+            assert!(!err.retries_on_fresh_stream(), "{label}: {err}");
+            assert_eq!(service.scripted_stream_count(), 1, "{label}: no rebuild");
+        }
+    }
+
+    /// While the mux stays open, its lane-level failures keep it (as before), and a batch
+    /// the SDK refused is still bad data.
+    #[tokio::test]
+    async fn open_mux_is_kept_on_lane_failures() {
+        for (source, category) in [
+            (
+                ZerobusError::ConnectionTimeout("capacity".to_string()),
+                ErrorCategory::Retryable,
+            ),
+            (
+                ZerobusError::InvalidArgument("bad batch".to_string()),
+                ErrorCategory::BadData,
+            ),
+        ] {
+            let mock = MockStream::failing(source).multiplexed();
+            let service = ZerobusService::new_with_mock(test_config(), mock)
+                .await
+                .unwrap();
+
+            let stream = current_stream(&service).await;
+            let err = service
+                .ingest(
+                    stream,
+                    dummy_payload(),
+                    GroupedCountByteSize::new_untagged(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ZerobusSinkError::IngestionError { .. }),
+                "{err}"
+            );
+            assert_eq!(err.category(), category, "{err}");
+            assert!(service.has_active_stream().await, "{err}");
         }
     }
 
@@ -2733,11 +3166,19 @@ mod tests {
     }
 
     fn retryable_error_counts() -> Vec<(Option<String>, vector_lib::event::MetricValue)> {
+        counts_of("zerobus_retryable_errors_total")
+    }
+
+    fn errored_batch_counts() -> Vec<(Option<String>, vector_lib::event::MetricValue)> {
+        counts_of("zerobus_errored_batches_total")
+    }
+
+    fn counts_of(name: &str) -> Vec<(Option<String>, vector_lib::event::MetricValue)> {
         let mut counts: Vec<_> = vector_lib::metrics::Controller::get()
             .unwrap()
             .capture_metrics()
             .into_iter()
-            .filter(|m| m.name() == "zerobus_retryable_errors_total")
+            .filter(|m| m.name() == name)
             .map(|m| {
                 let code = m.tags().and_then(|t| t.get("error_code")).map(String::from);
                 (code, m.value().clone())
@@ -2838,7 +3279,7 @@ mod tests {
         let inner = tower::service_fn(|_req: ZerobusRequest| async move {
             let err: crate::Error = Box::new(ZerobusSinkError::EncodingError {
                 message: "bad".to_string(),
-                schema_constraint: true,
+                schema_constraint: false,
             });
             Err::<ZerobusResponse, _>(err)
         });
@@ -2851,13 +3292,258 @@ mod tests {
             .await
             .unwrap_err();
         // Wrapped so the driver labels its metrics with the error's code.
-        assert_eq!(
-            CodedError::code_of(&err),
-            Some("encoding_schema_constraint")
-        );
+        assert_eq!(CodedError::code_of(&err), Some("encoding_failed"));
         let coded = err.downcast_ref::<CodedError>().unwrap();
         let zb = coded.error.downcast_ref::<ZerobusSinkError>().unwrap();
         assert!(matches!(zb, ZerobusSinkError::EncodingError { .. }));
+    }
+
+    /// The production stack, minus the service: the Errored layer outside the retry layer.
+    fn verdict_stack<F, Fut>(
+        max_retries: usize,
+        inner: F,
+    ) -> impl Service<ZerobusRequest, Response = ZerobusResponse, Error = crate::Error>
+    where
+        F: FnMut(ZerobusRequest) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = Result<ZerobusResponse, crate::Error>> + Send + 'static,
+    {
+        let policy = crate::sinks::util::retries::FibonacciRetryPolicy::new(
+            max_retries,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
+            ZerobusRetryLogic,
+            crate::sinks::util::retries::JitterMode::None,
+        );
+        tower::ServiceBuilder::new()
+            .layer(RetryableErrorAsErroredLayer)
+            .retry(policy)
+            .service(tower::service_fn(inner))
+    }
+
+    fn counter(value: f64) -> vector_lib::event::MetricValue {
+        vector_lib::event::MetricValue::Counter { value }
+    }
+
+    /// Category 3: not retried in the sink, answered `Ok(Errored)` at once, counted once
+    /// with the code. Nothing reaches the driver's error/discard metrics.
+    #[tokio::test(start_paused = true)]
+    async fn dependency_error_is_errored_immediately_without_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        vector_lib::metrics::init_test();
+        vector_lib::metrics::Controller::get().unwrap().reset();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let svc = verdict_stack(5, {
+            let attempts = Arc::clone(&attempts);
+            move |_req| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<ZerobusResponse, crate::Error>(Box::new(ZerobusSinkError::SchemaError {
+                        message: "UC 404".to_string(),
+                        retryable: false,
+                        status: Some(404),
+                    }))
+                }
+            }
+        });
+
+        let resp = svc.oneshot(dummy_request()).await.unwrap();
+        assert_eq!(resp.status, vector_lib::event::EventStatus::Errored);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            errored_batch_counts(),
+            vec![(Some("uc_not_found".to_string()), counter(1.0))]
+        );
+        assert!(retryable_error_counts().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_dependency_codes_are_errored() {
+        use tower::ServiceExt;
+
+        vector_lib::metrics::init_test();
+        vector_lib::metrics::Controller::get().unwrap().reset();
+
+        let cases: [(fn() -> ZerobusSinkError, &str); 5] = [
+            (
+                || ZerobusSinkError::ConfigError {
+                    message: "bad".to_string(),
+                },
+                "config",
+            ),
+            (
+                || ZerobusSinkError::IngestionError {
+                    source: ZerobusError::InvalidStateError("x".to_string()),
+                },
+                "invalid_state",
+            ),
+            (
+                || ZerobusSinkError::EncodingError {
+                    message: "null".to_string(),
+                    schema_constraint: true,
+                },
+                "encoding_schema_constraint",
+            ),
+            // A bad-data code is not bad data once it closed the stream, or when it
+            // came from stream setup.
+            (
+                || ZerobusSinkError::TerminalIngestionError {
+                    source: ZerobusError::StreamClosedError(
+                        databricks_zerobus_ingest_sdk::GrpcStatus::new(
+                            databricks_zerobus_ingest_sdk::GrpcCode::InvalidArgument,
+                            "x",
+                        ),
+                    ),
+                },
+                "grpc_invalid_argument",
+            ),
+            (
+                || ZerobusSinkError::StreamInitError {
+                    source: ZerobusError::InvalidArgument("bad option".to_string()),
+                },
+                "invalid_argument",
+            ),
+        ];
+        for (make, code) in cases {
+            let svc = verdict_stack(2, move |_req| async move {
+                Err::<ZerobusResponse, crate::Error>(Box::new(make()))
+            });
+            let resp = svc.oneshot(dummy_request()).await.unwrap();
+            assert_eq!(
+                resp.status,
+                vector_lib::event::EventStatus::Errored,
+                "{code}"
+            );
+            assert!(
+                errored_batch_counts().contains(&(Some(code.to_string()), counter(1.0))),
+                "{code}: {:?}",
+                errored_batch_counts()
+            );
+        }
+    }
+
+    /// Category 1: still Rejected (the error propagates to the driver), never counted as
+    /// Errored.
+    #[tokio::test(start_paused = true)]
+    async fn bad_data_error_is_rejected_and_not_counted() {
+        use tower::ServiceExt;
+
+        vector_lib::metrics::init_test();
+        vector_lib::metrics::Controller::get().unwrap().reset();
+
+        let cases: [(fn() -> ZerobusError, &str); 2] = [
+            (
+                || ZerobusError::InvalidArgument("x".to_string()),
+                "invalid_argument",
+            ),
+            (
+                || {
+                    ZerobusError::CreateStreamError(databricks_zerobus_ingest_sdk::GrpcStatus::new(
+                        databricks_zerobus_ingest_sdk::GrpcCode::InvalidArgument,
+                        "x",
+                    ))
+                },
+                "grpc_invalid_argument",
+            ),
+        ];
+        for (make, code) in cases {
+            let svc = verdict_stack(2, move |_req| async move {
+                Err::<ZerobusResponse, crate::Error>(Box::new(ZerobusSinkError::IngestionError {
+                    source: make(),
+                }))
+            });
+            let err = svc.oneshot(dummy_request()).await.unwrap_err();
+            assert_eq!(CodedError::code_of(&err), Some(code));
+        }
+        assert!(errored_batch_counts().is_empty());
+    }
+
+    /// Category 2 through a really exhausted retry stack: every attempt is counted as a
+    /// retryable error, the batch is counted once as Errored.
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_retryable_error_is_counted_once_as_errored() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        vector_lib::metrics::init_test();
+        vector_lib::metrics::Controller::get().unwrap().reset();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let svc = verdict_stack(2, {
+            let attempts = Arc::clone(&attempts);
+            move |_req| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<ZerobusResponse, crate::Error>(Box::new(ZerobusSinkError::SchemaError {
+                        message: "UC 503".to_string(),
+                        retryable: true,
+                        status: Some(503),
+                    }))
+                }
+            }
+        });
+
+        let resp = svc.oneshot(dummy_request()).await.unwrap();
+        assert_eq!(resp.status, vector_lib::event::EventStatus::Errored);
+        let attempts = attempts.load(Ordering::SeqCst);
+        assert!(attempts > 1, "expected retries, got {attempts}");
+        assert_eq!(
+            errored_batch_counts(),
+            vec![(Some("uc_server_error".to_string()), counter(1.0))]
+        );
+        assert_eq!(
+            retryable_error_counts(),
+            vec![(
+                Some("uc_server_error".to_string()),
+                counter((attempts - 1) as f64)
+            )]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivered_batch_is_not_counted_as_errored() {
+        use tower::ServiceExt;
+
+        vector_lib::metrics::init_test();
+        vector_lib::metrics::Controller::get().unwrap().reset();
+
+        let svc = verdict_stack(2, |_req| async {
+            Ok::<_, crate::Error>(ZerobusResponse::delivered(
+                GroupedCountByteSize::new_untagged(),
+                None,
+            ))
+        });
+        let resp = svc.oneshot(dummy_request()).await.unwrap();
+        assert_eq!(resp.status, vector_lib::event::EventStatus::Delivered);
+        assert!(errored_batch_counts().is_empty());
+    }
+
+    /// A dependency failure (non-retryable, not bad data) discards the cached stream so
+    /// the next batch rebuilds it with fresh credentials; bad data leaves it alone.
+    #[tokio::test]
+    async fn dependency_error_discards_stream() {
+        let mock = MockStream::failing(ZerobusError::InvalidStateError("broken".to_string()));
+        let service = ZerobusService::new_with_mock(test_config(), mock)
+            .await
+            .unwrap();
+        assert!(service.has_active_stream().await);
+
+        let stream = current_stream(&service).await;
+        let err = service
+            .ingest(
+                stream,
+                dummy_payload(),
+                GroupedCountByteSize::new_untagged(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_state");
+        assert_eq!(err.category(), ErrorCategory::Dependency);
+        assert!(!ZerobusRetryLogic.is_retriable_error(&err));
+        assert!(!service.has_active_stream().await);
     }
 
     #[tokio::test]

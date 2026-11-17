@@ -106,6 +106,184 @@ pub(super) struct DeferredConfig {
     pub(super) max_age_secs: u64,
 }
 
+/// Backoff applied when a message could not be finished and will be retried.
+///
+/// A message that fails normally waits out its full `visibility_timeout_secs` before SQS hands it
+/// out again. With this enabled (the default) the source instead tells SQS how long to hide the
+/// message, using the number of times it has been received. The first `initial_attempts` retries
+/// wait `initial_secs` (by default the source's own `visibility_timeout_secs`, so nothing changes
+/// for them); after that the wait doubles on every receive up to `max_secs`.
+///
+/// Applies to a sink that reported the events as errored (for example a destination that is
+/// down), a failed `GetObject` request, and a transient failure while reading the object body.
+/// It does not apply to a malformed notification, an unsupported event version, a notification
+/// for another region, or a truncated archive; those keep the normal visibility timeout.
+#[configurable_component]
+#[derive(Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ErroredMessageReleaseConfig {
+    /// Whether to back off failed messages.
+    ///
+    /// Set to `false` to restore the fixed `visibility_timeout_secs` wait for sink-errored
+    /// messages and read failures. A failed `GetObject` request then follows
+    /// `failed_message_visibility_timeout_secs` alone.
+    #[serde(default = "default_true")]
+    pub(super) enabled: bool,
+
+    /// How many receives of a message wait `initial_secs` before the wait starts doubling.
+    ///
+    /// Must be at least 1.
+    #[serde(default = "default_errored_initial_attempts")]
+    #[configurable(metadata(docs::examples = 3))]
+    pub(super) initial_attempts: u32,
+
+    /// The wait, in seconds, for the first `initial_attempts` receives, and the base of the
+    /// doubling after that.
+    ///
+    /// Defaults to the source's `visibility_timeout_secs`. Valid values are 0 - 43200.
+    #[serde(default)]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 600))]
+    pub(super) initial_secs: Option<u32>,
+
+    /// The longest wait, in seconds, no matter how many times the message has been received.
+    ///
+    /// Valid values are 0 - 43200. A wait is never longer than this, even when it is shorter
+    /// than `initial_secs`.
+    #[serde(default = "default_errored_max_secs")]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 3600))]
+    pub(super) max_secs: u32,
+
+    /// Whether to shorten each wait by a random 0 - 20%, so messages that failed together do not
+    /// all come back together.
+    ///
+    /// A wait is only ever shortened, so it never exceeds the schedule or `max_secs`.
+    #[serde(default = "default_true")]
+    pub(super) jitter: bool,
+}
+
+impl Default for ErroredMessageReleaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            initial_attempts: default_errored_initial_attempts(),
+            initial_secs: None,
+            max_secs: default_errored_max_secs(),
+            jitter: true,
+        }
+    }
+}
+
+const fn default_errored_initial_attempts() -> u32 {
+    3
+}
+
+const fn default_errored_max_secs() -> u32 {
+    3600
+}
+
+/// The resolved backoff schedule (see [`ErroredMessageReleaseConfig`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ReleaseSchedule {
+    initial_attempts: u32,
+    initial_secs: u32,
+    max_secs: u32,
+    jitter: bool,
+}
+
+/// The largest random reduction applied to a wait when jitter is on.
+const MAX_JITTER_FRACTION: f64 = 0.2;
+
+impl ReleaseSchedule {
+    /// The wait before the message is received again, given how many times it has been received
+    /// so far (1 for the first receive): `initial_secs` for the first `initial_attempts`
+    /// receives, then `initial_secs` doubled for every further receive, never above `max_secs`
+    /// or the SQS limit.
+    pub(super) fn base_secs(&self, receive_count: u32) -> u32 {
+        let cap = self.max_secs.min(MAX_VISIBILITY_TIMEOUT_SECS);
+        let doublings = receive_count.saturating_sub(self.initial_attempts);
+        // 2^20 times any valid base is far past the cap; clamping the exponent avoids overflow.
+        let factor = 1u64 << doublings.min(20);
+        let secs = u64::from(self.initial_secs).saturating_mul(factor);
+        secs.min(u64::from(cap)) as u32
+    }
+
+    /// `base_secs` with jitter applied. `unit` is a uniform sample in `[0, 1)`; the wait is
+    /// shortened by `unit * 20%`, so it stays within `[0.8 * base, base]`.
+    pub(super) fn delay_secs(&self, receive_count: u32, unit: f64) -> i32 {
+        let base = self.base_secs(receive_count);
+        let secs = if self.jitter {
+            f64::from(base) * (1.0 - MAX_JITTER_FRACTION * unit.clamp(0.0, 1.0))
+        } else {
+            f64::from(base)
+        };
+        // Bounded by MAX_VISIBILITY_TIMEOUT_SECS, so the cast cannot truncate.
+        secs.round() as i32
+    }
+}
+
+/// Why a failed message is made visible again early, which decides the metric reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReleaseKind {
+    /// The `GetObject` request failed.
+    GetObject,
+    /// The sink reported the events as errored.
+    Errored,
+    /// Reading the object body failed in a way that may not repeat.
+    ReadObject,
+}
+
+impl ReleaseKind {
+    pub(super) const fn reason(self) -> &'static str {
+        match self {
+            ReleaseKind::GetObject => "get_object",
+            ReleaseKind::Errored => "errored",
+            ReleaseKind::ReadObject => "read_object",
+        }
+    }
+}
+
+/// How failed messages are released early. `None` means the message keeps the normal
+/// visibility timeout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ReleasePolicy {
+    /// `failed_message_visibility_timeout_secs`: the fixed delay for a first `GetObject` failure.
+    pub(super) failed_secs: Option<i32>,
+    /// The backoff, when `errored_message_release.enabled`.
+    pub(super) schedule: Option<ReleaseSchedule>,
+}
+
+impl ReleasePolicy {
+    /// The wait before `kind` of failure is received again, or `None` to keep the normal
+    /// visibility timeout.
+    ///
+    /// Precedence for `GetObject`: the first failure (receive count 1) honours
+    /// `failed_message_visibility_timeout_secs` when set; later failures follow the backoff. With
+    /// the backoff disabled, `failed_message_visibility_timeout_secs` applies to every
+    /// `GetObject` failure, exactly as before. Sink-errored and read failures are released only
+    /// by the backoff.
+    pub(super) fn delay_secs(
+        &self,
+        kind: ReleaseKind,
+        receive_count: u32,
+        unit: f64,
+    ) -> Option<i32> {
+        let scheduled = || {
+            self.schedule
+                .map(|schedule| schedule.delay_secs(receive_count, unit))
+        };
+        match kind {
+            ReleaseKind::GetObject => match (self.failed_secs, self.schedule) {
+                (Some(secs), None) => Some(secs),
+                (Some(secs), Some(_)) if receive_count <= 1 => Some(secs),
+                _ => scheduled(),
+            },
+            ReleaseKind::Errored | ReleaseKind::ReadObject => scheduled(),
+        }
+    }
+}
+
 /// SQS configuration options.
 //
 // TODO: It seems awfully likely that we could re-use the existing configuration type for the `aws_sqs` source in some
@@ -194,6 +372,19 @@ pub(super) struct Config {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[configurable(metadata(docs::examples = 15))]
     pub(super) failed_message_visibility_timeout_secs: Option<u32>,
+
+    /// Backoff for messages that failed and will be retried. On by default.
+    ///
+    /// A message the sink reported as errored, or whose object could not be fetched or read, comes
+    /// back after a wait that grows with the number of times it has been received, instead of
+    /// always waiting out `visibility_timeout_secs`. See the fields for the schedule.
+    ///
+    /// When `failed_message_visibility_timeout_secs` is also set, it is used for the first failed
+    /// `GetObject` request, and the backoff applies from the second receive.
+    #[configurable(derived)]
+    #[serde(default)]
+    #[derivative(Default)]
+    pub(super) errored_message_release: ErroredMessageReleaseConfig,
 
     /// Number of concurrent tasks to create for polling the queue for messages.
     ///
@@ -296,6 +487,8 @@ pub(super) enum IngestorNewError {
         secs
     ))]
     InvalidFailedMessageVisibilityTimeout { secs: u32 },
+    #[snafu(display("Invalid errored_message_release: {}", reason))]
+    InvalidErroredMessageRelease { reason: String },
 }
 
 /// SQS rejects visibility timeouts above 12 hours.
@@ -356,6 +549,17 @@ pub enum ProcessingError {
         key: String,
     },
     #[snafu(display(
+        "Sink reported the events as errored (to be retried) for an s3 object in region {}: s3://{}/{}",
+        region,
+        bucket,
+        key
+    ))]
+    SinkErrored {
+        region: String,
+        bucket: String,
+        key: String,
+    },
+    #[snafu(display(
         "File s3://{}/{} too old.  Forwarded to deferred queue {}",
         bucket,
         key,
@@ -392,15 +596,75 @@ fn validate_failed_message_visibility_timeout(
     }
 }
 
+/// Resolves `errored_message_release` against the source's `visibility_timeout_secs`.
+fn validate_errored_message_release(
+    config: &ErroredMessageReleaseConfig,
+    visibility_timeout_secs: u32,
+) -> Result<Option<ReleaseSchedule>, IngestorNewError> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let invalid = |reason: String| Err(IngestorNewError::InvalidErroredMessageRelease { reason });
+    let initial_secs = config.initial_secs.unwrap_or(visibility_timeout_secs);
+    if config.initial_attempts < 1 {
+        return invalid("initial_attempts must be at least 1".to_string());
+    }
+    if initial_secs > MAX_VISIBILITY_TIMEOUT_SECS {
+        return invalid(format!(
+            "initial_secs {initial_secs} must be 0 - {MAX_VISIBILITY_TIMEOUT_SECS}"
+        ));
+    }
+    if config.max_secs > MAX_VISIBILITY_TIMEOUT_SECS {
+        return invalid(format!(
+            "max_secs {} must be 0 - {MAX_VISIBILITY_TIMEOUT_SECS}",
+            config.max_secs
+        ));
+    }
+    Ok(Some(ReleaseSchedule {
+        initial_attempts: config.initial_attempts,
+        initial_secs,
+        max_secs: config.max_secs,
+        jitter: config.jitter,
+    }))
+}
+
+/// How many times SQS has delivered the message, this delivery included. A missing or malformed
+/// attribute counts as the first delivery.
+fn receive_count(message: &Message) -> u32 {
+    message
+        .attributes()
+        .and_then(|attributes| attributes.get(&MessageSystemAttributeName::ApproximateReceiveCount))
+        .and_then(|count| count.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
 impl ProcessingError {
-    /// Whether the message should be made visible again early. Only a request-level `GetObject`
-    /// failure qualifies; broken or undecodable files would fail again on redelivery.
-    const fn release_reason(&self) -> Option<&'static str> {
+    /// How the message may be made visible again early. Only failures that can succeed on a
+    /// later attempt qualify: a request-level `GetObject` failure, a sink-errored batch, and a
+    /// transient failure reading the object. Broken notifications and a truncated archive would
+    /// fail again identically, so they keep the normal visibility timeout.
+    fn release_kind(&self) -> Option<ReleaseKind> {
         match self {
-            ProcessingError::GetObject { .. } => Some("get_object"),
+            ProcessingError::GetObject { .. } => Some(ReleaseKind::GetObject),
+            ProcessingError::SinkErrored { .. } => Some(ReleaseKind::Errored),
+            ProcessingError::ReadObject { source, .. }
+                if !is_truncated_archive(source.as_ref()) =>
+            {
+                Some(ReleaseKind::ReadObject)
+            }
             _ => None,
         }
     }
+}
+
+/// Whether a read error is the decoder reporting an archive that ends mid-member
+/// (`UnexpectedEof`). That object is immutable, so reading it again fails the same way.
+fn is_truncated_archive(error: &dyn FramingError) -> bool {
+    error
+        .as_any()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
 pub struct State {
@@ -420,7 +684,7 @@ pub struct State {
     visibility_timeout_secs: i32,
     delete_message: bool,
     delete_failed_message: bool,
-    failed_message_visibility_timeout_secs: Option<i32>,
+    release_policy: ReleasePolicy,
     decoder: Decoder,
 
     deferred: Option<DeferredConfig>,
@@ -468,6 +732,13 @@ impl Ingestor {
         let failed_message_visibility_timeout_secs = validate_failed_message_visibility_timeout(
             config.failed_message_visibility_timeout_secs,
         )?;
+        let release_policy = ReleasePolicy {
+            failed_secs: failed_message_visibility_timeout_secs,
+            schedule: validate_errored_message_release(
+                &config.errored_message_release,
+                config.visibility_timeout_secs,
+            )?,
+        };
 
         let state = Arc::new(State {
             region,
@@ -486,7 +757,7 @@ impl Ingestor {
             visibility_timeout_secs: config.visibility_timeout_secs as i32,
             delete_message: config.delete_message,
             delete_failed_message: config.delete_failed_message,
-            failed_message_visibility_timeout_secs,
+            release_policy,
             decoder,
 
             deferred: config.deferred,
@@ -752,6 +1023,7 @@ impl IngestorProcess {
                 .message_id
                 .clone()
                 .unwrap_or_else(|| "<unknown>".to_owned());
+            let receive_count = receive_count(&message);
             match self.handle_sqs_message(message.clone()).await {
                 Ok(()) => {
                     emit!(SqsMessageProcessingSucceeded {
@@ -778,6 +1050,7 @@ impl IngestorProcess {
                         &err,
                         ProcessingError::PipelineSend { .. }
                             | ProcessingError::ErrorAcknowledgement { .. }
+                            | ProcessingError::SinkErrored { .. }
                     );
                     match err {
                         ProcessingError::FileTooOld { .. } => {
@@ -873,11 +1146,20 @@ impl IngestorProcess {
                                 message_id: &message_id,
                                 error: &err,
                             });
-                            if let Some(secs) = self.state.failed_message_visibility_timeout_secs
-                                && let Some(reason) = err.release_reason()
+                            if let Some(kind) = err.release_kind()
+                                && let Some(secs) = self.state.release_policy.delay_secs(
+                                    kind,
+                                    receive_count,
+                                    rand::random::<f64>(),
+                                )
                             {
-                                self.release_message(&message_id, &receipt_handle, secs, reason)
-                                    .await;
+                                self.release_message(
+                                    &message_id,
+                                    &receipt_handle,
+                                    secs,
+                                    kind.reason(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1505,7 +1787,7 @@ impl IngestorProcess {
                             delivered = true;
                             Ok(())
                         }
-                        BatchStatus::Errored => Err(ProcessingError::ErrorAcknowledgement {
+                        BatchStatus::Errored => Err(ProcessingError::SinkErrored {
                             bucket: bucket.clone(),
                             key: key.clone(),
                             region: region.clone(),
@@ -1544,8 +1826,10 @@ impl IngestorProcess {
                 content_length = %content_length,
             );
             processing_result = Err(ProcessingError::ReadObject {
+                // Not `UnexpectedEof`: that kind means a truncated archive, which is permanent.
+                // A short transfer can succeed on the next attempt.
                 source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
+                    std::io::ErrorKind::ConnectionAborted,
                     format!("incomplete object download: read {pulled} of {content_length} bytes"),
                 )),
                 bucket: bucket.clone(),
@@ -1582,6 +1866,8 @@ impl IngestorProcess {
             // We make use of it during lag / delay metric calculations
             // Ref: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html#API_ReceiveMessage_RequestSyntax
             .message_system_attribute_names(MessageSystemAttributeName::SentTimestamp)
+            // The number of times SQS has delivered the message, which drives the retry backoff.
+            .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
             .send()
             .map_ok(|res| res.messages.unwrap_or_default());
         if adaptive {
@@ -2488,22 +2774,261 @@ fn failed_message_visibility_timeout_validation() {
     assert!(validate_failed_message_visibility_timeout(Some(43_201)).is_err());
 }
 
+#[cfg(test)]
+fn schedule(lease: u32) -> ReleaseSchedule {
+    validate_errored_message_release(&ErroredMessageReleaseConfig::default(), lease)
+        .unwrap()
+        .expect("enabled by default")
+}
+
 #[test]
-fn only_get_object_failures_release_early() {
+fn backoff_schedule_follows_the_lease_then_doubles_to_the_cap() {
+    let lp = schedule(600);
+    let secs: Vec<_> = (1..=8).map(|n| lp.base_secs(n)).collect();
+    assert_eq!(secs, [600, 600, 600, 1200, 2400, 3600, 3600, 3600]);
+
+    let short = schedule(60);
+    let secs: Vec<_> = (1..=9).map(|n| short.base_secs(n)).collect();
+    assert_eq!(secs, [60, 60, 60, 120, 240, 480, 960, 1920, 3600]);
+
+    // A huge receive count neither overflows nor passes the cap.
+    assert_eq!(lp.base_secs(u32::MAX), 3600);
+    assert_eq!(lp.base_secs(0), 600);
+}
+
+#[test]
+fn backoff_schedule_respects_its_settings() {
+    let config = ErroredMessageReleaseConfig {
+        initial_attempts: 1,
+        initial_secs: Some(10),
+        max_secs: 50,
+        ..Default::default()
+    };
+    let custom = validate_errored_message_release(&config, 600)
+        .unwrap()
+        .unwrap();
+    let secs: Vec<_> = (1..=5).map(|n| custom.base_secs(n)).collect();
+    assert_eq!(secs, [10, 20, 40, 50, 50]);
+
+    // The cap wins even over the base, and is bounded by the SQS limit.
+    let capped = ReleaseSchedule {
+        initial_attempts: 3,
+        initial_secs: 7200,
+        max_secs: 3600,
+        jitter: false,
+    };
+    assert_eq!(capped.base_secs(1), 3600);
+    let over_limit = ReleaseSchedule {
+        max_secs: u32::MAX,
+        initial_secs: 43_200,
+        ..capped
+    };
+    assert_eq!(over_limit.base_secs(50), MAX_VISIBILITY_TIMEOUT_SECS);
+}
+
+#[test]
+fn backoff_jitter_only_shortens_the_wait_by_up_to_a_fifth() {
+    let lp = schedule(600);
+    assert!(lp.jitter);
+    for n in 1..=10 {
+        let base = f64::from(lp.base_secs(n));
+        for unit in [0.0, 0.25, 0.5, 0.999_999, 1.0, 7.0, -3.0] {
+            let delay = f64::from(lp.delay_secs(n, unit));
+            assert!(delay <= base, "n={n} unit={unit}: {delay} > {base}");
+            assert!(
+                delay >= (base * 0.8).floor(),
+                "n={n} unit={unit}: {delay} < 80%"
+            );
+        }
+        assert_eq!(f64::from(lp.delay_secs(n, 0.0)), base);
+    }
+    let still = ReleaseSchedule {
+        jitter: false,
+        ..lp
+    };
+    assert_eq!(still.delay_secs(5, 0.9), 2400);
+    // The cap holds with jitter on.
+    assert!(lp.delay_secs(100, 0.0) <= 3600);
+}
+
+#[test]
+fn errored_message_release_config_defaults_and_parsing() {
+    const QUEUE: &str = r#"queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue""#;
+
+    let config: Config = toml::from_str(QUEUE).unwrap();
+    assert_eq!(
+        config.errored_message_release,
+        ErroredMessageReleaseConfig {
+            enabled: true,
+            initial_attempts: 3,
+            initial_secs: None,
+            max_secs: 3600,
+            jitter: true,
+        }
+    );
+    // Unset `initial_secs` follows the source's own lease.
+    let resolved = validate_errored_message_release(&config.errored_message_release, 450)
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.initial_secs, 450);
+
+    let config: Config = toml::from_str(&format!(
+        "{QUEUE}\n[errored_message_release]\nenabled = false"
+    ))
+    .unwrap();
+    assert!(!config.errored_message_release.enabled);
+    assert_eq!(
+        validate_errored_message_release(&config.errored_message_release, 600).unwrap(),
+        None
+    );
+
+    let config: Config = toml::from_str(&format!(
+        "{QUEUE}\n[errored_message_release]\ninitial_attempts = 5\ninitial_secs = 30\nmax_secs = 900\njitter = false"
+    ))
+    .unwrap();
+    assert_eq!(
+        validate_errored_message_release(&config.errored_message_release, 600).unwrap(),
+        Some(ReleaseSchedule {
+            initial_attempts: 5,
+            initial_secs: 30,
+            max_secs: 900,
+            jitter: false,
+        })
+    );
+
+    let unknown =
+        toml::from_str::<Config>(&format!("{QUEUE}\n[errored_message_release]\nbogus = 1"));
+    assert!(unknown.is_err());
+}
+
+#[test]
+fn errored_message_release_validation() {
+    let check = |config: ErroredMessageReleaseConfig, lease| {
+        validate_errored_message_release(&config, lease).is_ok()
+    };
+    let base = ErroredMessageReleaseConfig::default;
+    assert!(check(base(), 600));
+    assert!(check(
+        ErroredMessageReleaseConfig {
+            initial_secs: Some(43_200),
+            max_secs: 43_200,
+            ..base()
+        },
+        600
+    ));
+    assert!(check(
+        ErroredMessageReleaseConfig {
+            initial_secs: Some(0),
+            max_secs: 0,
+            ..base()
+        },
+        600
+    ));
+    assert!(!check(
+        ErroredMessageReleaseConfig {
+            initial_secs: Some(43_201),
+            ..base()
+        },
+        600
+    ));
+    assert!(!check(
+        ErroredMessageReleaseConfig {
+            max_secs: 43_201,
+            ..base()
+        },
+        600
+    ));
+    assert!(!check(
+        ErroredMessageReleaseConfig {
+            initial_attempts: 0,
+            ..base()
+        },
+        600
+    ));
+    // The lease is the default base, so it is bounded too.
+    assert!(!check(base(), 43_201));
+    // Disabled settings are not validated: nothing uses them.
+    assert!(check(
+        ErroredMessageReleaseConfig {
+            enabled: false,
+            max_secs: u32::MAX,
+            ..base()
+        },
+        600
+    ));
+}
+
+#[test]
+fn receive_count_comes_from_the_message_attribute() {
+    let with = |count: Option<&str>| {
+        let mut message = Message::builder();
+        if let Some(count) = count {
+            message =
+                message.attributes(MessageSystemAttributeName::ApproximateReceiveCount, count);
+        }
+        message.build()
+    };
+    assert_eq!(receive_count(&with(Some("7"))), 7);
+    assert_eq!(receive_count(&with(Some("1"))), 1);
+    // Missing, malformed, or zero counts are the first delivery.
+    assert_eq!(receive_count(&with(None)), 1);
+    assert_eq!(receive_count(&with(Some("many"))), 1);
+    assert_eq!(receive_count(&with(Some("0"))), 1);
+}
+
+#[cfg(test)]
+fn read_error(kind: std::io::ErrorKind) -> ProcessingError {
+    ProcessingError::ReadObject {
+        source: Box::new(std::io::Error::new(kind, "read failed")),
+        bucket: "b".into(),
+        key: "k".into(),
+    }
+}
+
+#[test]
+fn release_kind_of_each_error() {
     let get_object = || SdkError::timeout_error("timed out");
     let bucket = || "b".to_string();
     let key = || "k".to_string();
 
-    let released = [ProcessingError::GetObject {
-        source: get_object(),
-        bucket: bucket(),
-        key: key(),
-    }];
-    for err in &released {
-        assert_eq!(err.release_reason(), Some("get_object"), "{err:?}");
+    let released = [
+        (
+            ProcessingError::GetObject {
+                source: get_object(),
+                bucket: bucket(),
+                key: key(),
+            },
+            ReleaseKind::GetObject,
+        ),
+        (
+            ProcessingError::SinkErrored {
+                region: "r".into(),
+                bucket: bucket(),
+                key: key(),
+            },
+            ReleaseKind::Errored,
+        ),
+        (
+            read_error(std::io::ErrorKind::ConnectionReset),
+            ReleaseKind::ReadObject,
+        ),
+        (
+            read_error(std::io::ErrorKind::Other),
+            ReleaseKind::ReadObject,
+        ),
+        // A short transfer, as the source reports it.
+        (
+            read_error(std::io::ErrorKind::ConnectionAborted),
+            ReleaseKind::ReadObject,
+        ),
+    ];
+    for (err, kind) in &released {
+        assert_eq!(err.release_kind(), Some(*kind), "{err:?}");
     }
 
     let kept = [
+        // A truncated archive is permanent, whatever `tolerate_truncated_archives` says.
+        read_error(std::io::ErrorKind::UnexpectedEof),
         ProcessingError::InvalidSqsMessage {
             source: serde_json::from_str::<()>("x").unwrap_err(),
             message_id: "m".into(),
@@ -2521,6 +3046,7 @@ fn only_get_object_failures_release_early() {
         ProcessingError::UnsupportedS3EventVersion {
             version: semver::Version::new(9, 0, 0),
         },
+        // A rejected batch kept by `delete_failed_message = false`: unchanged.
         ProcessingError::ErrorAcknowledgement {
             region: "r".into(),
             bucket: bucket(),
@@ -2532,8 +3058,100 @@ fn only_get_object_failures_release_early() {
         },
     ];
     for err in &kept {
-        assert_eq!(err.release_reason(), None, "{err:?}");
+        assert_eq!(err.release_kind(), None, "{err:?}");
     }
+}
+
+#[test]
+fn release_reasons_are_stable_metric_labels() {
+    assert_eq!(ReleaseKind::GetObject.reason(), "get_object");
+    assert_eq!(ReleaseKind::Errored.reason(), "errored");
+    assert_eq!(ReleaseKind::ReadObject.reason(), "read_object");
+}
+
+#[test]
+fn release_policy_decides_the_delay() {
+    let on = |failed_secs| ReleasePolicy {
+        failed_secs,
+        schedule: Some(ReleaseSchedule {
+            jitter: false,
+            ..schedule(600)
+        }),
+    };
+    let off = |failed_secs| ReleasePolicy {
+        failed_secs,
+        schedule: None,
+    };
+    use ReleaseKind::{Errored, GetObject, ReadObject};
+
+    // Enabled, no fixed setting: the backoff for everything that can be released.
+    for kind in [GetObject, Errored, ReadObject] {
+        assert_eq!(on(None).delay_secs(kind, 1, 0.0), Some(600), "{kind:?}");
+        assert_eq!(on(None).delay_secs(kind, 4, 0.0), Some(1200), "{kind:?}");
+    }
+    // Enabled with the fixed `GetObject` setting: it covers the first failure only.
+    assert_eq!(on(Some(15)).delay_secs(GetObject, 1, 0.0), Some(15));
+    assert_eq!(on(Some(15)).delay_secs(GetObject, 2, 0.0), Some(600));
+    assert_eq!(on(Some(15)).delay_secs(GetObject, 5, 0.0), Some(2400));
+    // The fixed setting never touches the other kinds.
+    assert_eq!(on(Some(15)).delay_secs(Errored, 1, 0.0), Some(600));
+    assert_eq!(on(Some(15)).delay_secs(ReadObject, 1, 0.0), Some(600));
+
+    // Disabled: exactly the pre-backoff behavior.
+    assert_eq!(off(None).delay_secs(GetObject, 1, 0.0), None);
+    assert_eq!(off(Some(15)).delay_secs(GetObject, 1, 0.0), Some(15));
+    assert_eq!(off(Some(15)).delay_secs(GetObject, 9, 0.0), Some(15));
+    for failed_secs in [None, Some(15)] {
+        assert_eq!(off(failed_secs).delay_secs(Errored, 3, 0.0), None);
+        assert_eq!(off(failed_secs).delay_secs(ReadObject, 3, 0.0), None);
+    }
+}
+
+/// The real decoder path: a truncated gzip surfaces as an error the source classifies as a
+/// truncated archive, so it is not released early; a transport failure is.
+#[tokio::test]
+async fn real_truncated_gzip_read_error_is_not_released() {
+    use std::io::Write as _;
+
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(b"line1\nline2\nline3\n").unwrap();
+    let mut bytes = gz.finish().unwrap();
+    bytes.truncate(bytes.len() - 6);
+    let reader = super::s3_object_decoder(
+        super::Compression::Gzip,
+        "x.gz",
+        None,
+        None,
+        aws_smithy_types::byte_stream::ByteStream::from(bytes),
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await;
+    let decoder = crate::codecs::DecodingConfig::new(
+        vector_lib::codecs::decoding::FramingConfig::NewlineDelimited(
+            vector_lib::codecs::NewlineDelimitedDecoderConfig::default(),
+        ),
+        crate::serde::default_decoding(),
+        LogNamespace::Legacy,
+    )
+    .build()
+    .unwrap();
+    let mut framed = FramedRead::new(
+        reader,
+        TruncatedArchiveFramer::new(decoder.framer.clone(), Arc::new(AtomicBool::new(false))),
+    );
+    let mut error = None;
+    while let Some(item) = framed.next().await {
+        if let Err(err) = item {
+            error = Some(err);
+            break;
+        }
+    }
+    let error = ProcessingError::ReadObject {
+        source: error.expect("a truncated archive must fail to read"),
+        bucket: "b".into(),
+        key: "k".into(),
+    };
+    assert_eq!(error.release_kind(), None, "{error:?}");
 }
 
 #[test]
@@ -2825,15 +3443,30 @@ mod drain_tests {
         delete_fails: bool,
         get_response: ResponseTemplate,
     ) -> MockServer {
+        mock_sqs_and_s3_counted(delete_fails, get_response, None).await
+    }
+
+    /// Like `mock_sqs_and_s3_full`, with SQS reporting `receive_count` as the message's
+    /// `ApproximateReceiveCount` (absent when `None`).
+    async fn mock_sqs_and_s3_counted(
+        delete_fails: bool,
+        get_response: ResponseTemplate,
+        receive_count: Option<u32>,
+    ) -> MockServer {
+        let mut message = serde_json::json!(
+            {"MessageId": "m1", "ReceiptHandle": "rh-1", "Body": S3_EVENT}
+        );
+        if let Some(count) = receive_count {
+            message["Attributes"] =
+                serde_json::json!({"ApproximateReceiveCount": count.to_string()});
+        }
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(header("x-amz-target", "AmazonSQS.ReceiveMessage"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/x-amz-json-1.0")
-                    .set_body_json(serde_json::json!({
-                        "Messages": [{"MessageId": "m1", "ReceiptHandle": "rh-1", "Body": S3_EVENT}]
-                    })),
+                    .set_body_json(serde_json::json!({ "Messages": [message] })),
             )
             .mount(&server)
             .await;
@@ -2878,6 +3511,7 @@ mod drain_tests {
             failed_message_visibility_timeout_secs,
             None,
             None,
+            ErroredMessageReleaseConfig::default(),
         )
         .await;
         process.run_once().await.expect("receive succeeds");
@@ -2923,10 +3557,12 @@ mod drain_tests {
             None,
             adaptive,
             delivery_status,
+            ErroredMessageReleaseConfig::default(),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_configured(
         server: &MockServer,
         drain_gate: Option<DrainGate>,
@@ -2935,6 +3571,7 @@ mod drain_tests {
         failed_message_visibility_timeout_secs: Option<u32>,
         adaptive: Option<AdaptiveObjectStorageConcurrency>,
         delivery_status: Option<crate::event::EventStatus>,
+        errored_message_release: ErroredMessageReleaseConfig,
     ) -> (IngestorProcess, tokio::task::JoinHandle<()>) {
         let region = Region::new("us-east-1");
         let credentials = Credentials::new("akid", "secret", None, None, "test");
@@ -2966,6 +3603,7 @@ mod drain_tests {
             queue_url: format!("{}/123456789012/q", server.uri()),
             delete_message,
             failed_message_visibility_timeout_secs,
+            errored_message_release,
             poll_secs: 0,
             ..Default::default()
         };
@@ -3335,11 +3973,187 @@ mod drain_tests {
         );
     }
 
+    /// The `VisibilityTimeout` of each `ChangeMessageVisibility` call.
+    fn visibility_secs(changes: &[String]) -> Vec<i64> {
+        changes
+            .iter()
+            .map(|body| {
+                serde_json::from_str::<serde_json::Value>(body).unwrap()["VisibilityTimeout"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn no_jitter() -> ErroredMessageReleaseConfig {
+        ErroredMessageReleaseConfig {
+            jitter: false,
+            ..Default::default()
+        }
+    }
+
+    fn disabled() -> ErroredMessageReleaseConfig {
+        ErroredMessageReleaseConfig {
+            enabled: false,
+            ..Default::default()
+        }
+    }
+
+    /// One poll of a queue holding a message received `receive_count` times, whose S3 object
+    /// ends in `delivery_status` (`None`: no acknowledgements).
+    async fn poll_with_release(
+        server: &MockServer,
+        failed_secs: Option<u32>,
+        delivery_status: Option<crate::event::EventStatus>,
+        release: ErroredMessageReleaseConfig,
+    ) {
+        let (mut process, sink) = process_configured(
+            server,
+            None,
+            None,
+            true,
+            failed_secs,
+            None,
+            delivery_status,
+            release,
+        )
+        .await;
+        process.run_once().await.expect("receive succeeds");
+        drop(process);
+        sink.await.unwrap();
+    }
+
     #[tokio::test]
-    async fn get_object_failure_keeps_visibility_timeout_by_default() {
-        let server = mock_sqs_and_s3_full(false, ResponseTemplate::new(500)).await;
-        run_once_configured(&server, None, None, true, None).await;
+    async fn receive_requests_the_receive_count() {
+        let server = mock_sqs_and_s3_counted(false, ResponseTemplate::new(500), Some(1)).await;
+        mock_change_message_visibility(&server).await;
+        poll_with_release(&server, None, None, no_jitter()).await;
+        let received = server.received_requests().await.unwrap();
+        let receive = received
+            .iter()
+            .find(|request| target(request) == "AmazonSQS.ReceiveMessage")
+            .unwrap();
+        let body = String::from_utf8_lossy(&receive.body);
+        assert!(body.contains("ApproximateReceiveCount"), "{body}");
+        assert!(body.contains("SentTimestamp"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn get_object_failure_follows_the_backoff_by_default() {
+        // Default lease is 300s: receives 1-3 wait the lease, then it doubles.
+        for (count, expected) in [(None, 300), (Some(3), 300), (Some(4), 600), (Some(6), 2400)] {
+            let server = mock_sqs_and_s3_counted(false, ResponseTemplate::new(500), count).await;
+            mock_change_message_visibility(&server).await;
+            poll_with_release(&server, None, None, no_jitter()).await;
+            let changes = visibility_changes(&server).await;
+            assert_eq!(visibility_secs(&changes), vec![expected], "{count:?}");
+            assert!(changes[0].contains("rh-1"), "{changes:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn default_backoff_is_jittered_downwards() {
+        let server = mock_sqs_and_s3_counted(false, ResponseTemplate::new(500), Some(4)).await;
+        mock_change_message_visibility(&server).await;
+        poll_with_release(&server, None, None, ErroredMessageReleaseConfig::default()).await;
+        let secs = visibility_secs(&visibility_changes(&server).await);
+        assert_eq!(secs.len(), 1);
+        assert!((480..=600).contains(&secs[0]), "{secs:?}");
+    }
+
+    #[tokio::test]
+    async fn disabled_backoff_leaves_get_object_to_the_fixed_setting() {
+        // Unset: no early release at all (the pre-backoff behavior).
+        let server = mock_sqs_and_s3_counted(false, ResponseTemplate::new(500), Some(5)).await;
+        poll_with_release(&server, None, None, disabled()).await;
         assert!(visibility_changes(&server).await.is_empty());
+
+        // Set: the fixed delay, on every receive.
+        let server = mock_sqs_and_s3_counted(false, ResponseTemplate::new(500), Some(5)).await;
+        mock_change_message_visibility(&server).await;
+        poll_with_release(&server, Some(15), None, disabled()).await;
+        assert_eq!(
+            visibility_secs(&visibility_changes(&server).await),
+            vec![15]
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_get_object_delay_applies_to_the_first_failure_only() {
+        let server = mock_sqs_and_s3_counted(false, ResponseTemplate::new(500), Some(1)).await;
+        mock_change_message_visibility(&server).await;
+        poll_with_release(&server, Some(15), None, no_jitter()).await;
+        assert_eq!(
+            visibility_secs(&visibility_changes(&server).await),
+            vec![15]
+        );
+
+        let server = mock_sqs_and_s3_counted(false, ResponseTemplate::new(500), Some(2)).await;
+        mock_change_message_visibility(&server).await;
+        poll_with_release(&server, Some(15), None, no_jitter()).await;
+        assert_eq!(
+            visibility_secs(&visibility_changes(&server).await),
+            vec![300]
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_errored_message_is_released_on_the_backoff_and_not_deleted() {
+        use crate::event::EventStatus;
+        let ok = || ResponseTemplate::new(200).set_body_string("line\n");
+        for (count, expected) in [(Some(1), 300), (Some(5), 1200), (Some(30), 3600)] {
+            let server = mock_sqs_and_s3_counted(false, ok(), count).await;
+            mock_change_message_visibility(&server).await;
+            poll_with_release(&server, None, Some(EventStatus::Errored), no_jitter()).await;
+            let changes = visibility_changes(&server).await;
+            assert_eq!(visibility_secs(&changes), vec![expected], "{count:?}");
+            assert!(
+                requests(&server).await.1.is_empty(),
+                "an errored message must stay on the queue"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_backoff_does_not_release_a_sink_errored_message() {
+        use crate::event::EventStatus;
+        let server = mock_sqs_and_s3_counted(
+            false,
+            ResponseTemplate::new(200).set_body_string("line\n"),
+            Some(5),
+        )
+        .await;
+        poll_with_release(&server, None, Some(EventStatus::Errored), disabled()).await;
+        assert!(visibility_changes(&server).await.is_empty());
+        assert!(requests(&server).await.1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_message_is_deleted_not_released() {
+        use crate::event::EventStatus;
+        let server = mock_sqs_and_s3_counted(
+            false,
+            ResponseTemplate::new(200).set_body_string("line\n"),
+            Some(5),
+        )
+        .await;
+        poll_with_release(&server, None, Some(EventStatus::Rejected), no_jitter()).await;
+        assert!(visibility_changes(&server).await.is_empty());
+        assert_eq!(requests(&server).await.1.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delivered_message_is_deleted_not_released() {
+        use crate::event::EventStatus;
+        let server = mock_sqs_and_s3_counted(
+            false,
+            ResponseTemplate::new(200).set_body_string("line\n"),
+            Some(5),
+        )
+        .await;
+        poll_with_release(&server, None, Some(EventStatus::Delivered), no_jitter()).await;
+        assert!(visibility_changes(&server).await.is_empty());
+        assert_eq!(requests(&server).await.1.len(), 1);
     }
 
     #[tokio::test]
