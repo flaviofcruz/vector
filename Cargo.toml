@@ -582,7 +582,7 @@ databricks-redaction = ["vector-vrl-functions/databricks-redaction"]
 
 # Enables kubernetes dependencies and shared code. Kubernetes-related sources,
 # transforms and sinks should depend on this feature.
-kubernetes = ["dep:k8s-openapi", "dep:kube"]
+kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:rust_decimal"]
 
 docker = ["dep:bollard", "dep:dirs-next"]
 

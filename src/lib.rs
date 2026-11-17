@@ -103,6 +103,8 @@ pub mod list;
 pub mod nats;
 pub mod net;
 pub(crate) mod openssl_provider;
+#[cfg(feature = "kubernetes")]
+pub mod pod_rate_limit;
 #[allow(unreachable_pub)]
 pub(crate) mod proto;
 pub mod providers;
