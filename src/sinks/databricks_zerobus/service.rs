@@ -2987,6 +2987,7 @@ mod tests {
             desc_file: desc_file.path().to_path_buf(),
             message_type: "all_rows_dropped_test.Row".into(),
             schema: None,
+            ..Default::default()
         });
         service.config = Arc::new(config);
         service.script_schema_fetches([arrow_schema]);

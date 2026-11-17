@@ -1,5 +1,6 @@
 use super::append::read_packed_element;
 use super::plan::ScalarKind;
+use super::serializer::OnWireTypeMismatch;
 use super::{
     WireToArrowEncoder, WireToArrowError, WireToArrowSerializer, WireToArrowSerializerConfig,
 };
@@ -13,8 +14,8 @@ use prost_reflect::MessageDescriptor;
 use prost_reflect::prost::Message as _;
 use prost_reflect::prost_types::field_descriptor_proto::{Label, Type as ProtoType};
 use prost_reflect::prost_types::{
-    DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
-    OneofDescriptorProto,
+    DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto, FieldDescriptorProto,
+    FileDescriptorProto, FileDescriptorSet, OneofDescriptorProto,
 };
 use prost_reflect::{DescriptorPool, DynamicMessage, Value as ProtoValue};
 use std::path::PathBuf;
@@ -366,6 +367,8 @@ fn serializer_loads_descriptor_from_config() {
             .join("tests/data/protobuf/protos/test_protobuf.desc"),
         message_type: "test_protobuf.Person".to_string(),
         schema: Some(schema),
+        on_wire_type_mismatch: OnWireTypeMismatch::default(),
+        attribution_fields: Vec::new(),
     };
     let serializer = WireToArrowSerializer::new(config).expect("build");
     assert!(matches!(
@@ -381,6 +384,8 @@ fn serializer_errors_on_bad_descriptor_path() {
         desc_file: PathBuf::from("/nonexistent/path/to/schema.desc"),
         message_type: "some.Message".to_string(),
         schema: Some(schema),
+        on_wire_type_mismatch: OnWireTypeMismatch::default(),
+        attribution_fields: Vec::new(),
     };
     assert!(matches!(
         WireToArrowSerializer::new(config),
@@ -395,6 +400,8 @@ fn serializer_errors_on_missing_schema() {
             .join("tests/data/protobuf/protos/test_protobuf.desc"),
         message_type: "test_protobuf.Person".to_string(),
         schema: None,
+        on_wire_type_mismatch: OnWireTypeMismatch::default(),
+        attribution_fields: Vec::new(),
     };
     assert!(matches!(
         WireToArrowSerializer::new(config),
@@ -1458,6 +1465,158 @@ fn oneof_overwrites_do_not_hide_malformed_members_or_poison_neighbors() {
             vec![Some(7), Some(9)]
         );
     }
+}
+
+/// `message Choice { oneof x { int32 a = 1; int32 b = 2; } }` — same-typed
+/// members so an unprojected member can carry a wire-type mismatch.
+fn same_typed_oneof_descriptor() -> MessageDescriptor {
+    let mut file = oneof_descriptor().parent_file_descriptor_proto().clone();
+    file.message_type[0].field[1].r#type = Some(ProtoType::Int32 as i32);
+    DescriptorPool::decode(
+        FileDescriptorSet { file: vec![file] }
+            .encode_to_vec()
+            .as_slice(),
+    )
+    .unwrap()
+    .get_message_by_name("wire_to_arrow_poc_test.Choice")
+    .unwrap()
+}
+
+/// A wire-type-mismatched occurrence of an *unprojected* oneof member is an
+/// unknown field to protobuf-java: it is skipped (and counted) without
+/// clearing the well-typed projected sibling — in either wire order. A
+/// correctly-typed unprojected member still clears it.
+#[test]
+fn unprojected_oneof_member_mismatch_does_not_clear_projected_sibling() {
+    let desc = same_typed_oneof_descriptor();
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // a=5 then b as LEN (0x12 0x01 0x01) — the mismatch; and the reverse
+    // order; then a correctly-typed unprojected b (varint 7) clearing a.
+    let wire_a_then_mismatch = [0x08, 0x05, 0x12, 0x01, 0x01];
+    let wire_mismatch_then_a = [0x12, 0x01, 0x01, 0x08, 0x05];
+    let wire_valid_hidden = [0x08, 0x05, 0x10, 0x07];
+    let batch = enc
+        .encode_batch(&[
+            Bytes::from(wire_a_then_mismatch.to_vec()),
+            Bytes::from(wire_mismatch_then_a.to_vec()),
+            Bytes::from(wire_valid_hidden.to_vec()),
+        ])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(
+        batch
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(5), Some(5), None],
+        "mismatched hidden member keeps the sibling; well-typed one clears it"
+    );
+
+    // Each mismatched occurrence is counted exactly once, with the field's
+    // own path.
+    for wire in [&wire_a_then_mismatch, &wire_mismatch_then_a] {
+        let (result, skips) =
+            validate_with_mode_and_skips(&plan, wire, OnWireTypeMismatch::SkipField);
+        result.unwrap();
+        assert_eq!(skips.skipped, 1, "wire {wire:02x?}");
+        let sample = skips.sample.unwrap();
+        assert_eq!(sample.field_numbers, [2]);
+        assert_eq!(sample.expected, 0);
+        assert_eq!(sample.actual, 2);
+    }
+    // The well-typed hidden member records no skip; it still requests
+    // normalization, which is what clears the sibling (the encoder handles
+    // that; the raw validate pass only signals it).
+    let (result, skips) =
+        validate_with_mode_and_skips(&plan, &wire_valid_hidden, OnWireTypeMismatch::SkipField);
+    assert!(matches!(
+        result,
+        Err(WireToArrowError::OneofNeedsNormalization { field_number: 2 })
+    ));
+    assert_eq!(skips.skipped, 0);
+}
+
+/// Under `drop_row` a lone mismatched unprojected oneof member is ignored and
+/// the row kept, exactly as before the skip policy existed.
+#[test]
+fn unprojected_oneof_member_mismatch_kept_under_drop_row_like_base() {
+    let desc = same_typed_oneof_descriptor();
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+    let enc =
+        WireToArrowEncoder::with_options(&desc, schema, OnWireTypeMismatch::DropRow, &[]).unwrap();
+    // Lone mismatched member: ignored, row kept. Mismatched member alongside
+    // the projected sibling: the base codec's oneof normalization hits
+    // prost's strict wire-type check and drops the row.
+    let batch = enc
+        .encode_batch(&[
+            Bytes::from_static(&[0x12, 0x01, 0x01]),
+            Bytes::from_static(&[0x08, 0x05, 0x12, 0x01, 0x01]),
+            Bytes::from_static(&[0x08, 0x05]),
+        ])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    let col = batch
+        .column(0)
+        .as_primitive::<arrow::datatypes::Int32Type>();
+    assert!(col.is_null(0), "lone mismatch kept with null projection");
+    assert_eq!(col.value(1), 5);
+}
+
+/// The same rule inside a nested message: a mismatched unprojected oneof
+/// member in a sub-message keeps its sibling, with the skip attributed to the
+/// root-to-leaf path.
+#[test]
+fn nested_unprojected_oneof_member_mismatch_keeps_sibling() {
+    let mut file = same_typed_oneof_descriptor()
+        .parent_file_descriptor_proto()
+        .clone();
+    file.message_type.push(DescriptorProto {
+        name: Some("Holder".into()),
+        field: vec![FieldDescriptorProto {
+            name: Some("inner".into()),
+            number: Some(1),
+            label: Some(Label::Optional as i32),
+            r#type: Some(ProtoType::Message as i32),
+            type_name: Some(".wire_to_arrow_poc_test.Choice".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let pool = DescriptorPool::decode(
+        FileDescriptorSet { file: vec![file] }
+            .encode_to_vec()
+            .as_slice(),
+    )
+    .unwrap();
+    let desc = pool
+        .get_message_by_name("wire_to_arrow_poc_test.Holder")
+        .unwrap();
+    let inner = ArrowFields::from(vec![Field::new("a", DataType::Int32, true)]);
+    let schema = Schema::new(vec![Field::new("inner", DataType::Struct(inner), true)]);
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // inner = { a: 5, b as LEN }.
+    let wire = [0x0a, 0x05, 0x08, 0x05, 0x12, 0x01, 0x01];
+    let batch = enc.encode_batch(&[Bytes::from(wire.to_vec())]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let inner = batch.column(0).as_struct();
+    assert_eq!(
+        inner
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(0),
+        5
+    );
+
+    let (result, skips) = validate_with_mode_and_skips(&plan, &wire, OnWireTypeMismatch::SkipField);
+    result.unwrap();
+    assert_eq!(skips.skipped, 1);
+    assert_eq!(skips.sample.unwrap().field_numbers, [1, 2]);
 }
 
 /// `message Tree { Tree next = 1; int32 leaf = 2; }` — a proto that's
@@ -2575,10 +2734,9 @@ fn wire_type_mismatch_reports_root_to_leaf_proto_field_numbers() {
         (&[0x0a, 0x02, 0x12, 0x00], &[1, 2], 0, 2),
         (&[0x12, 0x02, 0x08, 0x00], &[2, 1], 2, 0),
     ];
+    // `DropRow` keeps the historical error with the root-to-leaf path.
     for &(wire, path, expected_type, actual_type) in cases {
-        let error =
-            super::scan::validate_message(&plan, wire, &mut super::scan::BuiltVariants::default())
-                .unwrap_err();
+        let error = validate_with_mode(&plan, wire, OnWireTypeMismatch::DropRow).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2598,6 +2756,51 @@ fn wire_type_mismatch_reports_root_to_leaf_proto_field_numbers() {
             other => panic!("expected a field path for wire mismatch: {other}"),
         }
     }
+    // `SkipField` accepts the same rows and records one skip each, with the
+    // same root-to-leaf path in the sample.
+    for &(wire, path, expected_type, actual_type) in cases {
+        let (result, skips) =
+            validate_with_mode_and_skips(&plan, wire, OnWireTypeMismatch::SkipField);
+        result.unwrap();
+        assert_eq!(skips.skipped, 1, "wire={wire:?}");
+        let sample = skips.sample.unwrap();
+        assert_eq!(sample.field_numbers, path);
+        assert_eq!(sample.expected, expected_type);
+        assert_eq!(sample.actual, actual_type);
+    }
+}
+
+/// Run `validate_message` on one row with the given mismatch policy.
+fn validate_with_mode(
+    plan: &super::plan::MessagePlan,
+    wire: &[u8],
+    on_mismatch: OnWireTypeMismatch,
+) -> super::errors::Result<()> {
+    validate_with_mode_and_skips(plan, wire, on_mismatch).0
+}
+
+fn validate_with_mode_and_skips(
+    plan: &super::plan::MessagePlan,
+    wire: &[u8],
+    on_mismatch: OnWireTypeMismatch,
+) -> (super::errors::Result<()>, super::scan::SkipAccumulator) {
+    let row = Bytes::from(wire.to_vec());
+    let mut variants = super::scan::BuiltVariants::default();
+    let mut skips = super::scan::SkipAccumulator::default();
+    let mut row_skips = super::scan::RowSkips::default();
+    let mut path = Vec::new();
+    row_skips.reset(true);
+    let mut ctx = super::scan::ValidateCtx {
+        on_mismatch,
+        row: &row,
+        skips: &mut row_skips,
+        path: &mut path,
+    };
+    let result = super::scan::validate_message(plan, wire, &mut variants, &mut ctx);
+    if result.is_ok() {
+        row_skips.commit(&mut skips, &row);
+    }
+    (result, skips)
 }
 
 #[test]
@@ -3196,6 +3399,1336 @@ proptest! {
         let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
         let _ = enc.encode_batch(&[Bytes::from(bytes)]);
     }
+}
+
+// -------------------------------------------------------------------------
+// Wire-type mismatch policy (`on_wire_type_mismatch`)
+//
+// A known field whose wire type disagrees with the descriptor is handled
+// like protobuf-java handles it: the occurrence is skipped (self-delimiting
+// by wire type), the column is null for that occurrence, and the row is
+// KEPT. Genuinely malformed bytes still drop the row.
+// -------------------------------------------------------------------------
+
+/// `message Stage { int64 peak_netty = 1; string name = 2; }`,
+/// `message StageReport { repeated Stage stages = 1; int64 top = 2; }` —
+/// mirrors the QPL incident shape: `repeated StageData` carrying an int64
+/// (`peak_netty_direct_memory`) that a diverged producer sent as `LEN`.
+fn stage_report_descriptor() -> MessageDescriptor {
+    let stage_fields = vec![
+        FieldDescriptorProto {
+            name: Some("peak_netty".into()),
+            number: Some(1),
+            label: Some(Label::Optional as i32),
+            r#type: Some(ProtoType::Int64 as i32),
+            ..Default::default()
+        },
+        FieldDescriptorProto {
+            name: Some("name".into()),
+            number: Some(2),
+            label: Some(Label::Optional as i32),
+            r#type: Some(ProtoType::String as i32),
+            ..Default::default()
+        },
+    ];
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_mismatch_test.proto".into()),
+        package: Some("wire_to_arrow_mismatch_test".into()),
+        message_type: vec![
+            DescriptorProto {
+                name: Some("Stage".into()),
+                field: stage_fields,
+                ..Default::default()
+            },
+            DescriptorProto {
+                name: Some("StageReport".into()),
+                field: vec![
+                    FieldDescriptorProto {
+                        name: Some("stages".into()),
+                        number: Some(1),
+                        label: Some(Label::Repeated as i32),
+                        r#type: Some(ProtoType::Message as i32),
+                        type_name: Some(".wire_to_arrow_mismatch_test.Stage".into()),
+                        ..Default::default()
+                    },
+                    FieldDescriptorProto {
+                        name: Some("top".into()),
+                        number: Some(2),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(ProtoType::Int64 as i32),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes).unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_mismatch_test.StageReport")
+        .unwrap()
+}
+
+/// Person row with `id` (int32, field 2) sent as `LEN` — the exact incident
+/// shape on a top-level scalar. The row must be kept, `id` null, the other
+/// columns intact.
+#[test]
+fn wire_type_mismatch_skips_field_and_keeps_row() {
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+        Field::new("email", DataType::LargeUtf8, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut wire = Vec::new();
+    wire.extend([0x0a, 5]);
+    wire.extend_from_slice(b"Alice");
+    // id (field 2) as LEN: tag (2<<3)|2 = 0x12. A mismatched occurrence is
+    // self-delimiting, so the decoder skips exactly this value.
+    wire.extend([0x12, 1, 0x01]);
+    wire.extend([0x1a, 11]);
+    wire.extend_from_slice(b"alice@x.com");
+
+    let batch = enc.encode_batch(&[Bytes::from(wire)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.column(0).as_string::<i64>().value(0), "Alice");
+    assert!(
+        batch.column(1).is_null(0),
+        "mismatched scalar must leave the column null"
+    );
+    assert_eq!(batch.column(2).as_string::<i64>().value(0), "alice@x.com");
+}
+
+/// Inside a repeated message, one element's mismatched field nulls only that
+/// element's column; siblings within the element, other elements and other
+/// columns of the row all survive.
+#[test]
+fn nested_repeated_element_field_mismatch_nulls_only_that_element() {
+    let desc = stage_report_descriptor();
+    let stage_fields = ArrowFields::from(vec![
+        Field::new("peak_netty", DataType::Int64, true),
+        Field::new("name", DataType::LargeUtf8, true),
+    ]);
+    let schema = Schema::new(vec![
+        Field::new(
+            "stages",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(stage_fields),
+                true,
+            ))),
+            true,
+        ),
+        Field::new("top", DataType::Int64, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // Element 1: peak_netty as varint (well-typed), name "a".
+    let mut elem1 = vec![0x08, 10];
+    elem1.extend([0x12, 1, b'a']);
+    // Element 2: peak_netty as LEN (mismatch — int64 expects varint), name "b".
+    let mut elem2 = vec![0x0a, 1, 0x7f];
+    elem2.extend([0x12, 1, b'b']);
+    let mut wire = Vec::new();
+    for elem in [&elem1, &elem2] {
+        wire.push(0x0a);
+        wire.push(elem.len() as u8);
+        wire.extend_from_slice(elem);
+    }
+    wire.extend([0x10, 99]); // top = 99 (varint, well-typed)
+
+    let batch = enc.encode_batch(&[Bytes::from(wire)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let stages = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::ListArray>()
+        .unwrap();
+    assert_eq!(stages.len(), 1);
+    let items = stages.value(0);
+    let inner = items.as_struct();
+    let peaks = inner
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(peaks.value(0), 10);
+    assert!(
+        peaks.is_null(1),
+        "only the mismatched element's field is null"
+    );
+    let names = inner
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::LargeStringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "a");
+    assert_eq!(names.value(1), "b");
+    assert_eq!(
+        batch
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int64Type>()
+            .value(0),
+        99
+    );
+}
+
+/// A message-typed field receiving a varint is skipped (column null), the
+/// rest of the row is kept.
+#[test]
+fn message_field_receiving_varint_is_skipped() {
+    let desc = self_referential_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("next", nested_tree_struct(2), true),
+        Field::new("leaf", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // next (field 1, message) as varint: tag 0x08 — skipped. leaf (field 2)
+    // as varint: tag 0x10 — kept.
+    let batch = enc
+        .encode_batch(&[Bytes::from(vec![0x08, 0x05, 0x10, 0x07])])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(batch.column(0).is_null(0));
+    assert_eq!(
+        batch
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(0),
+        7
+    );
+}
+
+/// Repeated numeric fields accept both unpacked and packed occurrences, mixed
+/// within one field.
+#[test]
+fn repeated_scalar_accepts_mixed_packed_and_unpacked() {
+    let desc = repeated_int32_descriptor();
+    let schema = Schema::new(vec![Field::new(
+        "numbers",
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut wire = vec![0x08, 0x05]; // unpacked: 5
+    wire.extend([0x0a, 0x03, 0x01, 0x02, 0x03]); // packed: [1, 2, 3]
+
+    let batch = enc.encode_batch(&[Bytes::from(wire)]).unwrap();
+    let list = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::ListArray>()
+        .unwrap();
+    let items = list.value(0);
+    let values = items
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .unwrap();
+    let got: Vec<i32> = values.iter().map(|v| v.unwrap()).collect();
+    assert_eq!(got, vec![5, 1, 2, 3]);
+}
+
+/// A mismatched occurrence of a singular field neither clobbers a well-typed
+/// occurrence before it nor gets clobbered by one after it — protobuf
+/// last-wins applies only to well-typed occurrences.
+#[test]
+fn duplicate_singular_mismatched_occurrence_does_not_clobber_valid() {
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // Valid first, mismatched second.
+    let valid_then_mismatch = [0x10, 7, 0x12, 1, 0x01];
+    let batch = enc
+        .encode_batch(&[Bytes::from(valid_then_mismatch.to_vec())])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(0),
+        7
+    );
+
+    // Mismatched first, valid second.
+    let mismatch_then_valid = [0x12, 1, 0x01, 0x10, 7];
+    let batch = enc
+        .encode_batch(&[Bytes::from(mismatch_then_valid.to_vec())])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(0),
+        7
+    );
+}
+
+/// Genuinely malformed bytes still drop the row: truncated `LEN`, overlong
+/// varint, invalid wire type 6/7, invalid UTF-8 in a declared string field.
+#[test]
+fn genuinely_malformed_rows_still_drop() {
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let truncated_len = [0x0a, 0x05, 0x61]; // name declared 5 bytes, 1 present
+    let overlong_varint = {
+        let mut v = vec![0x10];
+        v.extend([0xff_u8; 11]); // 11-byte varint for id
+        v
+    };
+    let invalid_wire_type = [0x17, 0x01]; // id with wire type 7
+    let invalid_utf8 = [0x0a, 0x01, 0xff]; // name with non-UTF-8 bytes
+    for wire in [
+        truncated_len.as_slice(),
+        overlong_varint.as_slice(),
+        invalid_wire_type.as_slice(),
+        invalid_utf8.as_slice(),
+    ] {
+        let batch = enc.encode_batch(&[Bytes::from(wire.to_vec())]).unwrap();
+        assert_eq!(batch.num_rows(), 0, "wire {wire:?} must still drop the row");
+    }
+}
+
+/// `on_wire_type_mismatch: drop_row` preserves the pre-option behavior: the
+/// whole row is dropped and counted via `wire_to_arrow_rows_dropped`.
+#[test]
+fn drop_row_mode_preserves_old_mismatch_behavior() {
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc =
+        WireToArrowEncoder::with_options(&desc, schema, OnWireTypeMismatch::DropRow, &[]).unwrap();
+
+    let wire = [0x0a, 5, b'A', b'l', b'i', b'c', b'e', 0x12, 1, 0x01];
+    let batch = enc
+        .encode_batch(&[Bytes::from(wire.as_slice().to_vec())])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
+}
+
+/// `message M { oneof x { int32 a = 1; string b = 2; } map<string, int32> m = 3; }`
+fn oneof_with_map_descriptor() -> MessageDescriptor {
+    use prost_reflect::prost_types::MessageOptions;
+    let entry_field = |name: &str, number: i32, ty: ProtoType| FieldDescriptorProto {
+        name: Some(name.into()),
+        number: Some(number),
+        label: Some(Label::Optional as i32),
+        r#type: Some(ty as i32),
+        ..Default::default()
+    };
+    let fd = FileDescriptorProto {
+        syntax: Some("proto3".into()),
+        name: Some("wire_to_arrow_oneof_map.proto".into()),
+        package: Some("wire_to_arrow_oneof_map_test".into()),
+        message_type: vec![DescriptorProto {
+            name: Some("M".into()),
+            field: vec![
+                FieldDescriptorProto {
+                    oneof_index: Some(0),
+                    ..entry_field("a", 1, ProtoType::Int32)
+                },
+                FieldDescriptorProto {
+                    oneof_index: Some(0),
+                    ..entry_field("b", 2, ProtoType::String)
+                },
+                FieldDescriptorProto {
+                    label: Some(Label::Repeated as i32),
+                    type_name: Some(".wire_to_arrow_oneof_map_test.M.MEntry".into()),
+                    ..entry_field("m", 3, ProtoType::Message)
+                },
+            ],
+            nested_type: vec![DescriptorProto {
+                name: Some("MEntry".into()),
+                field: vec![
+                    entry_field("key", 1, ProtoType::String),
+                    entry_field("value", 2, ProtoType::Int32),
+                ],
+                options: Some(MessageOptions {
+                    map_entry: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            oneof_decl: vec![OneofDescriptorProto {
+                name: Some("x".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes).unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_oneof_map_test.M")
+        .unwrap()
+}
+
+fn map_column(name: &str, value: DataType) -> Field {
+    let entry = ArrowFields::from(vec![
+        Field::new("key", DataType::LargeUtf8, false),
+        Field::new("value", value, true),
+    ]);
+    Field::new(
+        name,
+        DataType::Map(
+            Arc::new(Field::new("key_value", DataType::Struct(entry), false)),
+            false,
+        ),
+        true,
+    )
+}
+
+fn assert_map_empty_or_null(col: &arrow::array::ArrayRef) {
+    let map = col
+        .as_any()
+        .downcast_ref::<arrow::array::MapArray>()
+        .unwrap();
+    assert!(
+        map.is_null(0) || map.value_length(0) == 0,
+        "map must be empty"
+    );
+}
+
+/// The map field carried with each non-LEN wire type (field 4 on Person, 3 on M).
+fn mismatched_map_occurrences(field: u8) -> Vec<Vec<u8>> {
+    vec![
+        vec![field << 3, 0x05],
+        [vec![(field << 3) | 1], vec![0; 8]].concat(),
+        [vec![(field << 3) | 5], vec![0; 4]].concat(),
+    ]
+}
+
+fn skip_field_encoder(desc: &MessageDescriptor, schema: Schema) -> WireToArrowEncoder {
+    WireToArrowEncoder::with_options(desc, schema, OnWireTypeMismatch::SkipField, &[]).unwrap()
+}
+
+fn drop_row_encoder(desc: &MessageDescriptor, schema: Schema) -> WireToArrowEncoder {
+    WireToArrowEncoder::with_options(desc, schema, OnWireTypeMismatch::DropRow, &[]).unwrap()
+}
+
+/// A wrong-wire-type MAP field plus a duplicate singular scalar (normalization
+/// path) keeps the row under `skip_field`, as classic ScalaPB `skipField` does:
+/// last value wins, map empty. Both orders; `drop_row` still drops.
+#[test]
+fn map_mismatch_with_duplicate_singular_is_kept_under_skip_field() {
+    let desc = rich_descriptor();
+    let schema = || {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            map_column("data", DataType::Int32),
+        ])
+    };
+    let dup = [0x10, 0x01, 0x10, 0x02];
+    for mismatch in mismatched_map_occurrences(4) {
+        for mismatch_first in [true, false] {
+            let wire = if mismatch_first {
+                [mismatch.clone(), dup.to_vec()].concat()
+            } else {
+                [dup.to_vec(), mismatch.clone()].concat()
+            };
+            let batch = skip_field_encoder(&desc, schema())
+                .encode_batch(&[Bytes::from(wire.clone())])
+                .unwrap();
+            assert_eq!(batch.num_rows(), 1, "kept: {wire:02x?}");
+            assert_eq!(
+                batch
+                    .column(0)
+                    .as_primitive::<arrow::datatypes::Int32Type>()
+                    .value(0),
+                2
+            );
+            assert_map_empty_or_null(batch.column(1));
+            let dropped = drop_row_encoder(&desc, schema())
+                .encode_batch(&[Bytes::from(wire)])
+                .unwrap();
+            assert_eq!(dropped.num_rows(), 0);
+        }
+    }
+}
+
+/// Same, with the normalization trigger being a oneof switch.
+#[test]
+fn map_mismatch_with_oneof_switch_is_kept_under_skip_field() {
+    let desc = oneof_with_map_descriptor();
+    let schema = || {
+        Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::LargeUtf8, true),
+            map_column("m", DataType::Int32),
+        ])
+    };
+    let switch = [0x08, 0x01, 0x12, 0x01, b'z'];
+    for mismatch in mismatched_map_occurrences(3) {
+        for mismatch_first in [true, false] {
+            let wire = if mismatch_first {
+                [mismatch.clone(), switch.to_vec()].concat()
+            } else {
+                [switch.to_vec(), mismatch.clone()].concat()
+            };
+            let batch = skip_field_encoder(&desc, schema())
+                .encode_batch(&[Bytes::from(wire.clone())])
+                .unwrap();
+            assert_eq!(batch.num_rows(), 1, "kept: {wire:02x?}");
+            assert!(batch.column(0).is_null(0), "a cleared by the switch");
+            assert_eq!(batch.column(1).as_string::<i64>().value(0), "z");
+            assert_map_empty_or_null(batch.column(2));
+            let dropped = drop_row_encoder(&desc, schema())
+                .encode_batch(&[Bytes::from(wire)])
+                .unwrap();
+            assert_eq!(dropped.num_rows(), 0);
+        }
+    }
+}
+
+/// A mismatch inside a message-backed VARIANT slot combined with a repeated
+/// (merged) singular occurrence of that slot keeps the row.
+#[test]
+fn variant_mismatch_with_duplicate_singular_is_kept_under_skip_field() {
+    let desc = message_variant_descriptor();
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let enc = skip_field_encoder(&desc, schema);
+    // single = KV { k: "x", n as LEN }, then single = KV { k: "y" }.
+    let wire = vec![
+        0x0a, 0x06, 0x0a, 0x01, b'x', 0x12, 0x01, 0x01, // first, mismatched n
+        0x0a, 0x03, 0x0a, 0x01, b'y', // merges, k = "y"
+    ];
+    let batch = enc.encode_batch(&[Bytes::from(wire)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 0),
+        serde_json::json!({"k": "y"})
+    );
+}
+
+/// A malformed overwritten string drops the row under `skip_field` no matter
+/// where a wire-type mismatch sits: first, last, or absent.
+#[test]
+fn guard_drops_overwritten_malformed_string_regardless_of_mismatch_position() {
+    let desc = rich_descriptor();
+    let schema = || Schema::new(vec![Field::new("name", DataType::LargeUtf8, true)]);
+    let dup = [0x0a, 0x01, b'a', 0x0a, 0x02, 0xff, 0xfe, 0x0a, 0x01, b'b'];
+    let mismatch = [0x10, 0x01, 0x01]; // id (int32) as LEN
+    for wire in [
+        [mismatch.as_slice(), dup.as_slice()].concat(),
+        dup.to_vec(),
+        [dup.as_slice(), mismatch.as_slice()].concat(),
+    ] {
+        let batch = skip_field_encoder(&desc, schema())
+            .encode_batch(&[Bytes::from(wire.clone())])
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0, "must drop: {wire:02x?}");
+    }
+}
+
+/// The metrics registry is process-global. These tests assert before/after
+/// deltas and serialize against each other; counters bumped by unrelated
+/// concurrent tests can still skew a delta under threaded `cargo test`, so CI
+/// runs them under nextest (process per test).
+static METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sum of a global counter, optionally restricted to a `reason` tag. Tests
+/// compare before/after deltas instead of resetting the shared registry.
+fn counter_total(
+    controller: &vector_core::metrics::Controller,
+    name: &str,
+    reason: Option<&str>,
+) -> f64 {
+    controller
+        .capture_metrics()
+        .iter()
+        .filter(|m| {
+            m.name() == name
+                && reason.is_none_or(|r| m.tags().and_then(|t| t.get("reason")) == Some(r))
+        })
+        .map(|m| match m.value() {
+            vector_core::event::MetricValue::Counter { value } => *value,
+            other => panic!("not a counter: {other:?}"),
+        })
+        .sum()
+}
+
+/// The skip counter is emitted with the bounded `reason` label, and rows
+/// still dropped keep their counter.
+#[test]
+fn skip_and_drop_counters_emitted() {
+    use vector_core::metrics::{Controller, init_test};
+
+    let _guard = METRICS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init_test();
+    let controller = Controller::get().unwrap();
+    let skipped_before = counter_total(
+        controller,
+        "wire_to_arrow_fields_skipped_total",
+        Some("wire_type_mismatch"),
+    );
+    let dropped_before = counter_total(controller, "wire_to_arrow_rows_dropped", None);
+
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut mismatched = vec![0x0a, 5];
+    mismatched.extend_from_slice(b"Alice");
+    mismatched.extend([0x12, 1, 0x01]); // id as LEN — skipped
+    let malformed = [0x0a, 0x05, 0x61]; // truncated LEN — dropped
+
+    let batch = enc
+        .encode_batch(&[Bytes::from(mismatched), Bytes::from(malformed.to_vec())])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+
+    let skipped = counter_total(
+        controller,
+        "wire_to_arrow_fields_skipped_total",
+        Some("wire_type_mismatch"),
+    ) - skipped_before;
+    assert_eq!(skipped, 1.0, "one skipped occurrence expected");
+    let dropped = counter_total(controller, "wire_to_arrow_rows_dropped", None) - dropped_before;
+    assert_eq!(dropped, 1.0, "one dropped row expected");
+}
+
+/// Attribution: configured top-level fields are sampled from the offending
+/// row into the skip/drop warning payload. The extractor is tested directly;
+/// it only reads the configured fields, truncates values, and never logs
+/// payloads.
+#[test]
+fn attribution_samples_configured_fields_from_offending_row() {
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::with_options(
+        &desc,
+        schema,
+        OnWireTypeMismatch::SkipField,
+        &["email".to_string(), "id".to_string()],
+    )
+    .unwrap();
+
+    let mut wire = Vec::new();
+    wire.extend([0x1a, 11]);
+    wire.extend_from_slice(b"alice@x.com"); // email, well-typed
+    wire.extend([0x12, 1, 0x31]); // id as LEN — the mismatch (payload "1")
+
+    let attribution = enc.attribution_from_row(&wire);
+    assert_eq!(attribution, "email=alice@x.com,id=1");
+
+    // Long string values are truncated to the per-field cap.
+    let mut long = Vec::new();
+    long.extend([0x1a, 0x50]);
+    long.extend(std::iter::repeat_n(b'x', 80));
+    let attribution = enc.attribution_from_row(&long);
+    assert!(attribution.len() <= "email=".len() + 64, "{attribution}");
+
+    // Rows whose bytes don't parse yield an empty attribution string.
+    assert_eq!(enc.attribution_from_row(&[0xff]), "");
+}
+
+/// A mismatched occurrence of a repeated numeric field is skipped per
+/// occurrence: sibling elements, before and after, still land in the list.
+#[test]
+fn repeated_field_mismatch_skips_only_that_occurrence() {
+    let desc = repeated_int32_descriptor();
+    let schema = Schema::new(vec![Field::new(
+        "numbers",
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // Unpacked 5, one occurrence with fixed32 wire type (skipped), unpacked 7.
+    let wire = [0x08, 0x05, 0x0d, 0x01, 0x02, 0x03, 0x04, 0x08, 0x07];
+    let batch = enc.encode_batch(&[Bytes::from(wire.to_vec())]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let list = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::ListArray>()
+        .unwrap();
+    let items = list.value(0);
+    let values = items
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .unwrap();
+    let got: Vec<i32> = values.iter().map(|v| v.unwrap()).collect();
+    assert_eq!(got, vec![5, 7], "only the mismatched occurrence is skipped");
+}
+
+/// A singular enum paired with a STRING column receiving a `LEN` occurrence
+/// is skipped (column null, row kept) — enums are varints on the wire.
+#[test]
+fn enum_string_receiving_len_is_skipped() {
+    let color_values: Vec<EnumValueDescriptorProto> = [("RED", 0), ("GREEN", 1)]
+        .iter()
+        .map(|(n, v)| EnumValueDescriptorProto {
+            name: Some((*n).into()),
+            number: Some(*v),
+            ..Default::default()
+        })
+        .collect();
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_enum_mismatch_test.proto".into()),
+        package: Some("wire_to_arrow_enum_mismatch_test".into()),
+        enum_type: vec![EnumDescriptorProto {
+            name: Some("Color".into()),
+            value: color_values,
+            ..Default::default()
+        }],
+        message_type: vec![DescriptorProto {
+            name: Some("Shaded".into()),
+            field: vec![FieldDescriptorProto {
+                name: Some("color".into()),
+                number: Some(1),
+                label: Some(Label::Optional as i32),
+                r#type: Some(ProtoType::Enum as i32),
+                type_name: Some(".wire_to_arrow_enum_mismatch_test.Color".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let desc = DescriptorPool::decode(set.encode_to_vec().as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_enum_mismatch_test.Shaded")
+        .unwrap();
+
+    let schema = Schema::new(vec![Field::new("color", DataType::LargeUtf8, true)]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // color as LEN (tag 0x0a): skipped; sibling row shows the enum name path
+    // still works for well-typed occurrences.
+    let wire = [0x0a, 0x01, 0x01];
+    let batch = enc.encode_batch(&[Bytes::from(wire.to_vec())]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(batch.column(0).is_null(0), "mismatched enum must be null");
+}
+
+/// A map entry whose key (or value) occurrence carries a mismatched wire type
+/// keeps the entry with the proto3 default filled in — Arrow Map's key is
+/// non-nullable, so a skipped key becomes `""`/`0`, never null.
+#[test]
+fn map_entry_mismatch_fills_proto3_defaults() {
+    let desc = rich_descriptor();
+    let entry_fields = ArrowFields::from(vec![
+        Field::new("key", DataType::LargeUtf8, false),
+        Field::new("value", DataType::Int32, true),
+    ]);
+    let entry_field = Arc::new(Field::new(
+        "key_value",
+        DataType::Struct(entry_fields),
+        false,
+    ));
+    let schema = Schema::new(vec![Field::new(
+        "data",
+        DataType::Map(entry_field, false),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // One map entry (field 4, tag 0x22): key (field 1) as varint — mismatch;
+    // value (field 2) as LEN — mismatch.
+    let wire = [0x22, 0x05, 0x08, 0x01, 0x12, 0x01, 0x01];
+    let batch = enc.encode_batch(&[Bytes::from(wire.to_vec())]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let map = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::MapArray>()
+        .unwrap();
+    assert_eq!(map.value_length(0), 1, "entry kept, not dropped");
+    assert_eq!(map.keys().as_string::<i64>().value(0), "");
+    assert_eq!(
+        map.values()
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(0),
+        0
+    );
+}
+
+/// A message-backed VARIANT column receiving a non-`LEN` occurrence is
+/// skipped like any other message-typed field.
+#[test]
+fn variant_column_receiving_non_len_is_skipped() {
+    let desc = message_variant_descriptor();
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // single (field 1, message) as varint — the occurrence is skipped and the
+    // row kept, like any other message-typed field.
+    let batch = enc.encode_batch(&[Bytes::from(vec![0x08, 0x05])]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(batch.column(0).is_null(0));
+}
+
+/// A wire-type mismatch *inside* a message-backed VARIANT sub-message omits
+/// that field from the Variant object and keeps the row (the same treatment
+/// a Struct column gets), instead of dropping the row via the prost fallback.
+#[test]
+fn variant_sub_message_mismatch_is_skipped_under_skip_field() {
+    let desc = message_variant_descriptor();
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // single = KV { k: "x", n as LEN (int64 expects varint) }.
+    let mut sub = vec![0x0a, 0x01, b'x'];
+    sub.extend([0x12, 0x01, 0x01]);
+    let mut wire = vec![0x0a, sub.len() as u8];
+    wire.extend_from_slice(&sub);
+
+    let batch = enc.encode_batch(&[Bytes::from(wire)]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(!batch.column(0).is_null(0));
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 0),
+        serde_json::json!({"k": "x"}),
+        "mismatched field omitted from the Variant, well-typed sibling kept"
+    );
+}
+
+/// Walking a message-backed VARIANT must leave the shared field-number path
+/// at its prior depth, or a later skip in the same row reports a stale prefix.
+#[test]
+fn variant_walk_does_not_leak_into_later_skip_path() {
+    let desc = message_variant_descriptor();
+    let fields = ArrowFields::from(vec![
+        Field::new("k", DataType::LargeUtf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]);
+    let schema = Schema::new(vec![
+        variant_arrow_field("single"),
+        Field::new(
+            "many",
+            DataType::List(Arc::new(Field::new("item", DataType::Struct(fields), true))),
+            true,
+        ),
+    ]);
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+
+    // single = KV { k: "x" } (well-typed VARIANT), then many[0] = KV { k as varint }.
+    let wire = [0x0a, 0x03, 0x0a, 0x01, b'x', 0x12, 0x02, 0x08, 0x00];
+    let (result, skips) = validate_with_mode_and_skips(&plan, &wire, OnWireTypeMismatch::SkipField);
+    result.unwrap();
+    assert_eq!(skips.skipped, 1);
+    assert_eq!(skips.sample.unwrap().field_numbers, [2, 1]);
+}
+
+/// Under `drop_row` the same mismatch inside a VARIANT sub-message preserves
+/// the historical behavior: the whole row drops.
+#[test]
+fn variant_sub_message_mismatch_drops_row_under_drop_row() {
+    let desc = message_variant_descriptor();
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let enc =
+        WireToArrowEncoder::with_options(&desc, schema, OnWireTypeMismatch::DropRow, &[]).unwrap();
+
+    let mut sub = vec![0x0a, 0x01, b'x'];
+    sub.extend([0x12, 0x01, 0x01]); // n as LEN — mismatch
+    let mut wire = vec![0x0a, sub.len() as u8];
+    wire.extend_from_slice(&sub);
+
+    let batch = enc.encode_batch(&[Bytes::from(wire)]).unwrap();
+    assert_eq!(batch.num_rows(), 0);
+}
+
+/// `message KVMap { string k = 1; int64 n = 2; map<string,int32> labels = 3;
+/// google.protobuf.Timestamp ts = 4; oneof choice { int32 a = 6; string b = 7; } }`
+/// — a VARIANT sub-message that mixes plain fields with reference-only shapes
+/// (map, well-known type), so the direct walk falls back to the reference
+/// decoder, and with a resolvable-at-runtime oneof conflict (two members set).
+fn message_variant_map_descriptor() -> MessageDescriptor {
+    let timestamp = FileDescriptorProto {
+        name: Some("google/protobuf/timestamp.proto".into()),
+        package: Some("google.protobuf".into()),
+        syntax: Some("proto3".into()),
+        message_type: vec![DescriptorProto {
+            name: Some("Timestamp".into()),
+            field: vec![
+                FieldDescriptorProto {
+                    name: Some("seconds".into()),
+                    number: Some(1),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ProtoType::Int64 as i32),
+                    ..Default::default()
+                },
+                FieldDescriptorProto {
+                    name: Some("nanos".into()),
+                    number: Some(2),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ProtoType::Int32 as i32),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut fd = message_variant_descriptor()
+        .parent_file_descriptor_proto()
+        .clone();
+    fd.dependency.push("google/protobuf/timestamp.proto".into());
+    let kv = &mut fd.message_type[1];
+    kv.field.push(FieldDescriptorProto {
+        name: Some("labels".into()),
+        number: Some(4),
+        label: Some(Label::Repeated as i32),
+        r#type: Some(ProtoType::Message as i32),
+        type_name: Some(".wire_to_arrow_msg_variant_test.KV.LabelsEntry".into()),
+        ..Default::default()
+    });
+    kv.field.push(FieldDescriptorProto {
+        name: Some("ts".into()),
+        number: Some(5),
+        label: Some(Label::Optional as i32),
+        r#type: Some(ProtoType::Message as i32),
+        type_name: Some(".google.protobuf.Timestamp".into()),
+        ..Default::default()
+    });
+    // Oneof with two members: setting both on the wire makes the direct walk
+    // bail at runtime (last-wins depends on wire order).
+    kv.oneof_decl.push(OneofDescriptorProto {
+        name: Some("choice".into()),
+        ..Default::default()
+    });
+    kv.field.push(FieldDescriptorProto {
+        name: Some("a".into()),
+        number: Some(6),
+        label: Some(Label::Optional as i32),
+        r#type: Some(ProtoType::Int32 as i32),
+        oneof_index: Some(0),
+        ..Default::default()
+    });
+    kv.field.push(FieldDescriptorProto {
+        name: Some("b".into()),
+        number: Some(7),
+        label: Some(Label::Optional as i32),
+        r#type: Some(ProtoType::String as i32),
+        oneof_index: Some(0),
+        ..Default::default()
+    });
+    kv.nested_type.push(DescriptorProto {
+        name: Some("LabelsEntry".into()),
+        field: vec![
+            FieldDescriptorProto {
+                name: Some("key".into()),
+                number: Some(1),
+                label: Some(Label::Optional as i32),
+                r#type: Some(ProtoType::String as i32),
+                ..Default::default()
+            },
+            FieldDescriptorProto {
+                name: Some("value".into()),
+                number: Some(2),
+                label: Some(Label::Optional as i32),
+                r#type: Some(ProtoType::Int32 as i32),
+                ..Default::default()
+            },
+        ],
+        options: Some(prost_reflect::prost_types::MessageOptions {
+            map_entry: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let set = FileDescriptorSet {
+        file: vec![timestamp, fd],
+    };
+    DescriptorPool::decode(set.encode_to_vec().as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_msg_variant_test.Container")
+        .unwrap()
+}
+
+/// When a message-backed VARIANT falls back to the reference decoder (here:
+/// because the sub-message carries a map, a well-known type, or a conflicting
+/// oneof), the fallback path must not lose the skip policy: mismatched
+/// occurrences — at the top level, inside a map entry, or inside a well-known
+/// type — are stripped so the row is kept with those fields omitted, and each
+/// is counted exactly once (the abandoned direct walk's partial tally is
+/// rolled back).
+#[test]
+fn variant_fallback_shapes_are_sanitized_under_skip_field() {
+    let desc = message_variant_map_descriptor();
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // single = KVMap { k: "x", n as LEN (mismatch), labels {"a": 1} }.
+    let mismatch_plus_map = {
+        let mut sub = vec![0x0a, 0x01, b'x'];
+        sub.extend([0x12, 0x01, 0x01]); // n as LEN — mismatch
+        sub.extend([0x22, 0x05, 0x0a, 0x01, b'a', 0x10, 0x01]); // labels
+        let mut wire = vec![0x0a, sub.len() as u8];
+        wire.extend_from_slice(&sub);
+        wire
+    };
+    // single = KVMap { labels { key as varint (mismatch), value: 5 } }.
+    let mismatched_map_key = {
+        let sub = [0x22, 0x04, 0x08, 0x01, 0x10, 0x05];
+        let mut wire = vec![0x0a, sub.len() as u8];
+        wire.extend_from_slice(&sub);
+        wire
+    };
+    // single = KVMap { n as LEN (mismatch), ts { seconds: 5 } }.
+    let mismatch_plus_wkt = {
+        let mut sub = vec![0x12, 0x01, 0x01]; // n as LEN — mismatch
+        sub.extend([0x2a, 0x02, 0x08, 0x05]); // ts { seconds: 5 }
+        let mut wire = vec![0x0a, sub.len() as u8];
+        wire.extend_from_slice(&sub);
+        wire
+    };
+    // single = KVMap { n as LEN (mismatch), a: 1, b: "x" }: the oneof
+    // conflict makes the direct walk bail mid-walk, after it recorded the
+    // mismatch; the reference keeps only the last member set.
+    let mismatch_plus_oneof_conflict = {
+        let mut sub = vec![0x12, 0x01, 0x01]; // n as LEN — mismatch
+        sub.extend([0x30, 0x01]); // a: 1
+        sub.extend([0x3a, 0x01, b'x']); // b: "x"
+        let mut wire = vec![0x0a, sub.len() as u8];
+        wire.extend_from_slice(&sub);
+        wire
+    };
+
+    let batch = enc
+        .encode_batch(&[
+            Bytes::from(mismatch_plus_map),
+            Bytes::from(mismatched_map_key),
+            Bytes::from(mismatch_plus_wkt),
+            Bytes::from(mismatch_plus_oneof_conflict),
+        ])
+        .unwrap();
+    assert_eq!(batch.num_rows(), 4);
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 0),
+        serde_json::json!({"k": "x", "labels": {"a": 1}}),
+        "mismatched field stripped around the fallback-forcing map"
+    );
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 1),
+        serde_json::json!({"labels": {"": 5}}),
+        "mismatched map key stripped; entry kept with the proto default key"
+    );
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 2),
+        serde_json::json!({"ts": "1970-01-01T00:00:05Z"}),
+        "mismatched field stripped beside the well-known type \
+         (the reference renders Timestamp in its JSON mapping)"
+    );
+    assert_eq!(
+        decode_variant_wire(batch.column(0), 3),
+        serde_json::json!({"b": "x"}),
+        "mismatched field stripped around the oneof conflict; \
+         the reference keeps only the last member set"
+    );
+}
+
+/// The sanitized fallback rows above each count exactly one skip, with the
+/// root-to-leaf path of the mismatched occurrence. The column is a real
+/// message-backed VARIANT (`variant_arrow_field`, not a Struct), so this goes
+/// through `encode_variant_slot`: the direct walk records the mismatch before
+/// it bails mid-walk on the map field / the oneof conflict, so without the
+/// fallback's tally rollback this counts two skips.
+#[test]
+fn variant_fallback_sanitization_counts_exactly_one_skip() {
+    let desc = message_variant_map_descriptor();
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+
+    // single = KVMap { k: "x", n as LEN (mismatch), labels {"a": 1} }: the
+    // map field aborts the direct walk after the mismatch was recorded.
+    let map_wire = {
+        let mut sub = vec![0x0a, 0x01, b'x'];
+        sub.extend([0x12, 0x01, 0x01]);
+        sub.extend([0x22, 0x05, 0x0a, 0x01, b'a', 0x10, 0x01]);
+        let mut wire = vec![0x0a, sub.len() as u8];
+        wire.extend_from_slice(&sub);
+        wire
+    };
+    // single = KVMap { n as LEN (mismatch), a: 1, b: "x" }: the oneof
+    // conflict aborts the direct walk after the mismatch was recorded.
+    let oneof_wire = {
+        let mut sub = vec![0x12, 0x01, 0x01];
+        sub.extend([0x30, 0x01]); // a: 1
+        sub.extend([0x3a, 0x01, b'x']); // b: "x"
+        let mut wire = vec![0x0a, sub.len() as u8];
+        wire.extend_from_slice(&sub);
+        wire
+    };
+
+    for wire in [&map_wire, &oneof_wire] {
+        let (result, skips) =
+            validate_with_mode_and_skips(&plan, wire, OnWireTypeMismatch::SkipField);
+        result.unwrap();
+        assert_eq!(skips.skipped, 1, "wire={wire:?}");
+        let sample = skips.sample.unwrap();
+        assert_eq!(sample.field_numbers, [1, 2]);
+        assert_eq!((sample.expected, sample.actual), (0, 2));
+    }
+}
+
+/// Under `drop_row` a fallback-forcing shape plus a mismatch preserves the
+/// historical behavior: the whole row drops.
+#[test]
+fn variant_fallback_with_mismatch_drops_row_under_drop_row() {
+    let desc = message_variant_map_descriptor();
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let enc =
+        WireToArrowEncoder::with_options(&desc, schema, OnWireTypeMismatch::DropRow, &[]).unwrap();
+
+    let mut sub = vec![0x12, 0x01, 0x01]; // n as LEN — mismatch
+    sub.extend([0x22, 0x05, 0x0a, 0x01, b'a', 0x10, 0x01]); // labels
+    let mut wire = vec![0x0a, sub.len() as u8];
+    wire.extend_from_slice(&sub);
+
+    let batch = enc.encode_batch(&[Bytes::from(wire)]).unwrap();
+    assert_eq!(batch.num_rows(), 0);
+}
+
+/// Malformed bytes are not repaired by sanitization: a truncated map entry
+/// body inside the mismatch-bearing sub-message still drops the row.
+#[test]
+fn variant_fallback_malformed_with_mismatch_still_drops() {
+    let desc = message_variant_map_descriptor();
+    let schema = Schema::new(vec![variant_arrow_field("single")]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // n as LEN (mismatch) + labels entry declaring 3 bytes of body but
+    // carrying a key tag that promises more than remains.
+    let mut sub = vec![0x12, 0x01, 0x01];
+    sub.extend([0x22, 0x03, 0x0a, 0x05]);
+    let mut wire = vec![0x0a, sub.len() as u8];
+    wire.extend_from_slice(&sub);
+
+    let batch = enc.encode_batch(&[Bytes::from(wire)]).unwrap();
+    assert_eq!(batch.num_rows(), 0, "malformed entry body must still drop");
+}
+
+/// A truncated packed blob is wire-type-compatible but malformed, so the row
+/// still drops.
+#[test]
+fn truncated_packed_blob_still_drops_row() {
+    let desc = repeated_int32_descriptor();
+    let schema = Schema::new(vec![Field::new(
+        "numbers",
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        true,
+    )]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // Packed blob (tag 0x0a) declaring 1 byte holding a truncated varint.
+    let batch = enc
+        .encode_batch(&[Bytes::from(vec![0x0a, 0x01, 0x80])])
+        .unwrap();
+    assert_eq!(
+        batch.num_rows(),
+        0,
+        "malformed packed blob must drop the row"
+    );
+}
+
+/// A row carrying both a mismatched field and a truncated field drops, and
+/// its recorded skip must NOT reach the `wire_to_arrow_fields_skipped_total`
+/// metric — skips count only for kept rows.
+#[test]
+fn skip_not_counted_for_dropped_row() {
+    use vector_core::metrics::{Controller, init_test};
+
+    let _guard = METRICS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init_test();
+    let controller = Controller::get().unwrap();
+    let skipped_before = counter_total(
+        controller,
+        "wire_to_arrow_fields_skipped_total",
+        Some("wire_type_mismatch"),
+    );
+    let dropped_before = counter_total(controller, "wire_to_arrow_rows_dropped", None);
+
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+        Field::new("email", DataType::LargeUtf8, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // id as LEN (mismatch — recorded into the row tally), then a truncated
+    // email that drops the row.
+    let mut wire = vec![0x12, 0x01, 0x01];
+    wire.extend([0x1a, 0x05, 0x61]);
+
+    let batch = enc.encode_batch(&[Bytes::from(wire)]).unwrap();
+    assert_eq!(batch.num_rows(), 0);
+
+    let skipped = counter_total(
+        controller,
+        "wire_to_arrow_fields_skipped_total",
+        Some("wire_type_mismatch"),
+    ) - skipped_before;
+    assert_eq!(skipped, 0.0, "dropped row must not count skips");
+
+    // >= rather than ==: unlocked tests elsewhere can also drop rows concurrently.
+    let dropped = counter_total(controller, "wire_to_arrow_rows_dropped", None) - dropped_before;
+    assert!(
+        dropped >= 1.0,
+        "the truncated row must be counted as dropped, got {dropped}"
+    );
+}
+
+/// A row that needs canonicalization (duplicate singular field) keeps its
+/// first pass's skip exactly once: normalization strips the mismatched
+/// occurrence, so the revalidation cannot re-record it.
+#[test]
+fn skip_counted_once_through_normalize_and_revalidation() {
+    use vector_core::metrics::{Controller, init_test};
+
+    let _guard = METRICS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    init_test();
+    let controller = Controller::get().unwrap();
+    let skipped_before = counter_total(
+        controller,
+        "wire_to_arrow_fields_skipped_total",
+        Some("wire_type_mismatch"),
+    );
+
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    // id varint 7, id as LEN (mismatch), id varint 8 — the duplicate
+    // singular tag forces normalize + revalidation.
+    let wire = [0x10, 0x07, 0x12, 0x01, 0x01, 0x10, 0x08];
+    let batch = enc.encode_batch(&[Bytes::from(wire.to_vec())]).unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(0),
+        8,
+        "last well-typed occurrence wins"
+    );
+
+    let skipped = counter_total(
+        controller,
+        "wire_to_arrow_fields_skipped_total",
+        Some("wire_type_mismatch"),
+    ) - skipped_before;
+    assert_eq!(skipped, 1.0, "exactly one skip across both passes");
+}
+
+/// Config deserialization: `on_wire_type_mismatch` accepts both policy names
+/// and defaults to `skip_field` when omitted.
+#[test]
+fn config_deserializes_mismatch_policy() {
+    let config: WireToArrowSerializerConfig = serde_json::from_str(
+        r#"{"desc_file": "/tmp/x.desc", "message_type": "test_protobuf.Person"}"#,
+    )
+    .unwrap();
+    assert_eq!(config.on_wire_type_mismatch, OnWireTypeMismatch::SkipField);
+    assert!(config.attribution_fields.is_empty());
+
+    let config: WireToArrowSerializerConfig = serde_json::from_str(
+        r#"{"desc_file": "/tmp/x.desc", "message_type": "test_protobuf.Person",
+            "on_wire_type_mismatch": "drop_row"}"#,
+    )
+    .unwrap();
+    assert_eq!(config.on_wire_type_mismatch, OnWireTypeMismatch::DropRow);
+
+    assert!(
+        serde_json::from_str::<WireToArrowSerializerConfig>(
+            r#"{"desc_file": "/tmp/x.desc", "message_type": "test_protobuf.Person",
+                "on_wire_type_mismatch": "bogus"}"#,
+        )
+        .is_err(),
+        "unknown policy name must be rejected"
+    );
+}
+
+/// `attribution_fields` beyond the 8-field cap are ignored, and a name not
+/// present in the descriptor warns and is ignored.
+#[test]
+fn attribution_fields_capped_and_unknown_ignored() {
+    // message Wide { int32 f1 = 1; ... int32 f10 = 10; }
+    let fields: Vec<FieldDescriptorProto> = (1..=10)
+        .map(|i| FieldDescriptorProto {
+            name: Some(format!("f{i}")),
+            number: Some(i),
+            label: Some(Label::Optional as i32),
+            r#type: Some(ProtoType::Int32 as i32),
+            ..Default::default()
+        })
+        .collect();
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_attribution_test.proto".into()),
+        package: Some("wire_to_arrow_attribution_test".into()),
+        message_type: vec![DescriptorProto {
+            name: Some("Wide".into()),
+            field: fields,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let desc = DescriptorPool::decode(set.encode_to_vec().as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_attribution_test.Wide")
+        .unwrap();
+
+    let schema = Schema::new(
+        (1..=10)
+            .map(|i| Field::new(format!("f{i}"), DataType::Int32, true))
+            .collect::<Vec<_>>(),
+    );
+    // "nope" occupies one of the first 8 slots (warned + ignored), so only
+    // f1..f7 fit under the cap and f8+ are dropped by it.
+    let names: Vec<String> = ["f1", "f2", "nope", "f3", "f4", "f5", "f6", "f7", "f8", "f9"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let enc =
+        WireToArrowEncoder::with_options(&desc, schema, OnWireTypeMismatch::SkipField, &names)
+            .unwrap();
+
+    let mut wire = Vec::new();
+    for i in 1u8..=9 {
+        wire.push(i << 3);
+        wire.push(i);
+    }
+    let attribution = enc.attribution_from_row(&wire);
+    assert_eq!(
+        attribution, "f1=1,f2=2,f3=3,f4=4,f5=5,f6=6,f7=7",
+        "unknown name ignored, cap keeps the first 8 configured names"
+    );
 }
 
 // -------------------------------------------------------------------------

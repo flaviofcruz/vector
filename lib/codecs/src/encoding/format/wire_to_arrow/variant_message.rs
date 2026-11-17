@@ -15,19 +15,32 @@
 //! direct walk bail out and the whole value is re-encoded by the reference
 //! path, which also produces the reference's error for malformed input.
 //!
+//! Under the `skip_field` mismatch policy a known field whose wire type
+//! disagrees with the descriptor is instead omitted from the Variant
+//! (protobuf-java treats it as an unknown field) and reported to the caller.
+//! If the walk still bails for a reference-only shape elsewhere in the same
+//! message, the caller first sanitizes the bytes with
+//! [`VariantMessagePlan::sanitize_for_reference`] — stripping every
+//! wire-type-mismatched occurrence the reference decoder would reject — and
+//! hands the sanitized bytes to the reference decoder, so the row survives
+//! with the mismatched fields omitted. Malformed input survives sanitization
+//! untouched and still drops exactly as before.
+//!
 //! [`encode_variant_from_message`]: super::append::encode_variant_from_message
 
 use std::collections::HashMap;
 
 use base64::Engine as _;
 use parquet_variant::{BuilderSpecificState, ListBuilder, ObjectBuilder, Variant, VariantBuilder};
-use prost_reflect::{Cardinality, Kind, MessageDescriptor};
+use prost_reflect::prost::encoding::{WireType, encode_key, encode_varint};
+use prost_reflect::{Cardinality, FieldDescriptor, Kind, MessageDescriptor};
 use zeroparser::wire::{
     WireValue, decode_zigzag32, decode_zigzag64, try_parse_field, try_read_varint,
 };
 
-use super::append::encode_variant_from_message;
+use super::append::{encode_variant_from_message, wire_type_byte};
 use super::errors::Result;
+use super::plan::{WT_I32, WT_I64, WT_LEN, WT_VARINT};
 
 /// Recursion limit of the reference `DynamicMessage` decode (prost's default);
 /// deeper input falls back so the reference decides.
@@ -61,6 +74,16 @@ enum ScalarType {
 }
 
 impl ScalarType {
+    /// Wire type of a single (unpacked) value of this kind.
+    fn wire_type(self) -> u8 {
+        match self {
+            Self::Fixed32 | Self::Sfixed32 | Self::Float => WT_I32,
+            Self::Fixed64 | Self::Sfixed64 | Self::Double => WT_I64,
+            Self::String | Self::Bytes => WT_LEN,
+            _ => WT_VARINT,
+        }
+    }
+
     fn from_kind(kind: &Kind) -> Option<Self> {
         Some(match kind {
             Kind::Int32 => Self::Int32,
@@ -115,6 +138,8 @@ enum FieldType {
 }
 
 struct FieldPlan {
+    /// Proto field number, for skip attribution.
+    number: u32,
     name: Box<str>,
     field_type: FieldType,
     repeated: bool,
@@ -122,6 +147,19 @@ struct FieldPlan {
     has_presence: bool,
     /// Index of the containing (real or synthetic) oneof, if any.
     oneof: Option<u8>,
+}
+
+impl FieldPlan {
+    /// Wire type a single unpacked value of this field carries; reported as
+    /// `expected` in skip records (mirroring the frame-level validators,
+    /// which name the native type even for fields that also accept packed).
+    fn singular_wire_type(&self) -> u8 {
+        match &self.field_type {
+            FieldType::Scalar(scalar) => scalar.wire_type(),
+            FieldType::Enum { .. } => WT_VARINT,
+            FieldType::Message(_) | FieldType::Fallback => WT_LEN,
+        }
+    }
 }
 
 enum FieldLookup {
@@ -141,7 +179,101 @@ enum FieldIndex {
 
 struct MessageVariantPlan {
     fields: Vec<FieldPlan>,
+    /// One wire-type accept mask per field (bit n = wire type n), parallel to
+    /// `fields` — the skip-mode walk filters mismatched occurrences with it
+    /// at gather time, mirroring the frame-level `MessagePlan::wt_accept_masks`.
+    accept_masks: Vec<u8>,
     index: FieldIndex,
+}
+
+/// Wire types a field occurrence may carry, as a 1-bit-per-wire-type mask,
+/// mirroring `PlanSlot::accept_wire_type_mask`: singular values use the
+/// native type, repeated numerics/enums also accept a packed `LEN` blob.
+/// `Fallback` fields are the reference path's job and never mismatch here.
+fn field_accept_mask(field_type: &FieldType, repeated: bool) -> u8 {
+    match field_type {
+        FieldType::Fallback => 0xff,
+        FieldType::Message(_) => 1 << WT_LEN,
+        FieldType::Enum { .. } if repeated => (1 << WT_VARINT) | (1 << WT_LEN),
+        FieldType::Enum { .. } => 1 << WT_VARINT,
+        FieldType::Scalar(scalar) => match (repeated, scalar.packed_width()) {
+            (true, Some(_)) => (1 << scalar.wire_type()) | (1 << WT_LEN),
+            _ => 1 << scalar.wire_type(),
+        },
+    }
+}
+
+/// Skip reporting for one VARIANT walk under the `skip_field` policy.
+/// `None` keeps the reference-parity behavior: a mismatched occurrence
+/// aborts the direct walk and the reference path re-encodes the value.
+pub(super) struct SkipReport<'a> {
+    /// Root-to-leaf proto field path up to the value being walked, extended
+    /// with each nested message field as the walk descends. Caller-owned and
+    /// reused across rows.
+    pub(super) path: &'a mut Vec<u32>,
+    /// Called once per skipped occurrence with the enclosing path, the proto
+    /// field number, the wire type the field expects, and the wire type found.
+    pub(super) sink: SkipSinkFn<'a>,
+}
+
+type SkipSinkFn<'a> = &'a mut dyn FnMut(&[u32], u32, u8, u8);
+
+/// Wire-type accept mask and `expected` value for one descriptor field,
+/// derived straight from the descriptor with the same rules as
+/// [`field_accept_mask`]. Sanitization must strip exactly the occurrences the
+/// reference prost decoder rejects as wire-type mismatches — prost is the
+/// decoder that runs on the sanitized bytes, so the descriptor (not the
+/// compiled walker plan) is the source of truth here, and it covers shapes
+/// the walker plan never compiles (map entries, well-known types).
+fn descriptor_accept_mask(field: &FieldDescriptor) -> (u8, u8) {
+    let repeated = field.cardinality() == Cardinality::Repeated;
+    match field.kind() {
+        Kind::Message(_) => (1 << WT_LEN, WT_LEN),
+        Kind::Enum(_) if repeated => ((1 << WT_VARINT) | (1 << WT_LEN), WT_VARINT),
+        Kind::Enum(_) => (1 << WT_VARINT, WT_VARINT),
+        kind => {
+            let scalar =
+                ScalarType::from_kind(&kind).expect("descriptor kind is scalar after Message/Enum");
+            let expected = scalar.wire_type();
+            let mask = match (repeated, scalar.packed_width()) {
+                (true, Some(_)) => (1 << expected) | (1 << WT_LEN),
+                _ => 1 << expected,
+            };
+            (mask, expected)
+        }
+    }
+}
+
+/// The walker's view of the optional [`SkipReport`], so the emit functions
+/// never match on the option themselves.
+struct WalkReport<'a, 'r>(&'r mut Option<SkipReport<'a>>);
+
+impl WalkReport<'_, '_> {
+    fn active(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Descend into a nested message field for skip attribution.
+    fn enter(&mut self, field_number: u32) {
+        if let Some(report) = self.0.as_mut() {
+            report.path.push(field_number);
+        }
+    }
+
+    /// Leave a nested message field; paired with [`WalkReport::enter`] before
+    /// errors propagate so a failed walk leaves the path balanced.
+    fn leave(&mut self) {
+        if let Some(report) = self.0.as_mut() {
+            report.path.pop();
+        }
+    }
+
+    fn skip(&mut self, field_number: u32, expected: u8, actual: u8) {
+        if let Some(report) = self.0.as_mut() {
+            let SkipReport { path, sink } = report;
+            (sink)(path, field_number, expected, actual);
+        }
+    }
 }
 
 impl MessageVariantPlan {
@@ -215,6 +347,7 @@ impl VariantMessagePlan {
         seen.insert(desc.full_name().to_string(), idx);
         self.messages.push(MessageVariantPlan {
             fields: Vec::new(),
+            accept_masks: Vec::new(),
             index: FieldIndex::Sparse(HashMap::new()),
         });
 
@@ -265,6 +398,7 @@ impl VariantMessagePlan {
             };
             numbers.push((field.number(), fields.len() as u16));
             fields.push(FieldPlan {
+                number: field.number(),
                 name: field.name().into(),
                 field_type,
                 repeated: field.cardinality() == Cardinality::Repeated,
@@ -300,15 +434,25 @@ impl VariantMessagePlan {
                 }
                 FieldIndex::Sparse(map)
             };
-        self.messages[idx] = MessageVariantPlan { fields, index };
+        let accept_masks = fields
+            .iter()
+            .map(|f| field_accept_mask(&f.field_type, f.repeated))
+            .collect();
+        self.messages[idx] = MessageVariantPlan {
+            fields,
+            accept_masks,
+            index,
+        };
         idx
     }
 
     /// Encode one occurrence of the column's message (its wire bytes) into the
-    /// Parquet Variant `(metadata, value)` pair.
+    /// Parquet Variant `(metadata, value)` pair. A wire-type-mismatched
+    /// occurrence aborts the direct walk, deferring to the reference decoder —
+    /// which rejects it — so the caller's policy decides what a mismatch costs.
     pub(crate) fn encode(&self, wire: &WireValue) -> Result<(Vec<u8>, Vec<u8>)> {
         match wire {
-            WireValue::Len(bytes) => match self.encode_direct(bytes) {
+            WireValue::Len(bytes) => match self.encode_direct(bytes, &mut None) {
                 Some(built) => Ok(built),
                 None => encode_variant_from_message(&self.descriptor, wire),
             },
@@ -316,18 +460,60 @@ impl VariantMessagePlan {
         }
     }
 
-    /// The direct walk alone; `None` when the input needs the reference path.
-    fn encode_direct(&self, bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// `skip_field` counterpart of [`encode`]: the caller (in `scan.rs`) runs
+    /// [`Self::encode_direct`] with an active [`SkipReport`] so mismatched
+    /// occurrences are omitted from the Variant, and on fallback sanitizes the
+    /// bytes ([`Self::sanitize_for_reference`]) before re-encoding via the
+    /// reference decoder ([`Self::encode_reference`]).
+    ///
+    /// [`encode`]: Self::encode
+    pub(super) fn encode_direct(
+        &self,
+        bytes: &[u8],
+        report: &mut Option<SkipReport<'_>>,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
         if self.root_fallback {
             return None;
         }
         let mut builder = VariantBuilder::new();
         let mut scratch = Vec::new();
         let mut object = builder.new_object();
-        self.emit_message(0, bytes, 0, &mut scratch, &mut object)
+        let mut report = WalkReport(report);
+        self.emit_message(0, bytes, 0, &mut scratch, &mut object, &mut report)
             .ok()?;
         object.finish();
         Some(builder.finish())
+    }
+
+    /// Reference-path encode of one occurrence — the shapes the direct walk
+    /// rejects (and the sanitized replay of those shapes) go through here.
+    pub(super) fn encode_reference(&self, wire: &WireValue<'_>) -> Result<(Vec<u8>, Vec<u8>)> {
+        encode_variant_from_message(&self.descriptor, wire)
+    }
+
+    /// Strip every wire-type-mismatched occurrence of a known field from one
+    /// occurrence of the column's message, recursively through nested
+    /// messages, map entries and well-known types, so the reference prost
+    /// decoder accepts the remainder instead of rejecting the whole row.
+    /// Skips are reported through the [`SkipReport`] sink.
+    ///
+    /// Returns `None` when the bytes are malformed (a parse error, a group
+    /// wire type, or past prost's recursion limit) — the caller then re-encodes
+    /// the *original* bytes so the reference decoder produces its own error
+    /// and the row drops exactly as it would without sanitization. Anything
+    /// else malformed-but-wire-type-compatible (a truncated packed blob,
+    /// invalid UTF-8) is copied verbatim and still fails the reference decode,
+    /// unchanged.
+    pub(super) fn sanitize_for_reference(
+        &self,
+        wire: &WireValue<'_>,
+        report: &mut Option<SkipReport<'_>>,
+    ) -> Option<Vec<u8>> {
+        let WireValue::Len(bytes) = wire else {
+            return None;
+        };
+        let mut report = WalkReport(report);
+        sanitize_message(&self.descriptor, bytes, &mut report, 0)
     }
 
     fn emit_message<'a, S: BuilderSpecificState>(
@@ -337,6 +523,7 @@ impl VariantMessagePlan {
         depth: usize,
         scratch: &mut Vec<Entry<'a>>,
         object: &mut ObjectBuilder<'_, S>,
+        report: &mut WalkReport<'_, '_>,
     ) -> Walk {
         if depth >= MAX_DEPTH {
             return Err(Fallback);
@@ -347,10 +534,23 @@ impl VariantMessagePlan {
             let (field, rest) = try_parse_field(bytes).map_err(|_| Fallback)?;
             bytes = rest;
             match plan.lookup(field.field_num as u32) {
-                FieldLookup::Field(idx) => scratch.push(Entry {
-                    field: idx,
-                    value: field.value,
-                }),
+                FieldLookup::Field(idx) => {
+                    // Under the skip policy a mismatched occurrence is dropped
+                    // before grouping, so it can neither win a singular merge
+                    // nor trip the merge-deferred fallbacks.
+                    if report.active() {
+                        let actual = wire_type_byte(&field.value);
+                        if plan.accept_masks[idx as usize] & (1 << actual) == 0 {
+                            let field_plan = &plan.fields[idx as usize];
+                            report.skip(field_plan.number, field_plan.singular_wire_type(), actual);
+                            continue;
+                        }
+                    }
+                    scratch.push(Entry {
+                        field: idx,
+                        value: field.value,
+                    })
+                }
                 FieldLookup::Extension => return Err(Fallback),
                 FieldLookup::Unknown => {}
             }
@@ -376,10 +576,11 @@ impl VariantMessagePlan {
                 }
                 oneofs_seen |= bit;
             }
+            let run = i..end;
             if field_plan.repeated {
-                self.emit_repeated(field_plan, i, end, depth, scratch, object)?;
+                self.emit_repeated(field_plan, run, depth, scratch, object, report)?;
             } else {
-                self.emit_singular(field_plan, i, end, depth, scratch, object)?;
+                self.emit_singular(field_plan, run, depth, scratch, object, report)?;
             }
             i = end;
         }
@@ -390,12 +591,13 @@ impl VariantMessagePlan {
     fn emit_singular<'a, S: BuilderSpecificState>(
         &self,
         field_plan: &FieldPlan,
-        first: usize,
-        end: usize,
+        run: std::ops::Range<usize>,
         depth: usize,
         scratch: &mut Vec<Entry<'a>>,
         object: &mut ObjectBuilder<'_, S>,
+        report: &mut WalkReport<'_, '_>,
     ) -> Walk {
+        let (first, end) = (run.start, run.end);
         match &field_plan.field_type {
             FieldType::Message(sub) => {
                 // Repeated occurrences of a singular message merge; defer.
@@ -405,8 +607,14 @@ impl VariantMessagePlan {
                 let WireValue::Len(bytes) = scratch[first].value else {
                     return Err(Fallback);
                 };
+                // Extend the skip-attribution path for the nested walk; popped
+                // before the result propagates so a failed walk leaves the
+                // path balanced for the caller.
+                report.enter(field_plan.number);
                 let mut child = object.new_object(&field_plan.name);
-                self.emit_message(*sub, bytes, depth + 1, scratch, &mut child)?;
+                let walked = self.emit_message(*sub, bytes, depth + 1, scratch, &mut child, report);
+                report.leave();
+                walked?;
                 child.finish();
             }
             FieldType::Scalar(scalar) => {
@@ -444,12 +652,13 @@ impl VariantMessagePlan {
     fn emit_repeated<'a, S: BuilderSpecificState>(
         &self,
         field_plan: &FieldPlan,
-        first: usize,
-        end: usize,
+        run: std::ops::Range<usize>,
         depth: usize,
         scratch: &mut Vec<Entry<'a>>,
         object: &mut ObjectBuilder<'_, S>,
+        report: &mut WalkReport<'_, '_>,
     ) -> Walk {
+        let (first, end) = (run.start, run.end);
         match &field_plan.field_type {
             FieldType::Message(sub) => {
                 let mut list = object.new_list(&field_plan.name);
@@ -457,8 +666,12 @@ impl VariantMessagePlan {
                     let WireValue::Len(bytes) = scratch[k].value else {
                         return Err(Fallback);
                     };
+                    report.enter(field_plan.number);
                     let mut child = list.new_object();
-                    self.emit_message(*sub, bytes, depth + 1, scratch, &mut child)?;
+                    let walked =
+                        self.emit_message(*sub, bytes, depth + 1, scratch, &mut child, report);
+                    report.leave();
+                    walked?;
                     child.finish();
                 }
                 list.finish();
@@ -517,6 +730,68 @@ impl VariantMessagePlan {
         }
         Ok(())
     }
+}
+
+fn sanitize_message(
+    desc: &MessageDescriptor,
+    mut bytes: &[u8],
+    report: &mut WalkReport<'_, '_>,
+    depth: usize,
+) -> Option<Vec<u8>> {
+    if depth >= MAX_DEPTH {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    while !bytes.is_empty() {
+        let (field, rest) = try_parse_field(bytes).ok()?;
+        let raw = &bytes[..bytes.len() - rest.len()];
+        bytes = rest;
+        let number = field.field_num as u32;
+        let Some(field_desc) = desc.get_field(number) else {
+            // Unknown fields are kept verbatim; the reference decoder
+            // reaches the same verdict on them it would have reached
+            // without sanitization.
+            out.extend_from_slice(raw);
+            continue;
+        };
+        let (accept_mask, expected) = descriptor_accept_mask(&field_desc);
+        let actual = wire_type_byte(&field.value);
+        if accept_mask & (1 << actual) == 0 {
+            report.skip(number, expected, actual);
+            continue;
+        }
+        if let (Some(sub_desc), WireValue::Len(body)) =
+            (field_desc.kind().as_message(), &field.value)
+        {
+            report.enter(number);
+            let sanitized = sanitize_message(&sub_desc.clone(), body, report, depth + 1);
+            report.leave();
+            let sanitized = sanitized?;
+            // A strip always shortens the payload, and a no-strip pass
+            // copies bytes verbatim, so equal length means unmodified.
+            if sanitized.len() == body.len() {
+                out.extend_from_slice(raw);
+            } else {
+                encode_key(number, WireType::LengthDelimited, &mut out);
+                encode_varint(sanitized.len() as u64, &mut out);
+                out.extend_from_slice(&sanitized);
+            }
+        } else {
+            out.extend_from_slice(raw);
+        }
+    }
+    Some(out)
+}
+
+/// Strips every wire-type-mismatched occurrence of a known field from a whole
+/// row, recursively and without reporting. `None` means the bytes are malformed
+/// (parse error, group, or past the recursion limit); callers then keep the
+/// original bytes so the reference decoder reports the malformation.
+pub(super) fn strip_wire_type_mismatches(
+    desc: &MessageDescriptor,
+    bytes: &[u8],
+) -> Option<Vec<u8>> {
+    sanitize_message(desc, bytes, &mut WalkReport(&mut None), 0)
 }
 
 fn for_each_packed<'a>(

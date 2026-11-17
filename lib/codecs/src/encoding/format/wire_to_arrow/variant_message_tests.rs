@@ -424,7 +424,7 @@ fn random_wire(desc: &MessageDescriptor, rng: &mut Rng) -> Vec<u8> {
 
 fn assert_parity(desc: &MessageDescriptor, plan: &VariantMessagePlan, wire: &[u8]) -> bool {
     let reference = encode_variant_from_message(desc, &WireValue::Len(wire));
-    if let Some(direct) = plan.encode_direct(wire) {
+    if let Some(direct) = plan.encode_direct(wire, &mut None) {
         let reference = reference.expect("direct walk accepted input the reference rejects");
         assert_eq!(rendered(&direct), rendered(&reference), "wire {wire:02x?}");
         return true;
@@ -528,13 +528,61 @@ fn malformed_wire_reports_reference_error() {
         // An oversized field number must not wrap into the known field 14.
         &[0xf1, 0x80, 0x80, 0x80, 0x80, 0x01, 0, 0, 0, 0, 0, 0, 0, 0],
     ] {
-        assert!(plan.encode_direct(wire).is_none());
+        assert!(plan.encode_direct(wire, &mut None).is_none());
         let reference = encode_variant_from_message(&desc, &WireValue::Len(wire));
         assert_eq!(
             plan.encode(&WireValue::Len(wire)).is_ok(),
             reference.is_ok()
         );
     }
+}
+
+/// Sanitization strips a mismatched occurrence the direct walk (and the
+/// reference decoder) reject, keeps everything else verbatim, and reports the
+/// skip with the field's own path — the fallback rows then survive the
+/// reference decode instead of dropping.
+#[test]
+fn sanitize_strips_mismatch_and_reports_path() {
+    use super::SkipReport;
+
+    let pool = pool();
+    let desc = pool.get_message_by_name("vm.Rich").unwrap();
+    let plan = VariantMessagePlan::new(&desc);
+
+    // o_int32 (1) as fixed32 (mismatch) + labels {"a": 1} (map: fallback).
+    let mut wire = vec![0x0d, 0x01, 0x02, 0x03, 0x04];
+    wire.extend([0xd2, 0x05, 0x05, 0x0a, 0x01, b'a', 0x10, 0x01]);
+    assert!(plan.encode_direct(&wire, &mut None).is_none());
+
+    let mut path = Vec::new();
+    let mut recorded = Vec::new();
+    {
+        // The encoder-level caller pushes the VARIANT slot's field number
+        // before walking; mirror that so the recorded path has its prefix.
+        path.push(1);
+        let mut report = Some(SkipReport {
+            path: &mut path,
+            sink: &mut |path, number, expected, actual| {
+                recorded.push((path.to_vec(), number, expected, actual))
+            },
+        });
+        let clean = plan
+            .sanitize_for_reference(&WireValue::Len(&wire), &mut report)
+            .expect("well-formed bytes sanitize to Some");
+        let built = plan.encode_reference(&WireValue::Len(&clean)).unwrap();
+        // The map survives; the mismatched scalar is gone — equal to the
+        // reference output for the bytes with the mismatched field removed.
+        let mut without_mismatch = Vec::new();
+        without_mismatch.extend([0xd2, 0x05, 0x05, 0x0a, 0x01, b'a', 0x10, 0x01]);
+        let expected = encode_variant_from_message(&desc, &WireValue::Len(&without_mismatch))
+            .expect("mismatch-free bytes decode");
+        assert_eq!(
+            rendered(&built),
+            rendered(&expected),
+            "sanitized bytes decode like the mismatch-free input"
+        );
+    }
+    assert_eq!(recorded, vec![(vec![1], 1, 0, 5)]);
 }
 
 proptest! {

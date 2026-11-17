@@ -1034,6 +1034,7 @@ mod tests {
             desc_file: desc_file.path().to_path_buf(),
             message_type: "wire_to_arrow_uc_split_test.Row".into(),
             schema: Some(arrow_schema),
+            ..Default::default()
         };
         let batch_serializer = BatchSerializerConfig::WireToArrow(wire_config)
             .build()

@@ -13,10 +13,19 @@
 //!   * Event-shape problems (missing `message` field, non-`Bytes` value) fail
 //!     the batch — the pipeline is misconfigured if any event reaches here in
 //!     the wrong shape.
-//!   * Wire-format decode errors are isolated to the offending row: the row
-//!     is dropped from the output `RecordBatch`, counted via the
-//!     `wire_to_arrow_rows_dropped` metric, and a sample error is logged.
-//!     One poison message can't poison the whole batch.
+//!   * A known field whose wire type disagrees with the descriptor is handled
+//!     per `on_wire_type_mismatch`: by default the occurrence is skipped with
+//!     protobuf-java semantics (column null, row kept), counted via the
+//!     `wire_to_arrow_fields_skipped_total` metric; `drop_row` preserves the
+//!     original behavior. The policy reaches inside message-backed VARIANT
+//!     columns too: a mismatched occurrence there is omitted from the Variant
+//!     object instead of failing the prost reference decode. Skips are only
+//!     counted for rows the batch keeps.
+//!   * Other wire-format decode errors (truncated buffers, malformed packed
+//!     blobs, invalid UTF-8, unparseable VARIANT JSON) are isolated to the
+//!     offending row: the row is dropped from the output `RecordBatch`,
+//!     counted via the `wire_to_arrow_rows_dropped` metric, and a sample
+//!     error is logged. One poison message can't poison the whole batch.
 //!
 //! ## Scope
 //!
@@ -58,4 +67,4 @@ mod tests;
 
 pub use encoder::WireToArrowEncoder;
 pub use errors::WireToArrowError;
-pub use serializer::{WireToArrowSerializer, WireToArrowSerializerConfig};
+pub use serializer::{OnWireTypeMismatch, WireToArrowSerializer, WireToArrowSerializerConfig};

@@ -226,6 +226,14 @@ pub struct MessagePlan {
     pub(crate) slot_by_proto_field: Vec<u32>,
     /// Includes unprojected siblings, which still clear a projected oneof member.
     pub(crate) oneof_by_proto_field: BTreeMap<u32, usize>,
+    /// Accept masks for the *unprojected* members of tracked oneofs (parallel
+    /// keys to [`MessagePlan::oneof_by_proto_field`]). A projected member's
+    /// mask lives in `wt_accept_masks`; an unprojected member has no slot, but
+    /// its occurrences are still wire-type-checked before oneof bookkeeping —
+    /// protobuf-java treats a wrong-typed occurrence as an unknown field, so
+    /// it must neither trigger normalization nor clear a well-typed sibling.
+    /// Oneof members cannot be repeated, so the mask is the singular wire type.
+    pub(crate) unprojected_oneof_wt_masks: BTreeMap<u32, u8>,
     pub(crate) oneof_count: usize,
     /// Arrow `Fields` at this level, kept for assembly of `StructArray` / `ListArray`.
     pub(crate) arrow_fields: Fields,
@@ -237,6 +245,60 @@ pub struct MessagePlan {
     /// String, `0` for Int32) for absent scalar slots instead of writing a
     /// null, which would fail `StructArray::try_new` at batch finish.
     pub(crate) inside_map_entry: bool,
+    /// One wire-type accept mask per slot, parallel to `slots` (bit n set =
+    /// wire type n is a legal encoding for that slot). Precomputed at plan
+    /// build so the per-occurrence mismatch check in the validate and scan
+    /// passes is a load + and + shift instead of a `PlanSlot` match — the
+    /// check runs on every field occurrence of every row, twice.
+    pub(crate) wt_accept_masks: Vec<u8>,
+}
+
+impl PlanSlot {
+    /// Wire types this slot can legally receive, as a 1-bit-per-wire-type
+    /// mask (bit n = wire type n). Precomputed into
+    /// [`MessagePlan::wt_accept_masks`] and read by the scan pass's mismatch
+    /// guard; it must stay in lock step with the per-slot validators in
+    /// `append.rs`, whose `WireTypeMismatch` errors the validate pass
+    /// intercepts for the same policy.
+    pub(crate) fn accept_wire_type_mask(&self) -> u8 {
+        match self {
+            PlanSlot::Scalar(kind) => 1 << kind.wire_type(),
+            PlanSlot::EnumString(_) => 1 << WT_VARINT,
+            PlanSlot::Struct(_)
+            | PlanSlot::Map(_)
+            | PlanSlot::RepeatedMessage(_)
+            | PlanSlot::Variant(_)
+            | PlanSlot::RepeatedVariant(_) => 1 << WT_LEN,
+            // Repeated numerics/enums accept both unpacked (native wire
+            // type) and packed (`LEN`) occurrences.
+            PlanSlot::RepeatedScalar(kind) => (1 << kind.wire_type()) | (1 << WT_LEN),
+            PlanSlot::RepeatedEnumString(_) => (1 << WT_VARINT) | (1 << WT_LEN),
+            // No proto field number ever points at an Absent slot; accept
+            // anything so the mask check never fires (callers treat a
+            // dispatch to Absent as a code bug separately).
+            PlanSlot::Absent => 0xff,
+        }
+    }
+
+    /// The wire type this slot's validator names as `expected` in a
+    /// `WireTypeMismatch`: the native type for scalars/enums, `LEN` for
+    /// length-delimited slots — even for repeated slots that also accept a
+    /// packed `LEN` blob. Keep in lock step with the validators in
+    /// `append.rs`, whose errors this mirrors.
+    pub(crate) fn singular_wire_type(&self) -> u8 {
+        match self {
+            PlanSlot::Scalar(kind) | PlanSlot::RepeatedScalar(kind) => kind.wire_type(),
+            PlanSlot::EnumString(_) | PlanSlot::RepeatedEnumString(_) => WT_VARINT,
+            PlanSlot::Struct(_)
+            | PlanSlot::Map(_)
+            | PlanSlot::RepeatedMessage(_)
+            | PlanSlot::Variant(_)
+            | PlanSlot::RepeatedVariant(_)
+            // Unreachable: the Absent accept mask is 0xff, so the mismatch
+            // check never fires for one.
+            | PlanSlot::Absent => WT_LEN,
+        }
+    }
 }
 
 impl MessagePlan {
@@ -293,6 +355,7 @@ impl MessagePlan {
             });
         }
         let mut slots = Vec::with_capacity(fields.len());
+        let mut wt_accept_masks = Vec::with_capacity(fields.len());
         let mut max_field_num = 0u32;
         // `slot_proto_numbers[i] = Some(n)` means slot i maps to proto field n;
         // `None` means slot i is `Absent` (no proto tag maps here) and is skipped
@@ -368,6 +431,7 @@ impl MessagePlan {
                 )
                 .increment(1);
                 slots.push(PlanSlot::Absent);
+                wt_accept_masks.push(PlanSlot::Absent.accept_wire_type_mask());
                 slot_proto_numbers.push(None);
                 continue;
             };
@@ -612,6 +676,7 @@ impl MessagePlan {
                     | PlanSlot::Absent => {}
                 }
             }
+            wt_accept_masks.push(slot.accept_wire_type_mask());
             slots.push(slot);
         }
 
@@ -623,21 +688,27 @@ impl MessagePlan {
         }
 
         let mut oneof_by_proto_field = BTreeMap::new();
+        let mut unprojected_oneof_wt_masks = BTreeMap::new();
         let mut oneof_count = 0;
+        let is_projected = |field: &prost_reflect::FieldDescriptor| {
+            slot_by_proto_field
+                .get(field.number() as usize)
+                .is_some_and(|slot| *slot != SLOT_UNKNOWN)
+        };
         for oneof in descriptor.oneofs() {
             // Synthetic proto3 optional groups need only singular-field tracking.
             if oneof.fields().len() < 2 {
                 continue;
             }
-            if !oneof.fields().any(|field| {
-                slot_by_proto_field
-                    .get(field.number() as usize)
-                    .is_some_and(|slot| *slot != SLOT_UNKNOWN)
-            }) {
+            if !oneof.fields().any(|field| is_projected(&field)) {
                 continue;
             }
             for field in oneof.fields() {
                 oneof_by_proto_field.insert(field.number(), oneof_count);
+                if !is_projected(&field) {
+                    unprojected_oneof_wt_masks
+                        .insert(field.number(), oneof_member_accept_mask(&field.kind()));
+                }
             }
             oneof_count += 1;
         }
@@ -677,12 +748,27 @@ impl MessagePlan {
 
         Ok(MessagePlan {
             slots,
+            wt_accept_masks,
             slot_by_proto_field,
             oneof_by_proto_field,
+            unprojected_oneof_wt_masks,
             oneof_count,
             arrow_fields: fields.clone(),
             inside_map_entry,
         })
+    }
+}
+
+/// Wire-type accept mask for one oneof member, from its descriptor kind.
+/// Mirrors [`PlanSlot::accept_wire_type_mask`] for the singular (non-repeated)
+/// shapes a oneof member can have; used only for members with no Arrow slot.
+fn oneof_member_accept_mask(kind: &Kind) -> u8 {
+    match kind {
+        Kind::Message(_) => 1 << WT_LEN,
+        Kind::Enum(_) => 1 << WT_VARINT,
+        // Oneof members cannot be repeated, so `from_proto_kind`'s only `None`
+        // (message kinds) is handled above; 0xff would disable the check.
+        kind => ScalarKind::from_proto_kind(kind).map_or(0xff, |scalar| 1 << scalar.wire_type()),
     }
 }
 
@@ -730,8 +816,10 @@ impl MessagePlan {
         let slots = (0..fields.len()).map(|_| PlanSlot::Absent).collect();
         MessagePlan {
             slots,
+            wt_accept_masks: vec![PlanSlot::Absent.accept_wire_type_mask(); fields.len()],
             slot_by_proto_field: Vec::new(),
             oneof_by_proto_field: BTreeMap::new(),
+            unprojected_oneof_wt_masks: BTreeMap::new(),
             oneof_count: 0,
             arrow_fields: fields.clone(),
             inside_map_entry: false,
