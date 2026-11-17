@@ -13,6 +13,8 @@
 use vrl::{compiler::Function, path::OwnedTargetPath};
 
 #[cfg(feature = "databricks-redaction")]
+pub mod apply_governator_redaction;
+#[cfg(feature = "databricks-redaction")]
 pub mod apply_redaction;
 #[cfg(feature = "databricks-redaction")]
 pub mod enforce_metadata_shape;
@@ -65,6 +67,7 @@ pub fn lumberjack_prime_functions() -> Vec<Box<dyn Function>> {
 #[cfg(feature = "databricks-redaction")]
 pub fn redaction_functions() -> Vec<Box<dyn Function>> {
     vec![
+        Box::new(apply_governator_redaction::ApplyGovernatorRedaction) as _,
         Box::new(apply_redaction::ApplyRedaction) as _,
         Box::new(enforce_metadata_shape::EnforceMetadataShape) as _,
         Box::new(lp_splice_metadata::LpSpliceMetadata) as _,
