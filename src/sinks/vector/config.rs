@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use http::Uri;
 use hyper::client::HttpConnector;
 use hyper_openssl::HttpsConnector;
@@ -18,7 +20,7 @@ use crate::{
         AcknowledgementsConfig, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext,
         SinkHealthcheckOptions,
     },
-    http::build_proxy_connector,
+    http::build_proxy_connector_with_tcp_keepalive,
     proto::vector as proto,
     sinks::{
         Healthcheck, VectorSink as VectorSinkType,
@@ -29,6 +31,69 @@ use crate::{
     },
     tls::{MaybeTlsSettings, TlsEnableableConfig},
 };
+
+/// Keepalive settings for the connection pool the `vector` sink uses.
+///
+/// All fields are unset (disabled) by default, which preserves Hyper's and the
+/// OS's defaults.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KeepAliveConfig {
+    /// Send HTTP/2 PING frames at this interval to detect dead pooled connections.
+    ///
+    /// Unset by default.
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 30))]
+    #[configurable(validation(range(min = 1)))]
+    http2_keep_alive_interval_secs: Option<u64>,
+
+    /// How long to wait for an HTTP/2 PING acknowledgement before closing the connection.
+    ///
+    /// Used only when `http2_keep_alive_interval_secs` is set; Hyper defaults to 20 seconds.
+    /// Unset by default.
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 10))]
+    #[configurable(validation(range(min = 1)))]
+    http2_keep_alive_timeout_secs: Option<u64>,
+
+    /// Send HTTP/2 PING frames when no streams are active.
+    ///
+    /// Used only when `http2_keep_alive_interval_secs` is set. Unset by default, which
+    /// preserves Hyper's default (`false`).
+    #[configurable(metadata(docs::examples = true))]
+    http2_keep_alive_while_idle: Option<bool>,
+
+    /// TCP keepalive idle time for the connection to the next hop, such as a local proxy.
+    ///
+    /// Does not configure keepalive on downstream proxy hops. Unset by default.
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 60))]
+    #[configurable(validation(range(min = 1)))]
+    tcp_keepalive_secs: Option<u64>,
+}
+
+impl KeepAliveConfig {
+    fn tcp_keepalive(&self) -> Option<Duration> {
+        self.tcp_keepalive_secs.map(Duration::from_secs)
+    }
+
+    /// Applies the HTTP/2 keepalive settings to a Hyper client builder.
+    ///
+    /// Hyper treats the PING-ack timeout and the while-idle option as no-ops unless a
+    /// PING interval is set, so unset fields always leave Hyper's defaults in place.
+    fn apply_http2_keepalive(&self, builder: &mut hyper::client::Builder) {
+        if let Some(interval) = self.http2_keep_alive_interval_secs {
+            builder.http2_keep_alive_interval(Some(Duration::from_secs(interval)));
+        }
+        if let Some(timeout) = self.http2_keep_alive_timeout_secs {
+            builder.http2_keep_alive_timeout(Duration::from_secs(timeout));
+        }
+        if let Some(while_idle) = self.http2_keep_alive_while_idle {
+            builder.http2_keep_alive_while_idle(while_idle);
+        }
+    }
+}
 
 /// Configuration for the `vector` sink.
 #[configurable_component(sink("vector", "Relay observability data to a Vector instance."))]
@@ -59,6 +124,11 @@ pub struct VectorConfig {
     #[configurable(metadata(docs::advanced))]
     #[serde(default, deserialize_with = "deserialize_compression")]
     compression: bool,
+
+    /// Keepalive settings for the pooled connection to the downstream Vector instance.
+    #[configurable(derived)]
+    #[serde(default)]
+    keepalive: KeepAliveConfig,
 
     #[configurable(derived)]
     #[serde(default)]
@@ -100,6 +170,7 @@ fn default_config(address: &str) -> VectorConfig {
         version: None,
         address: address.to_owned(),
         compression: false,
+        keepalive: KeepAliveConfig::default(),
         batch: BatchConfig::default(),
         request: TowerRequestConfig::default(),
         tls: None,
@@ -114,7 +185,7 @@ impl SinkConfig for VectorConfig {
         let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
         let uri = with_default_scheme(&self.address, tls.is_tls())?;
 
-        let client = new_client(&tls, cx.proxy())?;
+        let client = new_client(&tls, cx.proxy(), self)?;
 
         let healthcheck_uri = cx
             .healthcheck
@@ -240,10 +311,19 @@ pub fn with_default_scheme(address: &str, tls: bool) -> crate::Result<Uri> {
 fn new_client(
     tls_settings: &MaybeTlsSettings,
     proxy_config: &ProxyConfig,
+    config: &VectorConfig,
 ) -> crate::Result<hyper::Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>> {
-    let proxy = build_proxy_connector(tls_settings.clone(), proxy_config)?;
+    let proxy = build_proxy_connector_with_tcp_keepalive(
+        tls_settings.clone(),
+        proxy_config,
+        config.keepalive.tcp_keepalive(),
+    )?;
 
-    Ok(hyper::Client::builder().http2_only(true).build(proxy))
+    let mut builder = hyper::Client::builder();
+    builder.http2_only(true);
+    config.keepalive.apply_http2_keepalive(&mut builder);
+
+    Ok(builder.build(proxy))
 }
 
 #[derive(Debug, Clone)]
@@ -279,7 +359,7 @@ impl RetryLogic for VectorGrpcRetryLogic {
 
 #[cfg(test)]
 mod tests {
-    use super::VectorConfig;
+    use super::{KeepAliveConfig, VectorConfig};
 
     fn compression_from(value: &str) -> Result<bool, toml::de::Error> {
         let config = format!("address = \"127.0.0.1:6000\"\ncompression = {value}\n");
@@ -306,5 +386,40 @@ mod tests {
         assert!(zstd.contains("zstd"), "{zstd}");
         let unknown = compression_from("\"snappy\"").unwrap_err().to_string();
         assert!(unknown.contains("gzip"), "{unknown}");
+    }
+
+    #[test]
+    fn keepalive_settings_default_to_disabled_and_parse_optional_values() {
+        let defaults: VectorConfig = toml::from_str("address = \"127.0.0.1:6000\"\n").unwrap();
+        assert_eq!(defaults.keepalive, KeepAliveConfig::default());
+
+        let configured: VectorConfig = toml::from_str(
+            r#"
+            address = "127.0.0.1:6000"
+            [keepalive]
+            http2_keep_alive_interval_secs = 30
+            http2_keep_alive_timeout_secs = 10
+            http2_keep_alive_while_idle = true
+            tcp_keepalive_secs = 60
+            "#,
+        )
+        .expect("optional keepalive settings should be accepted");
+        let configured = toml::Value::try_from(configured).unwrap();
+        assert_eq!(
+            configured["keepalive"]["http2_keep_alive_interval_secs"].as_integer(),
+            Some(30)
+        );
+        assert_eq!(
+            configured["keepalive"]["http2_keep_alive_timeout_secs"].as_integer(),
+            Some(10)
+        );
+        assert_eq!(
+            configured["keepalive"]["http2_keep_alive_while_idle"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            configured["keepalive"]["tcp_keepalive_secs"].as_integer(),
+            Some(60)
+        );
     }
 }

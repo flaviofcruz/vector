@@ -176,11 +176,19 @@ pub fn build_proxy_connector(
     tls_settings: MaybeTlsSettings,
     proxy_config: &ProxyConfig,
 ) -> Result<ProxyConnector<HttpsConnector<HttpConnector>>, HttpError> {
+    build_proxy_connector_with_tcp_keepalive(tls_settings, proxy_config, None)
+}
+
+pub(crate) fn build_proxy_connector_with_tcp_keepalive(
+    tls_settings: MaybeTlsSettings,
+    proxy_config: &ProxyConfig,
+    tcp_keepalive: Option<Duration>,
+) -> Result<ProxyConnector<HttpsConnector<HttpConnector>>, HttpError> {
     // Create dedicated TLS connector for the proxied connection with user TLS settings.
     let tls = tls_connector_builder(&tls_settings)
         .context(BuildTlsConnectorSnafu)?
         .build();
-    let https = build_tls_connector(tls_settings)?;
+    let https = build_tls_connector_with_tcp_keepalive(tls_settings, tcp_keepalive)?;
     let mut proxy = ProxyConnector::new(https).unwrap();
     // Make proxy connector aware of user TLS settings by setting the TLS connector:
     // https://github.com/vectordotdev/vector/issues/13683
@@ -194,8 +202,18 @@ pub fn build_proxy_connector(
 pub fn build_tls_connector(
     tls_settings: MaybeTlsSettings,
 ) -> Result<HttpsConnector<HttpConnector>, HttpError> {
+    build_tls_connector_with_tcp_keepalive(tls_settings, None)
+}
+
+fn build_tls_connector_with_tcp_keepalive(
+    tls_settings: MaybeTlsSettings,
+    tcp_keepalive: Option<Duration>,
+) -> Result<HttpsConnector<HttpConnector>, HttpError> {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
+    if let Some(tcp_keepalive) = tcp_keepalive {
+        http.set_keepalive(Some(tcp_keepalive));
+    }
 
     let tls = tls_connector_builder(&tls_settings).context(BuildTlsConnectorSnafu)?;
     let mut https = HttpsConnector::with_connector(http, tls).context(MakeHttpsConnectorSnafu)?;
