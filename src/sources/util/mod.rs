@@ -44,7 +44,11 @@ pub mod object_storage_compression;
 ))]
 pub mod object_storage_drain_gate;
 pub mod object_storage_rate_limit;
-#[cfg(any(feature = "sources-aws_s3", feature = "sources-azure_blob"))]
+#[cfg(any(
+    feature = "sources-aws_s3",
+    feature = "sources-azure_blob",
+    feature = "sources-gcp_gcs"
+))]
 mod truncated_archive_framer;
 #[cfg(all(
     unix,
@@ -60,7 +64,11 @@ mod wrappers;
 #[cfg(feature = "sources-file")]
 pub use encoding_config::EncodingConfig;
 pub use multiline_config::MultilineConfig;
-#[cfg(any(feature = "sources-aws_s3", feature = "sources-azure_blob"))]
+#[cfg(any(
+    feature = "sources-aws_s3",
+    feature = "sources-azure_blob",
+    feature = "sources-gcp_gcs"
+))]
 pub(crate) use truncated_archive_framer::TruncatedArchiveFramer;
 #[cfg(all(
     unix,

@@ -1722,6 +1722,7 @@ impl IngestorProcess {
                 cloud: CLOUD_PROVIDER,
                 container: &container,
                 blob: &blob,
+                dropped_tail_bytes: None,
             });
         }
 

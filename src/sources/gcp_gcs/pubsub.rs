@@ -125,6 +125,17 @@ pub(super) struct Config {
     #[serde(default)]
     pub(super) adaptive_concurrency: Option<ObjectStorageAdaptiveConcurrencyConfig>,
 
+    /// Whether to ingest the decodable prefix of a truncated compressed object and acknowledge it
+    /// instead of retrying the immutable object indefinitely.
+    ///
+    /// The option is off by default because the un-decodable tail is data loss. It applies only
+    /// when the full object size can be verified (objects served without `Content-Length` are
+    /// read without it) and only with newline or character-delimited framing; multiline
+    /// aggregation is not supported with this option.
+    #[serde(default)]
+    #[derivative(Default)]
+    pub(super) tolerate_truncated_archives: bool,
+
     /// Overrides the Pub/Sub API endpoint. Defaults to the public Pub/Sub endpoint.
     #[serde(default)]
     #[configurable(metadata(docs::examples = "https://pubsub.googleapis.com"))]
@@ -337,6 +348,21 @@ pub enum ProcessingError {
         key: String,
     },
 
+    /// The GCS response ended before its advertised content length.
+    #[snafu(display(
+        "Incomplete download of gs://{}/{}: read {} of {} bytes",
+        bucket,
+        key,
+        bytes_read,
+        content_length
+    ))]
+    IncompleteObjectDownload {
+        bytes_read: u64,
+        content_length: u64,
+        bucket: String,
+        key: String,
+    },
+
     /// Events could not be sent downstream.
     #[snafu(display("Failed to send events for gs://{}/{}: {}", bucket, key, source))]
     PipelineSend {
@@ -388,6 +414,17 @@ impl ProcessingError {
             // 503), downstream pipeline pressure. Re-delivery may succeed.
             _ => true,
         }
+    }
+
+    /// Some object-integrity failures must redeliver even when `acknowledge_failed_message` is
+    /// enabled: the object may be readable on a later attempt, and acknowledging it would lose it.
+    pub const fn must_redeliver(&self) -> bool {
+        matches!(self, ProcessingError::IncompleteObjectDownload { .. })
+    }
+
+    /// Whether a failed message may be acknowledged under the configured failure policy.
+    pub const fn should_acknowledge(&self, acknowledge_failed: bool) -> bool {
+        !self.is_retriable() || (acknowledge_failed && !self.must_redeliver())
     }
 
     /// Whether the message should be redelivered early. Only a request-level fetch failure
@@ -972,7 +1009,7 @@ impl IngestorProcess {
                     // Non-retriable errors must always be acknowledged to prevent
                     // an infinite retry loop. Retriable errors respect the
                     // acknowledge_failed_message config flag.
-                    if !err.is_retriable() || self.state.acknowledge_failed_message {
+                    if err.should_acknowledge(self.state.acknowledge_failed_message) {
                         ack_ids.push(ack_id);
                     } else if self.state.failed_message_ack_deadline_secs.is_some()
                         && let Some(reason) = err.release_reason()
@@ -1447,6 +1484,17 @@ mod tests {
             config.acknowledge_failed_message,
             "failed messages must be acknowledged by default to prevent infinite retries"
         );
+        assert!(
+            !config.tolerate_truncated_archives,
+            "truncated archives must not be tolerated by default"
+        );
+
+        let configured: Config = toml::from_str(
+            r#"subscription = "s"
+tolerate_truncated_archives = true"#,
+        )
+        .unwrap();
+        assert!(configured.tolerate_truncated_archives);
     }
 
     #[test]
@@ -1476,6 +1524,31 @@ mod tests {
             validate_failed_message_ack_deadline(Some(601)),
             Err(IngestorNewError::InvalidFailedMessageAckDeadline { secs: 601 })
         ));
+    }
+
+    #[test]
+    fn object_integrity_errors_force_redelivery() {
+        let errors = [ProcessingError::IncompleteObjectDownload {
+            bytes_read: 8,
+            content_length: 10,
+            bucket: "b".into(),
+            key: "k".into(),
+        }];
+
+        for error in errors {
+            assert!(error.is_retriable());
+            assert!(error.must_redeliver());
+            assert!(!error.should_acknowledge(true));
+            assert!(!error.should_acknowledge(false));
+        }
+
+        let ordinary_error = ProcessingError::ReadObject {
+            source: Box::new(std::io::Error::other("decode failure")),
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        assert!(ordinary_error.should_acknowledge(true));
+        assert!(!ordinary_error.should_acknowledge(false));
     }
 
     /// Only a request-level fetch failure is released early; body, decode, and permanent errors

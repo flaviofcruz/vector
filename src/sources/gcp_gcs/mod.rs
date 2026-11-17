@@ -166,6 +166,30 @@ const fn default_framing() -> FramingConfig {
     })
 }
 
+fn validate_truncated_archive_config(
+    tolerate_truncated_archives: bool,
+    has_multiline: bool,
+    framing: &FramingConfig,
+) -> crate::Result<()> {
+    if !tolerate_truncated_archives {
+        return Ok(());
+    }
+    if has_multiline {
+        return Err(
+            "`tolerate_truncated_archives` cannot be combined with multiline aggregation".into(),
+        );
+    }
+    if !matches!(
+        framing,
+        FramingConfig::NewlineDelimited(_) | FramingConfig::CharacterDelimited(_)
+    ) {
+        return Err(
+            "`tolerate_truncated_archives` requires newline- or character-delimited framing".into(),
+        );
+    }
+    Ok(())
+}
+
 impl_generate_config_from_default!(GcpGcsConfig);
 
 #[async_trait::async_trait]
@@ -180,6 +204,15 @@ impl SourceConfig for GcpGcsConfig {
         {
             return Err("adaptive blob concurrency requires end-to-end acknowledgements".into());
         }
+        let tolerate_truncated_archives = self
+            .pubsub
+            .as_ref()
+            .is_some_and(|config| config.tolerate_truncated_archives);
+        validate_truncated_archive_config(
+            tolerate_truncated_archives,
+            self.multiline.is_some(),
+            &self.framing,
+        )?;
         let log_namespace = cx.log_namespace(self.log_namespace);
 
         let multiline_config: Option<line_agg::Config> = self
@@ -278,15 +311,18 @@ impl GcpGcsConfig {
             TlsSettings::from_options(self.tls.as_ref()).map_err(|e| format!("TLS error: {e}"))?;
         let client = HttpClient::new(tls, proxy).map_err(|e| format!("{e}"))?;
 
-        let downloader = std::sync::Arc::new(object::GcsDownloader::new(
-            client.clone(),
-            auth.clone(),
-            self.compression,
-            decoder,
-            multiline,
-            self.project.clone(),
-            self.storage_endpoint.clone(),
-        )?);
+        let downloader = std::sync::Arc::new(
+            object::GcsDownloader::new(
+                client.clone(),
+                auth.clone(),
+                self.compression,
+                decoder,
+                multiline,
+                self.project.clone(),
+                self.storage_endpoint.clone(),
+            )?
+            .with_tolerate_truncated_archives(pubsub_config.tolerate_truncated_archives),
+        );
 
         let callback_client = self
             .ingestion_callback
@@ -468,6 +504,15 @@ mod tests {
             pubsub.client_concurrency,
             Some(std::num::NonZeroUsize::new(8).unwrap())
         );
+    }
+
+    #[test]
+    fn truncated_archive_tolerance_requires_safe_framing() {
+        let newline = default_framing();
+        assert!(validate_truncated_archive_config(true, false, &newline).is_ok());
+        assert!(validate_truncated_archive_config(true, true, &newline).is_err());
+        assert!(validate_truncated_archive_config(true, false, &FramingConfig::Bytes).is_err());
+        assert!(validate_truncated_archive_config(false, true, &FramingConfig::Bytes).is_ok());
     }
 
     #[test]

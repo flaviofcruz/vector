@@ -1,11 +1,18 @@
-use std::future::ready;
+use std::{
+    future::ready,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use http::Request;
 use hyper::Body;
 use smallvec::SmallVec;
+use tokio::io::AsyncRead;
 use tokio_util::codec::FramedRead;
 use vector_lib::{
     config::{LegacyKey, LogNamespace, log_schema},
@@ -25,13 +32,14 @@ use crate::{
     gcp::GcpAuthenticator,
     http::HttpClient,
     internal_events::{
-        GcsObjectProcessingFailed, GcsObjectProcessingSucceeded, StreamClosedError,
-        emit_object_storage_ack_metrics,
+        GcsObjectProcessingFailed, GcsObjectProcessingSucceeded, ObjectStorageBlobTruncated,
+        StreamClosedError, emit_object_storage_ack_metrics,
     },
     line_agg::{self, LineAgg},
     sources::gcp_gcs::{Compression, GcpGcsConfig},
     sources::util::object_storage_adaptive_concurrency::AdaptiveObjectStorageConcurrency,
     sources::util::object_storage_rate_limit::ByteCounter,
+    sources::util::{TolerateTrailingEof, TruncatedArchiveFramer},
 };
 
 pub use crate::sources::gcp_gcs::pubsub::ProcessingError;
@@ -47,6 +55,7 @@ pub(super) struct GcsDownloader {
     compression: Compression,
     decoder: Decoder,
     multiline: Option<line_agg::Config>,
+    tolerate_truncated_archives: bool,
     project: String,
     /// GCS base URL, parsed and validated at construction. Defaults to
     /// [`GCS_BASE_URL`] and can be overridden via the source's `storage_endpoint` config.
@@ -86,10 +95,16 @@ impl GcsDownloader {
             compression,
             decoder,
             multiline,
+            tolerate_truncated_archives: false,
             project,
             base_url: parse_base_url(endpoint)?,
             adaptive: None,
         })
+    }
+
+    pub(super) const fn with_tolerate_truncated_archives(mut self, tolerate: bool) -> Self {
+        self.tolerate_truncated_archives = tolerate;
+        self
     }
 
     pub(super) fn with_adaptive_concurrency(
@@ -180,6 +195,23 @@ impl GcsDownloader {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
+        let content_length = response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        // A truncated archive can only be told apart from a short transfer when the object size
+        // is known, so without Content-Length this object is read without tolerance.
+        let tolerate_truncated_archives =
+            self.tolerate_truncated_archives && content_length.is_some();
+        if self.tolerate_truncated_archives && content_length.is_none() {
+            warn!(
+                message = "GCS response has no Content-Length; reading without truncated-archive tolerance.",
+                bucket = %bucket,
+                key = %key,
+                internal_log_rate_limit = true
+            );
+        }
 
         debug!(
             message = "Fetched GCS object.",
@@ -188,7 +220,27 @@ impl GcsDownloader {
             internal_log_rate_limit = true
         );
 
-        let body_stream = response.into_body().map_err(std::io::Error::other);
+        let compressed_bytes = Arc::new(AtomicU64::new(0));
+        // Set when the body itself fails (e.g. the connection drops), as opposed to the decoder
+        // or the pipeline stopping the read early.
+        let transport_failed = Arc::new(AtomicBool::new(false));
+        let count_compressed_bytes = tolerate_truncated_archives;
+        let body_stream = response.into_body().map({
+            let compressed_bytes = Arc::clone(&compressed_bytes);
+            let transport_failed = Arc::clone(&transport_failed);
+            move |result| {
+                result
+                    .inspect(|chunk| {
+                        if count_compressed_bytes {
+                            compressed_bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        }
+                    })
+                    .map_err(|error| {
+                        transport_failed.store(true, Ordering::Relaxed);
+                        std::io::Error::other(error)
+                    })
+            }
+        });
 
         let (batch, receiver) = BatchNotifier::maybe_new_with_receiver(acknowledgements);
 
@@ -198,15 +250,34 @@ impl GcsDownloader {
             .resolve(Some(&content_encoding), Some(&content_type), &key)
             .build_decoder(body_stream)
             .await;
+        let truncated_tail = Arc::new(AtomicBool::new(false));
+        let dropped_tail_bytes = Arc::new(AtomicU64::new(0));
+        let object_reader: Box<dyn AsyncRead + Send + Unpin> = if tolerate_truncated_archives {
+            Box::new(TolerateTrailingEof::new(
+                object_reader,
+                Arc::clone(&truncated_tail),
+            ))
+        } else {
+            object_reader
+        };
 
         let mut read_error = None;
         let bytes_received = bytes_received.clone();
         let events_received = events_received.clone();
         // Count decoded bytes so the caller can pace on the batch total.
         let byte_counter = byte_counter.clone();
+        let framer = if tolerate_truncated_archives {
+            TruncatedArchiveFramer::with_dropped_tail_bytes(
+                self.decoder.framer.clone(),
+                Arc::clone(&truncated_tail),
+                Arc::clone(&dropped_tail_bytes),
+            )
+        } else {
+            TruncatedArchiveFramer::new(self.decoder.framer.clone(), Arc::clone(&truncated_tail))
+        };
 
         let lines: Box<dyn Stream<Item = Bytes> + Send + Unpin> = Box::new(
-            FramedRead::new(object_reader, self.decoder.framer.clone())
+            FramedRead::new(object_reader, framer)
                 .map(|res| {
                     res.inspect(|bytes| {
                         bytes_received.emit(ByteSize(bytes.len()));
@@ -273,6 +344,25 @@ impl GcsDownloader {
         drop(stream);
         drop(batch);
 
+        // A short read is an incomplete download only when the transfer itself ended early. A
+        // decode or pipeline failure also stops the read before the end of the body, and must
+        // keep its own error so it is classified (and acknowledged) as before.
+        if tolerate_truncated_archives
+            && let Some(content_length) = content_length
+            && (transport_failed.load(Ordering::Relaxed)
+                || (read_error.is_none() && send_error.is_none()))
+        {
+            let pulled = compressed_bytes.load(Ordering::Relaxed);
+            if pulled < content_length {
+                return Err(ProcessingError::IncompleteObjectDownload {
+                    bytes_read: pulled,
+                    content_length,
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                });
+            }
+        }
+
         if let Some(error) = read_error {
             return Err(ProcessingError::ReadObject {
                 source: error,
@@ -289,10 +379,26 @@ impl GcsDownloader {
             });
         }
 
-        match receiver {
+        let batch_status = match receiver {
+            None => None,
+            Some(receiver) => Some(receiver.await),
+        };
+        let delivered = batch_status
+            .as_ref()
+            .is_none_or(|status| *status == BatchStatus::Delivered);
+
+        if truncated_tail.load(Ordering::Relaxed) && delivered {
+            emit!(ObjectStorageBlobTruncated {
+                cloud: "gcp",
+                container: &bucket,
+                blob: &key,
+                dropped_tail_bytes: Some(dropped_tail_bytes.load(Ordering::Relaxed)),
+            });
+        }
+
+        match batch_status {
             None => Ok(()),
-            Some(receiver) => {
-                let result = receiver.await;
+            Some(result) => {
                 if result != BatchStatus::Delivered
                     && let Some(adaptive) = &self.adaptive
                 {
@@ -414,6 +520,14 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn test_downloader(base_url: &str) -> GcsDownloader {
+        test_downloader_with_options(base_url, Compression::Auto, false)
+    }
+
+    fn test_downloader_with_options(
+        base_url: &str,
+        compression: Compression,
+        tolerate_truncated_archives: bool,
+    ) -> GcsDownloader {
         use crate::codecs::DecodingConfig;
         use crate::serde::default_decoding;
 
@@ -429,13 +543,14 @@ mod tests {
         GcsDownloader::new(
             client,
             GcpAuthenticator::None,
-            Compression::Auto,
+            compression,
             decoder,
             None,
             "test-project".into(),
             Some(base_url.into()),
         )
         .expect("test downloader must build")
+        .with_tolerate_truncated_archives(tolerate_truncated_archives)
     }
 
     /// A bad `storage_endpoint` fails fast at construction with a config error
@@ -463,6 +578,15 @@ mod tests {
 
     /// Spawns a one-shot HTTP server that returns the given bytes with `status`.
     async fn spawn_test_server_bytes(status: u16, body: bytes::Bytes) -> SocketAddr {
+        spawn_test_server_bytes_with_length(status, body, None, false).await
+    }
+
+    async fn spawn_test_server_bytes_with_length(
+        status: u16,
+        body: bytes::Bytes,
+        content_length: Option<u64>,
+        chunked: bool,
+    ) -> SocketAddr {
         use std::sync::Arc;
         let body = Arc::new(body);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -478,12 +602,22 @@ mod tests {
                         Ok::<_, Infallible>(service_fn(move |_req| {
                             let body = Arc::clone(&body);
                             async move {
-                                Ok::<_, Infallible>(
-                                    Response::builder()
-                                        .status(status)
-                                        .body(Body::from((*body).clone()))
-                                        .unwrap(),
-                                )
+                                let mut builder = Response::builder().status(status);
+                                if let Some(content_length) = content_length {
+                                    builder = builder.header("content-length", content_length);
+                                }
+                                let response_body = if chunked {
+                                    builder = builder.header("transfer-encoding", "chunked");
+                                    Body::wrap_stream(futures::stream::iter([Ok::<
+                                        _,
+                                        std::io::Error,
+                                    >(
+                                        (*body).clone()
+                                    )]))
+                                } else {
+                                    Body::from((*body).clone())
+                                };
+                                Ok::<_, Infallible>(builder.body(response_body).unwrap())
                             }
                         }))
                     }
@@ -492,6 +626,44 @@ mod tests {
         });
 
         addr
+    }
+
+    async fn spawn_test_server_short_content_length(
+        body: bytes::Bytes,
+        content_length: u64,
+    ) -> SocketAddr {
+        use tokio::io::AsyncWriteExt as _;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            stream.write_all(&response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        addr
+    }
+
+    fn gzip_member(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn truncated_gzip_body() -> Vec<u8> {
+        let mut body = gzip_member(b"complete-1\ncomplete-2\n");
+        let mut last_member = gzip_member(b"complete-3\npartial-tail");
+        last_member.truncate(last_member.len() - 3);
+        body.extend_from_slice(&last_member);
+        body
     }
 
     // -------------------------------------------------------------------------
@@ -747,6 +919,255 @@ mod tests {
         assert_eq!(events[0].as_log()["message"], "first line".into());
         assert_eq!(events[1].as_log()["message"], "second line".into());
         assert_eq!(events[2].as_log()["message"], "third line".into());
+    }
+
+    #[tokio::test]
+    async fn truncated_gzip_with_newline_framing_ingests_complete_lines() {
+        let body = truncated_gzip_body();
+        let addr = spawn_test_server_bytes(200, bytes::Bytes::from(body)).await;
+        let downloader =
+            test_downloader_with_options(&format!("http://{addr}"), Compression::Gzip, true);
+        let (mut tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        let process = async move {
+            let result = downloader
+                .process_object(
+                    "my-bucket",
+                    "logs/archive.gz",
+                    None,
+                    &mut tx,
+                    LogNamespace::Legacy,
+                    true,
+                    false,
+                    &register!(BytesReceived::from(Protocol::HTTP)),
+                    &register!(EventsReceived),
+                    &ByteCounter::default(),
+                )
+                .await;
+            drop(tx);
+            result
+        };
+        let (result, events) = tokio::join!(process, rx.collect::<Vec<_>>());
+
+        assert!(
+            result.is_ok(),
+            "truncated archive should be tolerated: {result:?}"
+        );
+        assert_eq!(events.len(), 3, "the partial final line must be dropped");
+        assert_eq!(events[0].as_log()["message"], "complete-1".into());
+        assert_eq!(events[1].as_log()["message"], "complete-2".into());
+        assert_eq!(events[2].as_log()["message"], "complete-3".into());
+    }
+
+    #[tokio::test]
+    async fn short_gcs_download_is_not_acknowledged() {
+        let body = gzip_member(b"event\n");
+        let expected_size = body.len() as u64 + 10;
+        let addr =
+            spawn_test_server_short_content_length(bytes::Bytes::from(body), expected_size).await;
+        let downloader =
+            test_downloader_with_options(&format!("http://{addr}"), Compression::Gzip, true);
+        let (mut tx, _rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+
+        let result = downloader
+            .process_object(
+                "my-bucket",
+                "logs/short.gz",
+                None,
+                &mut tx,
+                LogNamespace::Legacy,
+                false,
+                true,
+                &register!(BytesReceived::from(Protocol::HTTP)),
+                &register!(EventsReceived),
+                &ByteCounter::default(),
+            )
+            .await;
+
+        let error = result.expect_err("short transfer must fail before acknowledging");
+        assert!(matches!(
+            error,
+            ProcessingError::IncompleteObjectDownload { .. }
+        ));
+        assert!(error.is_retriable());
+        assert!(!error.should_acknowledge(true));
+    }
+
+    /// Runs `process_object` with truncation tolerance on and acknowledgements off, returning the
+    /// result and the events that reached the pipeline.
+    async fn process_tolerant(
+        addr: SocketAddr,
+        key: &str,
+    ) -> (Result<(), ProcessingError>, Vec<Event>) {
+        let downloader =
+            test_downloader_with_options(&format!("http://{addr}"), Compression::Gzip, true);
+        let (mut tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        let key = key.to_owned();
+        let process = async move {
+            let result = downloader
+                .process_object(
+                    "my-bucket",
+                    &key,
+                    None,
+                    &mut tx,
+                    LogNamespace::Legacy,
+                    false,
+                    true,
+                    &register!(BytesReceived::from(Protocol::HTTP)),
+                    &register!(EventsReceived),
+                    &ByteCounter::default(),
+                )
+                .await;
+            drop(tx);
+            result
+        };
+        tokio::join!(process, rx.collect::<Vec<_>>())
+    }
+
+    /// Without Content-Length a short transfer cannot be told apart from a truncated archive,
+    /// so the object is read without tolerance: a healthy object is ingested normally.
+    #[tokio::test]
+    async fn unknown_gcs_object_size_reads_without_tolerance() {
+        let body = gzip_member(b"line-1\nline-2\n");
+        let addr =
+            spawn_test_server_bytes_with_length(200, bytes::Bytes::from(body), None, true).await;
+
+        let (result, events) = process_tolerant(addr, "logs/unknown-size.gz").await;
+
+        assert!(
+            result.is_ok(),
+            "healthy object must be ingested: {result:?}"
+        );
+        assert_eq!(events.len(), 2);
+    }
+
+    /// A truncated archive without Content-Length keeps the non-tolerant read error, which the
+    /// configured failure policy may acknowledge.
+    #[tokio::test]
+    async fn unknown_gcs_object_size_keeps_truncation_read_error() {
+        let addr = spawn_test_server_bytes_with_length(
+            200,
+            bytes::Bytes::from(truncated_gzip_body()),
+            None,
+            true,
+        )
+        .await;
+
+        let (result, _events) = process_tolerant(addr, "logs/unknown-size.gz").await;
+
+        let error = result.expect_err("truncation without a known size must not be tolerated");
+        assert!(
+            matches!(error, ProcessingError::ReadObject { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(error.should_acknowledge(true));
+    }
+
+    /// A gzip header followed by an invalid deflate block, padded well past what a socket buffers,
+    /// so the decoder fails before most of the body has been pulled.
+    fn corrupt_gzip_body() -> Vec<u8> {
+        let mut body = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        // BFINAL=1, BTYPE=11 (reserved): an invalid block type.
+        body.push(0x07);
+        body.resize(4 * 1024 * 1024, 0);
+        body
+    }
+
+    /// A decode failure stops the read early, but it is not a short transfer: it must stay a
+    /// `ReadObject` error that `acknowledge_failed_message` can acknowledge, not redeliver forever.
+    #[tokio::test]
+    async fn corrupt_gzip_with_tolerance_keeps_read_error() {
+        let body = corrupt_gzip_body();
+        let length = body.len() as u64;
+        let addr =
+            spawn_test_server_bytes_with_length(200, bytes::Bytes::from(body), Some(length), false)
+                .await;
+
+        let (result, _events) = process_tolerant(addr, "logs/corrupt.gz").await;
+
+        let error = result.expect_err("corrupt archive must fail");
+        assert!(
+            matches!(error, ProcessingError::ReadObject { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(!error.must_redeliver());
+        assert!(error.should_acknowledge(true));
+    }
+
+    /// A gzip object of incompressible lines, large enough that most of it is still unread when
+    /// the pipeline stops accepting events.
+    fn large_gzip_body() -> Vec<u8> {
+        use std::fmt::Write as _;
+
+        let mut lines = String::new();
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        while lines.len() < 8 * 1024 * 1024 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            writeln!(lines, "{state:016x}{:016x}", state.rotate_left(17)).unwrap();
+        }
+        gzip_member(lines.as_bytes())
+    }
+
+    /// A downstream send failure also leaves the body unread; it must stay `PipelineSend` so the
+    /// caller still sees back-pressure.
+    #[tokio::test]
+    async fn pipeline_send_failure_with_tolerance_keeps_send_error() {
+        let body = large_gzip_body();
+        let length = body.len() as u64;
+        let addr =
+            spawn_test_server_bytes_with_length(200, bytes::Bytes::from(body), Some(length), false)
+                .await;
+        let downloader =
+            test_downloader_with_options(&format!("http://{addr}"), Compression::Gzip, true);
+        let (mut tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        drop(rx);
+
+        let result = downloader
+            .process_object(
+                "my-bucket",
+                "logs/large.gz",
+                None,
+                &mut tx,
+                LogNamespace::Legacy,
+                false,
+                true,
+                &register!(BytesReceived::from(Protocol::HTTP)),
+                &register!(EventsReceived),
+                &ByteCounter::default(),
+            )
+            .await;
+
+        let error = result.expect_err("closed pipeline must fail the send");
+        assert!(
+            matches!(error, ProcessingError::PipelineSend { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_gzip_option_off_keeps_read_error() {
+        let addr = spawn_test_server_bytes(200, bytes::Bytes::from(truncated_gzip_body())).await;
+        let downloader =
+            test_downloader_with_options(&format!("http://{addr}"), Compression::Gzip, false);
+        let (mut tx, _rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+
+        let result = downloader
+            .process_object(
+                "my-bucket",
+                "logs/archive.gz",
+                None,
+                &mut tx,
+                LogNamespace::Legacy,
+                false,
+                false,
+                &register!(BytesReceived::from(Protocol::HTTP)),
+                &register!(EventsReceived),
+                &ByteCounter::default(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(ProcessingError::ReadObject { .. })));
     }
 
     // -------------------------------------------------------------------------

@@ -357,13 +357,15 @@ impl InternalEvent for QueueMessageCount<'_> {
 /// records that did decode and acked the message rather than redelivering an immutable blob that
 /// can never fully decode; the truncated tail is dropped. This is a tolerated data-drop, not a
 /// component error, so it is counted on its own metric (`object_storage_blob_truncated_total`)
-/// rather than `component_errors_total` — it must not inflate error-rate alerting. Per-blob
-/// granularity: how many records were in the dropped tail is unknown (they never decoded).
+/// rather than `component_errors_total` — it must not inflate error-rate alerting. Boundary
+/// framers can report the bytes in an unframed decoded tail; the compressed archive tail itself
+/// is not measurable from the decoder error.
 #[derive(Debug)]
 pub struct ObjectStorageBlobTruncated<'a> {
     pub cloud: &'a str,
     pub container: &'a str,
     pub blob: &'a str,
+    pub dropped_tail_bytes: Option<u64>,
 }
 
 impl NamedInternalEvent for ObjectStorageBlobTruncated<'_> {
@@ -374,13 +376,25 @@ impl NamedInternalEvent for ObjectStorageBlobTruncated<'_> {
 
 impl InternalEvent for ObjectStorageBlobTruncated<'_> {
     fn emit(self) {
-        warn!(
-            message = "Blob stream truncated (UnexpectedEof); ingested the decodable prefix and \
-                       acked the message to stop infinite redelivery. The truncated tail is dropped.",
-            container = %self.container,
-            blob = %self.blob,
-            cloud = %self.cloud,
-        );
+        if self.cloud == "gcp" {
+            warn!(
+                message = "Blob stream truncated (UnexpectedEof); ingested the decodable prefix and \
+                           acked the message to stop infinite redelivery. The truncated tail is dropped.",
+                bucket = %self.container,
+                key = %self.blob,
+                cloud = %self.cloud,
+                dropped_tail_bytes = ?self.dropped_tail_bytes,
+            );
+        } else {
+            warn!(
+                message = "Blob stream truncated (UnexpectedEof); ingested the decodable prefix and \
+                           acked the message to stop infinite redelivery. The truncated tail is dropped.",
+                container = %self.container,
+                blob = %self.blob,
+                cloud = %self.cloud,
+                dropped_tail_bytes = ?self.dropped_tail_bytes,
+            );
+        }
         counter!("object_storage_blob_truncated_total", "cloud" => self.cloud.to_string())
             .increment(1);
     }
