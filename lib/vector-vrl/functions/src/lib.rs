@@ -17,6 +17,7 @@ pub mod apply_redaction;
 #[cfg(feature = "databricks-redaction")]
 pub mod enforce_metadata_shape;
 pub mod get_secret;
+pub mod lp_any_subtable;
 pub mod lp_oneof_payload;
 #[cfg(feature = "databricks-redaction")]
 pub mod lp_splice_metadata;
@@ -56,6 +57,7 @@ pub fn lumberjack_prime_functions() -> Vec<Box<dyn Function>> {
         Box::new(registry_variant::LpRegistryVariant) as _,
         Box::new(lp_subtable_name::LpSubtableName) as _,
         Box::new(lp_oneof_payload::LpOneofPayload) as _,
+        Box::new(lp_any_subtable::LpAnySubtable) as _,
     ]
 }
 
