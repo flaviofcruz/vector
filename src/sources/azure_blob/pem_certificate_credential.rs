@@ -70,6 +70,8 @@ pub enum AzureCloud {
     Public,
     /// Azure US Government endpoints.
     UsGovernment,
+    /// Azure China endpoints.
+    China,
 }
 
 impl AzureCloud {
@@ -77,7 +79,26 @@ impl AzureCloud {
         match self {
             Self::Public => "core.windows.net",
             Self::UsGovernment => "core.usgovcloudapi.net",
+            Self::China => "core.chinacloudapi.cn",
         }
+    }
+
+    const fn authority_host(self) -> Option<&'static str> {
+        match self {
+            Self::Public => None,
+            Self::UsGovernment => Some("https://login.microsoftonline.us"),
+            Self::China => Some("https://login.chinacloudapi.cn"),
+        }
+    }
+
+    pub(super) fn from_blob_host(host: &str) -> Self {
+        let Some((_, suffix)) = host.split_once(".blob.") else {
+            return Self::Public;
+        };
+        [Self::UsGovernment, Self::China]
+            .into_iter()
+            .find(|cloud| suffix == cloud.storage_endpoint_suffix())
+            .unwrap_or(Self::Public)
     }
 }
 
@@ -142,8 +163,8 @@ impl PemCertificateCredential {
     /// Loads the PEM key and certificate for signing Azure client assertions.
     pub fn create_client_certificate_credential(&self) -> Result<PemTokenCredential> {
         let mut options = TokenCredentialOptions::default();
-        if self.cloud == AzureCloud::UsGovernment {
-            options.set_authority_host("https://login.microsoftonline.us".to_owned());
+        if let Some(authority_host) = self.cloud.authority_host() {
+            options.set_authority_host(authority_host.to_owned());
         }
         self.create_credential_with_options(options)
     }
@@ -450,6 +471,7 @@ FLgLKNR10xCWvrfoLa2uhwFmt1pjfBCV+GRkscoq3DxIpTxzESL5jIX5VRUSug==
         for (cloud, authority) in [
             (AzureCloud::Public, "https://login.microsoftonline.com"),
             (AzureCloud::UsGovernment, "https://login.microsoftonline.us"),
+            (AzureCloud::China, "https://login.chinacloudapi.cn"),
         ] {
             let mut config = test_config(&file, true);
             config.cloud = cloud;

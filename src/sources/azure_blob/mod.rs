@@ -550,7 +550,7 @@ fn build_blob_service_client(
 ) -> BlobServiceClient {
     let builder = match cloud {
         AzureCloud::Public => ClientBuilder::new(account, credentials),
-        AzureCloud::UsGovernment => ClientBuilder::with_location(
+        AzureCloud::UsGovernment | AzureCloud::China => ClientBuilder::with_location(
             CloudLocation::Custom {
                 uri: format!("https://{account}.blob.{}", cloud.storage_endpoint_suffix()),
                 account,
@@ -570,7 +570,7 @@ fn build_queue_service_client(
 ) -> QueueServiceClient {
     match cloud {
         AzureCloud::Public => QueueServiceClient::new(account, credentials),
-        AzureCloud::UsGovernment => QueueServiceClientBuilder::with_location(
+        AzureCloud::UsGovernment | AzureCloud::China => QueueServiceClientBuilder::with_location(
             CloudLocation::Custom {
                 uri: format!(
                     "https://{account}.queue.{}",
@@ -907,23 +907,25 @@ mod test {
         assert!(client_cert.send_certificate_chain);
         assert_eq!(config.queue.queue_name, "my-queue");
 
-        let gov_config: AzureBlobConfig = toml::from_str(
-            r#"
+        for (cloud, expected) in [
+            ("us_government", AzureCloud::UsGovernment),
+            ("china", AzureCloud::China),
+        ] {
+            let sovereign_config: AzureBlobConfig = toml::from_str(&format!(
+                r#"
             [client_certificate]
             tenant_id = "tenant"
             client_id = "client"
             storage_account = "account"
             client_certificate_path = "/path/to/cert.pem"
-            cloud = "us_government"
+            cloud = "{cloud}"
             [queue]
             queue_name = "messages"
             "#,
-        )
-        .unwrap();
-        assert_eq!(
-            gov_config.client_certificate.unwrap().cloud,
-            AzureCloud::UsGovernment
-        );
+            ))
+            .unwrap();
+            assert_eq!(sovereign_config.client_certificate.unwrap().cloud, expected);
+        }
 
         // Test 3: Test full config with connection string and all options
         let config: Result<AzureBlobConfig, _> = toml::from_str(
@@ -1202,6 +1204,12 @@ mod test {
                 "https://account.blob.core.usgovcloudapi.net/c/b",
                 "https://account.queue.core.usgovcloudapi.net/",
                 "other.blob.core.usgovcloudapi.net",
+            ),
+            (
+                AzureCloud::China,
+                "https://account.blob.core.chinacloudapi.cn/c/b",
+                "https://account.queue.core.chinacloudapi.cn/",
+                "other.blob.core.chinacloudapi.cn",
             ),
         ] {
             let credentials = StorageCredentials::access_key("account", "Zm9vYmFyYmF6");

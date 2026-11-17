@@ -675,18 +675,11 @@ pub(super) struct Ingestor {
 pub(super) fn cloud_for_cross_account(blob_client: &BlobServiceClient) -> super::AzureCloud {
     // Cross-account credentials are only present for certificate auth, whose primary
     // blob client already uses the configured cloud. Reuse its endpoint for extra accounts.
-    let gov_blob_suffix = format!(
-        ".blob.{}",
-        super::AzureCloud::UsGovernment.storage_endpoint_suffix()
-    );
-    if blob_client.url().ok().is_some_and(|url| {
-        url.host_str()
-            .is_some_and(|host| host.ends_with(&gov_blob_suffix))
-    }) {
-        super::AzureCloud::UsGovernment
-    } else {
-        super::AzureCloud::Public
-    }
+    blob_client
+        .url()
+        .ok()
+        .and_then(|url| url.host_str().map(super::AzureCloud::from_blob_host))
+        .unwrap_or(super::AzureCloud::Public)
 }
 
 impl Ingestor {
