@@ -14,8 +14,9 @@ pub use encoder::{BatchEncoder, BatchOutput, BatchSerializer, Encoder, EncoderKi
 #[cfg(feature = "arrow")]
 pub use format::{
     ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig, OnWireTypeMismatch,
-    SchemaProvider, WireToArrowEncoder, WireToArrowError, WireToArrowSerializer,
-    WireToArrowSerializerConfig, build_record_batch, record_batch_to_arrow_ipc_stream,
+    SchemaProvider, VariantMessageEncoding, WireToArrowEncoder, WireToArrowError,
+    WireToArrowSerializer, WireToArrowSerializerConfig, build_record_batch,
+    record_batch_to_arrow_ipc_stream,
 };
 pub use format::{
     AvroSerializer, AvroSerializerConfig, AvroSerializerOptions, CefSerializer,

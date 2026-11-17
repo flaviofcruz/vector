@@ -279,6 +279,17 @@ pub enum WireToArrowError {
         source: prost_reflect::prost::DecodeError,
     },
 
+    /// A VARIANT column's nested proto message (Spark encoding) lacks a
+    /// `required` field, which Spark's `DynamicMessage.parseFrom` rejects.
+    /// `encode_batch` first merges the row's singular occurrences and
+    /// revalidates, since a later occurrence can supply the field; a row
+    /// still missing it drops via per-row isolation.
+    #[snafu(display("VARIANT message field is missing required field '{field}'"))]
+    VariantMessageMissingRequiredField {
+        /// The missing field's full name.
+        field: String,
+    },
+
     /// The Arrow schema declares a singular column as non-nullable, but the
     /// encoder cannot guarantee a value will be present on every row.
     ///

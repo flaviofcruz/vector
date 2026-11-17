@@ -52,8 +52,8 @@ pub use text::{TextSerializer, TextSerializerConfig};
 use vector_core::event::Event;
 #[cfg(feature = "arrow")]
 pub use wire_to_arrow::{
-    OnWireTypeMismatch, WireToArrowEncoder, WireToArrowError, WireToArrowSerializer,
-    WireToArrowSerializerConfig,
+    OnWireTypeMismatch, VariantMessageEncoding, WireToArrowEncoder, WireToArrowError,
+    WireToArrowSerializer, WireToArrowSerializerConfig,
 };
 
 pub use self::csv::{CsvSerializer, CsvSerializerConfig};

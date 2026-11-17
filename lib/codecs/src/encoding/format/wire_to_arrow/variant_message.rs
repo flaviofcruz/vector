@@ -38,13 +38,15 @@ use zeroparser::wire::{
     WireValue, decode_zigzag32, decode_zigzag64, try_parse_field, try_read_varint,
 };
 
-use super::append::{encode_variant_from_message, wire_type_byte};
+use super::append::{encode_variant_from_message, expect_len, wire_type_byte};
 use super::errors::Result;
 use super::plan::{WT_I32, WT_I64, WT_LEN, WT_VARINT};
+use super::serializer::VariantMessageEncoding;
+use super::variant_spark::SparkVariantEncoder;
 
 /// Recursion limit of the reference `DynamicMessage` decode (prost's default);
 /// deeper input falls back so the reference decides.
-const MAX_DEPTH: usize = 100;
+pub(super) const MAX_DEPTH: usize = 100;
 
 /// Field-number range served by a dense lookup table; wider messages use a map.
 const DENSE_FIELD_NUMBER_LIMIT: u32 = 4096;
@@ -309,6 +311,9 @@ pub(crate) struct VariantMessagePlan {
     messages: Vec<MessageVariantPlan>,
     /// The column's own message is a well-known type: always use the reference.
     root_fallback: bool,
+    /// Set for [`VariantMessageEncoding::Spark`] and
+    /// [`VariantMessageEncoding::SparkStripNulls`]: replaces both the direct walk and the reference.
+    spark: Option<SparkVariantEncoder>,
 }
 
 impl std::fmt::Debug for VariantMessagePlan {
@@ -316,6 +321,7 @@ impl std::fmt::Debug for VariantMessagePlan {
         f.debug_struct("VariantMessagePlan")
             .field("message", &self.descriptor.full_name())
             .field("compiled_messages", &self.messages.len())
+            .field("spark", &self.spark.is_some())
             .finish()
     }
 }
@@ -330,11 +336,31 @@ impl VariantMessagePlan {
             descriptor: descriptor.clone(),
             messages: Vec::new(),
             root_fallback: is_well_known(descriptor),
+            spark: None,
         };
         if !plan.root_fallback {
             plan.compile(descriptor, &mut HashMap::new());
         }
         plan
+    }
+
+    /// A plan for `descriptor` that encodes with `encoding`. The proto JSON encoding is
+    /// [`VariantMessagePlan::new`]; the Spark encodings skip the direct-walk compile.
+    pub(crate) fn with_encoding(
+        descriptor: &MessageDescriptor,
+        encoding: VariantMessageEncoding,
+    ) -> Self {
+        let strip_nulls = match encoding {
+            VariantMessageEncoding::ProtoJson => return Self::new(descriptor),
+            VariantMessageEncoding::Spark => false,
+            VariantMessageEncoding::SparkStripNulls => true,
+        };
+        Self {
+            descriptor: descriptor.clone(),
+            messages: Vec::new(),
+            root_fallback: true,
+            spark: Some(SparkVariantEncoder::new(descriptor, strip_nulls)),
+        }
     }
 
     /// Compile `desc` (and, recursively, its message-typed fields) and return
@@ -451,6 +477,9 @@ impl VariantMessagePlan {
     /// occurrence aborts the direct walk, deferring to the reference decoder —
     /// which rejects it — so the caller's policy decides what a mismatch costs.
     pub(crate) fn encode(&self, wire: &WireValue) -> Result<(Vec<u8>, Vec<u8>)> {
+        if let Some(spark) = &self.spark {
+            return spark.encode(expect_len(wire)?);
+        }
         match wire {
             WireValue::Len(bytes) => match self.encode_direct(bytes, &mut None) {
                 Some(built) => Ok(built),
@@ -487,7 +516,12 @@ impl VariantMessagePlan {
 
     /// Reference-path encode of one occurrence — the shapes the direct walk
     /// rejects (and the sanitized replay of those shapes) go through here.
+    /// A Spark-encoded plan never walks directly, so every occurrence lands
+    /// here and is encoded with Spark's semantics.
     pub(super) fn encode_reference(&self, wire: &WireValue<'_>) -> Result<(Vec<u8>, Vec<u8>)> {
+        if let Some(spark) = &self.spark {
+            return spark.encode(expect_len(wire)?);
+        }
         encode_variant_from_message(&self.descriptor, wire)
     }
 

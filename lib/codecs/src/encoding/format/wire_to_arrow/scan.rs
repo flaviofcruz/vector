@@ -613,7 +613,17 @@ fn encode_variant_slot(
                             plan.sanitize_for_reference(value, &mut report)
                         };
                         match sanitized {
-                            Some(clean) => plan.encode_reference(&WireValue::Len(&clean)),
+                            // A failed encode either drops the row or (a Spark
+                            // `required` miss) retries it merged, and that
+                            // revalidation re-records these skips, so they are
+                            // discarded here.
+                            Some(clean) => {
+                                let result = plan.encode_reference(&WireValue::Len(&clean));
+                                if result.is_err() {
+                                    skips.restore(snapshot);
+                                }
+                                result
+                            }
                             // Malformed input: the row drops below; discard
                             // the sanitized walk's partial skips too and let
                             // the reference decoder produce its error from

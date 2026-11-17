@@ -47,6 +47,9 @@
 //! - Proto maps (`map<K, V>`) -> Arrow `Map<Struct(key, value)>`
 //! - Oneof variants
 //! - `int64 -> Timestamp(Microsecond, tz)` coercion
+//! - VARIANT columns from JSON text or from a nested proto message. A message-backed value uses
+//!   the proto JSON mapping by default, or Spark's `to_variant_object(from_protobuf(...))`
+//!   semantics with `variant_message_encoding` (see `variant_spark`).
 //!
 //! Benchmarks live at `benches/codecs/wire_to_arrow_bench.rs`.
 //!
@@ -61,10 +64,13 @@ mod plan;
 mod scan;
 mod serializer;
 mod variant_message;
+mod variant_spark;
 
 #[cfg(test)]
 mod tests;
 
 pub use encoder::WireToArrowEncoder;
 pub use errors::WireToArrowError;
-pub use serializer::{OnWireTypeMismatch, WireToArrowSerializer, WireToArrowSerializerConfig};
+pub use serializer::{
+    OnWireTypeMismatch, VariantMessageEncoding, WireToArrowSerializer, WireToArrowSerializerConfig,
+};

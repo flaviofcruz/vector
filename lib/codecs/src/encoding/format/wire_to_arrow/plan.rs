@@ -10,6 +10,7 @@ use prost_reflect::{Cardinality, EnumDescriptor, Kind, MessageDescriptor};
 
 use super::builders::TypedBuilder;
 use super::errors::{Result, WireToArrowError};
+use super::serializer::VariantMessageEncoding;
 use super::variant_message::VariantMessagePlan;
 
 /// Maximum nesting depth permitted in a plan. Arrow schemas can in principle
@@ -332,8 +333,18 @@ impl MessagePlan {
     /// Each member gets its own Arrow slot, but only the last member on the
     /// wire remains present. Track siblings even when they have no Arrow column
     /// so validation can request normalization before any builder is mutated.
-    pub fn build(descriptor: &MessageDescriptor, fields: &Fields) -> Result<Self> {
-        Self::build_at_depth(descriptor, fields, 0, /* inside_map_entry */ false)
+    ///
+    /// # VARIANT encoding
+    ///
+    /// `encoding` applies to every VARIANT column backed by a nested proto message.
+    pub fn build(
+        descriptor: &MessageDescriptor,
+        fields: &Fields,
+        encoding: VariantMessageEncoding,
+    ) -> Result<Self> {
+        Self::build_at_depth(
+            descriptor, fields, 0, /* inside_map_entry */ false, encoding,
+        )
     }
 
     /// Recursive helper for [`build`]; `depth` is the current nesting level
@@ -348,6 +359,7 @@ impl MessagePlan {
         fields: &Fields,
         depth: usize,
         inside_map_entry: bool,
+        encoding: VariantMessageEncoding,
     ) -> Result<Self> {
         if depth >= MAX_NESTING_DEPTH {
             return Err(WireToArrowError::SchemaTooDeep {
@@ -488,6 +500,7 @@ impl MessagePlan {
                     entry_fields,
                     depth + 1,
                     /* inside_map_entry */ true,
+                    encoding,
                 )?;
                 PlanSlot::Map(Arc::new(sub))
             } else {
@@ -509,7 +522,7 @@ impl MessagePlan {
                         if crate::encoding::format::variant::is_variant_field(arrow_field) =>
                     {
                         PlanSlot::Variant(VariantSource::Message(Arc::new(
-                            VariantMessagePlan::new(inner_desc),
+                            VariantMessagePlan::with_encoding(inner_desc, encoding),
                         )))
                     }
                     // Singular proto enum -> STRING column: render the enum
@@ -556,6 +569,7 @@ impl MessagePlan {
                             inner_fields,
                             depth + 1,
                             /* inside_map_entry */ false,
+                            encoding,
                         )?;
                         PlanSlot::Struct(Arc::new(sub))
                     }
@@ -567,7 +581,7 @@ impl MessagePlan {
                         if crate::encoding::format::variant::is_variant_field(item_field) =>
                     {
                         PlanSlot::RepeatedVariant(VariantSource::Message(Arc::new(
-                            VariantMessagePlan::new(inner_desc),
+                            VariantMessagePlan::with_encoding(inner_desc, encoding),
                         )))
                     }
                     // Repeated opaque message -> List<LargeBinary> (see the singular arm above).
@@ -592,6 +606,7 @@ impl MessagePlan {
                             inner_fields,
                             depth + 1,
                             /* inside_map_entry */ false,
+                            encoding,
                         )?;
                         PlanSlot::RepeatedMessage(Arc::new(sub))
                     }
@@ -852,7 +867,7 @@ mod tests {
             Field::new("id", DataType::Int32, true),
             Field::new("email", DataType::LargeUtf8, true),
         ]);
-        let plan = MessagePlan::build(&desc, &schema.fields().clone()).unwrap();
+        let plan = MessagePlan::build(&desc, &schema.fields().clone(), Default::default()).unwrap();
         assert_eq!(plan.slots.len(), 3);
         assert!(matches!(
             plan.slots[0],
@@ -878,7 +893,7 @@ mod tests {
             Field::new("deleted_in_proto", DataType::Int32, true),
             Field::new("id", DataType::Int32, true),
         ]);
-        let plan = MessagePlan::build(&desc, &schema.fields().clone()).unwrap();
+        let plan = MessagePlan::build(&desc, &schema.fields().clone(), Default::default()).unwrap();
         assert!(matches!(
             plan.slots[0],
             PlanSlot::Scalar(ScalarKind::String)
@@ -899,7 +914,8 @@ mod tests {
             DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int32, true)])),
             true,
         )]);
-        let err = MessagePlan::build(&desc, &schema.fields().clone()).expect_err("should fail");
+        let err = MessagePlan::build(&desc, &schema.fields().clone(), Default::default())
+            .expect_err("should fail");
         assert!(matches!(
             err,
             WireToArrowError::UnsupportedCombination { .. }
@@ -914,7 +930,7 @@ mod tests {
         // well-formed and don't need a fallthrough that fails the whole batch.
         let desc = load_person_descriptor();
         let schema = Schema::new(vec![Field::new("name", DataType::Int32, true)]);
-        let err = MessagePlan::build(&desc, &schema.fields().clone())
+        let err = MessagePlan::build(&desc, &schema.fields().clone(), Default::default())
             .expect_err("plan-build must reject String/Int32 pairing");
         assert!(
             matches!(err, WireToArrowError::UnsupportedCombination { .. }),

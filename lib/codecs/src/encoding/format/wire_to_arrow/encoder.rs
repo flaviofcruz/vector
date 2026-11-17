@@ -15,7 +15,7 @@ use super::errors::{Result, WireToArrowError};
 use super::normalize::normalize_message;
 use super::plan::MessagePlan;
 use super::scan::{BuiltVariants, ValidateCtx, scan_message, validate_message};
-use super::serializer::OnWireTypeMismatch;
+use super::serializer::{OnWireTypeMismatch, VariantMessageEncoding};
 use super::variant_message::strip_wire_type_mismatches;
 
 /// Upper bounds for attribution values in skip/drop warnings: per-field char
@@ -60,6 +60,22 @@ impl WireToArrowEncoder {
         Self::with_options(descriptor, schema, OnWireTypeMismatch::SkipField, &[])
     }
 
+    /// [`WireToArrowEncoder::new`], with `encoding` for every VARIANT column backed by a nested
+    /// proto message.
+    pub fn with_variant_message_encoding(
+        descriptor: &MessageDescriptor,
+        schema: Schema,
+        encoding: VariantMessageEncoding,
+    ) -> Result<Self> {
+        Self::from_parts(
+            descriptor,
+            schema,
+            OnWireTypeMismatch::SkipField,
+            &[],
+            encoding,
+        )
+    }
+
     /// Compile a plan with an explicit mismatch policy and producer-attribution
     /// field names for skip/drop warnings. Names are resolved to top-level
     /// field numbers on `descriptor`; unknown names are dropped with a warning
@@ -70,7 +86,25 @@ impl WireToArrowEncoder {
         on_wire_type_mismatch: OnWireTypeMismatch,
         attribution_field_names: &[String],
     ) -> Result<Self> {
-        let plan = MessagePlan::build(descriptor, &schema.fields().clone())?;
+        Self::from_parts(
+            descriptor,
+            schema,
+            on_wire_type_mismatch,
+            attribution_field_names,
+            VariantMessageEncoding::default(),
+        )
+    }
+
+    /// [`WireToArrowEncoder::with_options`], with `encoding` for every VARIANT column backed by
+    /// a nested proto message.
+    pub(crate) fn from_parts(
+        descriptor: &MessageDescriptor,
+        schema: Schema,
+        on_wire_type_mismatch: OnWireTypeMismatch,
+        attribution_field_names: &[String],
+        encoding: VariantMessageEncoding,
+    ) -> Result<Self> {
+        let plan = MessagePlan::build(descriptor, &schema.fields().clone(), encoding)?;
         let mut attribution_fields = Vec::new();
         for name in attribution_field_names.iter().take(ATTRIBUTION_FIELDS_MAX) {
             match descriptor.get_field_by_name(name) {
@@ -146,10 +180,14 @@ impl WireToArrowEncoder {
             };
             // Singular-field merges and oneof switches are legal protobuf. Normalize only
             // these rows before touching Arrow builders, preserving explicit scalar defaults.
+            // A VARIANT payload missing a required field may be completed by a later
+            // occurrence that validation has not reached yet; protobuf-java merges every
+            // occurrence before its initialization check, so that error retries here too.
             let canonical = if matches!(
                 &validation,
                 Err(WireToArrowError::DuplicateSingularField { .. }
-                    | WireToArrowError::OneofNeedsNormalization { .. })
+                    | WireToArrowError::OneofNeedsNormalization { .. }
+                    | WireToArrowError::VariantMessageMissingRequiredField { .. })
             ) {
                 // The decode guard keeps rows that prost-reflect itself
                 // rejects from being canonicalized — in particular so a

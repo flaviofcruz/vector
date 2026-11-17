@@ -91,6 +91,33 @@ pub struct WireToArrowSerializerConfig {
     #[serde(default)]
     #[configurable(metadata(docs::examples = "app_id"))]
     pub attribution_fields: Vec<String>,
+
+    /// How a VARIANT column backed by a nested proto message encodes its value.
+    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
+    #[configurable(derived)]
+    pub variant_message_encoding: VariantMessageEncoding,
+}
+
+/// How a VARIANT column backed by a nested proto message encodes its value. Columns backed by a
+/// JSON text field are unaffected.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VariantMessageEncoding {
+    /// The message's proto JSON mapping: proto field names, numeric 64-bit integers, enum names,
+    /// present fields only, bytes as base64, well-known types in their JSON forms.
+    #[default]
+    ProtoJson,
+
+    /// The value Spark's `to_variant_object(from_protobuf(...))` gives with the classic variant
+    /// union's decode options (`emit.default.values`, Timestamp and Duration as
+    /// `{seconds, nanos}`): native binary, float and integer types, unset fields as null keys,
+    /// proto3 defaults written out, protobuf-java's closed-enum handling. A row whose message
+    /// lacks a `required` field is dropped, as Spark fails its decode.
+    Spark,
+
+    /// `spark`, with null keys left out at every depth, as `variant_strip_nulls` stores it.
+    SparkStripNulls,
 }
 
 impl std::fmt::Debug for WireToArrowSerializerConfig {
@@ -107,6 +134,7 @@ impl std::fmt::Debug for WireToArrowSerializerConfig {
             )
             .field("on_wire_type_mismatch", &self.on_wire_type_mismatch)
             .field("attribution_fields", &self.attribution_fields)
+            .field("variant_message_encoding", &self.variant_message_encoding)
             .finish()
     }
 }
@@ -140,11 +168,12 @@ impl WireToArrowSerializer {
         let schema = config
             .schema
             .ok_or_else(|| WireToArrowError::ConfigurationMissing { field: "schema" })?;
-        let encoder = WireToArrowEncoder::with_options(
+        let encoder = WireToArrowEncoder::from_parts(
             &descriptor,
             schema,
             config.on_wire_type_mismatch,
             &config.attribution_fields,
+            config.variant_message_encoding,
         )?;
         Ok(Self {
             encoder: Arc::new(encoder),
@@ -156,7 +185,23 @@ impl WireToArrowSerializer {
     /// memory already. Uses the default mismatch policy (`SkipField`) and no
     /// attribution fields.
     pub fn from_descriptor(descriptor: MessageDescriptor, schema: Schema) -> Result<Self> {
-        let encoder = WireToArrowEncoder::new(&descriptor, schema)?;
+        Self::from_descriptor_with_variant_message_encoding(
+            descriptor,
+            schema,
+            VariantMessageEncoding::default(),
+        )
+    }
+
+    /// [`WireToArrowSerializer::from_descriptor`], with `encoding` for every VARIANT column backed
+    /// by a nested proto message. Uses the default mismatch policy (`SkipField`) and no
+    /// attribution fields.
+    pub fn from_descriptor_with_variant_message_encoding(
+        descriptor: MessageDescriptor,
+        schema: Schema,
+        encoding: VariantMessageEncoding,
+    ) -> Result<Self> {
+        let encoder =
+            WireToArrowEncoder::with_variant_message_encoding(&descriptor, schema, encoding)?;
         Ok(Self {
             encoder: Arc::new(encoder),
         })

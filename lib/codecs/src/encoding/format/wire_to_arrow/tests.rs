@@ -367,8 +367,7 @@ fn serializer_loads_descriptor_from_config() {
             .join("tests/data/protobuf/protos/test_protobuf.desc"),
         message_type: "test_protobuf.Person".to_string(),
         schema: Some(schema),
-        on_wire_type_mismatch: OnWireTypeMismatch::default(),
-        attribution_fields: Vec::new(),
+        ..Default::default()
     };
     let serializer = WireToArrowSerializer::new(config).expect("build");
     assert!(matches!(
@@ -384,8 +383,7 @@ fn serializer_errors_on_bad_descriptor_path() {
         desc_file: PathBuf::from("/nonexistent/path/to/schema.desc"),
         message_type: "some.Message".to_string(),
         schema: Some(schema),
-        on_wire_type_mismatch: OnWireTypeMismatch::default(),
-        attribution_fields: Vec::new(),
+        ..Default::default()
     };
     assert!(matches!(
         WireToArrowSerializer::new(config),
@@ -400,8 +398,7 @@ fn serializer_errors_on_missing_schema() {
             .join("tests/data/protobuf/protos/test_protobuf.desc"),
         message_type: "test_protobuf.Person".to_string(),
         schema: None,
-        on_wire_type_mismatch: OnWireTypeMismatch::default(),
-        attribution_fields: Vec::new(),
+        ..Default::default()
     };
     assert!(matches!(
         WireToArrowSerializer::new(config),
@@ -1210,7 +1207,7 @@ fn proto3_optional_preserves_presence_without_oneof_switch_tracking() {
         .get_message_by_name("wire_to_arrow_poc_test.Choice")
         .unwrap();
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
-    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields(), Default::default()).unwrap();
     assert!(plan.oneof_by_proto_field.is_empty());
     assert_eq!(plan.oneof_count, 0);
     let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
@@ -1247,7 +1244,8 @@ fn oneof_hidden_members_clear_projected_values_in_wire_order() {
             .get_message_by_name("wire_to_arrow_poc_test.Choice")
             .unwrap();
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
-        let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+        let plan =
+            super::plan::MessagePlan::build(&desc, schema.fields(), Default::default()).unwrap();
         assert_eq!(plan.slot_by_proto_field.len(), 2);
         let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
         let mut hidden = encode_varint_for_test(((hidden_tag as u64) << 3) | 2);
@@ -1490,7 +1488,7 @@ fn same_typed_oneof_descriptor() -> MessageDescriptor {
 fn unprojected_oneof_member_mismatch_does_not_clear_projected_sibling() {
     let desc = same_typed_oneof_descriptor();
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
-    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields(), Default::default()).unwrap();
     let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
 
     // a=5 then b as LEN (0x12 0x01 0x01) — the mismatch; and the reverse
@@ -1597,7 +1595,7 @@ fn nested_unprojected_oneof_member_mismatch_keeps_sibling() {
         .unwrap();
     let inner = ArrowFields::from(vec![Field::new("a", DataType::Int32, true)]);
     let schema = Schema::new(vec![Field::new("inner", DataType::Struct(inner), true)]);
-    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields(), Default::default()).unwrap();
     let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
 
     // inner = { a: 5, b as LEN }.
@@ -2728,7 +2726,7 @@ fn wire_type_mismatch_reports_root_to_leaf_proto_field_numbers() {
             true,
         ),
     ]);
-    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields(), Default::default()).unwrap();
     let cases: &[(&[u8], &[u32], u8, u8)] = &[
         (&[0x08, 0x00], &[1], 2, 0),
         (&[0x0a, 0x02, 0x12, 0x00], &[1, 2], 0, 2),
@@ -3947,11 +3945,11 @@ fn guard_drops_overwritten_malformed_string_regardless_of_mismatch_position() {
 /// deltas and serialize against each other; counters bumped by unrelated
 /// concurrent tests can still skew a delta under threaded `cargo test`, so CI
 /// runs them under nextest (process per test).
-static METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(super) static METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Sum of a global counter, optionally restricted to a `reason` tag. Tests
 /// compare before/after deltas instead of resetting the shared registry.
-fn counter_total(
+pub(super) fn counter_total(
     controller: &vector_core::metrics::Controller,
     name: &str,
     reason: Option<&str>,
@@ -4231,7 +4229,7 @@ fn variant_walk_does_not_leak_into_later_skip_path() {
             true,
         ),
     ]);
-    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields(), Default::default()).unwrap();
 
     // single = KV { k: "x" } (well-typed VARIANT), then many[0] = KV { k as varint }.
     let wire = [0x0a, 0x03, 0x0a, 0x01, b'x', 0x12, 0x02, 0x08, 0x00];
@@ -4459,7 +4457,7 @@ fn variant_fallback_shapes_are_sanitized_under_skip_field() {
 fn variant_fallback_sanitization_counts_exactly_one_skip() {
     let desc = message_variant_map_descriptor();
     let schema = Schema::new(vec![variant_arrow_field("single")]);
-    let plan = super::plan::MessagePlan::build(&desc, schema.fields()).unwrap();
+    let plan = super::plan::MessagePlan::build(&desc, schema.fields(), Default::default()).unwrap();
 
     // single = KVMap { k: "x", n as LEN (mismatch), labels {"a": 1} }: the
     // map field aborts the direct walk after the mismatch was recorded.
