@@ -1087,7 +1087,7 @@ fn build_decimal256_array(
 ///
 /// Used by `build_record_batch` for top-level fields and recursively by
 /// `build_struct_array` for nested child fields.
-fn build_column_for_path(
+pub(super) fn build_column_for_path(
     events: &[Event],
     path: &str,
     field: &Field,

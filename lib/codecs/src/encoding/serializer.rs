@@ -6,8 +6,8 @@ use vector_core::{config::DataType, event::Event, schema};
 
 #[cfg(feature = "arrow")]
 use super::format::{
-    ArrowStreamSerializer, ArrowStreamSerializerConfig, WireToArrowSerializer,
-    WireToArrowSerializerConfig,
+    ArrowIpcSerializer, ArrowIpcSerializerConfig, ArrowStreamSerializer,
+    ArrowStreamSerializerConfig, WireToArrowSerializer, WireToArrowSerializerConfig,
 };
 #[cfg(feature = "opentelemetry")]
 use super::format::{OtlpSerializer, OtlpSerializerConfig};
@@ -177,6 +177,19 @@ pub enum BatchSerializerConfig {
     #[cfg(feature = "arrow")]
     #[serde(rename = "wire_to_arrow")]
     WireToArrow(WireToArrowSerializerConfig),
+
+    /// Takes record batches that an upstream component already built: each event's `message`
+    /// field holds an [Apache Arrow][apache_arrow] IPC stream. Its batches are conformed to the
+    /// target schema by column name (zero-copy where the types match) and concatenated, instead of
+    /// building every column from event fields. Columns with different types use `arrow_stream`'s
+    /// value coercion; unsupported values and schema-constraint violations fail encoding.
+    ///
+    /// Requires the sink to inject the target Arrow `Schema` into the config before building.
+    ///
+    /// [apache_arrow]: https://arrow.apache.org/
+    #[cfg(feature = "arrow")]
+    #[serde(rename = "arrow_ipc")]
+    ArrowIpc(ArrowIpcSerializerConfig),
 }
 
 impl BatchSerializerConfig {
@@ -195,6 +208,11 @@ impl BatchSerializerConfig {
                 let serializer = WireToArrowSerializer::new(config.clone())?;
                 Ok(super::BatchSerializer::WireToArrow(serializer))
             }
+            #[cfg(feature = "arrow")]
+            BatchSerializerConfig::ArrowIpc(config) => {
+                let serializer = ArrowIpcSerializer::new(config.clone())?;
+                Ok(super::BatchSerializer::ArrowIpc(serializer))
+            }
         }
     }
 
@@ -205,6 +223,8 @@ impl BatchSerializerConfig {
             BatchSerializerConfig::ArrowStream(arrow_config) => arrow_config.input_type(),
             #[cfg(feature = "arrow")]
             BatchSerializerConfig::WireToArrow(config) => config.input_type(),
+            #[cfg(feature = "arrow")]
+            BatchSerializerConfig::ArrowIpc(config) => config.input_type(),
         }
     }
 
@@ -215,6 +235,8 @@ impl BatchSerializerConfig {
             BatchSerializerConfig::ArrowStream(arrow_config) => arrow_config.schema_requirement(),
             #[cfg(feature = "arrow")]
             BatchSerializerConfig::WireToArrow(config) => config.schema_requirement(),
+            #[cfg(feature = "arrow")]
+            BatchSerializerConfig::ArrowIpc(config) => config.schema_requirement(),
         }
     }
 }

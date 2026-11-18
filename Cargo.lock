@@ -767,6 +767,10 @@ name = "arrow-schema"
 version = "60.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de2c8e714b466404cdc1189e89f892426efea614d938e16c15518c340cd43ba3"
+dependencies = [
+ "serde_core",
+ "serde_json",
+]
 
 [[package]]
 name = "arrow-select"
@@ -9029,6 +9033,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-variant-compute"
+version = "60.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca43d38e0b3f91d177150fc72c86af888dcbd3c3d93888c2a2fbc95721200d89"
+dependencies = [
+ "arrow 60.1.0",
+ "arrow-schema 60.1.0",
+ "chrono",
+ "half",
+ "indexmap 2.13.0",
+ "num-traits",
+ "parquet-variant",
+ "parquet-variant-json",
+ "uuid",
+]
+
+[[package]]
 name = "parquet-variant-json"
 version = "60.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14316,6 +14337,7 @@ dependencies = [
  "openssl-src",
  "openssl-sys",
  "ordered-float 4.6.0",
+ "parquet-variant-compute",
  "paste",
  "pem",
  "percent-encoding",

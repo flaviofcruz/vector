@@ -4,7 +4,7 @@ use vector_common::internal_event::emit;
 use vector_core::event::Event;
 
 #[cfg(feature = "arrow")]
-use crate::encoding::{ArrowStreamSerializer, WireToArrowSerializer};
+use crate::encoding::{ArrowIpcSerializer, ArrowStreamSerializer, WireToArrowSerializer};
 use crate::{
     encoding::{Error, Framer, Serializer},
     internal_events::{EncoderFramingError, EncoderSerializeError},
@@ -27,6 +27,9 @@ pub enum BatchSerializer {
     /// Streaming wire-format to Arrow serializer.
     #[cfg(feature = "arrow")]
     WireToArrow(WireToArrowSerializer),
+    /// Pre-built Arrow IPC batches carried in events, conformed and concatenated.
+    #[cfg(feature = "arrow")]
+    ArrowIpc(ArrowIpcSerializer),
 }
 
 /// An encoder that encodes batches of events.
@@ -85,6 +88,19 @@ impl BatchEncoder {
                     .encode_to_record_batch_with_kept(events)
                     .map_err(|err| Error::SerializingError(Box::new(err)))?;
                 Ok((BatchOutput::Arrow(record_batch), kept))
+            }
+            #[cfg(feature = "arrow")]
+            BatchSerializer::ArrowIpc(serializer) => {
+                let record_batch = serializer.encode_to_record_batch(events).map_err(|err| {
+                    use crate::encoding::ArrowEncodingError;
+                    match err {
+                        ArrowEncodingError::NullConstraint { .. } => {
+                            Error::SchemaConstraintViolation(Box::new(err))
+                        }
+                        _ => Error::SerializingError(Box::new(err)),
+                    }
+                })?;
+                Ok(BatchOutput::Arrow(record_batch))
             }
             #[cfg(not(feature = "arrow"))]
             _ => unreachable!("BatchSerializer has no variants without the `arrow` feature"),

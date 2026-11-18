@@ -1,0 +1,2 @@
+Add the opt-in `hydra_remote_write` source, which writes each Prometheus remote-write request's samples as one pre-encoded payload per destination (NDJSON for S3, Arrow IPC for Zerobus) with an `arrow_ipc` codec that conforms to the loaded Zerobus table schema. Samples stay individual rows; this is unrelated to VAM row-merging and does not change sink batching or buffers. The source is in the normal production feature bundles; existing source and transform defaults are unchanged.
+https://github.com/databricks-eng/vector/pull/961

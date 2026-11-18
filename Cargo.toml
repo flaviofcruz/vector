@@ -418,6 +418,7 @@ libc.workspace = true
 lru = { version = "0.16.3", default-features = false }
 maxminddb = { version = "0.27.0", default-features = false, optional = true, features = ["simdutf8"] }
 md-5 = { version = "0.10", default-features = false, optional = true }
+parquet-variant-compute = { version = "60.0.0", optional = true }
 mongodb = { version = "3.3.0", default-features = false, optional = true, features = ["compat-3-0-0", "dns-resolver", "rustls-tls"] }
 async-nats = { version = "0.45.0", default-features = false, optional = true, features = ["ring"] }
 nkeys = { version = "0.4.5", default-features = false, optional = true }
@@ -692,6 +693,7 @@ sources-metrics = [
   "sources-nginx_metrics",
   "sources-postgresql_metrics",
   "sources-prometheus",
+  "sources-hydra_remote_write",
   "sources-static_metrics",
   "sources-statsd",
   "sources-vector",
@@ -748,6 +750,7 @@ sources-postgresql_metrics = ["dep:postgres-openssl", "dep:tokio-postgres"]
 sources-prometheus = ["sources-prometheus-scrape", "sources-prometheus-remote-write", "sources-prometheus-pushgateway"]
 sources-prometheus-scrape = ["sinks-prometheus", "sources-utils-http-client", "vector-lib/prometheus"]
 sources-prometheus-remote-write = ["sinks-prometheus", "sources-utils-http", "vector-lib/prometheus"]
+sources-hydra_remote_write = ["sources-prometheus-remote-write", "transforms-metric_to_log_hydra", "codecs-arrow", "dep:parquet-variant-compute"]
 sources-prometheus-pushgateway = ["sinks-prometheus", "sources-utils-http", "vector-lib/prometheus"]
 sources-pulsar = ["dep:apache-avro", "dep:pulsar"]
 sources-redis = ["dep:redis"]

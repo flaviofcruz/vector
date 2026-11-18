@@ -12,7 +12,7 @@ use crate::event::{
     metric::{Bucket, Metric, MetricKind, MetricTags, MetricValue, Quantile},
 };
 
-fn utc_timestamp(timestamp: Option<i64>, default: DateTime<Utc>) -> DateTime<Utc> {
+pub(super) fn utc_timestamp(timestamp: Option<i64>, default: DateTime<Utc>) -> DateTime<Utc> {
     timestamp
         .and_then(|timestamp| {
             Utc.timestamp_opt(timestamp / 1000, (timestamp % 1000) as u32 * 1000000)

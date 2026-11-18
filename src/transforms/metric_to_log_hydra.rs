@@ -136,6 +136,20 @@ impl TransformConfig for MetricToLogHydraConfig {
 const TS_WINDOW_FUTURE_MS: i64 = 300_000;
 const TS_WINDOW_PAST_MS: i64 = 600_000;
 
+/// The `topic` column value.
+pub(crate) const TOPIC: &str = "metric-to-log";
+
+/// Returns `timestamp_ms` and its hour if it is inside the accepted window around `now_ms`.
+pub(crate) const fn accept_timestamp(
+    timestamp_ms: i64,
+    now_ms: i64,
+) -> Result<(i64, i64), DropReason> {
+    if timestamp_ms > now_ms + TS_WINDOW_FUTURE_MS || timestamp_ms < now_ms - TS_WINDOW_PAST_MS {
+        return Err(DropReason::TimestampOutOfWindow);
+    }
+    Ok((timestamp_ms, timestamp_ms - (timestamp_ms % 3_600_000)))
+}
+
 /// Why `transform_one` dropped a metric. The `reason` label on `metric_to_log_hydra_dropped_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropReason {
@@ -172,7 +186,7 @@ const SUFFIXES: &[(&str, &str)] = &[
 ];
 
 /// The reserved `system` value marking the catch-all rule.
-const CATCH_ALL_SYSTEM: &str = "*";
+pub(crate) const CATCH_ALL_SYSTEM: &str = "*";
 
 /// Compiled routing table: O(1) exact-match on the event's `system_uri`, with the `"*"` rule lifted
 /// into `default`. Built once at config time, shared across instances via `Arc`. Keys are the
@@ -283,7 +297,7 @@ impl MetricToLogHydra {
     }
 
     /// Strip a known prometheus suffix from `name`, returning (base, type_str).
-    fn parse_metric_name(name: &str) -> (&str, &'static str) {
+    pub(crate) fn parse_metric_name(name: &str) -> (&str, &'static str) {
         for (suffix, type_str) in SUFFIXES {
             if let Some(base) = name.strip_suffix(suffix) {
                 return (base, type_str);
@@ -293,7 +307,7 @@ impl MetricToLogHydra {
     }
 
     /// `metric_part`: first 4 md5 bytes as big-endian u32, mod 100 (== first 8 hex chars, mod 100).
-    fn metric_part(metric_name: &str) -> i64 {
+    pub(crate) fn metric_part(metric_name: &str) -> i64 {
         let digest = Md5::digest(metric_name.as_bytes());
         (u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) as i64) % 100
     }
@@ -310,12 +324,7 @@ impl MetricToLogHydra {
             .unwrap_or(now_ms);
 
         // Checked before the value: out-of-window always reports TimestampOutOfWindow.
-        if timestamp_ms > now_ms + TS_WINDOW_FUTURE_MS || timestamp_ms < now_ms - TS_WINDOW_PAST_MS
-        {
-            return Err(DropReason::TimestampOutOfWindow);
-        }
-
-        let timestamp_hour_ms = timestamp_ms - (timestamp_ms % 3_600_000);
+        let (timestamp_ms, timestamp_hour_ms) = accept_timestamp(timestamp_ms, now_ms)?;
 
         // Only Gauge/Counter carry a scalar; both handled the same. Non-finite (NaN/±Inf) → drop as
         // NonFiniteValue (explicit is_finite: NotNan accepts ±Inf but not NaN). Others → [].
@@ -460,7 +469,7 @@ impl MetricToLogHydra {
         log.insert(event_path!("tenant_cluster_column"), tenant_cluster_column);
         log.insert(event_path!("shard_name"), Value::Bytes(shard_name.into()));
         log.insert(event_path!("system_uri"), system_uri);
-        log.insert(event_path!("topic"), Value::Bytes("metric-to-log".into()));
+        log.insert(event_path!("topic"), Value::Bytes(TOPIC.into()));
 
         Ok(log)
     }
@@ -475,6 +484,7 @@ impl SyncTransform for MetricToLogHydra {
                 emit!(MetricToLogHydraDropped {
                     reason: reason.as_str(),
                     counts_as_loss: reason.counts_as_loss(),
+                    count: 1,
                 });
                 return;
             }

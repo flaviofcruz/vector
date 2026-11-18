@@ -5,6 +5,8 @@
 
 #[cfg(feature = "arrow")]
 mod arrow;
+#[cfg(feature = "arrow")]
+mod arrow_ipc;
 mod avro;
 mod cef;
 mod common;
@@ -34,6 +36,8 @@ pub use arrow::{
     COERCE_DEFAULT_METADATA_KEY, SchemaProvider, build_record_batch,
     record_batch_to_arrow_ipc_stream,
 };
+#[cfg(feature = "arrow")]
+pub use arrow_ipc::{ArrowIpcSerializer, ArrowIpcSerializerConfig, conform_batch};
 pub use avro::{AvroSerializer, AvroSerializerConfig, AvroSerializerOptions};
 pub use cef::{CefSerializer, CefSerializerConfig};
 use dyn_clone::DynClone;

@@ -13,10 +13,10 @@ pub use config::{EncodingConfig, EncodingConfigWithFraming, SinkType};
 pub use encoder::{BatchEncoder, BatchOutput, BatchSerializer, Encoder, EncoderKind};
 #[cfg(feature = "arrow")]
 pub use format::{
-    ArrowEncodingError, ArrowStreamSerializer, ArrowStreamSerializerConfig, OnWireTypeMismatch,
-    SchemaProvider, VariantMessageEncoding, WireToArrowEncoder, WireToArrowError,
-    WireToArrowSerializer, WireToArrowSerializerConfig, build_record_batch,
-    record_batch_to_arrow_ipc_stream,
+    ArrowEncodingError, ArrowIpcSerializer, ArrowIpcSerializerConfig, ArrowStreamSerializer,
+    ArrowStreamSerializerConfig, OnWireTypeMismatch, SchemaProvider, VariantMessageEncoding,
+    WireToArrowEncoder, WireToArrowError, WireToArrowSerializer, WireToArrowSerializerConfig,
+    build_record_batch, record_batch_to_arrow_ipc_stream,
 };
 pub use format::{
     AvroSerializer, AvroSerializerConfig, AvroSerializerOptions, CefSerializer,

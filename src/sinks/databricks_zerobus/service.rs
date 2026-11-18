@@ -764,6 +764,10 @@ impl ZerobusService {
                 // `batch_encoding.desc_file` + `batch_encoding.message_type`.
                 config.schema = Some(arrow_schema.clone());
             }
+            BatchSerializerConfig::ArrowIpc(config) => {
+                // Upstream batches are conformed to the table's shape.
+                config.schema = Some(arrow_schema.clone());
+            }
         }
         let arrow_schema = Arc::new(arrow_schema);
 
@@ -1843,6 +1847,45 @@ mod tests {
             recover_from_schema_rejection: true,
             acknowledgements: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn arrow_ipc_uses_the_resolved_table_schema() {
+        use arrow::{
+            array::{ArrayRef, Int64Array},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+        use vector_lib::{
+            codecs::encoding::{
+                ArrowIpcSerializerConfig, BatchOutput, record_batch_to_arrow_ipc_stream,
+            },
+            event::{Event, LogEvent},
+        };
+
+        let mut config = test_config();
+        config.batch_encoding =
+            BatchSerializerConfig::ArrowIpc(ArrowIpcSerializerConfig::default());
+        let service = ZerobusService::new(config, &ProxyConfig::default())
+            .await
+            .unwrap();
+        let table = Schema::new(vec![Field::new("count", DataType::Int32, true)]);
+        service.script_schema_fetches([table.clone()]);
+        let resolved = service.ensure_schema().await.unwrap();
+        let upstream = RecordBatch::try_from_iter(vec![(
+            "count",
+            Arc::new(Int64Array::from(vec![7])) as ArrayRef,
+        )])
+        .unwrap();
+        let mut log = LogEvent::default();
+        log.insert(
+            "message",
+            record_batch_to_arrow_ipc_stream(&upstream).unwrap(),
+        );
+        let BatchOutput::Arrow(encoded) =
+            resolved.encoder.encode_batch(&[Event::Log(log)]).unwrap();
+        assert_eq!(encoded.schema().as_ref(), &table);
+        assert_eq!(encoded.num_rows(), 1);
     }
 
     fn dummy_payload() -> ZerobusPayload {
