@@ -290,13 +290,14 @@ where
         registry: &Registry<K, S>,
     ) -> bool
     where
-        S: Storage<K>,
+        S: Storage<K, Counter = Generational<Arc<AtomicU64>>>,
     {
         self.should_store(
             key,
             counter,
             registry,
             MetricKind::Counter,
+            Registry::get_counter,
             Registry::delete_counter,
         )
     }
@@ -314,13 +315,14 @@ where
         registry: &Registry<K, S>,
     ) -> bool
     where
-        S: Storage<K>,
+        S: Storage<K, Gauge = Generational<Arc<AtomicF64>>>,
     {
         self.should_store(
             key,
             gauge,
             registry,
             MetricKind::Gauge,
+            Registry::get_gauge,
             Registry::delete_gauge,
         )
     }
@@ -338,26 +340,29 @@ where
         registry: &Registry<K, S>,
     ) -> bool
     where
-        S: Storage<K>,
+        S: Storage<K, Histogram = Generational<Arc<Histogram>>>,
     {
         self.should_store(
             key,
             hist,
             registry,
             MetricKind::Histogram,
+            Registry::get_histogram,
             Registry::delete_histogram,
         )
     }
 
-    fn should_store<F, S, T>(
+    fn should_store<G, F, S, T>(
         &self,
         key: &K,
         value: &Generational<Arc<T>>,
         registry: &Registry<K, S>,
         kind: MetricKind,
+        get_op: G,
         delete_op: F,
     ) -> bool
     where
+        G: Fn(&Registry<K, S>, &K) -> Option<Generational<Arc<T>>>,
         F: Fn(&Registry<K, S>, &K) -> bool,
         S: Storage<K>,
     {
@@ -397,6 +402,13 @@ where
                     .find_map(|(matcher, timeout)| matcher.matches(key).then_some(*timeout))
                     .or(self.global_idle_timeout);
                 if let Some(timeout) = timeout {
+                    // A handle snapshot taken before a concurrent collection expired this key
+                    // must not re-track it: nothing would ever remove that entry again.
+                    let live = get_op(registry, key)
+                        .is_some_and(|current| Arc::ptr_eq(&current.inner, &value.inner));
+                    if !live {
+                        return false;
+                    }
                     entries.insert(key.clone(), (generation, now, timeout));
                 }
                 false
@@ -649,6 +661,32 @@ mod tests {
             registry.clear();
             assert_released(&[refs]);
         }
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_retrack_expired_key() {
+        let (clock, time) = Clock::mock();
+        let recency = Recency::<_, Matcher>::new(
+            clock,
+            MetricKindMask::ALL,
+            Some(Duration::from_secs(10)),
+            vec![],
+        );
+        let registry = registry();
+        let (key, refs) = tracked_key("counter", 0);
+        registry.get_or_create_counter(&key, |value| CounterFn::increment(value, 1));
+        assert_eq!(collect(&recency, &registry), [1, 0, 0]);
+        time.increment(Duration::from_secs(11));
+        assert_eq!(collect(&recency, &registry), [0; 3]);
+        // A concurrent collector can clone a handle between another collector's
+        // reference check and its delete; afterwards that handle no longer backs
+        // the registry, like one from an unrelated registry.
+        let unrelated = self::registry();
+        let stale = unrelated.get_or_create_counter(&key, Clone::clone);
+        assert!(!recency.should_store_counter(&key, &stale, &registry));
+        assert!(recency.inner.lock().1.is_empty());
+        drop((key, stale, unrelated));
+        assert_released(&[refs]);
     }
 
     #[test]

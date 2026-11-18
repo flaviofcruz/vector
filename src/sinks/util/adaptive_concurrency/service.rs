@@ -29,6 +29,17 @@ enum State {
 }
 
 impl<S, L> AdaptiveConcurrencyLimit<S, L> {
+    #[cfg(any(feature = "sinks-vector", feature = "sinks-kafka_producer_proxy"))]
+    pub(crate) fn diagnostics(&self) -> super::ConcurrencyDiagnostics {
+        self.controller.diagnostics()
+    }
+
+    /// Release a readiness reservation when routing chooses another destination.
+    #[cfg(any(feature = "sinks-vector", feature = "sinks-kafka_producer_proxy"))]
+    pub(crate) fn release_ready(&mut self) {
+        self.state = State::Empty;
+    }
+
     /// Create a new automated concurrency limiter.
     pub(crate) fn new(
         inner: S,

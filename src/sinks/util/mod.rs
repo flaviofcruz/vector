@@ -7,6 +7,14 @@ pub mod buffer;
 pub mod builder;
 pub mod compressor;
 pub mod datagram;
+#[cfg(any(
+    feature = "sinks-clickhouse",
+    feature = "sinks-vector",
+    feature = "sinks-kafka_producer_proxy"
+))]
+pub(crate) mod dns;
+#[cfg(any(feature = "sinks-vector", feature = "sinks-kafka_producer_proxy"))]
+pub(crate) mod dynamic_balance;
 pub mod encoding;
 pub mod http;
 pub mod metadata;

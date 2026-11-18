@@ -17,6 +17,8 @@ pub(crate) mod source;
 #[cfg(test)]
 pub mod tests;
 
+#[cfg(any(feature = "sinks-vector", feature = "sinks-kafka_producer_proxy"))]
+pub(crate) use controller::ConcurrencyDiagnostics;
 pub(crate) use layer::AdaptiveConcurrencyLimitLayer;
 pub(crate) use service::AdaptiveConcurrencyLimit;
 use vector_lib::configurable::configurable_component;
@@ -32,7 +34,7 @@ fn instant_now() -> std::time::Instant {
 // The defaults for these values were chosen after running several simulations on a test service that had
 // various responses to load. The values are the best balances found between competing outcomes.
 #[configurable_component]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AdaptiveConcurrencySettings {
     /// The initial concurrency limit to use. If not specified, the initial limit is 1 (no concurrency).

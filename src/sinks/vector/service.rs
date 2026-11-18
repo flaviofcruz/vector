@@ -30,6 +30,7 @@ pub struct VectorService {
     pub endpoint: String,
 }
 
+#[cfg_attr(test, derive(Default))]
 pub struct VectorResponse {
     events_byte_size: GroupedCountByteSize,
 }

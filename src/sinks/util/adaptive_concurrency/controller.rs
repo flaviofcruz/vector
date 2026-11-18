@@ -39,6 +39,19 @@ pub(super) struct Controller<L> {
     averaged_rtt: Registered<AdaptiveConcurrencyAveragedRtt>,
 }
 
+/// Read-only counters shared with balancer diagnostics without retaining the service.
+#[cfg(any(feature = "sinks-vector", feature = "sinks-kafka_producer_proxy"))]
+#[derive(Clone)]
+pub(crate) struct ConcurrencyDiagnostics(Arc<Mutex<Inner>>);
+
+#[cfg(any(feature = "sinks-vector", feature = "sinks-kafka_producer_proxy"))]
+impl ConcurrencyDiagnostics {
+    pub(crate) fn snapshot(&self) -> (usize, usize) {
+        let inner = self.0.lock().expect("Controller mutex is poisoned");
+        (inner.current_limit, inner.in_flight)
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Inner {
     pub(super) current_limit: usize,
@@ -91,6 +104,11 @@ impl<L> Controller<L> {
             observed_rtt: register!(AdaptiveConcurrencyObservedRtt),
             averaged_rtt: register!(AdaptiveConcurrencyAveragedRtt),
         }
+    }
+
+    #[cfg(any(feature = "sinks-vector", feature = "sinks-kafka_producer_proxy"))]
+    pub(super) fn diagnostics(&self) -> ConcurrencyDiagnostics {
+        ConcurrencyDiagnostics(Arc::clone(&self.inner))
     }
 
     /// An estimate of current load on service managed by this controller.
