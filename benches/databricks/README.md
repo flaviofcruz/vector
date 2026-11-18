@@ -15,7 +15,8 @@ reading inside them. Everything that knows a protocol sits behind an adapter:
 The first pipeline is Hydra, the metrics path: Prometheus remote write in, S3 or Zerobus out,
 through `metric_to_log_hydra`. Its source codec is `prom_remote_write` (`prom_remote_write.rs`).
 
-`check` runs the whole correctness flow in one command. The building blocks it drives are
+`check` runs the whole correctness flow in one command, and `profile` shows where a live pod's CPU
+goes. The building blocks it drives are
 `capture` (records real traffic from a pod into a corpus), the fake sink endpoints (record what a
 sink writes), `gen` (replays a corpus into targets) and `verify` (compares the outputs).
 
@@ -440,6 +441,121 @@ to (`items_per_request`: `{"size", "source"}`, where the source is `flag` or `me
 captured before the size was recorded have no `items_per_request`, and their bucket counts are
 ignored, so they still load. A corpus in another format, such as `databricks-bench-corpus/2`, is
 refused: re-run `capture` on it.
+
+## profile: where a live pod's CPU goes
+
+`profile` tells you which code in a live pod's pipeline costs the CPU, so you can choose what to
+optimize. It takes the same kube arguments as `capture`:
+
+```bash
+hb profile --context <kube-context> --namespace <namespace> --pod <pod> --container <container> \
+  [--method platform|perf-user|counters] [--duration-secs N] --out <dir>
+```
+
+First it checks the pod. It runs `kubectl get pod` and `kubectl exec` for `cat /proc/...`,
+`getconf` and `vector --version`. The pod must be Running with every container ready, and it must
+hold exactly one process whose `comm` is `--process` (default `vector`). The run fails if the
+pod's image or restart count changes, or if that process restarts (its start time changes).
+
+**`--method platform` (the default; 30 s, at most 60)** gives function-level stacks. It runs the
+platform's ad-hoc Rust profiler with `bazel run //common/profiling/rust/cpu:profiler` from a
+Universe checkout (`--universe`, else `$UNIVERSE_ROOT`, else `~/universe`). It points the tool at
+the Vector pid; the tool's default is pid 1, which in a VAM pod is the `sh` wrapper. This method
+is **not read-only**. The tool:
+
+- sets `perf_event_paranoid`, `perf_event_mlock_kb` and `kptr_restrict` on the pod's node over
+  kssh, and restores the original values on exit;
+- copies its helpers into a run directory under `/tmp/profiling` in the container, and removes it
+  afterwards;
+- needs perf in the image. Without it, it installs a build toolchain with apt and compiles perf
+  inside the pod.
+
+Use it only where the owners agree to that. It also needs an SSH agent in the shell that runs
+`profile` (`eval "$(ssh-agent -s)"`; the tool checks `ssh-add -l`) and node SSH over kssh. An Arca
+box has no node SSH today: the egress firewall closes the bastion connection on port 22
+(PLAT-150971), so the tool fails before it changes anything. Use `--method perf-user` there. It runs `--format flamegraph`, the one format that
+unwinds with DWARF. Vector is built without frame pointers, so the default pprof format, which
+uses frame-pointer stacks, would give broken stacks. DWARF stacks are heavy: perf keeps 64 KB of
+stack per sample, about 1 GB per busy-core-minute, in the pod's `/tmp`. That is why the default
+duration is 30 s. The tool returns an SVG. `profile` rebuilds the folded stacks from its frame
+boxes (inferno's `fg:x`/`fg:w`, in perf sample weight: the `cpu-clock` period in ns, per
+sample). Frames narrower than the SVG's minimum width are folded into their parent, or into a
+`[frames narrower …]` stack at the top. `--out` gets `platform.svg` and `platform-profiler.log`
+(the tool's output) as well.
+
+**`--method perf-user` (30 s, at most 60)** gives function-level stacks with no node change. It
+runs the image's own perf on the Vector process, `perf record -e cpu-clock:u -F 99 --call-graph
+dwarf,64000 -p <pid>`, in a fresh `/tmp/databricks-bench-profile.*` directory in the container,
+then `perf script -F comm,ip,sym --no-inline` there, and removes the directory, whether the run
+worked or not. `:u` samples user space only, which the node's default `perf_event_paranoid=2`
+allows for the container's own process, so no sysctl changes. Before recording it checks that
+`/tmp` has room for every CPU busy for the whole run (99 samples/s of about 64 KB). The stacks are
+folded here, with the thread name as the root frame, one count per sample (about 10 ms of user
+CPU at 99 Hz). The image's perf prints Rust symbols mangled, so they are demangled with binutils'
+`c++filt`, which must be on the local `PATH`, and the crate hashes it keeps (`[e020ed14…]`) are
+dropped. The price is that kernel CPU (syscalls, TCP, page faults) is not in the stacks, so the
+header also gives the process's user and kernel CPU over the run from `/proc/<pid>/stat` (utime
+and stime): the kernel share is what the stacks cannot show. `--out` also gets `perf-record.log`
+(perf's own report, with the sample count). It needs perf in the image; the VAM image has it.
+
+**`--method counters` (60 s)** only reads: no stack sampler is involved. It attributes the
+process's CPU with Vector's own counters over the run:
+
+| Cost | From | Covers |
+| --- | --- | --- |
+| process CPU | `/proc/<pid>/stat` utime + stime | everything |
+| each S3 sink | `component_encode_cpu_seconds_sum` | thread CPU of `encode_events`: JSON serialization and compression together |
+| each Zerobus sink | `zerobus_encoding_seconds_sum` | the Arrow/VARIANT encode on a blocking thread; wall time, so preemption is counted too |
+| the rest | process CPU minus the above | source decode, `Metric` construction, `metric_to_log_hydra`, fan-out, network/TLS, the runtime, allocation outside the encoders |
+
+Items are the events received by `prometheus_remote_write` sources, so each cost is also given in
+ms per 1,000 items. `utilization` is listed for context only. It is a busy fraction, not CPU:
+`metric_to_log_hydra` runs on several workers at once, and per-transform CPU
+(`measure_cpu_usage`) is off in the deployed config. A counters run also keeps the two exporter
+scrapes (`metrics-before.prom`, `metrics-after.prom`).
+
+**`--folded FILE`** summarizes an existing profile instead of measuring a pod. The file is either
+folded stacks (`root;...;leaf count` per line, as `inferno-collapse-perf` or `stackcollapse-perf.pl`
+write) or a flamegraph SVG (`.svg`, such as the platform profiler's). The deployed binary keeps its
+symbol table (`.symtab`) and `.eh_frame`, but no DWARF debug sections, so its stacks give function
+names but no file and line.
+
+`--out` (missing or empty) always gets:
+
+- `profile.folded`: the profile as folded stacks. For a counters run, each stack is one sink filed
+  under its module path, plus one unattributed stack, in CPU microseconds.
+- `summary.json` and `summary.md`. Both have a header saying how the profile was taken: method,
+  pod, image, version, pid, duration, total and unit, and for a platform or perf-user run the
+  perf sample count and the command; a perf-user run adds the process's user/kernel CPU split. Then come the top `--top` frames (default 20) by self and inclusive count, and
+  the buckets. A counters run also gets its counters per component, with ms per 1k items, and the
+  utilization gauges.
+
+**Buckets.** Each stack goes to the first bucket that matches it, so the order matters:
+
+1. By the leaf frame, wherever it is called from:
+   - *zstd compression* and *allocation*;
+   - *network and TLS* (`rustls`, `hyper`, `h2`, `tonic`, `tokio::net`, and kernel TCP/socket
+     syscalls). By the leaf, not the stack: the source runs inside hyper's server task, so every
+     source stack has hyper frames at its root. It comes ahead of the sinks so a sink's I/O is
+     not hidden in the sink.
+2. Then by any frame of the stack, in this order:
+   - *field lookup* (`vrl::path`, `LogEvent::get`);
+   - *VARIANT encoding* (`parquet_variant`);
+   - *Arrow arrow_stream encoding* (`codecs::encoding::format::arrow`, `arrow_*`);
+   - *Zerobus sink, not split further*;
+   - *metric_to_log_hydra*, ahead of the next one because it hashes with `serde_json`;
+   - *S3 JSON serialization* (`codecs::encoding::format::json`, `serde_json`);
+   - *S3 sink, not split further*;
+   - *Metric construction* (`event::metric::`);
+   - *remote-write decode* (`sources::prometheus`, `prost`, `snap`);
+   - *event cloning and fan-out*.
+3. Then *async runtime* (`tokio::runtime`, futex and epoll waits), by the leaf again: every worker
+   stack starts in the runtime.
+4. Anything else is *other / unattributed*.
+
+The patterns are in `BUCKETS` in `profile.rs`. A pattern that is a module path (`ring::`) matches
+only at the start of a path segment, so it does not match inside `alloc::string::`. A counters run fills only the two "not split
+further" sink buckets and *other*.
 
 ## Fakes: capturing sink output without changing the sink
 

@@ -226,7 +226,7 @@ fn kubectl_exec(args: &CaptureArgs) -> Command {
 }
 
 /// A label set, sorted by key.
-type Labels = Vec<(String, String)>;
+pub(super) type Labels = Vec<(String, String)>;
 
 /// A counter's name and full label set.
 type ReadingKey = (String, Labels);
@@ -266,7 +266,7 @@ fn scrape(args: &CaptureArgs, codec: &dyn SourceCodec) -> Result<Scrape, String>
 
 /// The API server's path to the pod's exporter through its proxy subresource. `kubectl get --raw`
 /// sends it unchanged.
-fn exporter_path(namespace: &str, pod: &str, port: u16) -> String {
+pub(super) fn exporter_path(namespace: &str, pod: &str, port: u16) -> String {
     format!("/api/v1/namespaces/{namespace}/pods/{pod}:{port}/proxy/metrics")
 }
 
@@ -303,15 +303,15 @@ fn received_readings(
 }
 
 /// One line of the Prometheus text exposition format.
-struct Reading {
-    name: String,
+pub(super) struct Reading {
+    pub(super) name: String,
     /// Sorted by key.
-    labels: Vec<(String, String)>,
-    value: f64,
+    pub(super) labels: Vec<(String, String)>,
+    pub(super) value: f64,
 }
 
 /// Parses `name{key="value",...} value [timestamp]` lines, skipping comments and blank lines.
-fn parse_exposition(text: &str) -> Result<Vec<Reading>, String> {
+pub(super) fn parse_exposition(text: &str) -> Result<Vec<Reading>, String> {
     let mut readings = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -394,7 +394,7 @@ fn parse_labels(mut s: &str) -> Result<(Labels, &str), String> {
     }
 }
 
-fn label<'a>(labels: &'a [(String, String)], key: &str) -> Option<&'a str> {
+pub(super) fn label<'a>(labels: &'a [(String, String)], key: &str) -> Option<&'a str> {
     labels
         .iter()
         .find(|(k, _)| k == key)

@@ -193,6 +193,29 @@ needs are:
   `staging-aws-us-west-2-0`, namespace `vector-aggregator`, container
   `vector-aggregator-metrics`, component and source type `prom_remote_write`. Pick a pod that is
   Running with all containers ready. A 30 s capture is about 300 MB.
+- **`profile`** takes `capture`'s kube arguments plus `--method`, `--duration-secs` and `--out`
+  (a missing or empty dir).
+  - `--method platform` (default; 30 s, at most 60) runs `//common/profiling/rust/cpu:profiler`
+    from `--universe` (else `$UNIVERSE_ROOT` or `~/universe`), with `--format flamegraph` (DWARF;
+    Vector has no frame pointers) and `--pid` set to the Vector process. It is not read-only: the
+    tool sets three perf sysctls on the node over kssh and restores them on exit, copies its
+    helpers into the pod's `/tmp/profiling` and removes them, and compiles perf inside the pod if
+    the image lacks it. Run it only with the owner's explicit go-ahead for that pod, and never
+    against prod without it. It needs an SSH agent (`eval "$(ssh-agent -s)"`) and node SSH over
+    kssh, which an Arca box lacks today (PLAT-150971): there it fails before changing anything.
+  - `--method perf-user` (30 s, at most 60) changes nothing on the node: it runs the image's perf
+    with `cpu-clock:u` (user space only, allowed at the node's default `perf_event_paranoid=2`)
+    and DWARF stacks in a `/tmp/databricks-bench-profile.*` dir it always removes, runs `perf
+    script` there, and folds and demangles locally (needs binutils' `c++filt`). Kernel CPU is not
+    in its stacks; the summary gives the process's user/kernel CPU split from `/proc/<pid>/stat`.
+    It still writes to the pod's `/tmp`, so it too needs the owner's go-ahead for that pod.
+  - `--method counters` (60 s) is read-only. It attributes the Vector process's CPU (from
+    `/proc/<pid>/stat`) to each S3 sink's `component_encode_cpu_seconds` and each Zerobus sink's
+    `zerobus_encoding_seconds`; the rest is unattributed.
+  - `--folded FILE` (folded stacks or a flamegraph SVG) summarizes an existing profile offline,
+    e.g. `perf record --call-graph dwarf` of a local candidate during a `bench` replay.
+  - Never commit a staging run's output: `metrics-*.prom` holds the pod's full exporter scrape,
+    and `platform.svg`/`profile.folded` the pod's stacks.
 - **`fetch-schema`** shells out to the `databricks` CLI, e.g. with profile
   `logfood-us-west-2-mt-staging` and table `main.eng_hydra.pod_prime_raw`. On an auth error run
   `databricks auth login --profile <p>` (interactive; ask the user to do it).

@@ -21,6 +21,7 @@ mod fetch_schema;
 mod generator;
 mod out_dir;
 mod process;
+mod profile;
 mod prom_remote_write;
 mod s3_ndjson;
 mod sink;
@@ -60,6 +61,18 @@ enum Command {
     Check(check::CheckArgs),
     /// Tap a live pod's source and reconstruct its input requests into a corpus.
     Capture(capture::CaptureArgs),
+    /// Measure where a live pod's Vector process spends CPU, or summarize an existing profile
+    /// (folded stacks or a flamegraph SVG) with --folded.
+    ///
+    /// Same kube arguments as `capture`. `--method platform` (default) runs the platform's Rust
+    /// profiler (`//common/profiling/rust/cpu:profiler`, perf with DWARF stacks) on the Vector
+    /// process. That tool changes the node's perf sysctls for the run and restores them, and
+    /// stages its helpers in the pod. `--method perf-user` runs the image's perf on user space only
+    /// (no node change; kernel CPU is not in the stacks). `--method counters` is read-only: it
+    /// attributes the process's CPU from /proc to each sink's encode counters. Writes profile.folded,
+    /// summary.json and summary.md (top frames, and buckets by module path) into --out, which must
+    /// be missing or empty.
+    Profile(profile::ProfileArgs),
     /// Save a Unity Catalog table's schema (via the databricks CLI) for fake-uc to serve.
     FetchSchema(fetch_schema::FetchSchemaArgs),
     /// Serve a minimal S3 PutObject endpoint that records every object it receives.
@@ -108,6 +121,7 @@ fn main() {
     let result = match cli.command {
         Command::Check(args) => runtime().block_on(check::run(args)),
         Command::Capture(args) => capture::capture(args),
+        Command::Profile(args) => profile::profile(args),
         Command::FetchSchema(args) => fetch_schema::fetch_schema(args),
         Command::FakeS3(args) => runtime().block_on(fake_s3::serve(args)),
         Command::FakeUc(args) => runtime().block_on(fake_uc::serve(args)),

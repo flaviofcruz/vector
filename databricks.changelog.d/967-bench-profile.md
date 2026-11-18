@@ -1,0 +1,2 @@
+Add a `profile` command to the Databricks bench harness. By default it runs the platform Rust profiler (perf, DWARF stacks) on a pod's Vector process and summarizes the stacks by module-path bucket; `--method perf-user` records user-space stacks with the pod's own perf and no node change; `--method counters` instead attributes CPU read-only from /proc and Vector's own encode counters, and `--folded` summarizes folded stacks or a flamegraph SVG.
+https://github.com/databricks-eng/vector/pull/967
