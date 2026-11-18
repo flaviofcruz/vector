@@ -75,6 +75,7 @@ fn azure_blob_build_request_without_compression() {
             ),
         ),
         compression,
+        event_logging: true,
     };
 
     let mut byte_size = GroupedCountByteSize::new_untagged();
@@ -125,6 +126,7 @@ fn azure_blob_build_request_with_compression() {
             ),
         ),
         compression,
+        event_logging: true,
     };
 
     let mut byte_size = GroupedCountByteSize::new_untagged();
@@ -175,6 +177,7 @@ fn azure_blob_build_request_with_time_format() {
             ),
         ),
         compression,
+        event_logging: true,
     };
 
     let mut byte_size = GroupedCountByteSize::new_untagged();
@@ -228,6 +231,7 @@ fn azure_blob_build_request_with_uuid() {
             ),
         ),
         compression,
+        event_logging: true,
     };
 
     let mut byte_size = GroupedCountByteSize::new_untagged();
@@ -274,6 +278,7 @@ fn azure_blob_build_request_with_crypto_nonce() {
             ),
         ),
         compression: Compression::None,
+        event_logging: true,
     };
 
     let mut byte_size = GroupedCountByteSize::new_untagged();
@@ -333,6 +338,7 @@ fn azure_blob_event_log_metadata_bucket_and_container_split() {
             ),
         ),
         compression: Compression::None,
+        event_logging: true,
     };
 
     let (metadata, _request_metadata_builder, _events) =
@@ -374,6 +380,7 @@ fn azure_blob_event_log_metadata_bucket_none_when_storage_account_unset() {
             ),
         ),
         compression: Compression::None,
+        event_logging: true,
     };
 
     let (metadata, _request_metadata_builder, _events) =
@@ -381,4 +388,79 @@ fn azure_blob_event_log_metadata_bucket_none_when_storage_account_unset() {
 
     assert_eq!(metadata.event_log_metadata.container, container_name);
     assert_eq!(metadata.event_log_metadata.bucket, None);
+}
+
+fn azure_blob_request_with_event_logging(
+    event_logging: bool,
+) -> crate::sinks::azure_common::config::AzureBlobRequest {
+    let request_options = AzureBlobRequestOptions {
+        container_name: String::from("logs"),
+        storage_account: Some(String::from("some-account")),
+        blob_time_format: String::new(),
+        blob_append_uuid: false,
+        blob_prepend_crypto_nonce: false,
+        encoder: (
+            Default::default(),
+            Encoder::<Framer>::new(
+                NewlineDelimitedEncoder::default().into(),
+                TextSerializerConfig::default().build().into(),
+            ),
+        ),
+        compression: Compression::None,
+        event_logging,
+    };
+    let events = vec![
+        Event::Log(LogEvent::from("first event")),
+        Event::Log(LogEvent::from("second event")),
+    ];
+    let (metadata, request_metadata_builder, events) =
+        request_options.split_input(("blob".into(), events));
+    let payload = request_options.encode_events(events).unwrap();
+    let request_metadata = request_metadata_builder.build(&payload);
+    request_options.build_request(metadata, request_metadata, payload)
+}
+
+#[test]
+fn azure_blob_skips_event_log_metadata_when_event_logging_disabled() {
+    let off = azure_blob_request_with_event_logging(false);
+    let on = azure_blob_request_with_event_logging(true);
+
+    assert!(off.metadata.event_log_metadata.count_map.is_empty());
+    assert!(
+        off.request_metadata
+            .event_log_metadata()
+            .file_send_event
+            .is_none()
+    );
+    assert!(!on.metadata.event_log_metadata.count_map.is_empty());
+    assert!(
+        on.request_metadata
+            .event_log_metadata()
+            .file_send_event
+            .is_some()
+    );
+
+    // Counts and sizes do not depend on event logging.
+    for request in [&off, &on] {
+        assert_eq!(request.metadata.count, 2);
+        assert_eq!(request.metadata.event_log_metadata.events_len, 2);
+        assert_eq!(request.request_metadata.event_count(), 2);
+        assert_eq!(
+            request.blob_data,
+            Bytes::from("first event\nsecond event\n")
+        );
+        assert_eq!(
+            request.metadata.event_log_metadata.bytes,
+            request.blob_data.len()
+        );
+    }
+    assert_eq!(
+        off.request_metadata.events_byte_size(),
+        on.request_metadata.events_byte_size()
+    );
+    assert_eq!(
+        off.request_metadata.request_encoded_size(),
+        on.request_metadata.request_encoded_size()
+    );
+    assert_eq!(off.metadata.byte_size, on.metadata.byte_size);
 }

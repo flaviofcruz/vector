@@ -1,0 +1,2 @@
+Skip building per-event sink event-log metadata (`generate_count_map`, `from_events_with_event_log`) in the `azure_blob` and `gcp_cloud_storage` sinks when `ENABLE_SINK_EVENT_LOGGING` is off, as `aws_s3` already does; outputs are unchanged and behavior with event logging on is unchanged. On the VAM Hydra bench this cuts about 11% CPU and a third of peak memory for both sinks.
+https://github.com/databricks-eng/vector/pull/998

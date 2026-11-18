@@ -11,7 +11,7 @@ use vector_lib::{
 
 use super::request_builder::AzureBlobRequestOptions;
 use crate::internal_events::vector_event::emit_blob_file_upload_attempt;
-use crate::sinks::util::vector_event_log::EventLoggingService;
+use crate::sinks::util::vector_event_log::{EventLoggingService, use_event_log_sink_wrapping};
 use crate::{
     Result,
     codecs::{Encoder, EncodingConfigWithFraming, SinkType},
@@ -265,6 +265,7 @@ impl AzureBlobSinkConfig {
             blob_prepend_crypto_nonce: self.blob_prepend_crypto_nonce,
             encoder: (transformer, encoder),
             compression: self.compression,
+            event_logging: use_event_log_sink_wrapping(),
         };
 
         let sink = AzureBlobSink::new(

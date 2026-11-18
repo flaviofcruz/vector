@@ -18,6 +18,7 @@ use vector_lib::{
     request_metadata::RequestMetadata,
 };
 
+use crate::sinks::util::vector_event_log::use_event_log_sink_wrapping;
 use crate::{
     codecs::{Encoder, EncodingConfigWithFraming, SinkType, Transformer},
     config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
@@ -407,6 +408,8 @@ struct RequestSettings {
     compression: Compression,
     tz_offset: Option<FixedOffset>,
     bucket: String,
+    // Whether sink event logging is on; read once from `use_event_log_sink_wrapping()`.
+    event_logging: bool,
 }
 
 impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
@@ -436,10 +439,18 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
         // can emit VECTOR_SINK_UPLOAD_{STAGED,DELIVERED} delivery events and
         // VECTOR_FILE_SEND_EVENT for each upload, matching the S3 and Azure blob sinks.
         // The concrete blob name and byte count are filled in below in build_request().
-        let builder = RequestMetadataBuilder::from_events_with_event_log(
-            &events,
-            Some(FileEventMetadata::default()),
-        );
+        // Gate the expensive per-event computation (event cloning + field lookups) on whether
+        // sink event logging is enabled. When disabled the count_map is empty and all emit_*
+        // calls become no-ops, so skipping the build is safe.
+        let vel_enabled = self.event_logging;
+        let builder = if vel_enabled {
+            RequestMetadataBuilder::from_events_with_event_log(
+                &events,
+                Some(FileEventMetadata::default()),
+            )
+        } else {
+            RequestMetadataBuilder::from_events(&events)
+        };
 
         // Create event metadata here as this is where the list of events are available pre-encoding
         // And we want to access this list to process the raw events to see specific field values
@@ -452,7 +463,11 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
             blob: "".to_string(),
             container: self.bucket.clone(),
             bucket: Some(self.bucket.clone()),
-            count_map: generate_count_map(&events, false),
+            count_map: if vel_enabled {
+                generate_count_map(&events, false)
+            } else {
+                Default::default()
+            },
         };
 
         let gcp_metadata = GcsMetadata {
@@ -587,6 +602,7 @@ impl RequestSettings {
             encoder: (transformer, encoder),
             tz_offset: offset,
             bucket: config.bucket.clone(),
+            event_logging: use_event_log_sink_wrapping(),
         })
     }
 }
@@ -1011,7 +1027,8 @@ mod tests {
             )
                 .into(),
         );
-        let builder = request_settings(&config, SinkContext::default());
+        let mut builder = request_settings(&config, SinkContext::default());
+        builder.event_logging = true;
         let (notifier, mut receiver) = BatchNotifier::new_with_receiver();
         let events = ["first event", "second event", "third event"]
             .into_iter()
@@ -1272,7 +1289,8 @@ mod tests {
         let mut byte_size = GroupedCountByteSize::new_untagged();
         byte_size.add_event(&log, log.estimated_json_encoded_size_of());
 
-        let request_settings = request_settings(&sink_config, context);
+        let mut request_settings = request_settings(&sink_config, context);
+        request_settings.event_logging = true;
         let (metadata, metadata_request_builder, _events) =
             request_settings.split_input((key, vec![log]));
         let payload = EncodeResult::uncompressed(Bytes::new(), byte_size);
@@ -1377,6 +1395,54 @@ mod tests {
         assert_eq!(
             request.settings.content_encoding,
             HeaderValue::from_str(custom_encoding).ok()
+        );
+    }
+
+    fn gcs_request_with_event_logging(event_logging: bool, events: Vec<Event>) -> GcsRequest {
+        let config = default_config(
+            (
+                Some(NewlineDelimitedEncoderConfig::new()),
+                JsonSerializerConfig::default(),
+            )
+                .into(),
+        );
+        let mut builder = request_settings(&config, SinkContext::default());
+        builder.event_logging = event_logging;
+        let (metadata, metadata_builder, events) = builder.split_input(("test/".into(), events));
+        let payload = builder.encode_events(events).unwrap();
+        let request_metadata = metadata_builder.build(&payload);
+        builder.build_request(metadata, request_metadata, payload)
+    }
+
+    #[test]
+    fn gcs_skips_event_log_metadata_when_event_logging_disabled() {
+        let events = vec![
+            Event::Log(LogEvent::from("first event")),
+            Event::Log(LogEvent::from("second event")),
+        ];
+        let off = gcs_request_with_event_logging(false, events.clone());
+        let on = gcs_request_with_event_logging(true, events);
+
+        assert!(off.event_log_metadata.count_map.is_empty());
+        assert!(off.metadata.event_log_metadata().file_send_event.is_none());
+        assert!(!on.event_log_metadata.count_map.is_empty());
+        assert!(on.metadata.event_log_metadata().file_send_event.is_some());
+
+        // Counts and sizes do not depend on event logging.
+        assert_eq!(off.body, on.body);
+        for request in [&off, &on] {
+            assert!(!request.body.is_empty());
+            assert_eq!(request.metadata.event_count(), 2);
+            assert_eq!(request.event_log_metadata.events_len, 2);
+            assert_eq!(request.event_log_metadata.bytes, request.body.len());
+        }
+        assert_eq!(
+            off.metadata.events_byte_size(),
+            on.metadata.events_byte_size()
+        );
+        assert_eq!(
+            off.metadata.request_encoded_size(),
+            on.metadata.request_encoded_size()
         );
     }
 }

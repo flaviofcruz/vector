@@ -30,6 +30,8 @@ pub struct AzureBlobRequestOptions {
     pub blob_prepend_crypto_nonce: bool,
     pub encoder: (Transformer, Encoder<Framer>),
     pub compression: Compression,
+    // Whether sink event logging is on; read once from `use_event_log_sink_wrapping()`.
+    pub event_logging: bool,
 }
 
 impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
@@ -54,6 +56,10 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
     ) -> (Self::Metadata, RequestMetadataBuilder, Self::Events) {
         let (partition_key, mut events) = input;
         let finalizers = events.take_finalizers();
+        // Gate the expensive per-event computation (event cloning + field lookups) on whether
+        // sink event logging is enabled. When disabled the count_map is empty and all emit_*
+        // calls become no-ops, so skipping the build is safe.
+        let vel_enabled = self.event_logging;
 
         // Create event metadata here as this is where the list of events are available pre-encoding
         // And we want to access this list to process the raw events to see specific field values
@@ -69,7 +75,11 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
             // field carries the Azure storage account name (log-daemon's
             // destination_bucket). `container` keeps powering the URL.
             bucket: self.storage_account.clone(),
-            count_map: generate_count_map(&events, false),
+            count_map: if vel_enabled {
+                generate_count_map(&events, false)
+            } else {
+                Default::default()
+            },
         };
 
         let azure_metadata = AzureBlobMetadata {
@@ -84,10 +94,14 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
         // Attach file-send event metadata so the EventLoggingService wrapper can emit
         // VECTOR_FILE_SEND_EVENT (staged/uploaded/error) for each blob upload. The
         // concrete blob name and byte count are filled in below in build_request().
-        let builder = RequestMetadataBuilder::from_events_with_event_log(
-            &events,
-            Some(FileEventMetadata::default()),
-        );
+        let builder = if vel_enabled {
+            RequestMetadataBuilder::from_events_with_event_log(
+                &events,
+                Some(FileEventMetadata::default()),
+            )
+        } else {
+            RequestMetadataBuilder::from_events(&events)
+        };
 
         (azure_metadata, builder, events)
     }
