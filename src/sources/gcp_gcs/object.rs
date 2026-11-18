@@ -423,16 +423,32 @@ impl GcsDownloader {
                         Ok(())
                     }
                     BatchStatus::Errored | BatchStatus::Rejected => {
-                        let err = ProcessingError::ErrorAcknowledgement {
-                            bucket: bucket.clone(),
-                            key: key.clone(),
+                        let errored = result == BatchStatus::Errored;
+                        let err = if errored {
+                            ProcessingError::SinkErrored {
+                                bucket: bucket.clone(),
+                                key: key.clone(),
+                            }
+                        } else {
+                            ProcessingError::SinkRejected {
+                                bucket: bucket.clone(),
+                                key: key.clone(),
+                            }
                         };
                         emit!(GcsObjectProcessingFailed {
                             bucket: &bucket,
                             key: &key,
                             error: &err,
                         });
-                        if acknowledge_failed { Ok(()) } else { Err(err) }
+                        // Errored means the sink could not deliver the events now but may later
+                        // (its destination is down, say): the message stays on the subscription,
+                        // whatever `acknowledge_failed` says. A rejection is permanent and
+                        // follows it.
+                        if acknowledge_failed && !errored {
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
                     }
                 }
             }

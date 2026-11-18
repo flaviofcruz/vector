@@ -93,6 +93,11 @@ pub(super) struct Config {
     /// When `true`, failed messages are acknowledged so they are not redelivered.
     /// When `false`, failed messages will be redelivered after the Pub/Sub
     /// acknowledgement deadline on the subscription expires.
+    ///
+    /// A message whose events the sink reported as errored (for example a destination that is
+    /// down) is never acknowledged, whatever this says: the data was not delivered and may be on a
+    /// later attempt, so it is always left for redelivery. Only a message the sink rejected (a
+    /// permanent failure) and other failures follow this setting.
     #[serde(default = "default_true")]
     #[derivative(Default(value = "default_true()"))]
     pub(super) acknowledge_failed_message: bool,
@@ -102,9 +107,8 @@ pub(super) struct Config {
     /// When set, a failed request for the object (a transport error or a non-success GCS status
     /// other than 404) calls `ModifyAckDeadline` on the message with this value, so it is
     /// redelivered after this delay instead of waiting out the subscription's full ack deadline.
-    /// Failures reading or decoding the object body, and every other error, keep the normal ack
-    /// deadline. Has no effect on messages acknowledged by `acknowledge_failed_message`. Unset (the
-    /// default) keeps that behavior for all failures.
+    /// Has no effect on messages acknowledged by `acknowledge_failed_message`. Unset (the default)
+    /// uses `errored_message_ack_deadline_secs` for fetch failures too.
     ///
     /// Valid values are 0 - 600. A small non-zero value, such as 10 - 30, avoids redelivering in a
     /// tight loop during a short GCS outage.
@@ -113,6 +117,25 @@ pub(super) struct Config {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[configurable(metadata(docs::examples = 15))]
     pub(super) failed_message_ack_deadline_secs: Option<u32>,
+
+    /// How long, in seconds, a failed message stays leased after the failure, before Pub/Sub
+    /// redelivers it.
+    ///
+    /// When set, a message whose events the sink reported as errored, or whose object body could
+    /// not be read (other than a truncated archive), calls `ModifyAckDeadline` with this value when
+    /// it fails, so it comes back this long after the failure rather than when the lease taken at
+    /// receive runs out. A failed object fetch uses it too unless `failed_message_ack_deadline_secs`
+    /// is set. Has no effect on messages acknowledged by `acknowledge_failed_message`. Unset (the
+    /// default) leaves these messages to the lease taken at receive.
+    ///
+    /// Pub/Sub caps an ack deadline at 600 seconds, so this is a fixed delay, not a growing
+    /// backoff. Valid values are 0 - 600; set it to the subscription's ack deadline to retry a
+    /// failed message one full lease after it failed.
+    #[serde(default)]
+    #[derivative(Default)]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 600))]
+    pub(super) errored_message_ack_deadline_secs: Option<u32>,
 
     /// Number of concurrent polling tasks.
     ///
@@ -289,17 +312,20 @@ pub(super) enum IngestorNewError {
     InvalidNumberOfMessages { messages: u32 },
     #[snafu(display("Invalid adaptive concurrency: {}", reason))]
     AdaptiveConcurrency { reason: String },
-    #[snafu(display("Invalid failed_message_ack_deadline_secs {}: must be 0–600", secs))]
-    InvalidFailedMessageAckDeadline { secs: u32 },
+    #[snafu(display("Invalid {} {}: must be 0–600", option, secs))]
+    InvalidAckDeadline { option: &'static str, secs: u32 },
 }
 
 /// Pub/Sub rejects ack deadlines above 10 minutes.
 const MAX_ACK_DEADLINE_SECS: u32 = 600;
 
-const fn validate_failed_message_ack_deadline(secs: Option<u32>) -> Result<(), IngestorNewError> {
+const fn validate_ack_deadline(
+    option: &'static str,
+    secs: Option<u32>,
+) -> Result<(), IngestorNewError> {
     match secs {
         Some(secs) if secs > MAX_ACK_DEADLINE_SECS => {
-            Err(IngestorNewError::InvalidFailedMessageAckDeadline { secs })
+            Err(IngestorNewError::InvalidAckDeadline { option, secs })
         }
         _ => Ok(()),
     }
@@ -383,9 +409,16 @@ pub enum ProcessingError {
         reason: String,
     },
 
-    /// The downstream sink reported an error for this object.
+    /// The sink reported the object's events as errored: it could not deliver them now (for
+    /// example its destination is down) but may on a later attempt. The message is never
+    /// acknowledged, whatever `acknowledge_failed_message` says.
     #[snafu(display("Sink reported an error for gs://{}/{}", bucket, key))]
-    ErrorAcknowledgement { bucket: String, key: String },
+    SinkErrored { bucket: String, key: String },
+
+    /// The sink rejected the object's events: a permanent failure that a retry cannot fix. The
+    /// message follows `acknowledge_failed_message`.
+    #[snafu(display("Sink rejected the events of gs://{}/{}", bucket, key))]
+    SinkRejected { bucket: String, key: String },
 
     /// The direct ingest message has an empty `file_id`.
     #[snafu(display(
@@ -416,10 +449,14 @@ impl ProcessingError {
         }
     }
 
-    /// Some object-integrity failures must redeliver even when `acknowledge_failed_message` is
-    /// enabled: the object may be readable on a later attempt, and acknowledging it would lose it.
+    /// Failures that must redeliver even when `acknowledge_failed_message` is enabled: the object
+    /// may be readable on a later attempt, or the sink could not deliver its events now (for
+    /// example its destination is down) but may on a later one. Acknowledging it would lose it.
     pub const fn must_redeliver(&self) -> bool {
-        matches!(self, ProcessingError::IncompleteObjectDownload { .. })
+        matches!(
+            self,
+            ProcessingError::IncompleteObjectDownload { .. } | ProcessingError::SinkErrored { .. }
+        )
     }
 
     /// Whether a failed message may be acknowledged under the configured failure policy.
@@ -427,15 +464,45 @@ impl ProcessingError {
         !self.is_retriable() || (acknowledge_failed && !self.must_redeliver())
     }
 
-    /// Whether the message should be redelivered early. Only a request-level fetch failure
-    /// qualifies; broken or undecodable files would fail again on redelivery.
-    pub const fn release_reason(&self) -> Option<&'static str> {
+    /// Why a failed, unacknowledged message gets its ack deadline reset when it fails, so it is
+    /// redelivered a set time after the failure: a sink-errored object, a failed object fetch,
+    /// and a failure reading the object body, including a short download.
+    ///
+    /// Not a truncated archive (the decoder's `UnexpectedEof`): the object is immutable, so it
+    /// would fail the same way, and it keeps the lease it got at receive. Nor a malformed message,
+    /// a missing object, or a closed pipeline.
+    pub fn release_reason(&self) -> Option<&'static str> {
         match self {
             ProcessingError::FetchObject { .. } => Some("fetch_object"),
             ProcessingError::GetObject { .. } => Some("get_object"),
+            ProcessingError::SinkErrored { .. } => Some("errored"),
+            ProcessingError::IncompleteObjectDownload { .. } => Some("read_object"),
+            ProcessingError::ReadObject { source, .. }
+                if !is_truncated_archive(source.as_ref()) =>
+            {
+                Some("read_object")
+            }
             _ => None,
         }
     }
+
+    /// Whether the GCS object itself could not be fetched, which `failed_message_ack_deadline_secs`
+    /// governs.
+    const fn is_fetch_failure(&self) -> bool {
+        matches!(
+            self,
+            ProcessingError::FetchObject { .. } | ProcessingError::GetObject { .. }
+        )
+    }
+}
+
+/// Whether a read error is the decoder reporting an archive that ends mid-member
+/// (`UnexpectedEof`). The object is immutable, so reading it again fails the same way.
+fn is_truncated_archive(error: &dyn FramingError) -> bool {
+    error
+        .as_any()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
 // ============================================================================
@@ -606,6 +673,7 @@ struct State {
     acknowledge_message: bool,
     acknowledge_failed_message: bool,
     failed_message_ack_deadline_secs: Option<u32>,
+    errored_message_ack_deadline_secs: Option<u32>,
     callback_client: Option<IngestionCallbackClient>,
     message_format: MessageFormat,
     rate_limiter: ObjectStorageRateLimiter,
@@ -647,7 +715,14 @@ impl Ingestor {
             });
         }
 
-        validate_failed_message_ack_deadline(config.failed_message_ack_deadline_secs)?;
+        validate_ack_deadline(
+            "failed_message_ack_deadline_secs",
+            config.failed_message_ack_deadline_secs,
+        )?;
+        validate_ack_deadline(
+            "errored_message_ack_deadline_secs",
+            config.errored_message_ack_deadline_secs,
+        )?;
 
         let subscription_resource_name =
             format!("projects/{project}/subscriptions/{}", config.subscription);
@@ -691,6 +766,7 @@ impl Ingestor {
             acknowledge_message: config.acknowledge_message,
             acknowledge_failed_message: config.acknowledge_failed_message,
             failed_message_ack_deadline_secs: config.failed_message_ack_deadline_secs,
+            errored_message_ack_deadline_secs: config.errored_message_ack_deadline_secs,
             callback_client,
             message_format,
             rate_limiter,
@@ -841,6 +917,13 @@ async fn fetch_backlog(state: &State) -> crate::Result<Option<u64>> {
     Ok(latest_backlog(&response))
 }
 
+/// A failed message whose ack deadline is reset when it fails (see `release_messages`).
+struct ReleasedMessage {
+    ack_id: String,
+    reason: &'static str,
+    secs: u32,
+}
+
 // ============================================================================
 // IngestorProcess — one per concurrent polling task.
 // ============================================================================
@@ -965,7 +1048,7 @@ impl IngestorProcess {
         let mut delivered = true;
         let mut back_pressure = false;
         let mut ack_ids: Vec<String> = Vec::new();
-        let mut released: Vec<(String, &'static str)> = Vec::new();
+        let mut released: Vec<ReleasedMessage> = Vec::new();
 
         for msg in messages {
             let message_id = msg.message.message_id.clone();
@@ -1000,7 +1083,8 @@ impl IngestorProcess {
                     back_pressure = matches!(
                         err,
                         ProcessingError::PipelineSend { .. }
-                            | ProcessingError::ErrorAcknowledgement { .. }
+                            | ProcessingError::SinkErrored { .. }
+                            | ProcessingError::SinkRejected { .. }
                     );
                     emit!(PubSubMessageProcessingError {
                         message_id: &message_id,
@@ -1008,22 +1092,23 @@ impl IngestorProcess {
                     });
                     // Non-retriable errors must always be acknowledged to prevent
                     // an infinite retry loop. Retriable errors respect the
-                    // acknowledge_failed_message config flag.
+                    // acknowledge_failed_message config flag, except those that
+                    // must redeliver (a short download, a sink-errored object).
                     if err.should_acknowledge(self.state.acknowledge_failed_message) {
                         ack_ids.push(ack_id);
-                    } else if self.state.failed_message_ack_deadline_secs.is_some()
-                        && let Some(reason) = err.release_reason()
-                    {
-                        released.push((ack_id, reason));
+                    } else if let Some((reason, secs)) = self.release_deadline(err) {
+                        released.push(ReleasedMessage {
+                            ack_id,
+                            reason,
+                            secs,
+                        });
                     }
                 }
             }
         }
 
-        if let Some(secs) = self.state.failed_message_ack_deadline_secs
-            && !released.is_empty()
-        {
-            self.release_messages(&released, secs).await;
+        if !released.is_empty() {
+            self.release_messages(&released).await;
         }
 
         if !ack_ids.is_empty() {
@@ -1356,23 +1441,50 @@ impl IngestorProcess {
         Ok(pull_response.received_messages)
     }
 
-    /// Redelivers failed messages after `secs` instead of the full ack deadline. A failure here
-    /// only logs: the messages then fall back to the subscription's normal ack deadline.
-    async fn release_messages(&self, released: &[(String, &'static str)], secs: u32) {
-        let ack_ids: Vec<String> = released.iter().map(|(id, _)| id.clone()).collect();
-        match self.modify_ack_deadline(&ack_ids, secs).await {
-            Ok(true) => {
-                for (_, reason) in released {
-                    emit!(PubSubMessageReleased { reason });
+    /// The reason and ack deadline to reset a failed, unacknowledged message to, if any (see
+    /// `ProcessingError::release_reason`). A failed fetch uses `failed_message_ack_deadline_secs`
+    /// when set; everything else uses `errored_message_ack_deadline_secs`.
+    fn release_deadline(&self, err: &ProcessingError) -> Option<(&'static str, u32)> {
+        let reason = err.release_reason()?;
+        let secs = if err.is_fetch_failure() {
+            self.state
+                .failed_message_ack_deadline_secs
+                .or(self.state.errored_message_ack_deadline_secs)
+        } else {
+            self.state.errored_message_ack_deadline_secs
+        }?;
+        Some((reason, secs))
+    }
+
+    /// Resets the ack deadline of failed messages, so each is redelivered its configured delay
+    /// after it failed. Messages sharing a delay go in one request. A failure here only logs: the
+    /// messages then fall back to the lease they got at receive.
+    async fn release_messages(&self, released: &[ReleasedMessage]) {
+        let mut delays: Vec<u32> = released.iter().map(|message| message.secs).collect();
+        delays.sort_unstable();
+        delays.dedup();
+        for secs in delays {
+            let batch: Vec<&ReleasedMessage> = released
+                .iter()
+                .filter(|message| message.secs == secs)
+                .collect();
+            let ack_ids: Vec<String> = batch.iter().map(|message| message.ack_id.clone()).collect();
+            match self.modify_ack_deadline(&ack_ids, secs).await {
+                Ok(true) => {
+                    for message in batch {
+                        emit!(PubSubMessageReleased {
+                            reason: message.reason
+                        });
+                    }
                 }
+                Ok(false) => {}
+                Err(error) => warn!(
+                    message = "Failed to modify Pub/Sub ack deadline.",
+                    %error,
+                    count = %ack_ids.len(),
+                    internal_log_rate_limit = true,
+                ),
             }
-            Ok(false) => {}
-            Err(error) => warn!(
-                message = "Failed to modify Pub/Sub ack deadline.",
-                %error,
-                count = %ack_ids.len(),
-                internal_log_rate_limit = true,
-            ),
         }
     }
 
@@ -1517,23 +1629,31 @@ tolerate_truncated_archives = true"#,
 
     #[test]
     fn failed_message_ack_deadline_validation() {
-        assert!(validate_failed_message_ack_deadline(None).is_ok());
-        assert!(validate_failed_message_ack_deadline(Some(0)).is_ok());
-        assert!(validate_failed_message_ack_deadline(Some(600)).is_ok());
+        let option = "failed_message_ack_deadline_secs";
+        assert!(validate_ack_deadline(option, None).is_ok());
+        assert!(validate_ack_deadline(option, Some(0)).is_ok());
+        assert!(validate_ack_deadline(option, Some(600)).is_ok());
         assert!(matches!(
-            validate_failed_message_ack_deadline(Some(601)),
-            Err(IngestorNewError::InvalidFailedMessageAckDeadline { secs: 601 })
+            validate_ack_deadline(option, Some(601)),
+            Err(IngestorNewError::InvalidAckDeadline { secs: 601, .. })
         ));
     }
 
     #[test]
     fn object_integrity_errors_force_redelivery() {
-        let errors = [ProcessingError::IncompleteObjectDownload {
-            bytes_read: 8,
-            content_length: 10,
-            bucket: "b".into(),
-            key: "k".into(),
-        }];
+        let errors = [
+            ProcessingError::IncompleteObjectDownload {
+                bytes_read: 8,
+                content_length: 10,
+                bucket: "b".into(),
+                key: "k".into(),
+            },
+            // The sink could not deliver the events now; they may land on a later attempt.
+            ProcessingError::SinkErrored {
+                bucket: "b".into(),
+                key: "k".into(),
+            },
+        ];
 
         for error in errors {
             assert!(error.is_retriable());
@@ -1551,12 +1671,43 @@ tolerate_truncated_archives = true"#,
         assert!(!ordinary_error.should_acknowledge(false));
     }
 
-    /// Only a request-level fetch failure is released early; body, decode, and permanent errors
-    /// are left alone.
     #[test]
-    fn only_fetch_failures_release_early() {
+    fn errored_message_ack_deadline_config() {
+        let config: Config = toml::from_str(r#"subscription = "s""#).unwrap();
+        assert_eq!(
+            config.errored_message_ack_deadline_secs, None,
+            "off by default: a failed message keeps the lease it got at receive"
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+                subscription = "s"
+                errored_message_ack_deadline_secs = 600
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.errored_message_ack_deadline_secs, Some(600));
+
+        let error = validate_ack_deadline("errored_message_ack_deadline_secs", Some(601))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("errored_message_ack_deadline_secs 601"),
+            "{error}"
+        );
+    }
+
+    /// A sink-errored object, a failed fetch, and a read failure get their deadline reset; a
+    /// truncated archive, a rejection, and permanent errors do not.
+    #[test]
+    fn release_reasons() {
         let bucket = || "b".to_string();
         let key = || "k".to_string();
+        let read = |kind| ProcessingError::ReadObject {
+            source: Box::new(std::io::Error::new(kind, "read failed")),
+            bucket: bucket(),
+            key: key(),
+        };
         let cases = [
             (
                 ProcessingError::GetObject {
@@ -1567,16 +1718,29 @@ tolerate_truncated_archives = true"#,
                 Some("get_object"),
             ),
             (
-                ProcessingError::ReadObject {
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "truncated",
-                    )),
+                ProcessingError::SinkErrored {
                     bucket: bucket(),
                     key: key(),
                 },
-                None,
+                Some("errored"),
             ),
+            (
+                read(std::io::ErrorKind::ConnectionReset),
+                Some("read_object"),
+            ),
+            (read(std::io::ErrorKind::InvalidData), Some("read_object")),
+            // A short download (#972) is a transient read failure too.
+            (
+                ProcessingError::IncompleteObjectDownload {
+                    bytes_read: 8,
+                    content_length: 10,
+                    bucket: bucket(),
+                    key: key(),
+                },
+                Some("read_object"),
+            ),
+            // A truncated archive is immutable and would fail the same way.
+            (read(std::io::ErrorKind::UnexpectedEof), None),
             (
                 ProcessingError::PipelineSend {
                     source: vector_lib::source_sender::SendError::Closed,
@@ -1586,7 +1750,7 @@ tolerate_truncated_archives = true"#,
                 None,
             ),
             (
-                ProcessingError::ErrorAcknowledgement {
+                ProcessingError::SinkRejected {
                     bucket: bucket(),
                     key: key(),
                 },
@@ -1939,12 +2103,20 @@ tolerate_truncated_archives = true"#,
                 "downstream pipeline closed transiently — retry may succeed after recovery",
             ),
             (
-                ProcessingError::ErrorAcknowledgement {
+                ProcessingError::SinkErrored {
                     bucket: "my-logs-bucket".into(),
                     key: "app/2026/03/21/events.log".into(),
                 },
                 true,
                 "sink error acknowledgement is transient — sink may recover on re-delivery",
+            ),
+            (
+                ProcessingError::SinkRejected {
+                    bucket: "my-logs-bucket".into(),
+                    key: "app/2026/03/21/events.log".into(),
+                },
+                true,
+                "a rejection follows acknowledge_failed_message, like other retriable failures",
             ),
         ];
 
@@ -2232,6 +2404,42 @@ mod drain_tests {
         adaptive: Option<AdaptiveObjectStorageConcurrency>,
         delivery_status: Option<crate::event::EventStatus>,
     ) -> (IngestorProcess, tokio::task::JoinHandle<()>) {
+        let config = Config {
+            acknowledge_message,
+            // Early release only applies to failed messages that are not acknowledged.
+            acknowledge_failed_message: failed_message_ack_deadline_secs.is_none(),
+            failed_message_ack_deadline_secs,
+            ..test_config(server)
+        };
+        process_from_config(
+            server,
+            drain_gate,
+            pause_gate,
+            config,
+            adaptive,
+            delivery_status,
+        )
+        .await
+    }
+
+    /// The pubsub config the harness uses, pointed at `server`.
+    fn test_config(server: &MockServer) -> Config {
+        Config {
+            subscription: "test-sub".into(),
+            endpoint: Some(server.uri()),
+            poll_secs: 0,
+            ..Default::default()
+        }
+    }
+
+    async fn process_from_config(
+        server: &MockServer,
+        drain_gate: Option<DrainGate>,
+        pause_gate: Option<PauseGate>,
+        config: Config,
+        adaptive: Option<AdaptiveObjectStorageConcurrency>,
+        delivery_status: Option<crate::event::EventStatus>,
+    ) -> (IngestorProcess, tokio::task::JoinHandle<()>) {
         let client = HttpClient::new(TlsSettings::default(), &ProxyConfig::default())
             .expect("HttpClient must build");
         let decoder = DecodingConfig::new(
@@ -2254,16 +2462,6 @@ mod drain_tests {
             .expect("downloader must build")
             .with_adaptive_concurrency(adaptive.clone()),
         );
-        let config = Config {
-            subscription: "test-sub".into(),
-            endpoint: Some(server.uri()),
-            acknowledge_message,
-            // Early release only applies to failed messages that are not acknowledged.
-            acknowledge_failed_message: failed_message_ack_deadline_secs.is_none(),
-            failed_message_ack_deadline_secs,
-            poll_secs: 0,
-            ..Default::default()
-        };
         let mut ingestor = Ingestor::new(
             "test-project".into(),
             client,
@@ -2816,5 +3014,171 @@ mod drain_tests {
             "an unpaused table fetches its object"
         );
         assert_eq!(polls, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Sink-errored vs rejected, and the ack deadline reset on failure
+    // -------------------------------------------------------------------------
+
+    /// One pull returning a single INGEST message, accepting acknowledge and modifyAckDeadline,
+    /// with `object` as the GCS download response.
+    async fn mock_pubsub_with_object(object: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        let data = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"kind": "INGEST", "bucket": "b", "key": "k.log", "file_id": "f1"}"#);
+        Mock::given(method("POST"))
+            .and(path_regex(":pull$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "receivedMessages": [{"ackId": "ack-1", "message": {"data": data, "messageId": "m1"}}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(":acknowledge$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        mock_modify_ack_deadline(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(object)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn object_lines() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_string("first\nsecond\n")
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn gzip_object(body: Vec<u8>) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-encoding", "gzip")
+            .set_body_bytes(body)
+    }
+
+    async fn run_once_with_config(
+        server: &MockServer,
+        config: Config,
+        delivery_status: crate::event::EventStatus,
+    ) {
+        let (mut process, sink) =
+            process_from_config(server, None, None, config, None, Some(delivery_status)).await;
+        process.run_once().await;
+        drop(process);
+        sink.await.unwrap();
+    }
+
+    /// A sink-errored message stays on the subscription even when failed messages are
+    /// acknowledged; with no `errored_message_ack_deadline_secs` it keeps its receive lease.
+    #[tokio::test]
+    async fn sink_errored_message_is_never_acknowledged() {
+        for acknowledge_failed_message in [true, false] {
+            let server = mock_pubsub_with_object(object_lines()).await;
+            let config = Config {
+                acknowledge_failed_message,
+                ..test_config(&server)
+            };
+            run_once_with_config(&server, config, crate::event::EventStatus::Errored).await;
+            let (gets, acks) = requests(&server).await;
+            assert_eq!(gets, 1, "the object is fetched");
+            assert!(
+                acks.is_empty(),
+                "acknowledge_failed_message = {acknowledge_failed_message}: {acks:?}"
+            );
+            assert!(ack_deadline_changes(&server).await.is_empty());
+        }
+    }
+
+    /// With `errored_message_ack_deadline_secs`, a sink-errored message is redelivered that long
+    /// after it failed.
+    #[tokio::test]
+    async fn sink_errored_message_is_redelivered_after_errored_deadline() {
+        let server = mock_pubsub_with_object(object_lines()).await;
+        let config = Config {
+            acknowledge_failed_message: true,
+            errored_message_ack_deadline_secs: Some(600),
+            ..test_config(&server)
+        };
+        run_once_with_config(&server, config, crate::event::EventStatus::Errored).await;
+        let changes = ack_deadline_changes(&server).await;
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(
+            changes[0].contains("\"ackDeadlineSeconds\":600") && changes[0].contains("ack-1"),
+            "{changes:?}"
+        );
+        assert!(requests(&server).await.1.is_empty(), "never acknowledged");
+    }
+
+    /// A rejected message follows `acknowledge_failed_message`, and its deadline is never reset:
+    /// a retry cannot fix it.
+    #[tokio::test]
+    async fn sink_rejected_message_follows_acknowledge_failed_message() {
+        for acknowledge_failed_message in [true, false] {
+            let server = mock_pubsub_with_object(object_lines()).await;
+            let config = Config {
+                acknowledge_failed_message,
+                errored_message_ack_deadline_secs: Some(600),
+                ..test_config(&server)
+            };
+            run_once_with_config(&server, config, crate::event::EventStatus::Rejected).await;
+            let acks = requests(&server).await.1;
+            assert_eq!(
+                acks.len(),
+                usize::from(acknowledge_failed_message),
+                "acknowledge_failed_message = {acknowledge_failed_message}: {acks:?}"
+            );
+            assert!(ack_deadline_changes(&server).await.is_empty());
+        }
+    }
+
+    /// A failed fetch uses `errored_message_ack_deadline_secs` unless
+    /// `failed_message_ack_deadline_secs` is set, which takes precedence.
+    #[tokio::test]
+    async fn fetch_failure_deadline_precedence() {
+        for (failed, errored, expected) in [(None, Some(600), 600), (Some(15), Some(600), 15)] {
+            let server = mock_pubsub_with_object(ResponseTemplate::new(503)).await;
+            let config = Config {
+                acknowledge_failed_message: false,
+                failed_message_ack_deadline_secs: failed,
+                errored_message_ack_deadline_secs: errored,
+                ..test_config(&server)
+            };
+            run_once_with_config(&server, config, crate::event::EventStatus::Delivered).await;
+            let changes = ack_deadline_changes(&server).await;
+            assert_eq!(changes.len(), 1, "{changes:?}");
+            assert!(
+                changes[0].contains(&format!("\"ackDeadlineSeconds\":{expected}")),
+                "failed = {failed:?}: {changes:?}"
+            );
+        }
+    }
+
+    /// A failure reading the object body is redelivered after the errored deadline; a truncated
+    /// archive is not, since it would fail the same way.
+    #[tokio::test]
+    async fn read_failure_is_released_but_truncated_archive_is_not() {
+        let complete = gzip(b"first\nsecond\nthird\n");
+        let truncated = complete[..complete.len() - 12].to_vec();
+        let mut corrupt = complete[..10].to_vec();
+        corrupt.extend_from_slice(&[0xff; 32]);
+        for (body, released) in [(corrupt, true), (truncated, false)] {
+            let server = mock_pubsub_with_object(gzip_object(body)).await;
+            let config = Config {
+                acknowledge_failed_message: false,
+                errored_message_ack_deadline_secs: Some(600),
+                ..test_config(&server)
+            };
+            run_once_with_config(&server, config, crate::event::EventStatus::Delivered).await;
+            let changes = ack_deadline_changes(&server).await;
+            assert_eq!(changes.len(), usize::from(released), "{changes:?}");
+            assert!(requests(&server).await.1.is_empty(), "never acknowledged");
+        }
     }
 }
