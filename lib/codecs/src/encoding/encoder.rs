@@ -100,7 +100,10 @@ impl BatchEncoder {
                         _ => Error::SerializingError(Box::new(err)),
                     }
                 })?;
-                Ok(BatchOutput::Arrow(record_batch))
+                Ok((
+                    BatchOutput::Arrow(record_batch),
+                    (0..events.len() as u32).collect(),
+                ))
             }
             #[cfg(not(feature = "arrow"))]
             _ => unreachable!("BatchSerializer has no variants without the `arrow` feature"),
