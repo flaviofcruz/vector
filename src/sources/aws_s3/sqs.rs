@@ -2020,6 +2020,9 @@ fn handle_single_log(
             }
         }
     };
+
+    // Upload-time stamp for the Zerobus sink's object-uploaded-to-saved freshness.
+    crate::sources::util::stamp_object_uploaded_ms(log, timestamp);
 }
 
 /// Extracts the notification timestamp from SQS message attributes.
@@ -2629,6 +2632,47 @@ fn handle_single_log_stamps_log_type_when_present() {
         None,
     );
     assert_eq!(log["log_type"], "cp_logs".into());
+}
+
+#[test]
+fn handle_single_log_stamps_object_uploaded_ms() {
+    let mut log = LogEvent::default();
+    let ts = Utc::now();
+    handle_single_log(
+        &mut log,
+        LogNamespace::Legacy,
+        "my-bucket",
+        "path/to/file.log",
+        "us-west-2",
+        None,
+        &None,
+        Some(ts),
+    );
+    assert_eq!(
+        log.get(metadata_path!("databricks", "object_uploaded_ms")),
+        Some(&vrl::value::Value::from(ts.timestamp_millis()))
+    );
+    // The stamp must not flip a Legacy event's runtime namespace.
+    assert_eq!(log.namespace(), LogNamespace::Legacy);
+}
+
+#[test]
+fn handle_single_log_omits_object_uploaded_ms_when_absent() {
+    let mut log = LogEvent::default();
+    handle_single_log(
+        &mut log,
+        LogNamespace::Legacy,
+        "my-bucket",
+        "path/to/file.log",
+        "us-west-2",
+        None,
+        &None,
+        None,
+    );
+    assert!(
+        log.get(metadata_path!("databricks", "object_uploaded_ms"))
+            .is_none()
+    );
 }
 
 #[test]

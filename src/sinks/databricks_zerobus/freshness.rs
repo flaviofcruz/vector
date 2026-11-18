@@ -8,9 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array, Int64Array, StructArray};
 use arrow::record_batch::RecordBatch;
-use metrics::histogram;
+use metrics::{counter, histogram};
+use vector_lib::lookup::metadata_path;
 
-use crate::internal_events::ZerobusAckFreshness;
+use crate::{event::Event, internal_events::ZerobusAckFreshness};
 
 /// LP freshness SLA. The alert divides `zerobus_ack_over_sla_total` by the born_to_saved `_count`.
 const FRESHNESS_SLA_MS: i64 = 30 * 60 * 1000;
@@ -53,7 +54,6 @@ impl AckTimes {
             lp_ingest: int64_at(batch, ["_log_metadata", "vector_metadata", "timestamp_ms"]),
         }
     }
-
     /// Records the lags of an acked batch. Call only after Zerobus acks the batch.
     pub(super) fn record_acked(&self, table: &str) {
         if self.born.is_none() && self.lp_ingest.is_none() {
@@ -80,6 +80,71 @@ impl AckTimes {
             missing_born_at: counts.missing_born_at,
             over_sla_born_to_saved: counts.over_sla_born_to_saved,
         });
+    }
+}
+
+/// Object-upload stamps (epoch ms) for the events of one batch.
+///
+/// The queue sources already know when the blob was written — S3 `last_modified`, Azure
+/// blob `Last-Modified`, GCS object `Last-Modified` response header — and stamp it as
+/// `%databricks.object_uploaded_ms` event metadata, so the freshness clock starts at the
+/// object upload rather than at the LP splice. Unlike `born`/`lp_ingest` this needs no Arrow
+/// column, so it works for wire_to_arrow tables without a table schema change. Events without
+/// the stamp are skipped; a batch where no event has it records nothing.
+///
+/// The vector is aligned with the request's events (one slot each, `None` when absent), so
+/// `keep_rows` can drop the slots of rows that `wire_to_arrow` dropped during encoding and
+/// that therefore never reach a Zerobus ack.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ObjectUploadTimes(Vec<Option<i64>>);
+
+impl ObjectUploadTimes {
+    pub(super) fn from_events(events: &[Event]) -> Self {
+        Self(
+            events
+                .iter()
+                .map(|event| {
+                    event
+                        .maybe_as_log()
+                        .and_then(|log| log.get(metadata_path!("databricks", "object_uploaded_ms")))
+                        .and_then(|value| value.as_integer())
+                })
+                .collect(),
+        )
+    }
+
+    /// Keeps only the slots of `kept` row indices (from the encoder, in event order), so
+    /// rows dropped by `wire_to_arrow` never enter the histogram.
+    pub(super) fn keep_rows(&mut self, kept: &[u32]) {
+        self.0 = kept.iter().map(|&row| self.0[row as usize]).collect();
+    }
+
+    /// Records the upload-to-ack lags of an acked batch. Call only after Zerobus acks.
+    pub(super) fn record_acked(&self, table: &str) {
+        if self.0.iter().all(Option::is_none) {
+            return;
+        }
+        // Handle resolved once per batch; the loop only calls `record`.
+        let seconds =
+            histogram!("zerobus_ack_object_uploaded_to_saved_seconds", "table" => table.to_owned());
+        let now_ms = now_epoch_ms();
+        let mut negative = 0;
+        for stamp in self.0.iter().flatten() {
+            let lag = now_ms.saturating_sub(*stamp);
+            if lag < 0 {
+                negative += 1;
+            } else {
+                seconds.record(lag as f64 / 1000.0);
+            }
+        }
+        if negative > 0 {
+            counter!(
+                "zerobus_ack_negative_latency_total",
+                "table" => table.to_owned(),
+                "series" => "object_uploaded_to_saved",
+            )
+            .increment(negative);
+        }
     }
 }
 

@@ -212,6 +212,21 @@ impl WireToArrowSerializer {
     /// Every event must carry a `Value::Bytes`-typed `message` field holding
     /// the original proto wire bytes; any miss rejects the batch.
     pub fn encode_to_record_batch(&self, events: &[Event]) -> Result<RecordBatch> {
+        self.encode_to_record_batch_with_kept(events)
+            .map(|(batch, _kept)| batch)
+    }
+
+    /// Encode a batch of events into a single Arrow `RecordBatch` plus the
+    /// indices of the events that produced an output row, in input order (see
+    /// [`WireToArrowEncoder::encode_batch_with_kept`]). Each event maps 1:1 to
+    /// a wire message, so event indices and wire-message indices coincide.
+    ///
+    /// Every event must carry a `Value::Bytes`-typed `message` field holding
+    /// the original proto wire bytes; any miss rejects the batch.
+    pub fn encode_to_record_batch_with_kept(
+        &self,
+        events: &[Event],
+    ) -> Result<(RecordBatch, Vec<u32>)> {
         if events.is_empty() {
             return Err(WireToArrowError::NoEvents);
         }
@@ -223,6 +238,6 @@ impl WireToArrowSerializer {
                 None => return Err(WireToArrowError::MessageBytesMissing),
             }
         }
-        self.encoder.encode_batch(&wire_bytes)
+        self.encoder.encode_batch_with_kept(&wire_bytes)
     }
 }

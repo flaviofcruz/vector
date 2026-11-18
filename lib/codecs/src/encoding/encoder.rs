@@ -48,6 +48,20 @@ impl BatchEncoder {
 
     /// Encode a batch of events into a `BatchOutput`.
     pub fn encode_batch(&self, events: &[Event]) -> Result<BatchOutput, Error> {
+        self.encode_batch_with_kept(events)
+            .map(|(output, _kept)| output)
+    }
+
+    /// Encode a batch of events into a `BatchOutput` plus the indices of the
+    /// events that produced an output row, in event order. Serializers that
+    /// drop malformed rows per-row (`wire_to_arrow`) report the survivors so
+    /// callers can align per-event metadata with the batch's rows; serializers
+    /// that encode all-or-nothing (Arrow) report every index.
+    #[cfg_attr(not(feature = "arrow"), allow(unused_variables))]
+    pub fn encode_batch_with_kept(
+        &self,
+        events: &[Event],
+    ) -> Result<(BatchOutput, Vec<u32>), Error> {
         match &self.serializer {
             #[cfg(feature = "arrow")]
             BatchSerializer::Arrow(serializer) => {
@@ -60,14 +74,17 @@ impl BatchEncoder {
                         _ => Error::SerializingError(Box::new(err)),
                     }
                 })?;
-                Ok(BatchOutput::Arrow(record_batch))
+                Ok((
+                    BatchOutput::Arrow(record_batch),
+                    (0..events.len() as u32).collect(),
+                ))
             }
             #[cfg(feature = "arrow")]
             BatchSerializer::WireToArrow(serializer) => {
-                let record_batch = serializer
-                    .encode_to_record_batch(events)
+                let (record_batch, kept) = serializer
+                    .encode_to_record_batch_with_kept(events)
                     .map_err(|err| Error::SerializingError(Box::new(err)))?;
-                Ok(BatchOutput::Arrow(record_batch))
+                Ok((BatchOutput::Arrow(record_batch), kept))
             }
             #[cfg(not(feature = "arrow"))]
             _ => unreachable!("BatchSerializer has no variants without the `arrow` feature"),

@@ -7,7 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use http::Request;
 use hyper::Body;
@@ -195,6 +195,14 @@ impl GcsDownloader {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
+        // Object write time (the JSON API's `updated`), the GCS analogue of S3/Azure
+        // `Last-Modified`. Absent or unparseable means no stamp rather than a wrong lag.
+        let last_modified = response
+            .headers()
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| DateTime::parse_from_rfc2822(v).ok())
+            .map(|dt| dt.with_timezone(&Utc));
         let content_length = response
             .headers()
             .get(http::header::CONTENT_LENGTH)
@@ -324,6 +332,9 @@ impl GcsDownloader {
                             &project,
                             log_type.as_deref(),
                         );
+                        // Upload-time stamp for the Zerobus sink's object-uploaded-to-saved
+                        // freshness.
+                        crate::sources::util::stamp_object_uploaded_ms(log_event, last_modified);
                     }
                     events_received.emit(CountByteSize(1, event.estimated_json_encoded_size_of()));
                     event
@@ -581,14 +592,38 @@ mod tests {
         spawn_test_server_bytes_with_length(status, body, None, false).await
     }
 
+    /// Like `spawn_test_server_bytes`, but the response carries extra headers, so tests
+    /// can exercise header-derived behavior (e.g. the `Last-Modified` upload stamp).
+    async fn spawn_test_server_bytes_with_headers(
+        status: u16,
+        body: bytes::Bytes,
+        headers: &[(&str, String)],
+    ) -> SocketAddr {
+        spawn_test_server_bytes_full(status, body, None, false, headers).await
+    }
+
     async fn spawn_test_server_bytes_with_length(
         status: u16,
         body: bytes::Bytes,
         content_length: Option<u64>,
         chunked: bool,
     ) -> SocketAddr {
+        spawn_test_server_bytes_full(status, body, content_length, chunked, &[]).await
+    }
+
+    async fn spawn_test_server_bytes_full(
+        status: u16,
+        body: bytes::Bytes,
+        content_length: Option<u64>,
+        chunked: bool,
+        headers: &[(&str, String)],
+    ) -> SocketAddr {
         use std::sync::Arc;
         let body = Arc::new(body);
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -598,11 +633,16 @@ mod tests {
                 .unwrap()
                 .serve(make_service_fn(move |_| {
                     let body = Arc::clone(&body);
+                    let headers = headers.clone();
                     async move {
                         Ok::<_, Infallible>(service_fn(move |_req| {
                             let body = Arc::clone(&body);
+                            let headers = headers.clone();
                             async move {
                                 let mut builder = Response::builder().status(status);
+                                for (name, value) in &headers {
+                                    builder = builder.header(name.as_str(), value.as_str());
+                                }
                                 if let Some(content_length) = content_length {
                                     builder = builder.header("content-length", content_length);
                                 }
@@ -1171,9 +1211,103 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // URL encoding: keys with spaces and special characters
+    // Object upload stamp: the response's Last-Modified (object write time)
     // -------------------------------------------------------------------------
 
+    /// The GET response's `Last-Modified` header is the object's write time, so it is
+    /// stamped as `%databricks.object_uploaded_ms` on every event — the GCS analogue of
+    /// the S3/Azure `last_modified` stamp. The stamp must not flip a Legacy event's
+    /// runtime namespace.
+    #[tokio::test]
+    async fn process_object_stamps_object_uploaded_ms_from_last_modified() {
+        let last_modified = chrono::DateTime::parse_from_rfc2822("Mon, 16 Nov 2026 10:00:00 GMT")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let addr = spawn_test_server_bytes_with_headers(
+            200,
+            bytes::Bytes::from_static(b"first\nsecond\n"),
+            &[("Last-Modified", "Mon, 16 Nov 2026 10:00:00 GMT".to_string())],
+        )
+        .await;
+        let downloader = test_downloader(&format!("http://{addr}"));
+        let (mut tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+
+        let result = downloader
+            .process_object(
+                "my-bucket",
+                "logs/app.log",
+                None,
+                &mut tx,
+                LogNamespace::Legacy,
+                false,
+                false,
+                &register!(BytesReceived::from(Protocol::HTTP)),
+                &register!(EventsReceived),
+                &ByteCounter::default(),
+            )
+            .await;
+
+        assert!(result.is_ok(), "200 response must succeed: {result:?}");
+        let events = collect_n(rx, 2).await;
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            let log = event.as_log();
+            assert_eq!(
+                log.get(metadata_path!("databricks", "object_uploaded_ms")),
+                Some(&vrl::value::Value::from(last_modified.timestamp_millis())),
+                "every event must carry the object write time"
+            );
+            assert_eq!(log.namespace(), LogNamespace::Legacy);
+        }
+    }
+
+    /// No `Last-Modified` header (or an unparseable one) must leave the stamp absent —
+    /// never a `Utc::now()` stand-in, which would record a wrong lag.
+    #[tokio::test]
+    async fn process_object_omits_object_uploaded_ms_without_last_modified() {
+        for headers in [
+            &[],
+            &[("Last-Modified", "not an rfc2822 date".to_string())][..],
+        ] {
+            let addr = spawn_test_server_bytes_with_headers(
+                200,
+                bytes::Bytes::from_static(b"line\n"),
+                headers,
+            )
+            .await;
+            let downloader = test_downloader(&format!("http://{addr}"));
+            let (mut tx, rx) = SourceSender::new_test_finalize(EventStatus::Delivered);
+
+            let result = downloader
+                .process_object(
+                    "my-bucket",
+                    "logs/app.log",
+                    None,
+                    &mut tx,
+                    LogNamespace::Legacy,
+                    false,
+                    false,
+                    &register!(BytesReceived::from(Protocol::HTTP)),
+                    &register!(EventsReceived),
+                    &ByteCounter::default(),
+                )
+                .await;
+
+            assert!(result.is_ok(), "200 response must succeed: {result:?}");
+            let events = collect_n(rx, 1).await;
+            assert!(
+                events[0]
+                    .as_log()
+                    .get(metadata_path!("databricks", "object_uploaded_ms"))
+                    .is_none(),
+                "stamp must be absent without a parseable Last-Modified ({headers:?})"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // URL encoding: keys with spaces and special characters
+    // -------------------------------------------------------------------------
     /// Object keys with spaces or special URL characters (?, #, &) must be
     /// percent-encoded. The mock server accepts any path — a successful response
     /// confirms the URL was valid HTTP (raw spaces/specials would be rejected by hyper).

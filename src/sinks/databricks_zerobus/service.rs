@@ -69,9 +69,13 @@ fn build_connector_factory(proxy: &ProxyConfig) -> Result<ConnectorFactory, Zero
     }))
 }
 
-/// The payload for a Zerobus request: an Arrow `RecordBatch` for Arrow Flight ingestion.
+/// The payload for a Zerobus request: an Arrow `RecordBatch` for Arrow Flight ingestion,
+/// plus the batch's  object-upload stamps (empty when the events carry none).
 #[derive(Clone, Debug)]
-pub struct ZerobusPayload(pub arrow::record_batch::RecordBatch);
+pub struct ZerobusPayload(
+    pub arrow::record_batch::RecordBatch,
+    pub freshness::ObjectUploadTimes,
+);
 
 /// Request type for the Zerobus service.
 ///
@@ -1128,7 +1132,7 @@ impl ZerobusService {
         payload: ZerobusPayload,
         events_byte_size: GroupedCountByteSize,
     ) -> Result<ZerobusResponse, ZerobusSinkError> {
-        let ZerobusPayload(record_batch) = payload;
+        let ZerobusPayload(record_batch, upload_times) = payload;
         let ack_times = freshness::AckTimes::from_batch(&record_batch);
         // Each arm reports, with a failure, whether that failure left the stream
         // closed. It is read before the read guard drops: the SDK marks a
@@ -1144,6 +1148,7 @@ impl ZerobusService {
                         let acked = s.wait_for_offset(offset).await;
                         if acked.is_ok() {
                             ack_times.record_acked(&self.config.table_name);
+                            upload_times.record_acked(&self.config.table_name);
                         }
                         // Take on every outcome so failed offsets don't linger in the map.
                         let sizes = stats.take(offset);
@@ -1175,6 +1180,7 @@ impl ZerobusService {
                 };
                 if acked.is_ok() {
                     ack_times.record_acked(&self.config.table_name);
+                    upload_times.record_acked(&self.config.table_name);
                 }
                 let closed = acked.is_err() && s.is_closed();
                 let result = acked.map(|_| {
@@ -1188,6 +1194,7 @@ impl ZerobusService {
                 let acked = mock.try_ingest().await;
                 if acked.is_ok() {
                     ack_times.record_acked(&self.config.table_name);
+                    upload_times.record_acked(&self.config.table_name);
                 }
                 let closed = acked.is_err() && mock.is_closed();
                 (acked.map(|_| None), closed)
@@ -1427,13 +1434,16 @@ impl Service<ZerobusRequest> for ZerobusService {
         Box::pin(async move {
             let schema = service.ensure_schema().await?;
             let event_count = request.events.len();
+            // Read before the encoding closure moves `request`: the object-upload stamps ride
+            // in event metadata, which never reaches the Arrow batch.
+            let mut upload_times = freshness::ObjectUploadTimes::from_events(&request.events);
             let encoding_schema = Arc::clone(&schema);
-            let BatchOutput::Arrow(record_batch) = service
+            let (BatchOutput::Arrow(record_batch), kept_rows) = service
                 .encoding
                 .run(move || {
                     encoding_schema
                         .encoder
-                        .encode_batch(&request.events)
+                        .encode_batch_with_kept(&request.events)
                         .map_err(|e| ZerobusSinkError::EncodingError {
                             schema_constraint: matches!(
                                 e,
@@ -1443,6 +1453,9 @@ impl Service<ZerobusRequest> for ZerobusService {
                         })
                 })
                 .await?;
+            // Rows wire_to_arrow dropped during encoding never reach a Zerobus ack, so
+            // their stamps must stay out of the freshness histogram.
+            upload_times.keep_rows(&kept_rows);
             // A 0-row batch means the encoder dropped every row (wire_to_arrow per-row
             // validation, counted in wire_to_arrow_rows_dropped), so nothing is left to deliver.
             // The SDK rejects empty batches as a non-retryable InvalidArgument; letting that
@@ -1456,7 +1469,7 @@ impl Service<ZerobusRequest> for ZerobusService {
                 });
                 return Ok(ZerobusResponse::delivered_nothing_sent());
             }
-            let payload = ZerobusPayload(record_batch);
+            let payload = ZerobusPayload(record_batch, upload_times);
 
             // Both legs below can surface the server's schema rejection: stream
             // setup rejects the shape outright, and an established stream can
@@ -1834,9 +1847,10 @@ mod tests {
 
     fn dummy_payload() -> ZerobusPayload {
         use arrow::datatypes::Schema;
-        ZerobusPayload(arrow::record_batch::RecordBatch::new_empty(Arc::new(
-            Schema::empty(),
-        )))
+        ZerobusPayload(
+            arrow::record_batch::RecordBatch::new_empty(Arc::new(Schema::empty())),
+            freshness::ObjectUploadTimes::default(),
+        )
     }
 
     async fn current_stream(service: &ZerobusService) -> Arc<ActiveStream> {
@@ -2297,10 +2311,10 @@ mod tests {
             .await
             .unwrap();
         let stream = current_stream(&service).await;
-        let payload = ZerobusPayload(batch_with_times(
-            vec![Some(1_000), None],
-            vec![Some(2_000), Some(2_000)],
-        ));
+        let payload = ZerobusPayload(
+            batch_with_times(vec![Some(1_000), None], vec![Some(2_000), Some(2_000)]),
+            freshness::ObjectUploadTimes::default(),
+        );
         service
             .ingest(stream, payload, GroupedCountByteSize::new_untagged())
             .await
@@ -2350,7 +2364,10 @@ mod tests {
             .await
             .unwrap();
         let stream = current_stream(&service).await;
-        let payload = ZerobusPayload(batch_with_times(vec![Some(1_000)], vec![Some(2_000)]));
+        let payload = ZerobusPayload(
+            batch_with_times(vec![Some(1_000)], vec![Some(2_000)]),
+            freshness::ObjectUploadTimes::default(),
+        );
         assert!(
             service
                 .ingest(stream, payload, GroupedCountByteSize::new_untagged())
@@ -2358,6 +2375,276 @@ mod tests {
                 .is_err()
         );
         assert!(freshness_metrics("freshness.failed.logs").is_empty());
+    }
+
+    fn stamped_event(age: chrono::Duration) -> Event {
+        let mut log = vector_lib::event::LogEvent::default();
+        log.insert("status", 200_i64);
+        let mut event = Event::Log(log);
+        crate::sources::util::stamp_object_uploaded_ms(
+            event.as_mut_log(),
+            Some(chrono::Utc::now() - age),
+        );
+        event
+    }
+
+    fn histogram_edges(metrics: &[vector_lib::event::Metric], name: &str) -> Vec<f64> {
+        metrics
+            .iter()
+            .filter(|m| m.name() == name)
+            .map(|m| match m.value() {
+                MetricValue::AggregatedHistogram { buckets, .. } => {
+                    buckets.iter().map(|b| b.upper_limit).collect()
+                }
+                other => panic!("{name} is not a histogram: {other:?}"),
+            })
+            .next()
+            .unwrap_or_else(|| panic!("{name} was not captured"))
+    }
+
+    #[test]
+    fn object_upload_freshness_uses_slo_buckets_and_skips_negatives() {
+        use crate::sources::util::stamp_object_uploaded_ms;
+
+        vector_lib::metrics::init_test();
+        let controller = vector_lib::metrics::Controller::get().unwrap();
+        controller.reset();
+
+        let mut future = stamped_event(chrono::Duration::zero());
+        stamp_object_uploaded_ms(
+            future.as_mut_log(),
+            Some(chrono::Utc::now() + chrono::Duration::seconds(60)),
+        );
+        let events = vec![
+            // 65 s old: falls in the 120 s SLO bucket.
+            stamped_event(chrono::Duration::seconds(65)),
+            // 2 s old: falls in the 5 s bucket.
+            stamped_event(chrono::Duration::seconds(2)),
+            // No stamp: skipped entirely.
+            Event::Log(vector_lib::event::LogEvent::default()),
+            // Clock skew: counted, never recorded into the histogram.
+            future,
+        ];
+
+        freshness::ObjectUploadTimes::from_events(&events).record_acked("freshness.upload.logs");
+
+        let metrics = freshness_metrics("freshness.upload.logs");
+        assert_eq!(
+            histogram_count(&metrics, "zerobus_ack_object_uploaded_to_saved_seconds"),
+            2
+        );
+        assert_eq!(
+            histogram_edges(&metrics, "zerobus_ack_object_uploaded_to_saved_seconds"),
+            vec![
+                1.0,
+                5.0,
+                15.0,
+                30.0,
+                60.0,
+                120.0,
+                300.0,
+                600.0,
+                900.0,
+                1200.0,
+                1800.0,
+                2700.0,
+                3600.0,
+                7200.0,
+                f64::INFINITY,
+            ]
+        );
+        assert_eq!(
+            counter_value(
+                &metrics,
+                "zerobus_ack_negative_latency_total",
+                Some("object_uploaded_to_saved")
+            ),
+            1.0
+        );
+        // The 65 s sample landed in the 120 s bucket, not the 60 s one.
+        let buckets: Vec<(f64, u64)> = metrics
+            .iter()
+            .filter(|m| m.name() == "zerobus_ack_object_uploaded_to_saved_seconds")
+            .map(|m| match m.value() {
+                MetricValue::AggregatedHistogram { buckets, .. } => {
+                    buckets.iter().map(|b| (b.upper_limit, b.count)).collect()
+                }
+                other => panic!("not a histogram: {other:?}"),
+            })
+            .next()
+            .unwrap();
+        assert_eq!(buckets[4], (60.0, 0));
+        assert_eq!(buckets[5], (120.0, 1));
+    }
+
+    #[test]
+    fn object_upload_freshness_records_nothing_without_metadata() {
+        vector_lib::metrics::init_test();
+        let controller = vector_lib::metrics::Controller::get().unwrap();
+        controller.reset();
+
+        let events = vec![
+            Event::Log(vector_lib::event::LogEvent::default()),
+            Event::Log(vector_lib::event::LogEvent::default()),
+        ];
+        freshness::ObjectUploadTimes::from_events(&events).record_acked("freshness.upload.logs");
+        assert!(freshness_metrics("freshness.upload.logs").is_empty());
+    }
+
+    #[tokio::test]
+    async fn service_call_carries_object_upload_stamps_to_ack_freshness() {
+        vector_lib::metrics::init_test();
+        let controller = vector_lib::metrics::Controller::get().unwrap();
+        controller.reset();
+
+        let mut config = test_config();
+        config.table_name = "freshness.call.logs".to_string();
+        let (mock, gate) = MockStream::succeeding().with_gate();
+        let mut service = ZerobusService::new_with_mock(config, mock).await.unwrap();
+        service.seed_schema(narrow_schema()).await;
+        service.pin_stream_to_cached_schema().await;
+        let mut request = dummy_request();
+        request.events = Arc::new(vec![stamped_event(chrono::Duration::seconds(65))]);
+        let response = tokio::spawn(service.call(request));
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_for_started(1))
+            .await
+            .unwrap();
+        gate.release(1);
+        assert_eq!(
+            response.await.unwrap().unwrap().status,
+            vector_lib::event::EventStatus::Delivered
+        );
+
+        let metrics = freshness_metrics("freshness.call.logs");
+        assert_eq!(
+            histogram_count(&metrics, "zerobus_ack_object_uploaded_to_saved_seconds"),
+            1
+        );
+    }
+
+    #[test]
+    fn upload_stamps_of_dropped_rows_never_enter_the_histogram() {
+        vector_lib::metrics::init_test();
+        let controller = vector_lib::metrics::Controller::get().unwrap();
+        controller.reset();
+
+        let events = vec![
+            stamped_event(chrono::Duration::seconds(65)),
+            stamped_event(chrono::Duration::seconds(2)),
+        ];
+        let mut times = freshness::ObjectUploadTimes::from_events(&events);
+        // wire_to_arrow kept only the second row; the first was malformed.
+        times.keep_rows(&[1]);
+        times.record_acked("freshness.kept.logs");
+        assert_eq!(
+            histogram_count(
+                &freshness_metrics("freshness.kept.logs"),
+                "zerobus_ack_object_uploaded_to_saved_seconds"
+            ),
+            1
+        );
+    }
+
+    /// End-to-end: with wire_to_arrow encoding, a batch of 1 valid + 1 malformed
+    /// proto row must record exactly 1 upload-to-ack sample — the malformed row's
+    /// stamp dies with the row, not in the histogram.
+    #[tokio::test]
+    async fn service_call_drops_upload_stamps_of_wire_to_arrow_rejected_rows() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use bytes::Bytes;
+        use prost_reflect::prost::Message as _;
+        use prost_reflect::prost_types::field_descriptor_proto::{Label, Type as ProtoType};
+        use prost_reflect::prost_types::{
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        };
+        use prost_reflect::{DescriptorPool, DynamicMessage, Value as ProtoValue};
+        use vector_lib::codecs::encoding::{BatchSerializerConfig, WireToArrowSerializerConfig};
+        use vector_lib::event::LogEvent;
+
+        vector_lib::metrics::init_test();
+        let controller = vector_lib::metrics::Controller::get().unwrap();
+        controller.reset();
+
+        // One string field: the table's only column.
+        let wire_fd = FileDescriptorProto {
+            name: Some("freshness_wire_test.proto".into()),
+            package: Some("freshness_wire_test".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Row".into()),
+                field: vec![FieldDescriptorProto {
+                    name: Some("status".into()),
+                    number: Some(1),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(ProtoType::String as i32),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut set_bytes = Vec::new();
+        FileDescriptorSet {
+            file: vec![wire_fd],
+        }
+        .encode(&mut set_bytes)
+        .unwrap();
+        let desc_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(desc_file.path(), &set_bytes).unwrap();
+
+        let arrow_schema = Schema::new(vec![Field::new("status", DataType::LargeUtf8, true)]);
+        let mut config = test_config();
+        config.table_name = "freshness.wire.logs".to_string();
+        config.batch_encoding = BatchSerializerConfig::WireToArrow(WireToArrowSerializerConfig {
+            desc_file: desc_file.path().to_path_buf(),
+            message_type: "freshness_wire_test.Row".into(),
+            schema: Some(arrow_schema.clone()),
+            ..Default::default()
+        });
+
+        let (mock, gate) = MockStream::succeeding().with_gate();
+        let mut service = ZerobusService::new_with_mock(config, mock).await.unwrap();
+        service.seed_schema(arrow_schema).await;
+        service.pin_stream_to_cached_schema().await;
+
+        let pool = DescriptorPool::decode(set_bytes.as_slice()).unwrap();
+        let descriptor = pool.get_message_by_name("freshness_wire_test.Row").unwrap();
+        let mut msg = DynamicMessage::new(descriptor);
+        msg.set_field_by_name("status", ProtoValue::String("200".into()));
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+
+        let mut valid = LogEvent::default();
+        valid.insert("message", Bytes::from(buf));
+        let mut malformed = LogEvent::default();
+        // 0xff starts an unterminated varint: protobuf decode fails per row.
+        malformed.insert("message", Bytes::from_static(&[0xff, 0xff]));
+        let events = vec![valid, malformed].into_iter().map(|log| {
+            let mut event = Event::Log(log);
+            crate::sources::util::stamp_object_uploaded_ms(
+                event.as_mut_log(),
+                Some(chrono::Utc::now() - chrono::Duration::seconds(65)),
+            );
+            event
+        });
+
+        let mut request = dummy_request();
+        request.events = Arc::new(events.collect());
+        let response = tokio::spawn(service.call(request));
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_for_started(1))
+            .await
+            .unwrap();
+        gate.release(1);
+        assert_eq!(
+            response.await.unwrap().unwrap().status,
+            vector_lib::event::EventStatus::Delivered
+        );
+
+        let metrics = freshness_metrics("freshness.wire.logs");
+        assert_eq!(
+            histogram_count(&metrics, "zerobus_ack_object_uploaded_to_saved_seconds"),
+            1,
+            "exactly the surviving row's stamp may be recorded"
+        );
     }
 
     fn freshness_perf_schema() -> arrow::datatypes::Schema {

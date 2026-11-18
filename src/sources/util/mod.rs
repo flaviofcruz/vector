@@ -124,3 +124,29 @@ pub fn extract_tag_key_and_value<S: AsRef<str>>(
         None => (tag_chunk.to_string(), TagValue::Bare),
     }
 }
+
+/// Stamps the object-upload time (epoch ms) as event metadata
+/// (`%databricks.object_uploaded_ms`) for the Databricks Zerobus sink's
+/// `zerobus_ack_object_uploaded_to_saved_seconds` freshness histogram. No-op when the
+/// source has no upload time, so nothing is recorded rather than a wrong lag.
+///
+/// The key lives under `%databricks`, not `%vector`, because `LogEvent::namespace()`
+/// treats any `%vector` metadata as proof of a Vector-namespace pipeline, which would
+/// flip Legacy-namespace events' runtime namespace.
+///
+/// Each queue source passes the write time it already carries: S3 `last_modified`, Azure
+/// blob `Last-Modified`, GCS object `Last-Modified` response header.
+pub fn stamp_object_uploaded_ms(
+    log: &mut crate::event::LogEvent,
+    timestamp: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let Some(timestamp) = timestamp else {
+        return;
+    };
+    // Metadata insert (under `%vector.`) regardless of the pipeline's log namespace, so
+    // the stamp never leaks into event fields.
+    log.metadata_mut().value_mut().insert(
+        vrl::path!("databricks", "object_uploaded_ms"),
+        timestamp.timestamp_millis(),
+    );
+}

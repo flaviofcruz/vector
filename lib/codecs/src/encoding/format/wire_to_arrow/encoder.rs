@@ -128,6 +128,18 @@ impl WireToArrowEncoder {
 
     /// Encode a batch of serialized proto messages into a single `RecordBatch`.
     ///
+    /// See [`WireToArrowEncoder::encode_batch_with_kept`]; this drops the
+    /// survivor indices.
+    pub fn encode_batch(&self, messages: &[Bytes]) -> Result<RecordBatch> {
+        self.encode_batch_with_kept(messages)
+            .map(|(batch, _kept)| batch)
+    }
+
+    /// Encode a batch of serialized proto messages into a single `RecordBatch`
+    /// plus the indices of the messages that produced an output row, in input
+    /// order. Callers carrying per-message metadata use the indices to drop
+    /// the metadata of rows that failed validation.
+    ///
     /// Per-row isolation: each message is pre-validated via
     /// [`validate_message`] before any builder is touched. Rows that fail
     /// validation are dropped from the output batch and counted via the
@@ -147,18 +159,19 @@ impl WireToArrowEncoder {
     /// (scan-vs-validate divergence surfaced as `PlanBuilderMismatch`) or
     /// a `RecordBatchAssembly` rejection from Arrow. Row-finalize is
     /// infallible, so it doesn't appear in this list.
-    pub fn encode_batch(&self, messages: &[Bytes]) -> Result<RecordBatch> {
+    pub fn encode_batch_with_kept(&self, messages: &[Bytes]) -> Result<(RecordBatch, Vec<u32>)> {
         let capacity = messages.len();
         let mut builders = BuilderNodeList::with_capacity(&self.plan, capacity)?;
         let mut dropped = 0u64;
         let mut sample_err: Option<WireToArrowError> = None;
         let mut first_dropped_row: Option<Bytes> = None;
         let mut variants = BuiltVariants::default();
+        let mut kept = Vec::with_capacity(capacity);
         let mut skips = super::scan::SkipAccumulator::default();
         let mut row_skips = super::scan::RowSkips::default();
         let mut path = Vec::new();
 
-        for msg_bytes in messages {
+        for (index, msg_bytes) in messages.iter().enumerate() {
             variants.clear();
             // Skips are tallied per row and committed only once the row is
             // kept below. `capture` stops snapshotting paths once the batch
@@ -254,6 +267,7 @@ impl WireToArrowEncoder {
                 &mut variants,
             )?;
             builders.finalize_row(&self.plan);
+            kept.push(index as u32);
             row_skips.commit(&mut skips, msg_bytes);
         }
 
@@ -296,8 +310,9 @@ impl WireToArrowEncoder {
         }
 
         let arrays = builders.finish(&self.plan)?;
-        RecordBatch::try_new(Arc::clone(&self.schema), arrays)
-            .map_err(|source| WireToArrowError::RecordBatchAssembly { source })
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), arrays)
+            .map_err(|source| WireToArrowError::RecordBatchAssembly { source })?;
+        Ok((batch, kept))
     }
 
     /// Extract the configured attribution fields from one row's top-level

@@ -449,6 +449,50 @@ fn serializer_wrong_type_message_errors() {
 }
 
 #[test]
+fn encode_batch_with_kept_reports_surviving_event_indices() {
+    let desc = scalar_descriptor();
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+        Field::new("email", DataType::LargeUtf8, true),
+    ]);
+    let serializer = serializer_for(&desc, schema.clone());
+    let enc = WireToArrowEncoder::new(&desc, schema).unwrap();
+
+    let mut messages = Vec::new();
+    let mut events = Vec::new();
+    for (i, valid) in [true, false, true, false, true].into_iter().enumerate() {
+        let bytes = if valid {
+            let mut msg = DynamicMessage::new(desc.clone());
+            msg.set_field_by_name("name", ProtoValue::String(format!("n-{i}")));
+            msg.set_field_by_name("id", ProtoValue::I32(i as i32));
+            let mut buf = Vec::new();
+            msg.encode(&mut buf).unwrap();
+            Bytes::from(buf)
+        } else {
+            // 0xff starts an unterminated varint: the row drops per-row.
+            Bytes::from_static(&[0xff, 0xff])
+        };
+        messages.push(bytes.clone());
+        events.push(event_with_message_bytes(bytes));
+    }
+
+    let (batch, kept) = enc.encode_batch_with_kept(&messages).unwrap();
+    assert_eq!(
+        kept,
+        vec![0, 2, 4],
+        "indices are event indices, not row slots"
+    );
+    assert_eq!(batch.num_rows(), 3);
+
+    let (batch, kept) = serializer
+        .encode_to_record_batch_with_kept(&events)
+        .unwrap();
+    assert_eq!(kept, vec![0, 2, 4]);
+    assert_eq!(batch.num_rows(), 3);
+}
+
+#[test]
 fn serializer_end_to_end_matches_direct_encode() {
     // Build events with wire bytes on `message`, encode via the
     // serializer, and compare against calling the lower-level encoder

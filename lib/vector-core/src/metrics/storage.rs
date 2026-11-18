@@ -11,6 +11,34 @@ use crate::event::{MetricValue, metric::Bucket};
 
 pub(super) struct VectorStorage;
 
+/// SLO bucket overrides, keyed by metric name. Upper limits are in the metric's own
+/// unit and must end at `f64::INFINITY`; `Histogram::new_custom` relies on that.
+fn custom_buckets(name: &str) -> Option<&'static [f64]> {
+    match name {
+        // Lumberjack Prime's object-upload-to-Zerobus-ack freshness, in seconds. SLO-friendly
+        // edges so the alert threshold can move (30 min today, less later) by changing only
+        // the alert rule, without losing history.
+        "zerobus_ack_object_uploaded_to_saved_seconds" => Some(&[
+            1.0,
+            5.0,
+            15.0,
+            30.0,
+            60.0,
+            120.0,
+            300.0,
+            600.0,
+            900.0,
+            1200.0,
+            1800.0,
+            2700.0,
+            3600.0,
+            7200.0,
+            f64::INFINITY,
+        ]),
+        _ => None,
+    }
+}
+
 impl Storage<Key> for VectorStorage {
     type Counter = Arc<AtomicU64>;
     type Gauge = Arc<AtomicF64>;
@@ -25,6 +53,9 @@ impl Storage<Key> for VectorStorage {
     }
 
     fn histogram(&self, key: &Key) -> Self::Histogram {
+        if let Some(buckets) = custom_buckets(key.name()) {
+            return Arc::new(Histogram::new_custom(buckets));
+        }
         let use_integer = key
             .labels()
             .any(|l| l.key() == "buckets" && l.value() == "integer");
@@ -38,7 +69,7 @@ impl Storage<Key> for VectorStorage {
 
 #[derive(Debug)]
 pub(super) struct Histogram {
-    buckets: Box<[(f64, AtomicU32); 26]>,
+    buckets: Box<[(f64, AtomicU32)]>,
     power_of_two: bool,
     count: AtomicU64,
     sum: AtomicF64,
@@ -132,6 +163,22 @@ impl Histogram {
         }
     }
 
+    /// Custom cumulative upper limits for one metric, ending at `f64::INFINITY`.
+    /// Uses the linear-scan index path, so keep the list short.
+    pub(crate) fn new_custom(buckets: &[f64]) -> Self {
+        assert!(buckets.last().is_some_and(|last| last.is_infinite()));
+        Self {
+            buckets: buckets
+                .iter()
+                .map(|&upper| (upper, AtomicU32::new(0)))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            power_of_two: false,
+            count: AtomicU64::new(0),
+            sum: AtomicF64::new(0.0),
+        }
+    }
+
     fn bucket_index(&self, value: f64) -> usize {
         if self.power_of_two {
             // The buckets are all powers of two, so compute the ceiling of the log_2 of the
@@ -143,13 +190,14 @@ impl Histogram {
             let index = (log - Self::MIN_BUCKET_EXP) as usize;
             index.min(Self::BUCKETS - 1)
         } else {
-            // Integer buckets [1, 2, ..., 25, +∞]: linear scan for the first bucket that fits.
+            // Integer buckets [1, 2, ..., 25, +∞] and custom lists: linear scan for the
+            // first bucket that fits.
             for (i, (upper, _)) in self.buckets.iter().enumerate() {
                 if value <= *upper {
                     return i;
                 }
             }
-            Self::BUCKETS - 1
+            self.buckets.len() - 1
         }
     }
 
@@ -280,5 +328,108 @@ mod test {
         // Values > 25 land in the +inf bucket
         assert_eq!(h.bucket_index(26.0), 25);
         assert_eq!(h.bucket_index(1000.0), 25);
+    }
+
+    #[test]
+    fn custom_buckets_place_values_and_end_at_infinity() {
+        let h = Histogram::new_custom(&[
+            1.0,
+            5.0,
+            15.0,
+            30.0,
+            60.0,
+            120.0,
+            300.0,
+            600.0,
+            900.0,
+            1200.0,
+            1800.0,
+            2700.0,
+            3600.0,
+            7200.0,
+            f64::INFINITY,
+        ]);
+
+        assert_eq!(h.bucket_index(0.5), 0); // <= 1.0
+        assert_eq!(h.bucket_index(1.0), 0);
+        assert_eq!(h.bucket_index(5.0), 1);
+        assert_eq!(h.bucket_index(30.0), 3);
+        assert_eq!(h.bucket_index(1800.0), 10);
+        assert_eq!(h.bucket_index(7200.0), 13);
+        // Above every finite upper limit lands in the +inf bucket.
+        assert_eq!(h.bucket_index(7200.5), 14);
+        assert_eq!(h.bucket_index(f64::INFINITY), 14);
+
+        h.record(65.0);
+        assert_eq!(h.count(), 1);
+        assert_eq!(h.sum(), 65.0);
+        let buckets = h.buckets();
+        // Exactly-at and below counts are cumulative via `bucket_index` placement only;
+        // each record lands in exactly one bucket.
+        assert_eq!(buckets[5].count, 1); // 120.0
+        assert!(
+            buckets
+                .iter()
+                .enumerate()
+                .all(|(i, b)| { i == 5 || b.count == 0 })
+        );
+    }
+
+    #[test]
+    fn custom_buckets_apply_only_to_the_listed_metric_name() {
+        use crate::event::MetricValue;
+
+        crate::metrics::init_test();
+        let controller = crate::metrics::Controller::get().unwrap();
+        controller.reset();
+
+        metrics::histogram!("zerobus_ack_object_uploaded_to_saved_seconds", "table" => "t")
+            .record(65.0);
+        metrics::histogram!("zerobus_ack_born_to_saved_seconds", "table" => "t").record(65.0);
+
+        let edges = |name: &str| -> Vec<f64> {
+            let metric = controller
+                .capture_metrics()
+                .into_iter()
+                .find(|m| m.name() == name);
+            match metric {
+                Some(m) => match m.value() {
+                    MetricValue::AggregatedHistogram { buckets, .. } => {
+                        buckets.iter().map(|b| b.upper_limit).collect()
+                    }
+                    other => panic!("{name} is not a histogram: {other:?}"),
+                },
+                None => panic!("{name} was not captured"),
+            }
+        };
+
+        assert_eq!(
+            edges("zerobus_ack_object_uploaded_to_saved_seconds"),
+            vec![
+                1.0,
+                5.0,
+                15.0,
+                30.0,
+                60.0,
+                120.0,
+                300.0,
+                600.0,
+                900.0,
+                1200.0,
+                1800.0,
+                2700.0,
+                3600.0,
+                7200.0,
+                f64::INFINITY,
+            ]
+        );
+        // Any other histogram keeps the fixed power-of-2 edges.
+        assert_eq!(
+            edges("zerobus_ack_born_to_saved_seconds"),
+            (0..=24)
+                .map(|i| 2.0f64.powi(i - 12))
+                .chain(std::iter::once(f64::INFINITY))
+                .collect::<Vec<_>>()
+        );
     }
 }
