@@ -18,6 +18,29 @@ use super::scan::{BuiltVariants, ValidateCtx, scan_message, validate_message};
 use super::serializer::{OnWireTypeMismatch, VariantMessageEncoding};
 use super::variant_message::strip_wire_type_mismatches;
 
+/// How the first validation pass over a row's original bytes treats a
+/// needs-normalization verdict (see `ValidateCtx::needs_normalization`).
+#[derive(Clone, Copy)]
+enum FirstPass {
+    /// Park the verdict and record the rest of the row's wire-type skips.
+    DeferToNormalization,
+    /// Return the verdict at once, recording nothing past it: the reference
+    /// behavior for [`WireToArrowEncoder::assert_rows_match_first_pass_stopping_at_verdict`].
+    #[cfg(test)]
+    StopAtVerdict,
+}
+
+/// One encoded batch with the per-batch drop and skip tallies reported once
+/// the batch is built.
+struct EncodedRows {
+    batch: RecordBatch,
+    kept: Vec<u32>,
+    dropped: u64,
+    sample_err: Option<WireToArrowError>,
+    first_dropped_row: Option<Bytes>,
+    skips: super::scan::SkipAccumulator,
+}
+
 /// Upper bounds for attribution values in skip/drop warnings: per-field char
 /// cap and per-row field cap. Bounded so a hostile or oversized payload can
 /// neither bloat logs nor leak unbounded content — attribution fields are
@@ -160,6 +183,15 @@ impl WireToArrowEncoder {
     /// a `RecordBatchAssembly` rejection from Arrow. Row-finalize is
     /// infallible, so it doesn't appear in this list.
     pub fn encode_batch_with_kept(&self, messages: &[Bytes]) -> Result<(RecordBatch, Vec<u32>)> {
+        let encoded = self.encode_rows(messages, FirstPass::DeferToNormalization);
+        #[cfg(test)]
+        self.assert_rows_match_first_pass_stopping_at_verdict(messages, &encoded);
+        let encoded = encoded?;
+        self.report_dropped_and_skipped(messages.len(), &encoded);
+        Ok((encoded.batch, encoded.kept))
+    }
+
+    fn encode_rows(&self, messages: &[Bytes], first_pass: FirstPass) -> Result<EncodedRows> {
         let capacity = messages.len();
         let mut builders = BuilderNodeList::with_capacity(&self.plan, capacity)?;
         let mut dropped = 0u64;
@@ -169,6 +201,9 @@ impl WireToArrowEncoder {
         let mut kept = Vec::with_capacity(capacity);
         let mut skips = super::scan::SkipAccumulator::default();
         let mut row_skips = super::scan::RowSkips::default();
+        // Sink for the revalidation pass, which must not record: the first
+        // pass already counted every mismatch of the original row.
+        let mut revalidation_skips = super::scan::RowSkips::default();
         let mut path = Vec::new();
 
         for (index, msg_bytes) in messages.iter().enumerate() {
@@ -182,20 +217,34 @@ impl WireToArrowEncoder {
             // nested-struct `finalize_row` calls inside `scan_message` are
             // not reversible, so an upfront validation pass is how we
             // isolate per-row decode failures.
+            //
+            // The pass is the single skip recorder for the row: normalization
+            // strips mismatched occurrences silently, and its canonical bytes
+            // no longer show the row as the producer sent it. Once the row
+            // needs normalization the pass stops validating — the verdict on
+            // the occurrences after it belongs to the canonical bytes — and
+            // only records the rest of the row's wire-type skips.
+            let mut needs_normalization = None;
             let mut validation = {
                 let mut ctx = ValidateCtx {
                     on_mismatch: self.on_wire_type_mismatch,
                     row: msg_bytes,
                     skips: &mut row_skips,
                     path: &mut path,
+                    needs_normalization: match first_pass {
+                        FirstPass::DeferToNormalization => Some(&mut needs_normalization),
+                        #[cfg(test)]
+                        FirstPass::StopAtVerdict => None,
+                    },
                 };
                 validate_message(&self.plan, msg_bytes, &mut variants, &mut ctx)
-            };
+            }
+            .and_then(|()| needs_normalization.map_or(Ok(()), Err));
             // Singular-field merges and oneof switches are legal protobuf. Normalize only
             // these rows before touching Arrow builders, preserving explicit scalar defaults.
             // A VARIANT payload missing a required field may be completed by a later
-            // occurrence that validation has not reached yet; protobuf-java merges every
-            // occurrence before its initialization check, so that error retries here too.
+            // occurrence; protobuf-java merges every occurrence before its initialization
+            // check, so that verdict retries here too.
             let canonical = if matches!(
                 &validation,
                 Err(WireToArrowError::DuplicateSingularField { .. }
@@ -240,14 +289,17 @@ impl WireToArrowEncoder {
             };
             if let Some(bytes) = &canonical {
                 variants.clear();
-                // No tally reset here: canonicalization strips mismatched
-                // occurrences, so the revalidation cannot re-record them, and
-                // the first pass's skips must survive the row being kept.
+                // The canonical bytes still carry every mismatch inside a
+                // message-backed VARIANT payload (normalization concatenates
+                // those payloads unchanged), all already counted by the first
+                // pass, so this pass records into a discarded tally.
+                revalidation_skips.reset(false);
                 let mut ctx = ValidateCtx {
                     on_mismatch: self.on_wire_type_mismatch,
                     row: msg_bytes,
-                    skips: &mut row_skips,
+                    skips: &mut revalidation_skips,
                     path: &mut path,
+                    needs_normalization: None,
                 };
                 validation = validate_message(&self.plan, bytes, &mut variants, &mut ctx);
             }
@@ -271,6 +323,29 @@ impl WireToArrowEncoder {
             row_skips.commit(&mut skips, msg_bytes);
         }
 
+        let arrays = builders.finish(&self.plan)?;
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), arrays)
+            .map_err(|source| WireToArrowError::RecordBatchAssembly { source })?;
+        Ok(EncodedRows {
+            batch,
+            kept,
+            dropped,
+            sample_err,
+            first_dropped_row,
+            skips,
+        })
+    }
+
+    /// Emit the batch's drop and skip metrics and their sampled warnings.
+    fn report_dropped_and_skipped(&self, batch_size: usize, encoded: &EncodedRows) {
+        let EncodedRows {
+            dropped,
+            sample_err,
+            first_dropped_row,
+            skips,
+            ..
+        } = encoded;
+        let dropped = *dropped;
         if dropped > 0 {
             metrics::counter!("wire_to_arrow_rows_dropped").increment(dropped);
             let attribution = first_dropped_row
@@ -280,7 +355,7 @@ impl WireToArrowEncoder {
             tracing::warn!(
                 message = "wire-to-Arrow dropped malformed rows from batch",
                 dropped,
-                batch_size = messages.len(),
+                batch_size,
                 sample_error = ?sample_err,
                 attribution = %attribution,
             );
@@ -300,7 +375,7 @@ impl WireToArrowEncoder {
                     message = "wire-to-Arrow skipped wire-type-mismatched fields; \
                                field left null, row kept",
                     skipped = skips.skipped,
-                    batch_size = messages.len(),
+                    batch_size,
                     field_numbers = ?sample.field_numbers,
                     expected_wire_type = sample.expected,
                     actual_wire_type = sample.actual,
@@ -308,11 +383,42 @@ impl WireToArrowEncoder {
                 );
             }
         }
+    }
 
-        let arrays = builders.finish(&self.plan)?;
-        let batch = RecordBatch::try_new(Arc::clone(&self.schema), arrays)
-            .map_err(|source| WireToArrowError::RecordBatchAssembly { source })?;
-        Ok((batch, kept))
+    /// Test-build differential check run on every `encode_batch_with_kept`
+    /// call, so the whole test corpus asserts it: recording skips past a
+    /// needs-normalization verdict must never change which rows are kept,
+    /// their output, or the drop sample — only skip telemetry. The reference
+    /// is the first pass that stops at the verdict, as before skips past it
+    /// were recorded.
+    #[cfg(test)]
+    fn assert_rows_match_first_pass_stopping_at_verdict(
+        &self,
+        messages: &[Bytes],
+        encoded: &Result<EncodedRows>,
+    ) {
+        let reference = self.encode_rows(messages, FirstPass::StopAtVerdict);
+        match (encoded, &reference) {
+            (Ok(encoded), Ok(reference)) => {
+                assert_eq!(encoded.kept, reference.kept, "kept rows diverged");
+                assert_eq!(encoded.batch, reference.batch, "row output diverged");
+                assert_eq!(encoded.dropped, reference.dropped);
+                assert_eq!(
+                    format!("{:?}", encoded.sample_err),
+                    format!("{:?}", reference.sample_err),
+                    "drop sample diverged"
+                );
+                assert_eq!(encoded.first_dropped_row, reference.first_dropped_row);
+            }
+            (Err(encoded), Err(reference)) => {
+                assert_eq!(format!("{encoded:?}"), format!("{reference:?}"));
+            }
+            _ => panic!(
+                "batch outcome diverged: {:?} vs {:?}",
+                encoded.as_ref().map(|_| ()),
+                reference.as_ref().map(|_| ())
+            ),
+        }
     }
 
     /// Extract the configured attribution fields from one row's top-level

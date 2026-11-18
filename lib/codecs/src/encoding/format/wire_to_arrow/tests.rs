@@ -9,6 +9,7 @@ use proptest::prelude::*;
 
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Fields as ArrowFields, Schema};
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use prost_reflect::MessageDescriptor;
 use prost_reflect::prost::Message as _;
@@ -20,6 +21,7 @@ use prost_reflect::prost_types::{
 use prost_reflect::{DescriptorPool, DynamicMessage, Value as ProtoValue};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing_test::traced_test;
 use vector_core::event::Event;
 use zeroparser::wire::WireValue;
 
@@ -2832,13 +2834,16 @@ fn validate_with_mode_and_skips(
     let mut row_skips = super::scan::RowSkips::default();
     let mut path = Vec::new();
     row_skips.reset(true);
+    let mut needs_normalization = None;
     let mut ctx = super::scan::ValidateCtx {
         on_mismatch,
         row: &row,
         skips: &mut row_skips,
         path: &mut path,
+        needs_normalization: Some(&mut needs_normalization),
     };
-    let result = super::scan::validate_message(plan, wire, &mut variants, &mut ctx);
+    let result = super::scan::validate_message(plan, wire, &mut variants, &mut ctx)
+        .and_then(|()| needs_normalization.map_or(Ok(()), Err));
     if result.is_ok() {
         row_skips.commit(&mut skips, &row);
     }
@@ -4643,9 +4648,9 @@ fn skip_not_counted_for_dropped_row() {
     );
 }
 
-/// A row that needs canonicalization (duplicate singular field) keeps its
-/// first pass's skip exactly once: normalization strips the mismatched
-/// occurrence, so the revalidation cannot re-record it.
+/// A row that needs canonicalization (duplicate singular field) counts its
+/// skip exactly once: the first pass over the original row records it, and
+/// the revalidation of the canonical bytes records nothing.
 #[test]
 fn skip_counted_once_through_normalize_and_revalidation() {
     use vector_core::metrics::{Controller, init_test};
@@ -4686,6 +4691,607 @@ fn skip_counted_once_through_normalize_and_revalidation() {
         Some("wire_type_mismatch"),
     ) - skipped_before;
     assert_eq!(skipped, 1.0, "exactly one skip across both passes");
+}
+
+/// Encode `row` as a one-row batch and return it with the row's
+/// `wire_to_arrow_fields_skipped_total` delta. Callers hold
+/// `METRICS_TEST_LOCK`.
+fn encode_row_counting_skips(enc: &WireToArrowEncoder, row: &[u8]) -> (RecordBatch, f64) {
+    use vector_core::metrics::{Controller, init_test};
+
+    init_test();
+    let controller = Controller::get().unwrap();
+    let skipped = || {
+        counter_total(
+            controller,
+            "wire_to_arrow_fields_skipped_total",
+            Some("wire_type_mismatch"),
+        )
+    };
+    let before = skipped();
+    let batch = enc.encode_batch(&[Bytes::from(row.to_vec())]).unwrap();
+    (batch, skipped() - before)
+}
+
+/// A mismatch *after* the duplicate that sends the row to normalization is
+/// counted and attributed: the first pass no longer stops at the duplicate,
+/// so the occurrence normalization strips silently is still recorded.
+#[traced_test]
+#[test]
+fn skip_after_duplicate_singular_counted_and_attributed() {
+    let _guard = METRICS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("id", DataType::Int32, true),
+    ]);
+    let enc = WireToArrowEncoder::with_options(
+        &scalar_descriptor(),
+        schema,
+        OnWireTypeMismatch::SkipField,
+        &["id".to_string()],
+    )
+    .unwrap();
+
+    // id varint 7, id varint 8 (duplicate), then id as LEN (mismatch).
+    let (batch, skipped) =
+        encode_row_counting_skips(&enc, &[0x10, 0x07, 0x10, 0x08, 0x12, 0x01, 0x01]);
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column(1)
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(0),
+        8,
+        "last well-typed occurrence wins"
+    );
+    assert_eq!(skipped, 1.0, "the stripped mismatch counts once");
+    assert!(logs_contain("skipped wire-type-mismatched fields"));
+    assert!(logs_contain("field_numbers=[2]"));
+    assert!(logs_contain("attribution=id=7"));
+}
+
+/// The oneof counterpart: a mismatched member after a oneof switch is counted
+/// and attributed even though normalization strips it.
+#[traced_test]
+#[test]
+fn skip_after_oneof_switch_counted_and_attributed() {
+    let _guard = METRICS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::LargeUtf8, true),
+    ]);
+    let enc = WireToArrowEncoder::with_options(
+        &oneof_descriptor(),
+        schema,
+        OnWireTypeMismatch::SkipField,
+        &["b".to_string()],
+    )
+    .unwrap();
+
+    // a = 1, b = "x" (switches the oneof), then a as LEN (mismatch).
+    let (batch, skipped) =
+        encode_row_counting_skips(&enc, &[0x08, 0x01, 0x12, 0x01, b'x', 0x0a, 0x01, 0x01]);
+    assert_eq!(batch.num_rows(), 1);
+    assert!(
+        batch.column(0).is_null(0),
+        "the mismatch must not reselect a"
+    );
+    assert_eq!(batch.column(1).as_string::<i64>().value(0), "x");
+    assert_eq!(skipped, 1.0, "the stripped mismatch counts once");
+    assert!(logs_contain("skipped wire-type-mismatched fields"));
+    assert!(logs_contain("field_numbers=[1]"));
+    assert!(logs_contain("attribution=b=x"));
+}
+
+/// A mismatch inside a message-backed VARIANT payload of a row that needs
+/// normalization counts exactly once wherever it sits: in the first
+/// occurrence (once double-counted, as the canonical bytes still carry it),
+/// in the duplicate after it, or in a repeated VARIANT element after it.
+#[test]
+fn variant_payload_skip_counted_once_through_normalization() {
+    let _guard = METRICS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let schema = Schema::new(vec![
+        variant_arrow_field("single"),
+        Field::new(
+            "many",
+            DataType::List(Arc::new(variant_arrow_field("item"))),
+            true,
+        ),
+    ]);
+    let enc = skip_field_encoder(&message_variant_descriptor(), schema);
+
+    let kv_x_mismatched = [0x0a, 0x06, 0x0a, 0x01, b'x', 0x12, 0x01, 0x01]; // KV { k: "x", n as LEN }
+    let kv_y = [0x0a, 0x03, 0x0a, 0x01, b'y']; // KV { k: "y" }
+    let many_mismatched = [0x12, 0x03, 0x12, 0x01, 0x01]; // many { n as LEN }
+    for (row, single) in [
+        (
+            [kv_x_mismatched.as_slice(), &kv_y].concat(),
+            serde_json::json!({"k": "y"}),
+        ),
+        (
+            [kv_y.as_slice(), &kv_x_mismatched].concat(),
+            serde_json::json!({"k": "x"}),
+        ),
+        (
+            [kv_y.as_slice(), &kv_y, &many_mismatched].concat(),
+            serde_json::json!({"k": "y"}),
+        ),
+    ] {
+        let (batch, skipped) = encode_row_counting_skips(&enc, &row);
+        assert_eq!(batch.num_rows(), 1, "row={row:02x?}");
+        assert_eq!(
+            decode_variant_wire(batch.column(0), 0),
+            single,
+            "row={row:02x?}"
+        );
+        assert_eq!(skipped, 1.0, "row={row:02x?}");
+    }
+}
+
+/// `message Outer { Rec rec = 1; string name = 2; Kind kind = 3; }`,
+/// `message Rec { Kind kind = 3; int64 ts = 4; }`, `enum Kind { A = 0; B = 1; }` in
+/// proto2 — the shape of `DbrActivityLog.activity_log_type`, a top-level
+/// optional enum, beside nested messages.
+fn proto2_enum_descriptor() -> MessageDescriptor {
+    let field =
+        |name: &str, number: i32, ty: ProtoType, type_name: Option<&str>| FieldDescriptorProto {
+            name: Some(name.into()),
+            number: Some(number),
+            label: Some(Label::Optional as i32),
+            r#type: Some(ty as i32),
+            type_name: type_name.map(Into::into),
+            ..Default::default()
+        };
+    let kind = || {
+        field(
+            "kind",
+            3,
+            ProtoType::Enum,
+            Some(".wire_to_arrow_proto2_enum.Kind"),
+        )
+    };
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_proto2_enum.proto".into()),
+        package: Some("wire_to_arrow_proto2_enum".into()),
+        syntax: Some("proto2".into()),
+        enum_type: vec![EnumDescriptorProto {
+            name: Some("Kind".into()),
+            value: ["A", "B"]
+                .iter()
+                .zip(0..)
+                .map(|(name, number)| EnumValueDescriptorProto {
+                    name: Some((*name).into()),
+                    number: Some(number),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }],
+        message_type: vec![
+            DescriptorProto {
+                name: Some("Outer".into()),
+                field: vec![
+                    field(
+                        "rec",
+                        1,
+                        ProtoType::Message,
+                        Some(".wire_to_arrow_proto2_enum.Rec"),
+                    ),
+                    field("name", 2, ProtoType::String, None),
+                    kind(),
+                ],
+                ..Default::default()
+            },
+            DescriptorProto {
+                name: Some("Rec".into()),
+                field: vec![kind(), field("ts", 4, ProtoType::Int64, None)],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes).unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_proto2_enum.Outer")
+        .unwrap()
+}
+
+/// A single wire-type-mismatched (LEN) occurrence of an otherwise-absent enum
+/// counts exactly once wherever it sits relative to a needs-normalization
+/// verdict (a duplicate singular field), at the top level, in a Struct and in
+/// a message-backed VARIANT under every encoding, and the row is the one the
+/// same bytes without that occurrence produce. Before the first pass recorded
+/// skips past the verdict, an occurrence after it was stripped by
+/// normalization uncounted (seen as `activity_log_type` sent as LEN).
+#[test]
+fn lone_mismatched_enum_counted_once_around_normalization() {
+    use super::serializer::VariantMessageEncoding;
+
+    let _guard = METRICS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let desc = proto2_enum_descriptor();
+    let rec_fields = ArrowFields::from(vec![
+        Field::new("kind", DataType::LargeUtf8, true),
+        Field::new("ts", DataType::Int64, true),
+    ]);
+    let variant_schema = Schema::new(vec![
+        variant_arrow_field("rec"),
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("kind", DataType::LargeUtf8, true),
+    ]);
+    let struct_schema = Schema::new(vec![
+        Field::new("rec", DataType::Struct(rec_fields), true),
+        Field::new("name", DataType::LargeUtf8, true),
+        Field::new("kind", DataType::LargeUtf8, true),
+    ]);
+
+    const MISMATCHED_KIND: &[u8] = &[0x1a, 0x01, 0x01]; // kind as LEN
+    const NAME: &[u8] = &[0x12, 0x01, b'n'];
+    const TS: &[u8] = &[0x20, 0x05];
+    fn rec(body: &[&[u8]]) -> Vec<u8> {
+        let body = body.concat();
+        [&[0x0a, body.len() as u8][..], &body].concat()
+    }
+    // Each case builds its row around `m`: the mismatched occurrence, or
+    // nothing for the expected row.
+    type Case = (&'static str, fn(&[u8]) -> Vec<u8>);
+    let cases: [Case; 5] = [
+        ("top level after verdict", |m| {
+            [NAME, NAME, &rec(&[TS]), m].concat()
+        }),
+        ("top level before verdict", |m| {
+            [m, NAME, NAME, &rec(&[TS])].concat()
+        }),
+        ("in a duplicated rec", |m| {
+            [NAME, &rec(&[TS]), &rec(&[m])].concat()
+        }),
+        ("in rec after a duplicate name", |m| {
+            [NAME, NAME, &rec(&[TS, m])].concat()
+        }),
+        ("in rec before its duplicate", |m| {
+            [NAME, &rec(&[TS, m]), &rec(&[TS])].concat()
+        }),
+    ];
+
+    let encoders = [
+        (
+            "struct",
+            WireToArrowEncoder::new(&desc, struct_schema).unwrap(),
+        ),
+        (
+            "variant proto_json",
+            WireToArrowEncoder::with_variant_message_encoding(
+                &desc,
+                variant_schema.clone(),
+                VariantMessageEncoding::ProtoJson,
+            )
+            .unwrap(),
+        ),
+        (
+            "variant spark",
+            WireToArrowEncoder::with_variant_message_encoding(
+                &desc,
+                variant_schema.clone(),
+                VariantMessageEncoding::Spark,
+            )
+            .unwrap(),
+        ),
+        (
+            "variant spark_strip_nulls",
+            WireToArrowEncoder::with_variant_message_encoding(
+                &desc,
+                variant_schema,
+                VariantMessageEncoding::SparkStripNulls,
+            )
+            .unwrap(),
+        ),
+    ];
+    for (encoding, enc) in &encoders {
+        for (case, build) in &cases {
+            let (batch, skipped) = encode_row_counting_skips(enc, &build(MISMATCHED_KIND));
+            let (expected, expected_skipped) = encode_row_counting_skips(enc, &build(&[]));
+            assert_eq!(expected_skipped, 0.0, "{encoding}: {case}");
+            assert_eq!(batch.num_rows(), 1, "{encoding}: {case}");
+            assert_eq!(batch, expected, "{encoding}: {case}");
+            assert!(batch.column(2).is_null(0), "{encoding}: {case}");
+            assert_eq!(skipped, 1.0, "{encoding}: {case}");
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// The first pass stops validating once a row needs normalization: an
+// occurrence normalization discards (a losing singular, a cleared oneof
+// member) must not drop a row the canonical bytes accept. Every
+// `encode_batch` call in this crate's tests also asserts, in
+// `assert_rows_match_first_pass_stopping_at_verdict`, that rows match a first
+// pass that returns at the verdict.
+// -------------------------------------------------------------------------
+
+/// Both mismatch policies' encoders for one fixture.
+fn encoders_for_both_policies(
+    desc: &MessageDescriptor,
+    schema: &Schema,
+) -> [(OnWireTypeMismatch, WireToArrowEncoder); 2] {
+    [OnWireTypeMismatch::SkipField, OnWireTypeMismatch::DropRow].map(|policy| {
+        let enc = WireToArrowEncoder::with_options(desc, schema.clone(), policy, &[]).unwrap();
+        (policy, enc)
+    })
+}
+
+/// A losing singular occurrence carrying invalid JSON for a JSON-text VARIANT
+/// is discarded by last-wins, so the row keeps the final valid value under
+/// either policy, with no wire-type mismatch involved.
+#[test]
+fn losing_singular_json_variant_occurrence_keeps_row() {
+    let schema = Schema::new(vec![variant_arrow_field("name")]);
+    // name = "{}", name = "!", name = "{}".
+    let row = [
+        0x0a, 0x02, b'{', b'}', 0x0a, 0x01, b'!', 0x0a, 0x02, b'{', b'}',
+    ];
+    for (policy, enc) in encoders_for_both_policies(&scalar_descriptor(), &schema) {
+        let batch = enc.encode_batch(&[Bytes::from(row.to_vec())]).unwrap();
+        assert_eq!(batch.num_rows(), 1, "{policy:?}");
+        assert_eq!(
+            decode_variant_wire(batch.column(0), 0),
+            serde_json::json!({}),
+            "{policy:?}"
+        );
+    }
+}
+
+/// The oneof counterpart: a member carrying invalid JSON that a later switch
+/// clears never reaches the canonical bytes, so the row is kept; the same
+/// member left selected still drops it.
+#[test]
+fn cleared_oneof_member_with_invalid_json_keeps_row() {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        variant_arrow_field("b"),
+    ]);
+    // a = 1, b = "!" (switches the oneof), a = 2 (switches it back).
+    let cleared = [0x08, 0x01, 0x12, 0x01, b'!', 0x08, 0x02];
+    // a = 1, b = "!": b stays selected.
+    let selected = [0x08, 0x01, 0x12, 0x01, b'!'];
+    for (policy, enc) in encoders_for_both_policies(&oneof_descriptor(), &schema) {
+        let batch = enc
+            .encode_batch(&[
+                Bytes::from(cleared.to_vec()),
+                Bytes::from(selected.to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1, "{policy:?}");
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .value(0),
+            2,
+            "{policy:?}"
+        );
+        assert!(batch.column(1).is_null(0), "{policy:?}");
+    }
+}
+
+/// `message Mixed { string one = 1; repeated string many = 2; }` — a singular
+/// and a repeated JSON-text VARIANT column side by side.
+fn singular_and_repeated_string_descriptor() -> MessageDescriptor {
+    let string_field = |name: &str, number: i32, label: Label| FieldDescriptorProto {
+        name: Some(name.into()),
+        number: Some(number),
+        label: Some(label as i32),
+        r#type: Some(ProtoType::String as i32),
+        ..Default::default()
+    };
+    let fd = FileDescriptorProto {
+        name: Some("wire_to_arrow_mixed_variant_test.proto".into()),
+        package: Some("wire_to_arrow_mixed_variant_test".into()),
+        message_type: vec![DescriptorProto {
+            name: Some("Mixed".into()),
+            field: vec![
+                string_field("one", 1, Label::Optional),
+                string_field("many", 2, Label::Repeated),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let set = FileDescriptorSet { file: vec![fd] };
+    let mut bytes = Vec::new();
+    set.encode(&mut bytes).unwrap();
+    DescriptorPool::decode(bytes.as_slice())
+        .unwrap()
+        .get_message_by_name("wire_to_arrow_mixed_variant_test.Mixed")
+        .unwrap()
+}
+
+fn singular_and_repeated_variant_schema() -> Schema {
+    Schema::new(vec![
+        variant_arrow_field("one"),
+        Field::new(
+            "many",
+            DataType::List(Arc::new(variant_arrow_field("item"))),
+            true,
+        ),
+    ])
+}
+
+/// Normalization discards a losing singular occurrence but keeps every
+/// repeated element, so invalid JSON after the duplicate is harmless in the
+/// singular field and still drops the row in the repeated one.
+#[test]
+fn invalid_json_after_duplicate_drops_row_only_when_repeated() {
+    use arrow::array::ListArray;
+
+    let schema = singular_and_repeated_variant_schema();
+    // one = "{}", one = "!", one = "1", many = "2".
+    let losing_singular = [
+        0x0a, 0x02, b'{', b'}', 0x0a, 0x01, b'!', 0x0a, 0x01, b'1', 0x12, 0x01, b'2',
+    ];
+    // one = "{}", one = "1", many = "!".
+    let repeated_after_duplicate = [0x0a, 0x02, b'{', b'}', 0x0a, 0x01, b'1', 0x12, 0x01, b'!'];
+    for (policy, enc) in
+        encoders_for_both_policies(&singular_and_repeated_string_descriptor(), &schema)
+    {
+        let (batch, kept) = enc
+            .encode_batch_with_kept(&[
+                Bytes::from(losing_singular.to_vec()),
+                Bytes::from(repeated_after_duplicate.to_vec()),
+            ])
+            .unwrap();
+        assert_eq!(kept, [0], "{policy:?}");
+        assert_eq!(
+            decode_variant_wire(batch.column(0), 0),
+            serde_json::json!(1),
+            "{policy:?}"
+        );
+        let many = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(many.len(), 1, "{policy:?}");
+        assert_eq!(
+            decode_variant_wire(&many, 0),
+            serde_json::json!(2),
+            "{policy:?}"
+        );
+    }
+}
+
+/// Occurrence pools for [`first_pass_past_verdict_never_changes_rows`]: one
+/// fixture per verdict shape, each pool mixing valid values, values only
+/// validation rejects (invalid JSON, invalid UTF-8), and wire-type mismatches.
+fn verdict_fixture_pools() -> Vec<(MessageDescriptor, Schema, Vec<Vec<u8>>)> {
+    let kv_fields = ArrowFields::from(vec![
+        Field::new("k", DataType::LargeUtf8, true),
+        Field::new("n", DataType::Int64, true),
+    ]);
+    vec![
+        (
+            scalar_descriptor(),
+            Schema::new(vec![
+                variant_arrow_field("name"),
+                Field::new("id", DataType::Int32, true),
+                Field::new("email", DataType::LargeUtf8, true),
+            ]),
+            vec![
+                vec![0x0a, 0x02, b'{', b'}'],
+                vec![0x0a, 0x01, b'!'],
+                vec![0x0a, 0x01, 0xff],
+                vec![0x08, 0x01],
+                vec![0x10, 0x07],
+                vec![0x12, 0x01, 0x01],
+                vec![0x1a, 0x01, b'x'],
+                vec![0x1a, 0x01, 0xff],
+                vec![0xf8, 0x06, 0x01],
+            ],
+        ),
+        (
+            oneof_descriptor(),
+            Schema::new(vec![
+                Field::new("a", DataType::Int32, true),
+                variant_arrow_field("b"),
+            ]),
+            vec![
+                vec![0x08, 0x01],
+                vec![0x08, 0x02],
+                vec![0x12, 0x02, b'{', b'}'],
+                vec![0x12, 0x01, b'!'],
+                vec![0x0a, 0x01, 0x01],
+                vec![0x10, 0x01],
+            ],
+        ),
+        (
+            singular_and_repeated_string_descriptor(),
+            singular_and_repeated_variant_schema(),
+            vec![
+                vec![0x0a, 0x02, b'{', b'}'],
+                vec![0x0a, 0x01, b'!'],
+                vec![0x12, 0x01, b'1'],
+                vec![0x12, 0x01, b'!'],
+                vec![0x08, 0x01],
+                vec![0x10, 0x01],
+            ],
+        ),
+        (
+            message_variant_descriptor(),
+            Schema::new(vec![
+                variant_arrow_field("single"),
+                Field::new(
+                    "many",
+                    DataType::List(Arc::new(variant_arrow_field("item"))),
+                    true,
+                ),
+            ]),
+            vec![
+                vec![0x0a, 0x03, 0x0a, 0x01, b'y'],
+                vec![0x0a, 0x06, 0x0a, 0x01, b'x', 0x12, 0x01, 0x01],
+                vec![0x0a, 0x03, 0x0a, 0x01, 0xff],
+                vec![0x12, 0x03, 0x12, 0x01, 0x01],
+                vec![0x12, 0x03, 0x0a, 0x01, 0xff],
+                vec![0x08, 0x01],
+            ],
+        ),
+        (
+            message_variant_descriptor(),
+            Schema::new(vec![
+                Field::new("single", DataType::Struct(kv_fields.clone()), true),
+                Field::new(
+                    "many",
+                    DataType::List(Arc::new(Field::new(
+                        "item",
+                        DataType::Struct(kv_fields),
+                        true,
+                    ))),
+                    true,
+                ),
+            ]),
+            vec![
+                vec![0x0a, 0x03, 0x0a, 0x01, b'y'],
+                vec![0x0a, 0x06, 0x0a, 0x01, b'x', 0x12, 0x01, 0x01],
+                vec![0x0a, 0x03, 0x0a, 0x01, 0xff],
+                vec![0x0a, 0x04, 0x10, 0x01, 0x10, 0x02],
+                vec![0x12, 0x03, 0x0a, 0x01, 0xff],
+                vec![0x08, 0x01],
+            ],
+        ),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        timeout: 10_000,
+        ..ProptestConfig::default()
+    })]
+
+    /// Rows assembled from the fixture pools hit duplicates, oneof switches
+    /// and invalid occurrences on both sides of the verdict; `encode_batch`
+    /// asserts each batch matches the first pass that stops at the verdict.
+    #[test]
+    fn first_pass_past_verdict_never_changes_rows(
+        rows in proptest::collection::vec(proptest::collection::vec(any::<usize>(), 0..7), 1..4),
+    ) {
+        for (desc, schema, pool) in verdict_fixture_pools() {
+            let messages: Vec<Bytes> = rows
+                .iter()
+                .map(|picks| {
+                    let row: Vec<u8> = picks
+                        .iter()
+                        .flat_map(|&i| pool[i % pool.len()].iter().copied())
+                        .collect();
+                    Bytes::from(row)
+                })
+                .collect();
+            for (_, enc) in encoders_for_both_policies(&desc, &schema) {
+                let _ = enc.encode_batch(&messages);
+            }
+        }
+    }
 }
 
 /// Config deserialization: `on_wire_type_mismatch` accepts both policy names

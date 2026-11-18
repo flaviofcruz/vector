@@ -22,7 +22,7 @@ use super::builders::{self, BuilderNodeList};
 use super::errors::{Result, WireToArrowError};
 use super::plan::{MessagePlan, PlanSlot, SLOT_UNKNOWN, VariantSource};
 use super::serializer::OnWireTypeMismatch;
-use super::variant_message::SkipReport;
+use super::variant_message::{SkipReport, VariantMessagePlan};
 
 /// Wire-type guard shared by the validate and scan passes: is this wire
 /// value a legal encoding for the slot at `slot_idx`?
@@ -158,13 +158,52 @@ pub(super) struct RowSkipsSnapshot {
 
 /// Context threaded through `validate_message`: the configured mismatch
 /// policy, the full row's wire bytes (for skip attribution), the row's
-/// pending skip tally, and the stack of enclosing proto field numbers used to
-/// build root-to-leaf paths for skip samples.
+/// pending skip tally, the stack of enclosing proto field numbers used to
+/// build root-to-leaf paths for skip samples, and where to park a
+/// needs-normalization verdict.
 pub(super) struct ValidateCtx<'a> {
     pub(super) on_mismatch: OnWireTypeMismatch,
     pub(super) row: &'a Bytes,
     pub(super) skips: &'a mut RowSkips,
     pub(super) path: &'a mut Vec<u32>,
+    /// `Some` on the first pass over a row's original bytes: a verdict that
+    /// only normalization can resolve (duplicate singular, oneof switch, a
+    /// VARIANT `required` miss a later occurrence may fill) is parked here and
+    /// the rest of the row is walked for wire-type skips only (see
+    /// [`record_wire_type_skips`]), so every mismatch in the row — including
+    /// ones normalization strips — is recorded exactly once. `None` (the
+    /// revalidation of canonical bytes) returns the verdict as an error.
+    pub(super) needs_normalization: Option<&'a mut Option<WireToArrowError>>,
+}
+
+impl ValidateCtx<'_> {
+    /// Hand a needs-normalization verdict to the encoder, which normalizes the
+    /// row and revalidates the canonical bytes. `remainder` is the rest of the
+    /// current message from the occurrence that decided the verdict (or the
+    /// one after it): validation stops there — normalization may discard those
+    /// occurrences, so judging their values could drop a row the canonical
+    /// bytes accept — and only their wire-type skips are recorded.
+    fn defer_normalization(
+        &mut self,
+        plan: &MessagePlan,
+        remainder: &[u8],
+        verdict: WireToArrowError,
+    ) -> Result<()> {
+        let Some(pending) = self.needs_normalization.as_deref_mut() else {
+            return Err(verdict);
+        };
+        pending.get_or_insert(verdict);
+        record_wire_type_skips(plan, remainder, self);
+        Ok(())
+    }
+
+    /// A nested level deferred to normalization: the enclosing levels must
+    /// stop validating too.
+    fn normalization_pending(&self) -> bool {
+        self.needs_normalization
+            .as_deref()
+            .is_some_and(|pending| pending.is_some())
+    }
 }
 
 /// Scan one proto message's wire bytes, appending values into `builders`.
@@ -332,18 +371,20 @@ pub(super) fn validate_message(
     ctx: &mut ValidateCtx<'_>,
 ) -> Result<()> {
     // Track which singular slots (Scalar / Struct) have been seen in this
-    // message so a duplicate tag drops the row instead of corrupting
-    // column-length alignment downstream in scan_message. Proto3 parsers
-    // are required to accept duplicate singular tags (last-wins for
-    // scalars, merge for sub-messages), but Arrow `*Builder` types don't
-    // expose retraction. The encoder canonicalizes these rows and validates
-    // them again before scanning, leaving ordinary rows on the direct wire path.
+    // message so a duplicate tag cannot corrupt column-length alignment
+    // downstream in scan_message. Proto3 parsers are required to accept
+    // duplicate singular tags (last-wins for scalars, merge for sub-messages),
+    // but Arrow `*Builder` types don't expose retraction. A duplicate is a
+    // needs-normalization verdict (see `ValidateCtx::needs_normalization`): the
+    // encoder canonicalizes these rows and validates them again before
+    // scanning, leaving ordinary rows on the direct wire path.
     //
     // Slots and oneof groups share 128 inline bits; wider plans use a heap bitvec.
     // Common case is zero allocations on the hot path.
     let mut seen_singular = SeenSingular::with_capacity(plan.slots.len() + plan.oneof_count);
 
     while !bytes.is_empty() {
+        let occurrence = bytes;
         let (field, rest) = try_parse_field(bytes)?;
         bytes = rest;
         let field_number = field.field_num as usize;
@@ -381,9 +422,13 @@ pub(super) fn validate_message(
                         continue;
                     }
                     if seen_singular.test_and_set(plan.slots.len() + oneof) {
-                        return Err(WireToArrowError::OneofNeedsNormalization {
-                            field_number: field.field_num as u32,
-                        });
+                        return ctx.defer_normalization(
+                            plan,
+                            occurrence,
+                            WireToArrowError::OneofNeedsNormalization {
+                                field_number: field.field_num as u32,
+                            },
+                        );
                     }
                 }
                 continue;
@@ -417,25 +462,37 @@ pub(super) fn validate_message(
         if let Some(&oneof) = plan.oneof_by_proto_field.get(&(field.field_num as u32))
             && seen_singular.test_and_set(plan.slots.len() + oneof)
         {
-            return Err(WireToArrowError::OneofNeedsNormalization {
-                field_number: field.field_num as u32,
-            });
+            return ctx.defer_normalization(
+                plan,
+                occurrence,
+                WireToArrowError::OneofNeedsNormalization {
+                    field_number: field.field_num as u32,
+                },
+            );
         }
 
         let validation = match slot {
             PlanSlot::Scalar(sk) => {
                 if seen_singular.test_and_set(slot_idx) {
-                    return Err(WireToArrowError::DuplicateSingularField {
-                        field_number: field.field_num as u32,
-                    });
+                    return ctx.defer_normalization(
+                        plan,
+                        occurrence,
+                        WireToArrowError::DuplicateSingularField {
+                            field_number: field.field_num as u32,
+                        },
+                    );
                 }
                 validate_scalar_from_wire(*sk, &field.value)
             }
             PlanSlot::Struct(sub_plan) => {
                 if seen_singular.test_and_set(slot_idx) {
-                    return Err(WireToArrowError::DuplicateSingularField {
-                        field_number: field.field_num as u32,
-                    });
+                    return ctx.defer_normalization(
+                        plan,
+                        occurrence,
+                        WireToArrowError::DuplicateSingularField {
+                            field_number: field.field_num as u32,
+                        },
+                    );
                 }
                 validate_sub_message(
                     sub_plan,
@@ -456,9 +513,13 @@ pub(super) fn validate_message(
             PlanSlot::RepeatedEnumString(desc) => validate_repeated_enum_string(desc, &field.value),
             PlanSlot::EnumString(desc) => {
                 if seen_singular.test_and_set(slot_idx) {
-                    return Err(WireToArrowError::DuplicateSingularField {
-                        field_number: field.field_num as u32,
-                    });
+                    return ctx.defer_normalization(
+                        plan,
+                        occurrence,
+                        WireToArrowError::DuplicateSingularField {
+                            field_number: field.field_num as u32,
+                        },
+                    );
                 }
                 validate_enum_string_from_wire(desc, &field.value)
             }
@@ -467,9 +528,13 @@ pub(super) fn validate_message(
             // the scan appends it.
             PlanSlot::Variant(source) => {
                 if seen_singular.test_and_set(slot_idx) {
-                    return Err(WireToArrowError::DuplicateSingularField {
-                        field_number: field.field_num as u32,
-                    });
+                    return ctx.defer_normalization(
+                        plan,
+                        occurrence,
+                        WireToArrowError::DuplicateSingularField {
+                            field_number: field.field_num as u32,
+                        },
+                    );
                 }
                 encode_variant_slot(source, &field.value, ctx, field.field_num as u32)
                     .map(|value| variants.push(value))
@@ -498,6 +563,10 @@ pub(super) fn validate_message(
         // rather than dropping the row. Other errors are attributed to this
         // field's root-to-leaf path.
         match validation {
+            Ok(()) if ctx.normalization_pending() => {
+                record_wire_type_skips(plan, bytes, ctx);
+                return Ok(());
+            }
             Ok(()) => {}
             Err(WireToArrowError::WireTypeMismatch { expected, actual }) => match ctx.on_mismatch {
                 OnWireTypeMismatch::SkipField => {
@@ -509,6 +578,9 @@ pub(super) fn validate_message(
                         .at_proto_field(field.field_num as u32));
                 }
             },
+            Err(verdict @ WireToArrowError::VariantMessageMissingRequiredField { .. }) => {
+                return ctx.defer_normalization(plan, bytes, verdict);
+            }
             Err(error) => return Err(error.at_proto_field(field.field_num as u32)),
         }
     }
@@ -537,10 +609,96 @@ fn validate_sub_message(
             row: ctx.row,
             skips: ctx.skips,
             path: ctx.path,
+            needs_normalization: ctx.needs_normalization.as_deref_mut(),
         },
     );
     ctx.path.pop();
     result
+}
+
+/// Record the wire-type skips of `bytes` without validating or building any
+/// value: the remainder of a first pass that has deferred the row to
+/// normalization. It recognizes mismatches by the same accept masks as
+/// [`validate_message`] and descends where that pass would record nested
+/// skips — Struct, repeated-message and map sub-messages, and message-backed
+/// VARIANT payloads — so the tally matches a full walk. Malformed bytes end
+/// the walk quietly; the normalization guard drops such rows, and the tally
+/// of a dropped row is never committed. A no-op under `DropRow`, which
+/// records nothing.
+fn record_wire_type_skips(plan: &MessagePlan, mut bytes: &[u8], ctx: &mut ValidateCtx<'_>) {
+    if ctx.on_mismatch != OnWireTypeMismatch::SkipField {
+        return;
+    }
+    while !bytes.is_empty() {
+        let Ok((field, rest)) = try_parse_field(bytes) else {
+            return;
+        };
+        bytes = rest;
+        let number = field.field_num as u32;
+        let actual = wire_type_byte(&field.value);
+        let slot_idx = match plan.slot_by_proto_field.get(field.field_num as usize) {
+            Some(&idx) if idx != SLOT_UNKNOWN => idx as usize,
+            _ => {
+                if let Some(&accept_mask) = plan.unprojected_oneof_wt_masks.get(&number)
+                    && !wire_type_matches(accept_mask, &field.value)
+                {
+                    let expected = accept_mask.trailing_zeros() as u8;
+                    ctx.skips.record(ctx.path, number, expected, actual);
+                }
+                continue;
+            }
+        };
+        let slot = &plan.slots[slot_idx];
+        if !wire_type_matches(plan.wt_accept_masks[slot_idx], &field.value) {
+            ctx.skips
+                .record(ctx.path, number, slot.singular_wire_type(), actual);
+            continue;
+        }
+        match (slot, &field.value) {
+            (
+                PlanSlot::Struct(sub_plan)
+                | PlanSlot::RepeatedMessage(sub_plan)
+                | PlanSlot::Map(sub_plan),
+                WireValue::Len(body),
+            ) => {
+                ctx.path.push(number);
+                record_wire_type_skips(sub_plan, body, ctx);
+                ctx.path.pop();
+            }
+            (
+                PlanSlot::Variant(VariantSource::Message(variant_plan))
+                | PlanSlot::RepeatedVariant(VariantSource::Message(variant_plan)),
+                value,
+            ) => {
+                let snapshot = ctx.skips.snapshot();
+                let saved = ctx.path.len();
+                ctx.path.push(number);
+                // Malformed payload: the row drops, as `encode_variant_slot`
+                // assumes when it discards these partial skips.
+                if sanitize_recording_skips(variant_plan, value, ctx.skips, ctx.path).is_none() {
+                    ctx.skips.restore(snapshot);
+                }
+                ctx.path.truncate(saved);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Strip a message-backed VARIANT occurrence's wire-type mismatches for the
+/// reference decoder (see [`VariantMessagePlan::sanitize_for_reference`]),
+/// recording each stripped occurrence into the row's tally under `path`.
+fn sanitize_recording_skips(
+    plan: &VariantMessagePlan,
+    value: &WireValue<'_>,
+    skips: &mut RowSkips,
+    path: &mut Vec<u32>,
+) -> Option<Vec<u8>> {
+    let mut report = Some(SkipReport {
+        path,
+        sink: &mut |path, number, expected, actual| skips.record(path, number, expected, actual),
+    });
+    plan.sanitize_for_reference(value, &mut report)
 }
 
 /// Encode one VARIANT wire value during validation.
@@ -559,7 +717,9 @@ fn validate_sub_message(
 /// the row is kept. The abandoned direct walk may have recorded skips before
 /// bailing; sanitization re-walks and is the authoritative skip recorder for
 /// the fallback, so the tally is rolled back to its pre-walk state first and
-/// each mismatched occurrence is counted exactly once.
+/// each mismatched occurrence is counted exactly once. Skips of an occurrence
+/// whose encode then fails are kept: the row either drops (uncommitted) or is
+/// retried merged by a revalidation that does not record.
 fn encode_variant_slot(
     source: &VariantSource,
     value: &WireValue<'_>,
@@ -603,27 +763,12 @@ fn encode_variant_slot(
                         // tally borrow is not held across the restore —
                         // record them once.
                         skips.restore(snapshot);
-                        let sanitized = {
-                            let mut report = Some(SkipReport {
-                                path,
-                                sink: &mut |path, number, expected, actual| {
-                                    skips.record(path, number, expected, actual)
-                                },
-                            });
-                            plan.sanitize_for_reference(value, &mut report)
-                        };
-                        match sanitized {
-                            // A failed encode either drops the row or (a Spark
-                            // `required` miss) retries it merged, and that
-                            // revalidation re-records these skips, so they are
-                            // discarded here.
-                            Some(clean) => {
-                                let result = plan.encode_reference(&WireValue::Len(&clean));
-                                if result.is_err() {
-                                    skips.restore(snapshot);
-                                }
-                                result
-                            }
+                        match sanitize_recording_skips(plan, value, skips, path) {
+                            // A failed encode either drops the row (its tally
+                            // is never committed) or, for a Spark `required`
+                            // miss, retries it merged — and that revalidation
+                            // does not record, so these skips must stay.
+                            Some(clean) => plan.encode_reference(&WireValue::Len(&clean)),
                             // Malformed input: the row drops below; discard
                             // the sanitized walk's partial skips too and let
                             // the reference decoder produce its error from
