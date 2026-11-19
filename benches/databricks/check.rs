@@ -600,9 +600,9 @@ mod tests {
 
     #[test]
     fn sinks_are_known_and_not_repeated() {
-        let error = parse_sinks(&["gcs".into()]).err().unwrap().to_string();
+        let error = parse_sinks(&["kafka".into()]).err().unwrap().to_string();
         assert!(error.contains("--sink"), "{error}");
-        assert!(error.contains("unknown sink `gcs`"), "{error}");
+        assert!(error.contains("unknown sink `kafka`"), "{error}");
         let error = parse_sinks(&["s3".into(), "s3".into()])
             .err()
             .unwrap()
@@ -756,13 +756,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((setup.out.clone(), setup.latency_ms));
-                super::super::fake_s3::start(super::super::fake_s3::FakeS3Args {
-                    listen: EPHEMERAL_LOOPBACK,
-                    out: setup.out.clone(),
-                    discard: false,
-                    latency_ms: setup.latency_ms,
-                    fail_every: 0,
-                })
+                super::super::blob_ndjson::S3_NDJSON.start_fake(setup)
             }
             fn candidate_env(
                 &self,

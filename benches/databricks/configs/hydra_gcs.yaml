@@ -1,0 +1,57 @@
+# Hydra candidate for `check --sink gcs`: remote write -> metric_to_log_hydra -> gcp_cloud_storage
+# (fake-gcs), in one Vector process. Staging GCP VAM writes only blob sinks (no Zerobus).
+# The sink mirrors staging us-central1 VAM's diskless_logs_metric_to_log_json, except:
+#   - `endpoint` points at the local fake, and `skip_authentication` replaces the pod's
+#     credentials (so no OAuth token is fetched or sent);
+#   - batch timeout 5s (prod 90s) so objects appear quickly;
+#   - the buffer blocks instead of dropping, so a slow fake loses nothing.
+# Every DATABRICKS_BENCH_* variable below is set by `check`. The candidate needs a Vector built
+# with the `sinks-gcp` feature.
+data_dir: "${DATABRICKS_BENCH_DATA_DIR}"
+
+sources:
+  prom_remote_write:
+    type: prometheus_remote_write
+    address: "${DATABRICKS_BENCH_SOURCE_ADDR}"
+    metadata_conflict_strategy: ignore
+    group_metrics: false
+    acknowledgements:
+      enabled: false
+
+transforms:
+  log_based_metric_hydra_transformed:
+    type: metric_to_log_hydra
+    inputs: [prom_remote_write]
+
+sinks:
+  gcs_metric_to_log_json:
+    type: gcp_cloud_storage
+    inputs: [log_based_metric_hydra_transformed]
+    endpoint: "${DATABRICKS_BENCH_GCS_ENDPOINT}"
+    skip_authentication: true
+    bucket: databricks-bench
+    key_prefix: "metric-to-log-json/date=%F/vector-aggregator-lumberjack-"
+    filename_time_format: "%F-%s"
+    filename_extension: json.zst
+    compression: zstd
+    content_encoding: ""
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
+    batch:
+      max_bytes: 314572800
+      timeout_secs: 5
+    request:
+      concurrency: 32
+      retry_attempts: 1
+      retry_max_duration_secs: 60
+      timeout_secs: 30
+    healthcheck:
+      enabled: false
+    acknowledgements:
+      enabled: false
+    buffer:
+      type: memory
+      max_events: 500000
+      when_full: block

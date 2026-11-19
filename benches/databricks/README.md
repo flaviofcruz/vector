@@ -10,10 +10,11 @@ reading inside them. Everything that knows a protocol sits behind an adapter:
 | Adapter | Where | Knows |
 | --- | --- | --- |
 | `SourceCodec` (`source_codec.rs`) | source side | how a tapped event becomes an item, how items become requests, how responses are classified |
-| `SinkKind` (`sink.rs`; kinds in `s3_ndjson.rs` and `zerobus_flight.rs`) | sink side: `verify` and `check` | how a fake's captured output reads back as rows, with their destinations; which fake to start for a candidate and which environment points the candidate's config at it |
+| `SinkKind` (`sink.rs`; kinds in `blob_ndjson.rs` and `zerobus_flight.rs`) | sink side: `verify` and `check` | how a fake's captured output reads back as rows, with their destinations; which fake to start for a candidate and which environment points the candidate's config at it |
 
-The first pipeline is Hydra, the metrics path: Prometheus remote write in, S3 or Zerobus out,
-through `metric_to_log_hydra`. Its source codec is `prom_remote_write` (`prom_remote_write.rs`).
+The first pipeline is Hydra, the metrics path: Prometheus remote write in, an object store (S3,
+Azure Blob or GCS) or Zerobus out, through `metric_to_log_hydra`. Its source codec is
+`prom_remote_write` (`prom_remote_write.rs`).
 
 `check` runs the whole correctness flow in one command, and `profile` shows where a live pod's CPU
 goes. The building blocks it drives are
@@ -96,8 +97,8 @@ can then land under different dates for different candidates, and differ by dest
 
 Flags:
 
-- `--sink KIND` (repeatable; `s3` or `zerobus`). The candidate's config must use exactly these
-  sinks: a variable the config reads that `check` did not set fails the config load.
+- `--sink KIND` (repeatable; `s3`, `azure_blob`, `gcs` or `zerobus`). The candidate's config must
+  use exactly these sinks: a variable the config reads that `check` did not set fails the config load.
 - `--baseline NAME=BIN:CONFIG` and `--candidate NAME=BIN:CONFIG` (at least one candidate). The
   config is taken after the last colon, so it may not contain one. Names are letters, digits and
   underscores, and must differ.
@@ -110,9 +111,9 @@ Flags:
 - `--iterations`, `--items-per-sec`, `--max-concurrency`: as for `gen`.
 - `--work-dir DIR`: everything the run writes goes under it.
 
-### Fan-out: several tables and S3 prefixes
+### Fan-out: several tables and key prefixes
 
-A candidate's config may write several Zerobus tables and several S3 key prefixes. The harness sets
+A candidate's config may write several Zerobus tables and several object-store key prefixes. The harness sets
 one `DATABRICKS_BENCH_ZEROBUS_TABLE` for all of them, so a fan-out config writes each Zerobus sink's
 `table_name` itself, and gives every table its own `--schema TABLE=PATH`. Each `--sink` kind gets
 one fake per candidate, which every sink of that kind in the config writes to:
@@ -120,8 +121,9 @@ one fake per candidate, which every sink of that kind in the config writes to:
 - `fake-zerobus` writes each table's frames to `<zerobus-out>/<last segment of the table>/`. Two
   tables whose names differ only by catalog or schema have the same last segment, so their rows land
   in one directory and `verify` cannot tell them apart. Give fan-out tables distinct last segments.
-- `fake-s3` writes each object to `<s3-out>/<bucket>/<key>`, so sinks with different key
-  prefixes land in different directories, and a sink with the same prefix as another would merge.
+- The object-store fakes write each object to `<kind>-out/<bucket>/<key>`, so sinks with
+  different key prefixes land in different directories, and a sink with the same prefix as another
+  would merge.
 
 A table or prefix the candidate writes and the baseline does not shows as a destination `verify`
 reports as extra, so the verdict is DIFFERENT.
@@ -143,15 +145,21 @@ The candidate's config reads its endpoints from environment variables that `chec
 | `DATABRICKS_BENCH_SOURCE_ADDR` | every candidate | `127.0.0.1:<port>`, where its source must listen |
 | `DATABRICKS_BENCH_DATA_DIR` | every candidate | its fresh data dir |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_EC2_METADATA_DISABLED` | `s3` | dummy credentials; the fake does not check them |
-| `DATABRICKS_BENCH_S3_ENDPOINT` | `s3` | `http://127.0.0.1:<port>` of its fake-s3 |
+| `DATABRICKS_BENCH_S3_ENDPOINT` | `s3` | `http://127.0.0.1:<port>` of its fake-s3, the sink's `endpoint` |
+| `DATABRICKS_BENCH_AZURE_BLOB_ENDPOINT` | `azure_blob` | `http://127.0.0.1:<port>` of its fake-azure-blob; the connection string's `BlobEndpoint` is this plus `/<account>` |
+| `DATABRICKS_BENCH_GCS_ENDPOINT` | `gcs` | `http://127.0.0.1:<port>` of its fake-gcs, the sink's `endpoint` |
 | `DATABRICKS_BENCH_ZEROBUS_INGEST_ENDPOINT` | `zerobus` | `https://127.0.0.1:<port>` of its fake-zerobus |
 | `DATABRICKS_BENCH_ZEROBUS_UC_ENDPOINT` | `zerobus` | `http://127.0.0.1:<port>` of the shared fake-uc |
 | `DATABRICKS_BENCH_ZEROBUS_TABLE` | `zerobus` | `main.databricks_bench.output`, the same for every candidate |
 | `SSL_CERT_FILE` | `zerobus` | `<work-dir>/<name>/tls/ca.pem` |
 
-The committed config, `configs/hydra_dual_write.yaml`, uses both `s3` and `zerobus` and reads all
-of these. Its S3 batch timeout is 5 s, and buffers block rather than drop. A config for another
-sink set is written the same way, with the variables for the sinks it uses.
+The committed configs are `configs/hydra_dual_write.yaml` (`--sink s3 --sink zerobus`), and
+`configs/hydra_azure_blob.yaml` (`--sink azure_blob`) and `configs/hydra_gcs.yaml` (`--sink gcs`):
+the same pipeline with one object-store sink, as staging Azure and GCP VAM run it (no Zerobus).
+Their object-store batch timeout is 5 s, and buffers block rather than drop. A candidate's Vector
+needs its sinks' features (`sinks-aws_s3`, `sinks-azure_blob`, `sinks-gcp`,
+`sinks-databricks-zerobus`). A config for another sink set is written the same way, with the
+variables for the sinks it uses.
 
 Example, with the committed config for both sides and the Hydra corpus (for a real run, replace
 `hb` with `cargo bench --bench databricks --no-default-features --features $FEATURES --`, and use
@@ -327,7 +335,7 @@ Flags, as for `check` unless noted:
 - `--sink-latency-ms KIND=MS` (repeatable, once per selected `--sink` kind), e.g.
   `--sink-latency-ms s3=100 --sink-latency-ms zerobus=50`. Omitted kinds use zero. One fake
   endpoint per kind gets that delay, identical for every candidate and round, not per table or
-  pod. S3 delays each PUT before storage/response (`fake-s3 --latency-ms`); Zerobus delays each
+  pod. Object stores delay each PUT before storage/response (`--latency-ms`); Zerobus delays each
   batch acknowledgement (`fake-zerobus --ack-delay-ms`). This does not simulate bandwidth, TLS
   or network behaviour. Malformed, negative/non-integer, unknown, duplicate and unselected kinds
   are refused before anything starts. `check` stays zero-delay and has no such flag.
@@ -565,7 +573,7 @@ for performance (encoding, compression, batching, transport, retries) still runs
 
 | Output | Fake | `--out` holds |
 | --- | --- | --- |
-| `aws_s3` (and any S3-compatible sink) | `fake-s3` | `<bucket>/<key>`: each object as uploaded, with aws-chunked framing removed and the sink's compression kept |
+| `aws_s3`, `azure_blob`, `gcp_cloud_storage` | `fake-s3`, `fake-azure-blob`, `fake-gcs` | `<bucket>/<key>` (Azure: `<account>/<container>/<blob>`): each object as uploaded, with the sink's compression kept |
 | `databricks_zerobus` (`oauth` auth) | `fake-zerobus` | `<bucket>/conn-NNNNNN.flight`: the frames of each connection, as received (still compressed) |
 
 The `databricks_zerobus` sink in `oauth` mode calls two endpoints, so it needs two fakes. Point its
@@ -582,7 +590,24 @@ fetches them the first time it needs a stream, and again after Zerobus rejects i
 `recover_from_schema_rejection` is set. It has no `--out` and records nothing. Start order: `fetch-schema`, then `fake-uc`, then
 `fake-zerobus`, then the sink.
 
-Both write `index.ndjson`, one line per accepted PUT or batch, in arrival order:
+**Object stores.** The three sinks upload each batch as one PUT of the whole object, which is all
+their fakes model. One module, `fake_blob.rs`, serves all three, and they differ only where the
+store's protocol does:
+
+| | `fake-s3` | `fake-azure-blob` | `fake-gcs` |
+| --- | --- | --- | --- |
+| Sink config | `endpoint`, `force_path_style: true`, dummy AWS credentials | `connection_string` with `BlobEndpoint=<fake>/<account>` and a dummy SAS token | `endpoint`, `skip_authentication: true` |
+| Upload | PutObject at `/<bucket>/<key>`, plain or aws-chunked (framing removed before storing) | Put Blob of a block blob at `/<account>/<container>/<blob>` | the XML API's object PUT at `/<bucket>/<key>` |
+| Query on a PUT | only the SDK's `x-id=PutObject` | any (the SAS token, not checked) but `comp=` or `restype=` | none |
+| Healthcheck (GET or HEAD) | HeadBucket, no query: empty 200 | Get Container Properties (`restype=container`, no `comp=`): 200 with the container headers the SDK parses | HEAD of the bucket, no query: empty 200 |
+| Success | 200 with ETag and `x-amz-request-id` | 201 with the headers the SDK requires: ETag, Last-Modified, Date, a UUID `x-ms-request-id`, `x-ms-request-server-encrypted` | 200 with ETag |
+
+Everything else is shared: errors carry the XML `<Error><Code>` body all three stores use,
+`--latency-ms`, `--fail-every`, `--discard`, the index, and the rules below. With
+`healthcheck.enabled: true`, each sink's healthcheck passes against its fake.
+
+The object-store and Zerobus fakes write `index.ndjson`, one line per accepted PUT or batch, in
+arrival order (for Azure, `bucket` is `<account>/<container>`):
 
 - `bucket`, `key`, `bytes` (the stored size; for Zerobus, the frame's header and body bytes).
 - `recv_ms`: when the request or batch was fully read, before any injected delay.
@@ -595,20 +620,21 @@ yet; later steps will.
 
 Injected behaviour:
 
-- `fake-s3 --latency-ms N`: delays every PUT before it is stored or failed.
-- `fake-s3 --fail-every N`: answers every Nth PUT that passes validation with 503 SlowDown,
-  counting from 1.
+- `--latency-ms N` (object-store fakes): delays every PUT before it is stored or failed.
+- `--fail-every N` (object-store fakes): answers every Nth PUT that passes validation with 503
+  SlowDown, counting from 1.
 - `fake-zerobus --ack-delay-ms N`: delays each batch's ack, after its frame is read.
-- `--discard` (`fake-s3` and `fake-zerobus`): stores no objects or frames. The index is still
+- `--discard` (object-store fakes and `fake-zerobus`): stores no objects or frames. The index is still
   written.
 
 So with `--latency-ms 200`, `ack_ms - recv_ms` is at least 200 for every indexed PUT.
 
 Rejections:
 
-- A request with a query string other than the SDK's `?x-id=PutObject` tag gets 501
-  NotImplemented. This covers multipart uploads and other subresources, which would otherwise be
-  stored as plain objects.
+- A request the store's fake does not model (another query or probe, see the table; for Azure, a
+  blob type other than `BlockBlob`) gets 501 NotImplemented. This covers multipart uploads, staged blocks and
+  other subresources, which would otherwise be stored as plain objects.
+- A PUT without a key, or whose bucket or key would leave `--out`, gets 500.
 - An aws-chunked PUT whose body is malformed, or whose decoded length differs from
   `x-amz-decoded-content-length`, gets 400 and is not stored.
 
@@ -616,14 +642,14 @@ Rejections:
 name it in the error, because the index is append-only and capture files are numbered per process: a
 reused directory would mix two runs. The fakes never delete anything; pick a fresh `--out`, or
 remove the old one yourself. Capture files and objects are created new, so a clash fails instead
-of replacing data. A repeated S3 key is answered with a 500, where S3 would overwrite the object: the
-fake keeps `create_new`, since a capture must never be replaced, so a sink that re-PUTs a key sees an
-error here that S3 would not return. The index is written even with `--discard`, so the same rule
+of replacing data. A repeated key is answered with a 500, where the store would overwrite the
+object: the fake keeps `create_new`, since a capture must never be replaced, so a sink that re-PUTs
+a key sees an error here that the store would not return. The index is written even with `--discard`, so the same rule
 applies.
 
-**Checksums are not verified.** `fake-s3` stores a PUT's body whatever its `Content-MD5` or
-`x-amz-checksum-*` headers say. A candidate that sends a wrong checksum therefore passes here, where
-S3 would answer 400 BadDigest. The fake records what was sent; it does not check the sink's integrity
+**Checksums are not verified.** The object-store fakes store a PUT's body whatever its checksum
+headers (`Content-MD5`, `x-amz-checksum-*`) say. A candidate that sends a wrong checksum therefore
+passes here, where the store would answer 400. The fake records what was sent; it does not check the sink's integrity
 headers, and `check` does not cover them.
 
 **Zerobus specifics.** The ingestion fake follows the SDK's own mock protocol (schema message →
@@ -676,8 +702,8 @@ hb gen --corpus corpus.ndjson --target a=http://127.0.0.1:9100/ \
 `verify` compares what each candidate's sinks wrote with the baseline of the same sink. Each sink
 reads its own output back as rows (see [Sinks](#sinks)). The baseline is the first output of each
 sink; every other output of that sink is a candidate. It needs the sent log that `gen` wrote, and one
-`--output <target>=<sink>:<dir>` per capture: the `gen --target` name, the sink kind (`s3` or
-`zerobus`) and the fake's `--out`.
+`--output <target>=<sink>:<dir>` per capture: the `gen --target` name, the sink kind (`s3`,
+`azure_blob`, `gcs` or `zerobus`) and the fake's `--out`.
 
 ```bash
 hb verify --sent-log sent.ndjson \
@@ -691,21 +717,21 @@ hb verify --sent-log sent.ndjson \
   names the codec, so verify needs no corpus file. Each sink that appears needs at least two
   outputs, one baseline and one candidate, or verify refuses and names the sink.
 - **Rows.** A row is its destination (the directory it was written under, without its file name:
-  `<bucket>/<key prefix>` for S3, the table's last name segment for Zerobus), a metadata fingerprint,
+  `<bucket>/<key prefix>` for an object store, the table's last name segment for Zerobus), a metadata fingerprint,
   and its original bytes. Each candidate is compared with its baseline as a multiset of these
   triples; all three parts must match. Nothing is parsed or canonicalized: key order, whitespace
   and number spelling are part of the row. So rows that hold the same data but are serialized
   differently are different rows. A pipeline that needs semantic equality normalizes its rows in
   its sink's `read_back`, which then
   applies the same normalization to every output.
-- **Metadata.** Fingerprinted once per S3 object or decoded Zerobus schema, then reused for
+- **Metadata.** Fingerprinted once per object or decoded Zerobus schema, then reused for
   each associated row. Object, batch and connection boundaries do not count, but changing which
   rows use which metadata does, even when the row set and schema set stay the same.
   - Zerobus: Arrow's native schema hash includes column order, names, nested types/nullability,
     and field/schema metadata (sorted by key). It is computed before timezone retagging, so
     `LargeUtf8` versus `Utf8`, timestamp units, and `UTC` versus `+00:00` remain distinct even
     when the rendered rows match. Column order matters because Zerobus validates it.
-  - S3: the existing normalized filename (UUID masked as `<uuid>`, other ASCII digits as `#`)
+  - Object stores: the existing normalized filename (UUID masked as `<uuid>`, other ASCII digits as `#`)
     and the codec detected from content (`zstd`, `gzip`, `none`). This retains the prefix tail,
     time format shape and extension. A zero-padded format keeps its shape across seconds/days;
     an unpadded field can change width. A `date=%F` directory still changes destination at
@@ -743,7 +769,7 @@ whether the sink reads a table schema (`needs_schema`), starts its fake for a ca
 
 | Kind | Fake | Captured files | Read back as |
 | --- | --- | --- | --- |
-| `s3` (`s3_ndjson.rs`) | `fake-s3` | every object except the fake's top-level `index.ndjson` | NDJSON, one row per line; zstd or gzip detected by content. A stream cut short keeps the rows before the cut and counts one damaged record. Metadata: normalized object name and detected codec. |
+| `s3`, `azure_blob`, `gcs` (`blob_ndjson.rs`) | `fake-s3`, `fake-azure-blob`, `fake-gcs` | every object except the fake's top-level `index.ndjson` | NDJSON, one row per line; zstd or gzip detected by content. A stream cut short keeps the rows before the cut and counts one damaged record. Metadata: normalized object name and detected codec. |
 | `zerobus` (`zerobus_flight.rs`) | `fake-zerobus` | every `.flight` file | Arrow Flight frames in order: a schema, then record batches, rendered with arrow's JSON writer and explicit nulls. A schema frame later in the stream applies to the batches after it. A cut-off frame keeps the complete frames before it and counts one damaged record. Metadata: decoded schema as sent, applied to subsequent rows. |
 
 The Zerobus reader retags `UTC` timestamps as `+00:00` before rendering, since arrow's JSON

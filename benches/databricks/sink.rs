@@ -13,8 +13,8 @@ use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use super::blob_ndjson::{AZURE_BLOB_NDJSON, GCS_NDJSON, S3_NDJSON};
 use super::fakes::RunningFake;
-use super::s3_ndjson::S3Ndjson;
 use super::zerobus_flight::ZerobusFlight;
 use super::{err, io_at};
 
@@ -29,7 +29,8 @@ pub struct FakeSetup {
     pub tls_dir: PathBuf,
     /// The shared fake-uc, when a requested sink `needs_schema`; `None` otherwise.
     pub schema_endpoint: Option<SocketAddr>,
-    /// This kind's fake delay: PUT latency for S3, batch ack delay for Zerobus. `check` uses zero.
+    /// This kind's fake delay: PUT latency for an object store, batch ack delay for Zerobus.
+    /// `check` uses zero.
     pub latency_ms: u64,
 }
 
@@ -57,7 +58,7 @@ pub trait SinkKind: Sync {
     /// Calls `row` with each row's destination, metadata fingerprint and original bytes, in no
     /// particular order. The destination is the capture's directory. Metadata is fingerprinted
     /// once per object or schema and reused for its rows: the normalized file name and codec for
-    /// S3, or the decoded schema as sent for Zerobus. Bytes exclude the line break.
+    /// an object store, or the decoded schema as sent for Zerobus. Bytes exclude the line break.
     fn read_back(
         &self,
         out: &Path,
@@ -84,7 +85,7 @@ pub trait SinkKind: Sync {
 }
 
 /// Every sink this build can read, by the kind its `--output` names.
-pub const SINKS: &[&dyn SinkKind] = &[&S3Ndjson, &ZerobusFlight];
+pub const SINKS: &[&dyn SinkKind] = &[&S3_NDJSON, &AZURE_BLOB_NDJSON, &GCS_NDJSON, &ZerobusFlight];
 
 /// The sink with this kind, or an error that lists the known kinds.
 pub fn sink_named(kind: &str) -> Result<&'static dyn SinkKind, BoxError> {
@@ -120,8 +121,8 @@ pub fn files_under(root: &Path) -> Result<Vec<PathBuf>, BoxError> {
     Ok(files)
 }
 
-/// The destination of a capture file: its directory under the fake's `--out`, which for S3 is
-/// `<bucket>/<key prefix>` and for Zerobus the table's bucket.
+/// The destination of a capture file: its directory under the fake's `--out`, which for an object
+/// store is `<bucket>/<key prefix>` and for Zerobus the table's bucket.
 pub fn destination_of(relative: &Path) -> String {
     relative
         .parent()
@@ -145,8 +146,10 @@ mod tests {
     fn sinks_are_found_by_kind() {
         assert_eq!(sink_named("s3").unwrap().name(), "s3");
         assert_eq!(sink_named("zerobus").unwrap().name(), "zerobus");
-        let error = sink_named("gcs").err().unwrap().to_string();
-        assert!(error.contains("unknown sink `gcs`"), "{error}");
-        assert!(error.contains("s3, zerobus"), "{error}");
+        assert_eq!(sink_named("azure_blob").unwrap().name(), "azure_blob");
+        assert_eq!(sink_named("gcs").unwrap().name(), "gcs");
+        let error = sink_named("kafka").err().unwrap().to_string();
+        assert!(error.contains("unknown sink `kafka`"), "{error}");
+        assert!(error.contains("s3, azure_blob, gcs, zerobus"), "{error}");
     }
 }

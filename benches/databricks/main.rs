@@ -7,12 +7,13 @@
 #![allow(deprecated)] // hyper 0.14 server/client APIs, matching the rest of the crate.
 
 mod bench;
+mod blob_ndjson;
 mod capture;
 mod cgroup;
 mod check;
 mod corpus;
 mod cpus;
-mod fake_s3;
+mod fake_blob;
 mod fake_uc;
 mod fake_zerobus;
 mod fakes;
@@ -23,7 +24,6 @@ mod out_dir;
 mod process;
 mod profile;
 mod prom_remote_write;
-mod s3_ndjson;
 mod sink;
 mod source_codec;
 mod tls;
@@ -76,7 +76,11 @@ enum Command {
     /// Save a Unity Catalog table's schema (via the databricks CLI) for fake-uc to serve.
     FetchSchema(fetch_schema::FetchSchemaArgs),
     /// Serve a minimal S3 PutObject endpoint that records every object it receives.
-    FakeS3(fake_s3::FakeS3Args),
+    FakeS3(fake_blob::FakeBlobArgs),
+    /// Serve a minimal Azure Blob Put Blob endpoint that records every blob it receives.
+    FakeAzureBlob(fake_blob::FakeBlobArgs),
+    /// Serve a minimal GCS object PUT endpoint (XML API) that records every object it receives.
+    FakeGcs(fake_blob::FakeBlobArgs),
     /// Serve the Unity Catalog and OAuth endpoints the sink calls to get its table schemas, one
     /// `--schema TABLE=PATH` per table.
     FakeUc(fake_uc::FakeUcArgs),
@@ -123,7 +127,13 @@ fn main() {
         Command::Capture(args) => capture::capture(args),
         Command::Profile(args) => profile::profile(args),
         Command::FetchSchema(args) => fetch_schema::fetch_schema(args),
-        Command::FakeS3(args) => runtime().block_on(fake_s3::serve(args)),
+        Command::FakeS3(args) => runtime().block_on(fake_blob::serve(fake_blob::BlobApi::S3, args)),
+        Command::FakeAzureBlob(args) => {
+            runtime().block_on(fake_blob::serve(fake_blob::BlobApi::AzureBlob, args))
+        }
+        Command::FakeGcs(args) => {
+            runtime().block_on(fake_blob::serve(fake_blob::BlobApi::Gcs, args))
+        }
         Command::FakeUc(args) => runtime().block_on(fake_uc::serve(args)),
         Command::FakeZerobus(args) => runtime().block_on(fake_zerobus::serve(args)),
         Command::Gen(args) => runtime().block_on(generator::run_cli(args)),

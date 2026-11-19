@@ -67,15 +67,15 @@ pub async fn serve_until_signal(fake: RunningFake) -> CmdResult {
 /// address, so a parent that passed a `:0` port can learn which port it got.
 pub const READY_PREFIX: &str = "DATABRICKS_BENCH_LISTENING ";
 
-/// Index file in `--out` (S3 and Zerobus only): one JSON line per accepted PUT or record batch,
-/// in arrival order.
+/// Index file in `--out` (object-store and Zerobus fakes): one JSON line per accepted PUT or
+/// record batch, in arrival order.
 pub const INDEX_FILE: &str = "index.ndjson";
 
 #[derive(Serialize, Deserialize)]
 pub struct IndexEntry {
     pub bucket: String,
     pub key: String,
-    /// S3: the object's bytes as stored. Zerobus: the frame's header and body bytes.
+    /// Object stores: the object's bytes as stored. Zerobus: the frame's header and body bytes.
     pub bytes: u64,
     /// When the request or batch was fully read, before any injected delay.
     pub recv_ms: i64,

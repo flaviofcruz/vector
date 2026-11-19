@@ -44,8 +44,8 @@ pub struct VerifyArgs {
     /// Sent log written by `gen`. It names the corpus's codec and records every request of the run.
     #[arg(long)]
     sent_log: PathBuf,
-    /// `<target>=<sink>:<dir>`: the `gen --target` name, the sink kind (`s3` or `zerobus`) and the
-    /// fake's `--out`. Repeatable. Each sink needs at least two outputs: the first is the
+    /// `<target>=<sink>:<dir>`: the `gen --target` name, the sink kind (`s3`, `azure_blob`, `gcs`
+    /// or `zerobus`) and the fake's `--out`. Repeatable. Each sink needs at least two outputs: the first is the
     /// baseline, and the others are compared with it.
     #[arg(long = "output", required = true)]
     outputs: Vec<String>,
@@ -70,7 +70,8 @@ fn parse_outputs(specs: &[String]) -> Result<Vec<Output>, BoxError> {
         .map(|spec| {
             let usage = || {
                 err(format!(
-                    "--output `{spec}`: expected <target>=<sink>:<dir>, sink `s3` or `zerobus`"
+                    "--output `{spec}`: expected <target>=<sink>:<dir>, sink `s3`, `azure_blob`, \
+                     `gcs` or `zerobus`"
                 ))
             };
             let (target, rest) = spec.split_once('=').ok_or_else(usage)?;
@@ -590,7 +591,7 @@ mod tests {
         let outputs = parse_outputs(&["a=zerobus:/tmp/x:y".into()]).unwrap();
         assert_eq!(outputs[0].label(), "a/zerobus");
         assert_eq!(outputs[0].dir, Path::new("/tmp/x:y"));
-        for bad in ["a", "a=gcs:/x", "=s3:/x", "a=s3:"] {
+        for bad in ["a", "a=kafka:/x", "=s3:/x", "a=s3:"] {
             let error = parse_outputs(&[bad.into()]).err().unwrap().to_string();
             assert!(error.contains("--output"), "{error}");
         }

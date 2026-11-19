@@ -83,8 +83,8 @@ pub struct BenchArgs {
     #[arg(long = "sink", required = true, value_name = "KIND")]
     sinks: Vec<String>,
     /// Fake delay per selected sink kind, as KIND=MS. Repeatable, once per kind; omitted kinds
-    /// use zero. Identical for every candidate and round. S3 delays PUT storage/responses;
-    /// Zerobus delays batch acknowledgements. No bandwidth or network simulation.
+    /// use zero. Identical for every candidate and round. Object stores (`s3`, `azure_blob`,
+    /// `gcs`) delay PUT storage/responses; Zerobus delays batch acknowledgements. No bandwidth or network simulation.
     #[arg(long = "sink-latency-ms", value_name = "KIND=MS", value_parser = parse_sink_latency)]
     sink_latencies: Vec<(String, u64)>,
     /// A candidate, as NAME=VECTOR_BIN:CONFIG. Repeatable. Candidates run one at a time, in the
@@ -1049,7 +1049,7 @@ mod tests {
             "s3=+1",
             "s3=1=2",
             "s3= 1",
-            "gcs=10",
+            "kafka=10",
             "s3=18446744073709551616",
         ] {
             let error = latency_args(&[spec]).err().unwrap().to_string();

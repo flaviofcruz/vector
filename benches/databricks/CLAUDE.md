@@ -2,11 +2,12 @@
 
 `benches/databricks` is a harness for checking implementations of Databricks Vector pipelines
 against a baseline. The first supported pipeline is Hydra: Prometheus remote write in, then
-`metric_to_log_hydra`, then the `aws_s3` or `databricks_zerobus` sink. The core (`capture`,
+`metric_to_log_hydra`, then an object-store sink (`aws_s3`, `azure_blob` or `gcp_cloud_storage`)
+or `databricks_zerobus`. The core (`capture`,
 `corpus`, `gen`, `verify`) handles items and rows and never reads inside them. A source's protocol
 lives behind the `SourceCodec` trait in `source_codec.rs` (first codec: `prom_remote_write.rs`), and
-a sink's output behind `SinkKind` in `sink.rs` (kinds `s3` and `zerobus`), whose `read_back` reads
-it back as rows, and which `check` also uses to start the sink's fake and point a candidate at it.
+a sink's output behind `SinkKind` in `sink.rs` (kinds `s3`, `azure_blob`, `gcs` and `zerobus`),
+whose `read_back` reads it back as rows, and which `check` also uses to start the sink's fake and point a candidate at it.
 A new pipeline adds a codec, and a reader if its sink is new; see `README.md` ("Adding a pipeline").
 This file covers what an agent on a fresh Databricks dev box (Arca/Arclet) needs in order to
 build, test and run the harness without guessing.
@@ -158,8 +159,8 @@ needs are:
   ```
 
 - **Fake delays.** `--sink-latency-ms s3=100 --sink-latency-ms zerobus=50` sets per-kind delays
-  identically for every candidate and round; omitted kinds use zero. S3 delays PUT storage/responses,
-  Zerobus delays batch acknowledgements, using the existing fakes, not network simulation.
+  identically for every candidate and round; omitted kinds use zero. Object stores delay PUT
+  storage/responses, Zerobus delays batch acknowledgements, using the existing fakes, not network simulation.
   `results.json` records every selected kind's effective value in `settings.sink_latencies_ms`.
   `check` remains zero-delay. For a latency smoke, inspect each fake's `index.ndjson`:
   `ack_ms - recv_ms` includes the injected delay (plus storage/scheduling); wall times can overlap.
@@ -219,9 +220,9 @@ needs are:
 - **`fetch-schema`** shells out to the `databricks` CLI, e.g. with profile
   `logfood-us-west-2-mt-staging` and table `main.eng_hydra.pod_prime_raw`. On an auth error run
   `databricks auth login --profile <p>` (interactive; ask the user to do it).
-- **Fakes** (`fake-s3`, `fake-uc`, `fake-zerobus`) stand in for the sinks' remote services
-  locally, and print `DATABRICKS_BENCH_LISTENING <addr>` once bound. A Zerobus candidate also needs
-  `SSL_CERT_FILE` pointing at `<tls-dir>/ca.pem`.
+- **Fakes** (`fake-s3`, `fake-azure-blob`, `fake-gcs`, `fake-uc`, `fake-zerobus`) stand in for the
+  sinks' remote services locally, and print `DATABRICKS_BENCH_LISTENING <addr>` once bound. A
+  Zerobus candidate also needs `SSL_CERT_FILE` pointing at `<tls-dir>/ca.pem`.
 - **`gen`** replays a corpus to one or more `--target name=http://…` (plain HTTP only),
   `--iterations` passes in captured order, paced by `--items-per-sec` and capped at
   `--max-concurrency` requests in flight. It loads the whole corpus into memory first (a 300 MB
@@ -231,27 +232,26 @@ needs are:
   needs only the sent log.
 - **`verify`** compares each candidate's sink output with its sink's baseline (the first output of
   that sink), as a multiset of (destination, metadata fingerprint, exact row bytes). Metadata is
-  the Zerobus Arrow schema as sent, or the S3 object's name (UUID and digits masked) and codec,
+  the Zerobus Arrow schema as sent, or the object's name (UUID and digits masked) and codec,
   fingerprinted once per schema/object and reused for its rows. Empty objects/streams have no
   metadata comparison. Differences show original rows and metadata hashes (README, "verify").
-  Run it once the sinks have flushed (the S3 batch
-  timeout, then a few seconds). A sent log that is truncated or has a gap is refused (exit 2). Each `--output <target>=<s3|zerobus>:<dir>` names the sent-log target, the sink
+  Run it once the sinks have flushed (the object-store batch
+  timeout, then a few seconds). A sent log that is truncated or has a gap is refused (exit 2). Each `--output <target>=<kind>:<dir>` names the sent-log target, the sink
   kind and that fake's `--out`; each sink needs at least two outputs. Any retried or not-accepted
   request on a compared target makes the verdict INCONCLUSIVE. It proves only that outputs agree
   with the baseline, not that the baseline is right. Exit 0 when IDENTICAL, 1 when DIFFERENT or
   INCONCLUSIVE, 2 on error. The report and its limits are in `README.md`.
-- **A vector candidate under test** needs, besides its config: a fresh `data_dir`, dummy AWS
-  credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_EC2_METADATA_DISABLED=true`)
-  for an `aws_s3` sink pointed at fake-s3 (`endpoint` + `force_path_style: true`), and a
+- **A vector candidate under test** needs, besides its config: a fresh `data_dir`, the
+  environment `check` sets for each of its sinks (the table in `README.md`, "check"), and a
   restart after fake-uc is up, since the Zerobus sink fetches its schema lazily. Build it with
   `cargo build --profile dev --bin vector --no-default-features --features` and the bench list
-  minus `databricks-benches`.
+  minus `databricks-benches`, plus `sinks-azure_blob` or `sinks-gcp` for those sinks.
 
 ### Manual flow (debugging only)
 
 `check` does all of this. Use the manual flow only to debug one part, such as a fake or a sink
-config, that `check` does not expose. Start fake-uc (`--schema TABLE=PATH` per table), fake-s3 and
-fake-zerobus on fresh `--out` dirs, export the candidate's `DATABRICKS_BENCH_*` variables (the table in `README.md`,
+config, that `check` does not expose. Start fake-uc (`--schema TABLE=PATH` per table) and the
+sinks' fakes on fresh `--out` dirs, export the candidate's `DATABRICKS_BENCH_*` variables (the table in `README.md`,
 "check") pointing at them, and start the candidate. Then:
 
 1. `hb gen --corpus c.ndjson --target a=http://127.0.0.1:<port>/ --sent-log sent.ndjson`

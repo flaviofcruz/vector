@@ -1,8 +1,12 @@
-//! S3 sink output: the objects that `fake-s3` records, read back as NDJSON rows.
+//! Object-store sink output: the objects that `fake-s3` (`aws_s3`), `fake-azure-blob`
+//! (`azure_blob`) and `fake-gcs` (`gcp_cloud_storage`) record, read back as NDJSON rows. The three
+//! stores are one [`BlobNdjson`] kind each, which differ only in the fake's protocol and the
+//! environment that points a config at it.
 //!
-//! Each object is stored as `<bucket>/<key>` under the fake's `--out`, with the sink's compression
-//! kept. A row is one line of an object, and its destination is the object's `<bucket>/<key
-//! prefix>`, without the file name.
+//! Each object is stored as `<bucket>/<key>` under the fake's `--out` (for Azure, the bucket is
+//! `<account>/<container>`), with the sink's compression kept. A row is one line of an object, and
+//! its destination is the object's directory, `<bucket>/<key prefix>`, without the file name. All
+//! three sinks name objects `<prefix><time>-<uuid>.<extension>`.
 //!
 //! Each row includes a fingerprint of its object metadata: its file name with the parts
 //! that differ per run masked (see [`object_name_shape`]), and the compression its content is in.
@@ -14,35 +18,70 @@ use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::Path;
 
-use super::fake_s3::{self, FakeS3Args};
+use super::fake_blob::{self, BlobApi, FakeBlobArgs};
 use super::fakes::{EPHEMERAL_LOOPBACK, INDEX_FILE, RunningFake};
 use super::io_at;
 use super::sink::{FakeSetup, ReadBack, SinkKind, destination_of, emit, files_under, fingerprint};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Environment variable that gives a candidate's config the S3 fake's endpoint.
-const S3_ENDPOINT_VAR: &str = "DATABRICKS_BENCH_S3_ENDPOINT";
-
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
-/// S3 objects written by `aws_s3` through the fake: NDJSON, one row per line.
-pub struct S3Ndjson;
+/// Objects written by an object-store sink through its fake: NDJSON, one row per line.
+pub struct BlobNdjson {
+    name: &'static str,
+    api: BlobApi,
+    /// Gives the config the fake's `http://<addr>`: the S3 or GCS sink's `endpoint`, or the Azure
+    /// connection string's `BlobEndpoint` before `/<account>`.
+    endpoint_var: &'static str,
+    /// Set as well, for an SDK that needs more than the endpoint.
+    extra_env: &'static [(&'static str, &'static str)],
+}
 
-impl SinkKind for S3Ndjson {
+pub const S3_NDJSON: BlobNdjson = BlobNdjson {
+    name: "s3",
+    api: BlobApi::S3,
+    endpoint_var: "DATABRICKS_BENCH_S3_ENDPOINT",
+    // The AWS SDK signs every request, so it needs credentials: dummy ones, which the fake does
+    // not check. The metadata service is off so the SDK does not wait on it.
+    extra_env: &[
+        ("AWS_ACCESS_KEY_ID", "databricks-bench"),
+        ("AWS_SECRET_ACCESS_KEY", "databricks-bench"),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+    ],
+};
+
+pub const AZURE_BLOB_NDJSON: BlobNdjson = BlobNdjson {
+    name: "azure_blob",
+    api: BlobApi::AzureBlob,
+    endpoint_var: "DATABRICKS_BENCH_AZURE_BLOB_ENDPOINT",
+    extra_env: &[],
+};
+
+pub const GCS_NDJSON: BlobNdjson = BlobNdjson {
+    name: "gcs",
+    api: BlobApi::Gcs,
+    endpoint_var: "DATABRICKS_BENCH_GCS_ENDPOINT",
+    extra_env: &[],
+};
+
+impl SinkKind for BlobNdjson {
     fn name(&self) -> &'static str {
-        "s3"
+        self.name
     }
 
     fn start_fake(&self, setup: &FakeSetup) -> Result<RunningFake, BoxError> {
-        fake_s3::start(FakeS3Args {
-            listen: EPHEMERAL_LOOPBACK,
-            out: setup.out.clone(),
-            discard: false,
-            latency_ms: setup.latency_ms,
-            fail_every: 0,
-        })
+        fake_blob::start(
+            self.api,
+            FakeBlobArgs {
+                listen: EPHEMERAL_LOOPBACK,
+                out: setup.out.clone(),
+                discard: false,
+                latency_ms: setup.latency_ms,
+                fail_every: 0,
+            },
+        )
     }
 
     fn candidate_env(
@@ -50,14 +89,9 @@ impl SinkKind for S3Ndjson {
         _: &FakeSetup,
         fake: SocketAddr,
     ) -> Result<Vec<(&'static str, String)>, BoxError> {
-        Ok(vec![
-            (S3_ENDPOINT_VAR, format!("http://{fake}")),
-            // Dummy credentials: the fake does not check them. The metadata service is off so
-            // the SDK does not wait on it.
-            ("AWS_ACCESS_KEY_ID", "databricks-bench".to_owned()),
-            ("AWS_SECRET_ACCESS_KEY", "databricks-bench".to_owned()),
-            ("AWS_EC2_METADATA_DISABLED", "true".to_owned()),
-        ])
+        let endpoint = (self.endpoint_var, format!("http://{fake}"));
+        let extra = self.extra_env.iter().map(|(k, v)| (*k, (*v).to_owned()));
+        Ok(std::iter::once(endpoint).chain(extra).collect())
     }
 
     fn read_back(
@@ -175,19 +209,26 @@ mod tests {
 
     const ROW: &str = "{\"name\":\"up\",\"labels\":{},\"values\":[{\"ts\":1,\"v\":1.0}]}\n";
 
-    /// Reads back `root` as `(destination, metadata hash, original row)` triples, in read order.
+    const STORES: [&BlobNdjson; 3] = [&S3_NDJSON, &AZURE_BLOB_NDJSON, &GCS_NDJSON];
+
+    /// Reads back `root` as `(destination, metadata hash, original row)` triples, in read order,
+    /// the same for every store.
     fn read(root: &Path) -> (ReadBack, Vec<(String, u64, Vec<u8>)>) {
-        let mut rows = Vec::new();
-        let found = S3Ndjson
-            .read_back(root, &mut |destination, metadata, bytes| {
-                rows.push((destination.to_owned(), metadata, bytes.to_vec()))
-            })
-            .unwrap();
-        (found, rows)
+        let [first, rest @ ..] = STORES.map(|store| {
+            let mut rows = Vec::new();
+            let found = store
+                .read_back(root, &mut |destination, metadata, bytes| {
+                    rows.push((destination.to_owned(), metadata, bytes.to_vec()))
+                })
+                .unwrap();
+            (found, rows)
+        });
+        assert!(rest.iter().all(|other| *other == first));
+        first
     }
 
     #[test]
-    fn s3_objects_read_back_plain_zstd_and_gzip_with_their_destinations() {
+    fn objects_read_back_plain_zstd_and_gzip_with_their_destinations() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         // Objects are `<bucket>/<key>`; the destination drops the final file name.
@@ -219,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_s3_object_keeps_its_rows_and_counts_as_damaged() {
+    fn a_truncated_object_keeps_its_rows_and_counts_as_damaged() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("bucket")).unwrap();
@@ -281,5 +322,65 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].1, rows[1].1);
         assert_ne!(rows[0].1, rows[2].1);
+    }
+
+    fn setup(dir: &Path) -> FakeSetup {
+        FakeSetup {
+            out: dir.join("out"),
+            tls_dir: dir.join("tls"),
+            schema_endpoint: None,
+            latency_ms: 0,
+        }
+    }
+
+    /// A PUT of `body` to `path` on the fake, which must answer with a success status.
+    async fn put(fake: &RunningFake, path: &str, headers: &[(&str, &str)], body: Vec<u8>) {
+        let mut req = hyper::Request::put(format!("http://{}{path}", fake.addr));
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let response = hyper::Client::new()
+            .request(req.body(hyper::Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+    }
+
+    #[tokio::test]
+    async fn each_store_starts_its_fake_points_the_config_at_it_and_reads_its_objects() {
+        // Every store's fake accepts this header; only Azure's needs it.
+        let blob_type = [("x-ms-blob-type", "BlockBlob")];
+        let aws = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_EC2_METADATA_DISABLED",
+        ];
+        for (store, container, extra_env) in [
+            (&S3_NDJSON, "bkt", &aws[..]),
+            (&AZURE_BLOB_NDJSON, "acct/logs", &[]),
+            (&GCS_NDJSON, "bkt", &[]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let setup = setup(dir.path());
+            let fake = store.start_fake(&setup).unwrap();
+            let env = store.candidate_env(&setup, fake.addr).unwrap();
+            let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+            assert_eq!(names[0], store.endpoint_var);
+            assert_eq!(names[1..], *extra_env, "{}", store.name);
+            assert_eq!(env[0].1, format!("http://{}", fake.addr));
+            let zst = zstd::encode_all(ROW.repeat(2).as_bytes(), 0).unwrap();
+            let path = format!("/{container}/date=1/x-1.json.zst");
+            put(&fake, &path, &blob_type, zst).await;
+            let path = format!("/{container}/other/x-2.json");
+            put(&fake, &path, &blob_type, ROW.into()).await;
+            fake.stop().await.unwrap();
+
+            let (found, rows) = read(&setup.out);
+            assert_eq!((found.files, found.damaged), (2, 0), "{}", store.name);
+            let destinations: Vec<&str> = rows.iter().map(|(d, _, _)| d.as_str()).collect();
+            let (dated, other) = (format!("{container}/date=1"), format!("{container}/other"));
+            assert_eq!(destinations, [&dated, &dated, &other], "{}", store.name);
+            assert!(setup.out.join(INDEX_FILE).is_file());
+        }
     }
 }
