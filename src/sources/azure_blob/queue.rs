@@ -233,9 +233,13 @@ pub(super) struct Config {
     #[derivative(Default(value = "default_true()"))]
     pub(super) delete_message: bool,
 
-    /// Whether to delete messages that fail processing and are not retryable.
-    /// If true, failed messages are removed from the queue to prevent blocking
+    /// Whether to delete messages whose events the sink rejected (a permanent failure).
+    /// If true, a rejected message is removed from the queue to prevent blocking
     /// the processing of other messages.
+    ///
+    /// This applies to rejected messages only. A message the sink reported as errored (for example
+    /// because its destination is down) is never deleted: it stays on the queue and is retried once
+    /// its `visibility_timeout_secs` expires.
     #[serde(default = "default_true")]
     #[derivative(Default(value = "default_true()"))]
     pub(super) delete_failed_message: bool,
@@ -627,7 +631,7 @@ pub struct State {
     visibility_timeout_secs: u64,
     /// Whether to delete successfully processed messages
     delete_message: bool,
-    /// Whether to delete failed messages
+    /// Whether to delete rejected messages
     delete_failed_message: bool,
     /// Decoder for processing blob contents
     decoder: Decoder,
@@ -1665,8 +1669,13 @@ impl IngestorProcess {
                             delivered = true;
                             Ok(())
                         }
-                        // Counted here, not by the per-message arm: with `delete_failed_message`
-                        // these become `Ok` (and are deleted), so they would otherwise go uncounted.
+                        // Counted here, not by the per-message arm: with `delete_failed_message` a
+                        // rejected batch becomes `Ok` (and is deleted), so it would otherwise go
+                        // uncounted.
+                        // Errored means the sink could not deliver but may later (its destination is
+                        // down, say), so the message is never deleted, whatever
+                        // `delete_failed_message` says: it stays on the queue and is retried once its
+                        // visibility timeout expires.
                         BatchStatus::Errored => {
                             let err = ProcessingError::BlobDeliveryErrored {
                                 container: container.clone(),
@@ -1676,11 +1685,7 @@ impl IngestorProcess {
                                 message_id,
                                 error: &err,
                             });
-                            if self.state.delete_failed_message {
-                                Ok(())
-                            } else {
-                                Err(err)
-                            }
+                            Err(err)
                         }
                         BatchStatus::Rejected => {
                             let err = ProcessingError::BlobDeliveryRejected {
@@ -3631,9 +3636,13 @@ mod drain_tests {
                     1,
                     "{status:?}, {delete_failed_message}"
                 );
+                // Only a rejected batch follows the flag; an errored one is never deleted.
                 assert_eq!(
                     requests(&server).await,
-                    (1, usize::from(delete_failed_message)),
+                    (
+                        1,
+                        usize::from(delete_failed_message && status == EventStatus::Rejected)
+                    ),
                     "{status:?}, {delete_failed_message}"
                 );
             }
@@ -3822,9 +3831,9 @@ mod drain_tests {
         );
     }
 
-    /// A batch the sink errors or rejects is counted exactly once. With `delete_failed_message`
-    /// the message is still acknowledged and deleted, as before; without it the error propagates
-    /// and the message stays queued. Both paths keep their behavior, and neither double-counts.
+    /// A batch the sink errors or rejects is counted exactly once. A rejected batch follows
+    /// `delete_failed_message` (deleted when true, left queued when false). An errored batch is
+    /// never deleted, whatever the flag says. Neither double-counts.
     #[tokio::test(flavor = "multi_thread")]
     async fn failed_delivery_is_counted_once_whether_or_not_failed_message_is_deleted() {
         trace_init();
@@ -3833,7 +3842,7 @@ mod drain_tests {
             (EventStatus::Rejected, "delivery_rejected"),
         ];
         for (status, code) in cases {
-            // delete_failed_message = true: Ok, so the message is deleted.
+            // delete_failed_message = true: a rejected message is deleted, an errored one is not.
             let server = mock_queue(&ingest_message_text(), 204, blob_ok()).await;
             let before = component_errors("acknowledgment_failed", code, "sending");
             run_once_full(&server, None, None, true, true, Some(status)).await;
@@ -3845,8 +3854,8 @@ mod drain_tests {
             );
             assert_eq!(
                 requests(&server).await,
-                (1, 1),
-                "{code}: the blob is fetched and the message deleted when delete_failed_message = true"
+                (1, usize::from(status == EventStatus::Rejected)),
+                "{code}: the blob is fetched; only a rejected message is deleted when delete_failed_message = true"
             );
 
             // delete_failed_message = false: the error propagates and the message stays queued.
