@@ -254,6 +254,16 @@ pub trait SinkConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sync
     /// returned.
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)>;
 
+    /// Validate and snapshot reloadable credentials before any running component stops.
+    fn prepare_reload(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// Retain runtime state across reloads that leave this sink unchanged.
+    fn reload_snapshot(&self) -> Option<BoxedSink> {
+        None
+    }
+
     /// Gets the input configuration for this sink.
     fn input(&self) -> Input;
 

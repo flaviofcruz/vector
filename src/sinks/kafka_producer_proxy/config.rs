@@ -104,6 +104,9 @@ pub struct KafkaProducerProxyConfig {
     #[serde(default)]
     tls: Option<TlsEnableableConfig>,
 
+    #[serde(skip)]
+    tls_snapshot: crate::config::tls_snapshot::TlsConfigSnapshot,
+
     #[configurable(derived)]
     #[serde(
         default,
@@ -126,6 +129,7 @@ impl Default for KafkaProducerProxyConfig {
             request: TowerRequestConfig::default(),
             load_balancing: LoadBalancingConfig::default(),
             tls: None,
+            tls_snapshot: Default::default(),
             acknowledgements: AcknowledgementsConfig::default(),
         }
     }
@@ -167,12 +171,20 @@ impl GenerateConfig for KafkaProducerProxyConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "kafka_producer_proxy")]
 impl SinkConfig for KafkaProducerProxyConfig {
+    fn prepare_reload(&mut self) -> crate::Result<()> {
+        self.tls_snapshot.prepare(self.tls.as_ref(), false)
+    }
+
+    fn reload_snapshot(&self) -> Option<crate::config::BoxedSink> {
+        Some(Box::new(self.clone()))
+    }
+
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         if self.load_balancing.enabled {
             return self.build_balanced(cx).await;
         }
 
-        let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
+        let tls = self.tls_snapshot.get_or_load(self.tls.as_ref(), false)?;
         let uri = with_default_scheme(&self.address, tls.is_tls())?;
 
         let client = new_client(&tls, cx.proxy())?;
@@ -216,7 +228,7 @@ impl SinkConfig for KafkaProducerProxyConfig {
 
 impl KafkaProducerProxyConfig {
     async fn build_balanced(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
+        let tls = self.tls_snapshot.get_or_load(self.tls.as_ref(), false)?;
         let uri = with_default_scheme(&self.address, tls.is_tls())?;
         let target = self.load_balancing.discovery_uri(&uri)?;
         let client = dynamic_balance::new_client(&tls, self.tls.as_ref(), cx.proxy())?;

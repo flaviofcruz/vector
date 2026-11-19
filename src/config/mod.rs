@@ -42,6 +42,12 @@ pub mod schema;
 mod secret;
 mod sink;
 mod source;
+#[cfg(any(
+    feature = "sources-vector",
+    feature = "sinks-vector",
+    feature = "sinks-kafka_producer_proxy"
+))]
+pub(crate) mod tls_snapshot;
 mod transform;
 pub mod unit_test;
 mod validation;
@@ -205,6 +211,12 @@ impl Config {
 
     pub fn sinks(&self) -> impl Iterator<Item = (&ComponentKey, &SinkOuter<OutputId>)> {
         self.sinks.iter()
+    }
+
+    pub(crate) fn sinks_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&ComponentKey, &mut SinkOuter<OutputId>)> {
+        self.sinks.iter_mut()
     }
 
     pub fn sink(&self, id: &ComponentKey) -> Option<&SinkOuter<OutputId>> {

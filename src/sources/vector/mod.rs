@@ -24,13 +24,13 @@ use crate::{
     SourceSender,
     config::{
         DataType, GenerateConfig, Resource, SourceAcknowledgementsConfig, SourceConfig,
-        SourceContext, SourceOutput,
+        SourceContext, SourceOutput, tls_snapshot::TlsConfigSnapshot,
     },
     internal_events::{EventsReceived, StreamClosedError},
     proto::vector as proto,
     serde::bool_or_struct,
     sources::{Source, util::grpc::run_grpc_server},
-    tls::{MaybeTlsSettings, TlsEnableableConfig},
+    tls::TlsEnableableConfig,
 };
 
 /// Marker type for version two of the configuration for the `vector` source.
@@ -339,6 +339,9 @@ pub struct VectorConfig {
     #[serde(default)]
     #[configurable(metadata(docs::hidden))]
     pub emit_read_delivery_events: bool,
+
+    #[serde(skip)]
+    tls_snapshot: TlsConfigSnapshot,
 }
 
 impl VectorConfig {
@@ -361,6 +364,7 @@ impl Default for VectorConfig {
             log_namespace: None,
             max_concurrent_requests: None,
             emit_read_delivery_events: false,
+            tls_snapshot: Default::default(),
         }
     }
 }
@@ -374,8 +378,16 @@ impl GenerateConfig for VectorConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "vector")]
 impl SourceConfig for VectorConfig {
+    fn prepare_reload(&mut self) -> crate::Result<()> {
+        self.tls_snapshot.prepare(self.tls.as_ref(), true)
+    }
+
+    fn reload_snapshot(&self) -> Option<crate::config::BoxedSource> {
+        Some(Box::new(self.clone()))
+    }
+
     async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
-        let tls_settings = MaybeTlsSettings::from_config(self.tls.as_ref(), true)?;
+        let tls_settings = self.tls_snapshot.get_or_load(self.tls.as_ref(), true)?;
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
         let log_namespace = cx.log_namespace(self.log_namespace);
 

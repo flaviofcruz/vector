@@ -1079,6 +1079,20 @@ impl RunningTopology {
                 source.inner = snapshot;
             }
         }
+        for (key, sink) in new_config.sinks_mut() {
+            if diff.sinks.contains_new(key) {
+                if let Err(error) = sink.inner.prepare_reload() {
+                    error!(component_id = %key, %error, "Sink reload preparation failed; keeping the running topology.");
+                    return Err(ReloadError::TopologyBuildFailed);
+                }
+            } else if let Some(snapshot) = self
+                .config
+                .sink(key)
+                .and_then(|current| current.inner.reload_snapshot())
+            {
+                sink.inner = snapshot;
+            }
+        }
         let buffers = self.shutdown_diff(&diff, &new_config).await;
 
         // Gives windows some time to make available any port

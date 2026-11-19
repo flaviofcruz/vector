@@ -52,6 +52,12 @@ mod end_to_end;
 mod reload;
 #[cfg(all(feature = "sinks-console", feature = "sources-demo_logs"))]
 mod source_finished;
+#[cfg(all(
+    feature = "sources-vector",
+    feature = "sinks-vector",
+    feature = "sinks-kafka_producer_proxy"
+))]
+mod tls_reload;
 mod transient_state;
 
 fn basic_config() -> Config {

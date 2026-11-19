@@ -19,7 +19,7 @@ use crate::sinks::util::vector_event_log::EventLoggingService;
 use crate::{
     config::{
         AcknowledgementsConfig, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext,
-        SinkHealthcheckOptions,
+        SinkHealthcheckOptions, tls_snapshot::TlsConfigSnapshot,
     },
     http::build_proxy_connector_with_tcp_keepalive,
     proto::vector as proto,
@@ -155,6 +155,9 @@ pub struct VectorConfig {
         skip_serializing_if = "crate::serde::is_default"
     )]
     pub(in crate::sinks::vector) acknowledgements: AcknowledgementsConfig,
+
+    #[serde(skip)]
+    tls_snapshot: TlsConfigSnapshot,
 }
 
 impl VectorConfig {
@@ -182,18 +185,27 @@ fn default_config(address: &str) -> VectorConfig {
         load_balancing: LoadBalancingConfig::default(),
         tls: None,
         acknowledgements: Default::default(),
+        tls_snapshot: Default::default(),
     }
 }
 
 #[async_trait::async_trait]
 #[typetag::serde(name = "vector")]
 impl SinkConfig for VectorConfig {
+    fn prepare_reload(&mut self) -> crate::Result<()> {
+        self.tls_snapshot.prepare(self.tls.as_ref(), false)
+    }
+
+    fn reload_snapshot(&self) -> Option<crate::config::BoxedSink> {
+        Some(Box::new(self.clone()))
+    }
+
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSinkType, Healthcheck)> {
         if self.load_balancing.enabled {
             return self.build_balanced(cx).await;
         }
 
-        let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
+        let tls = self.tls_snapshot.get_or_load(self.tls.as_ref(), false)?;
         let uri = with_default_scheme(&self.address, tls.is_tls())?;
 
         let client = new_client(&tls, cx.proxy(), self)?;
@@ -240,7 +252,7 @@ impl VectorConfig {
         &self,
         cx: SinkContext,
     ) -> crate::Result<(VectorSinkType, Healthcheck)> {
-        let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
+        let tls = self.tls_snapshot.get_or_load(self.tls.as_ref(), false)?;
         let uri = with_default_scheme(&self.address, tls.is_tls())?;
         let target = self.load_balancing.discovery_uri(&uri)?;
         let client = dynamic_balance::new_client(&tls, self.tls.as_ref(), cx.proxy())?;
