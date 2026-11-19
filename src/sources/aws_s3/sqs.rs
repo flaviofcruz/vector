@@ -55,6 +55,7 @@ use crate::sources::util::object_storage_adaptive_concurrency::{
     ADAPTIVE_POLL_BACKOFF, ADAPTIVE_POLL_TIMEOUT, AdaptiveObjectStorageConcurrency,
     ObjectStorageAdaptiveConcurrencyConfig,
 };
+use crate::sources::util::object_storage_client_concurrency::report_client_concurrency;
 use crate::{
     SourceSender,
     aws::AwsTimeout,
@@ -810,6 +811,12 @@ impl Ingestor {
             );
             handles.push(depth_handle);
         }
+
+        // Independent of the depth sampler and receive loop, so the gauge stays fresh when idle.
+        handles.push(tokio::spawn(
+            report_client_concurrency(self.state.client_concurrency, cx.shutdown.clone())
+                .in_current_span(),
+        ));
 
         // Wait for all of the processes to finish.  If any one of them panics, we resume
         // that panic here to properly shutdown Vector.
@@ -3724,6 +3731,64 @@ mod drain_tests {
         assert_eq!(body["WaitTimeSeconds"], 17);
         drop(process);
         sink.await.unwrap();
+    }
+
+    /// Runs `Ingestor::run` with no successful receives and returns the client_concurrency gauge.
+    async fn client_concurrency_gauge_while_running(process: &IngestorProcess) -> Option<f64> {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        use crate::sources::util::object_storage_client_concurrency::client_concurrency_gauge;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let (out, _rx) = SourceSender::new_test();
+        let run = tokio::spawn(
+            Ingestor {
+                state: Arc::clone(&process.state),
+            }
+            .run(
+                SourceContext::new_test(out, None),
+                SourceAcknowledgementsConfig::default(),
+                LogNamespace::Legacy,
+            ),
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        run.abort();
+        client_concurrency_gauge(&snapshotter)
+    }
+
+    #[tokio::test]
+    async fn client_concurrency_gauge_reports_fixed_ceiling_without_receives() {
+        // No mocks are mounted, so every receive fails and no message is ever delivered.
+        let server = MockServer::start().await;
+        let (mut process, _sink) =
+            process_with_admission(&server, None, None, true, None, None).await;
+        Arc::get_mut(&mut process.state).unwrap().client_concurrency = 4;
+
+        assert_eq!(
+            client_concurrency_gauge_while_running(&process).await,
+            Some(4.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn client_concurrency_gauge_ignores_adaptive_limit() {
+        let server = MockServer::start().await;
+        let (adaptive, _usage) = AdaptiveObjectStorageConcurrency::for_test(2, 4, 4);
+        let (mut process, _sink) =
+            process_with_admission(&server, None, None, true, Some(adaptive), None).await;
+        Arc::get_mut(&mut process.state).unwrap().client_concurrency = 4;
+        // The live controller drops to 1, below the configured ceiling; the gauge must stay at 4.
+        let controller = process.state.adaptive.as_ref().unwrap();
+        controller.note_failed_delivery();
+        assert_eq!(controller.test_limit(), 1);
+
+        assert_eq!(
+            client_concurrency_gauge_while_running(&process).await,
+            Some(4.0)
+        );
     }
 
     #[tokio::test]

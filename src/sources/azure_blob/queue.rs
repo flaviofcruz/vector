@@ -54,6 +54,7 @@ use crate::sources::util::object_storage_adaptive_concurrency::{
     ADAPTIVE_POLL_BACKOFF, ADAPTIVE_POLL_TIMEOUT, AdaptiveObjectStorageConcurrency,
     ObjectStorageAdaptiveConcurrencyConfig,
 };
+use crate::sources::util::object_storage_client_concurrency::report_client_concurrency;
 use crate::{
     SourceSender,
     config::{SourceAcknowledgementsConfig, SourceContext},
@@ -819,6 +820,12 @@ impl Ingestor {
             Self::run_depth_poller(Arc::clone(&self.state), cx.shutdown.clone()).in_current_span(),
         );
         handles.push(depth_handle);
+
+        // Independent of the depth sampler and receive loop, so the gauge stays fresh when idle.
+        handles.push(tokio::spawn(
+            report_client_concurrency(self.state.client_concurrency, cx.shutdown.clone())
+                .in_current_span(),
+        ));
 
         // Wait for all tasks to complete, propagating any panics
         for handle in handles.drain(..) {

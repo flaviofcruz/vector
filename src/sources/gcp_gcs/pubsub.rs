@@ -51,6 +51,7 @@ use crate::sources::util::object_storage_adaptive_concurrency::{
     ADAPTIVE_POLL_BACKOFF, ADAPTIVE_POLL_TIMEOUT, AdaptiveObjectStorageConcurrency,
     ObjectStorageAdaptiveConcurrencyConfig,
 };
+use crate::sources::util::object_storage_client_concurrency::report_client_concurrency;
 
 /// Configuration options for the Pub/Sub subscription.
 #[serde_as]
@@ -817,6 +818,12 @@ impl Ingestor {
             );
             handles.push(depth_handle);
         }
+
+        // Independent of the depth sampler and receive loop, so the gauge stays fresh when idle.
+        handles.push(tokio::spawn(
+            report_client_concurrency(self.state.client_concurrency, cx.shutdown.clone())
+                .in_current_span(),
+        ));
 
         for handle in handles.drain(..) {
             if let Err(e) = handle.await

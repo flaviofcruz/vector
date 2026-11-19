@@ -36,6 +36,7 @@ pub mod net;
     feature = "sources-gcp_gcs"
 ))]
 pub mod object_storage_adaptive_concurrency;
+pub mod object_storage_client_concurrency;
 pub mod object_storage_compression;
 #[cfg(any(
     feature = "sources-aws_s3",

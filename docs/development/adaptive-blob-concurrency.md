@@ -71,6 +71,10 @@ or an OOM guarantee: active objects are not preempted.
 
 Observe these per-component metrics:
 
+- `object_storage_client_concurrency`: the configured `client_concurrency` ceiling, reported
+  even when adaptive is on. It does not follow the adaptive limit; use
+  `object_storage_adaptive_concurrency_limit` for that. Refreshed on a timer while the source
+  runs, including when idle.
 - `object_storage_adaptive_concurrency_limit`: actual per-source limit.
 - `object_storage_adaptive_active_objects`: shared process active count as
   observed by this source; use a maximum, not a sum across sources.

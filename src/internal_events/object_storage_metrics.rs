@@ -25,6 +25,25 @@ impl InternalEvent for ObjectStorageAdaptiveConcurrency {
     }
 }
 
+/// The configured `client_concurrency` ceiling. The live adaptive limit is reported separately
+/// as `object_storage_adaptive_concurrency_limit`.
+#[derive(Debug)]
+pub struct ObjectStorageClientConcurrency {
+    pub client_concurrency: usize,
+}
+
+impl NamedInternalEvent for ObjectStorageClientConcurrency {
+    fn name(&self) -> &'static str {
+        "ObjectStorageClientConcurrency"
+    }
+}
+
+impl InternalEvent for ObjectStorageClientConcurrency {
+    fn emit(self) {
+        gauge!("object_storage_client_concurrency").set(self.client_concurrency as f64);
+    }
+}
+
 #[derive(Debug)]
 pub struct ObjectStorageAdaptiveCompletion {
     pub elapsed: std::time::Duration,
